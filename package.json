@@ -1,0 +1,92 @@
+{
+  "name": "pocket-bridge",
+  "productName": "Pocket Bridge",
+  "version": "1.0.0",
+  "description": "Remote terminal access via Cloudflare Tunnel",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac",
+    "build:unsigned": "electron-builder --mac -c.mac.identity=null",
+    "rebuild": "electron-rebuild -f -w node-pty keytar",
+    "postinstall": "electron-rebuild -f -w node-pty keytar",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "terminal",
+    "remote",
+    "cloudflare",
+    "tunnel"
+  ],
+  "author": "stellarwings",
+  "license": "ISC",
+  "dependencies": {
+    "cloudflared": "^0.7.1",
+    "electron-store": "^11.0.2",
+    "fix-path": "^5.0.0",
+    "is-electron": "^2.2.2",
+    "keytar": "^7.9.0",
+    "node-pty": "^1.1.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.3",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-web-links": "^0.9.0"
+  },
+  "devDependencies": {
+    "@electron/notarize": "^2.5.0",
+    "@electron/rebuild": "^3.7.2",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "electron-rebuild": "^3.2.9"
+  },
+  "build": {
+    "appId": "com.stellarwings.pocketbridge",
+    "productName": "Pocket Bridge",
+    "copyright": "Copyright © 2024 stellarwings",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false
+    },
+    "dmg": {
+      "sign": false
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "ui/**/*",
+      "public/**/*",
+      "node_modules/**/*",
+      "!node_modules/**/*.md",
+      "!node_modules/**/LICENSE*",
+      "!node_modules/**/*.map"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/node-pty/**/*",
+      "node_modules/keytar/**/*"
+    ],
+    "afterSign": "scripts/notarize.js"
+  }
+}
