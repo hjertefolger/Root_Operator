@@ -35,6 +35,70 @@ let wakeLock;
 let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
 
+// ANSI ESCAPE SEQUENCE SANITIZER
+// Blocks dangerous sequences while preserving normal terminal functionality
+// Reference: https://www.cyberark.com/resources/threat-research-blog/dont-trust-this-title-abusing-terminal-emulators-with-ansi-escape-characters
+function sanitizeTerminalOutput(data) {
+    // OSC (Operating System Command) sequences: ESC ] ... (ST or BEL)
+    // ST = ESC \ or 0x9C, BEL = 0x07
+    // Dangerous: OSC 52 (clipboard), OSC 0/1/2 (title - can be used for phishing)
+
+    // Pattern matches OSC sequences: ESC ] <number> ; <content> (BEL or ESC \)
+    const oscPattern = /\x1b\](\d+);[^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+    // DCS (Device Control String): ESC P ... ST - can execute commands on some terminals
+    const dcsPattern = /\x1bP[^\x1b]*\x1b\\/g;
+
+    // APC (Application Program Command): ESC _ ... ST
+    const apcPattern = /\x1b_[^\x1b]*\x1b\\/g;
+
+    // PM (Privacy Message): ESC ^ ... ST
+    const pmPattern = /\x1b\^[^\x1b]*\x1b\\/g;
+
+    // SOS (Start of String): ESC X ... ST
+    const sosPattern = /\x1bX[^\x1b]*\x1b\\/g;
+
+    let sanitized = data;
+
+    // Filter OSC sequences - allow only safe ones (color palette: 4, 10, 11, 12, 104, 110, 111, 112)
+    sanitized = sanitized.replace(oscPattern, (match, oscNum) => {
+        const num = parseInt(oscNum, 10);
+        // Safe OSC codes for color configuration
+        const safeOsc = [4, 10, 11, 12, 104, 110, 111, 112, 17, 19];
+        if (safeOsc.includes(num)) {
+            return match; // Allow color-related OSC
+        }
+        logDebug(`[SECURITY] Blocked OSC ${num} sequence`);
+        return ''; // Block title changes (0,1,2), clipboard (52), and others
+    });
+
+    // Block all DCS sequences (rarely needed, high risk)
+    sanitized = sanitized.replace(dcsPattern, (match) => {
+        logDebug('[SECURITY] Blocked DCS sequence');
+        return '';
+    });
+
+    // Block APC sequences
+    sanitized = sanitized.replace(apcPattern, (match) => {
+        logDebug('[SECURITY] Blocked APC sequence');
+        return '';
+    });
+
+    // Block PM sequences
+    sanitized = sanitized.replace(pmPattern, (match) => {
+        logDebug('[SECURITY] Blocked PM sequence');
+        return '';
+    });
+
+    // Block SOS sequences
+    sanitized = sanitized.replace(sosPattern, (match) => {
+        logDebug('[SECURITY] Blocked SOS sequence');
+        return '';
+    });
+
+    return sanitized;
+}
+
 // 1. GUI SETUP
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -665,7 +729,7 @@ function startPty(ws) {
             logDebug(`[PTY] Output Hex: ${hex}`);
         }
 
-        // Claude Code uses different circle/dot characters. 
+        // Claude Code uses different circle/dot characters.
         // We force "Text Presentation" (\uFE0E) on all of them.
         let filtered = raw
             .replace(/\u25CF/g, '\u25CF\uFE0E') // ● Black Circle
@@ -674,6 +738,9 @@ function startPty(ws) {
             .replace(/\u2219/g, '\u2219\uFE0E') // ∙ Bullet Operator
             .replace(/\u23FA/g, '\u23FA\uFE0E') // ⏺ Black Circle for Record
             .replace(/\uD83D\uDD35/g, '\u25CF\uFE0E'); // Force blue circle emoji to black circle text
+
+        // SECURITY: Sanitize dangerous ANSI escape sequences
+        filtered = sanitizeTerminalOutput(filtered);
 
         // Broadcast to all authenticated clients
         const msg = JSON.stringify({ type: 'output', data: filtered });
