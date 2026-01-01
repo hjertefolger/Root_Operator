@@ -195,6 +195,63 @@
             background: #ddd;
         }
 
+        .toggle-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+        }
+
+        .toggle-row span {
+            font-size: 10px;
+            color: #888;
+        }
+
+        .switch {
+            position: relative;
+            width: 36px;
+            height: 20px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #333;
+            transition: 0.2s;
+            border-radius: 20px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: #666;
+            transition: 0.2s;
+            border-radius: 50%;
+        }
+
+        .switch input:checked + .slider {
+            background-color: #fff;
+        }
+
+        .switch input:checked + .slider:before {
+            transform: translateX(16px);
+            background-color: #000;
+        }
+
         /* MODAL */
         #modal {
             position: fixed;
@@ -267,6 +324,13 @@
         <div class="settings-content">
             <input type="password" id="cf-token" placeholder="Cloudflare Token">
             <input type="text" id="cf-domain" placeholder="Custom Domain">
+            <div class="toggle-row">
+                <span>Debug Logging</span>
+                <label class="switch">
+                    <input type="checkbox" id="debug-logging">
+                    <span class="slider"></span>
+                </label>
+            </div>
             <button onclick="saveSettings()" class="save-btn">Save Changes</button>
         </div>
     </div>
@@ -298,6 +362,7 @@
             ]);
             document.getElementById('cf-token').value = token || '';
             document.getElementById('cf-domain').value = (settings && settings.domain) || '';
+            document.getElementById('debug-logging').checked = (settings && settings.debugLogging) || false;
         }
         loadSettings();
 
@@ -330,12 +395,13 @@
         async function saveSettings() {
             const token = document.getElementById('cf-token').value;
             const domain = document.getElementById('cf-domain').value;
+            const debugLogging = document.getElementById('debug-logging').checked;
 
             // Store token securely in OS keychain
             await api.invoke('SET_SECURE_TOKEN', token);
 
             // Store non-sensitive settings in regular store
-            await api.invoke('SET_STORE', 'cfSettings', { domain });
+            await api.invoke('SET_STORE', 'cfSettings', { domain, debugLogging });
 
             hideSettings();
         }

@@ -118,13 +118,11 @@ app.whenReady().then(async () => {
 
     const { default: ES } = await import('electron-store');
     store = new ES();
+    logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
 
     await fixPath();
     createWindow();
     createTray();
-
-    // For debugging: show window if no tray appears after 5 seconds? 
-    // No, better to just log.
 });
 
 // 2. IPC API (Frontend -> Backend)
@@ -212,26 +210,17 @@ ipcMain.handle('DELETE_SECURE_TOKEN', async () => {
 // Logging with rotation and sensitive data redaction
 const LOG_MAX_SIZE = 1024 * 1024; // 1MB max log size
 const LOG_MAX_FILES = 3; // Keep 3 rotated files
-const logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
+let logFile;
 
-// Patterns to redact from logs
-const REDACT_PATTERNS = [
-    /token[=:]\s*["']?[A-Za-z0-9_\-\.]+["']?/gi,
-    /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, // JWT
-    /[A-Za-z0-9]{32,}/g, // Long hex strings (potential secrets)
-];
-
-function redactSensitive(msg) {
-    let redacted = msg;
-    for (const pattern of REDACT_PATTERNS) {
-        redacted = redacted.replace(pattern, '[REDACTED]');
-    }
-    return redacted;
+function isDebugLoggingEnabled() {
+    if (!store) return false;
+    const settings = store.get('cfSettings', {});
+    return settings.debugLogging === true;
 }
 
 function rotateLogIfNeeded() {
     try {
-        if (!fs.existsSync(logFile)) return;
+        if (!logFile || !fs.existsSync(logFile)) return;
 
         const stats = fs.statSync(logFile);
         if (stats.size < LOG_MAX_SIZE) return;
@@ -252,23 +241,23 @@ function rotateLogIfNeeded() {
         // Rotate current log
         fs.renameSync(logFile, `${logFile}.1`);
     } catch (e) {
-        console.error('Log rotation failed:', e.message);
+        // Ignore rotation errors
     }
 }
 
 function logDebug(msg) {
-    rotateLogIfNeeded();
-    const time = new Date().toISOString();
-    const safeMsg = redactSensitive(msg);
-    const line = `[${time}] ${safeMsg}\n`;
-    try {
-        fs.appendFileSync(logFile, line);
-    } catch (e) {
-        // Ignore write errors
+    // Only write to file if debug logging is enabled
+    if (isDebugLoggingEnabled() && logFile) {
+        rotateLogIfNeeded();
+        const time = new Date().toISOString();
+        const line = `[${time}] ${msg}\n`;
+        try {
+            fs.appendFileSync(logFile, line);
+        } catch (e) {
+            // Ignore write errors
+        }
     }
-    console.log(line.trim());
 }
-logDebug('--- POCKET BRIDGE START ---');
 
 // 3. BRIDGE LOGIC
 
