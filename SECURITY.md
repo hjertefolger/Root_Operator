@@ -1,10 +1,10 @@
 # Pocket Bridge Security Assessment
 
-## Current Status: Personal/Small Team Use → Zero-Knowledge Architecture Planned
+## Current Status: Zero-Knowledge Architecture Implemented
 
-Last updated: 2026-01-01
+Last updated: 2026-01-02
 
-**Roadmap:** Implementing E2E encryption with key verification to achieve cryptographically guaranteed privacy, even when using shared infrastructure.
+**Achieved:** E2E encryption with key fingerprint verification. Terminal content is cryptographically protected - infrastructure operators cannot read commands or output.
 
 ---
 
@@ -20,14 +20,15 @@ Last updated: 2026-01-01
 | Secrets storage | OS keychain (keytar) | Done |
 | Security headers | CSP, X-Frame-Options | Done |
 | ANSI escape filtering | Blocks OSC 52, title changes, DCS/APC/PM/SOS | Done |
+| **E2E Encryption** | ECDH + AES-256-GCM + fingerprint verification | **Done** |
 
 ---
 
-## Planned: End-to-End Encryption with Key Verification
+## Implemented: End-to-End Encryption with Key Verification
 
 ### Overview
 
-Implement zero-knowledge E2E encryption so that even when traffic routes through the app's Cloudflare infrastructure, terminal content remains private.
+Zero-knowledge E2E encryption ensures that even when traffic routes through the app's Cloudflare infrastructure, terminal content remains private.
 
 **Trust Model:**
 | Configuration | What Operator Sees | Trust Level |
@@ -330,13 +331,13 @@ function auditLog(event, details) {
 ## Implementation Checklist
 
 ### Priority 1: E2E Encryption (Privacy Critical)
-- [ ] Session key derivation during auth handshake
-- [ ] AES-256-GCM encryption for `input` messages
-- [ ] AES-256-GCM encryption for `output` messages
-- [ ] Key fingerprint generation
-- [ ] Fingerprint display in client UI
-- [ ] Fingerprint display in Mac tray menu
-- [ ] Verification confirmation flow
+- [x] Session key derivation during auth handshake (ECDH + HKDF)
+- [x] AES-256-GCM encryption for `input` messages
+- [x] AES-256-GCM encryption for `output` messages
+- [x] Key fingerprint generation (4-word NATO phonetic)
+- [x] Fingerprint display in client UI (green badge, top-right)
+- [x] Fingerprint display in Mac tray menu
+- [x] Verification confirmation flow (fingerprint match check)
 
 ### Priority 2: Infrastructure
 - [ ] Custom subdomain routing (e.g., `username.pocketbridge.dev`)

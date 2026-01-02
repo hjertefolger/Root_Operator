@@ -99,6 +99,183 @@ function sanitizeTerminalOutput(data) {
     return sanitized;
 }
 
+// E2E ENCRYPTION MODULE
+// Provides zero-knowledge encryption using ECDH key exchange + AES-256-GCM
+
+// Word list for human-readable fingerprints (NATO phonetic-inspired)
+const FINGERPRINT_WORDS = [
+    'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+    'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
+    'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray',
+    'yankee', 'zulu', 'amber', 'bronze', 'coral', 'dune', 'ember', 'frost'
+];
+
+// Global state for current session fingerprint (shown in tray)
+let currentFingerprint = null;
+
+// Generate ECDH key pair for key exchange
+function generateECDHKeyPair() {
+    const ecdh = crypto.createECDH('prime256v1');
+    ecdh.generateKeys();
+    return {
+        publicKey: ecdh.getPublicKey('base64'),
+        privateKey: ecdh.getPrivateKey('base64'),
+        ecdh: ecdh
+    };
+}
+
+// Derive shared secret from ECDH
+function deriveSharedSecret(ecdh, otherPublicKeyBase64) {
+    const otherPublicKey = Buffer.from(otherPublicKeyBase64, 'base64');
+    return ecdh.computeSecret(otherPublicKey);
+}
+
+// Derive AES-256-GCM key using HKDF
+function deriveSessionKey(sharedSecret, salt) {
+    // Use HKDF to derive a 256-bit key
+    const info = Buffer.from('pocket-bridge-e2e-v1');
+    const key = crypto.hkdfSync('sha256', sharedSecret, salt, info, 32);
+    return Buffer.from(key);
+}
+
+// Generate human-readable fingerprint from key material
+function generateFingerprint(sharedSecret, salt) {
+    const combined = Buffer.concat([sharedSecret, salt]);
+    const hash = crypto.createHash('sha256').update(combined).digest();
+
+    // Use first 4 bytes to select 4 words
+    const words = [];
+    for (let i = 0; i < 4; i++) {
+        const index = hash[i] % FINGERPRINT_WORDS.length;
+        words.push(FINGERPRINT_WORDS[index]);
+    }
+    return words.join('-');
+}
+
+// Encrypt message with AES-256-GCM
+function encryptMessage(plaintext, sessionKey) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', sessionKey, iv);
+
+    const encrypted = Buffer.concat([
+        cipher.update(plaintext, 'utf8'),
+        cipher.final()
+    ]);
+    const authTag = cipher.getAuthTag();
+
+    return {
+        iv: iv.toString('base64'),
+        data: encrypted.toString('base64'),
+        tag: authTag.toString('base64')
+    };
+}
+
+// Decrypt message with AES-256-GCM
+function decryptMessage(encrypted, sessionKey) {
+    try {
+        const iv = Buffer.from(encrypted.iv, 'base64');
+        const data = Buffer.from(encrypted.data, 'base64');
+        const authTag = Buffer.from(encrypted.tag, 'base64');
+
+        const decipher = crypto.createDecipheriv('aes-256-gcm', sessionKey, iv);
+        decipher.setAuthTag(authTag);
+
+        const decrypted = Buffer.concat([
+            decipher.update(data),
+            decipher.final()
+        ]);
+
+        return decrypted.toString('utf8');
+    } catch (e) {
+        logDebug(`[E2E] Decryption failed: ${e.message}`);
+        return null;
+    }
+}
+
+// Initialize E2E for a WebSocket connection
+function initE2EKeyExchange(ws) {
+    const keyPair = generateECDHKeyPair();
+    const salt = crypto.randomBytes(16);
+
+    // Store on ws object for later use
+    ws.e2e = {
+        ecdh: keyPair.ecdh,
+        salt: salt,
+        sessionKey: null,
+        fingerprint: null,
+        ready: false
+    };
+
+    // Send our public key and salt to client
+    ws.send(JSON.stringify({
+        type: 'e2e_init',
+        publicKey: keyPair.publicKey,
+        salt: salt.toString('base64')
+    }));
+
+    logDebug('[E2E] Key exchange initiated');
+}
+
+// Complete E2E setup when we receive client's public key
+function completeE2EKeyExchange(ws, clientPublicKey) {
+    if (!ws.e2e || !ws.e2e.ecdh) {
+        logDebug('[E2E] Error: No ECDH context for this connection');
+        return false;
+    }
+
+    try {
+        const sharedSecret = deriveSharedSecret(ws.e2e.ecdh, clientPublicKey);
+        ws.e2e.sessionKey = deriveSessionKey(sharedSecret, ws.e2e.salt);
+        ws.e2e.fingerprint = generateFingerprint(sharedSecret, ws.e2e.salt);
+        ws.e2e.ready = true;
+
+        // Update global fingerprint for tray display
+        currentFingerprint = ws.e2e.fingerprint;
+        updateTrayMenu();
+
+        logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
+
+        // Notify client that E2E is ready
+        ws.send(JSON.stringify({
+            type: 'e2e_ready',
+            fingerprint: ws.e2e.fingerprint
+        }));
+
+        // Notify renderer to show fingerprint
+        if (mainWindow) {
+            mainWindow.webContents.send('E2E_FINGERPRINT', ws.e2e.fingerprint);
+        }
+
+        return true;
+    } catch (e) {
+        logDebug(`[E2E] Key exchange failed: ${e.message}`);
+        return false;
+    }
+}
+
+// Send encrypted output to client
+function sendEncryptedOutput(ws, data) {
+    if (!ws.e2e || !ws.e2e.ready) {
+        // Fallback to unencrypted if E2E not ready
+        ws.send(JSON.stringify({ type: 'output', data: data }));
+        return;
+    }
+
+    const encrypted = encryptMessage(data, ws.e2e.sessionKey);
+    ws.send(JSON.stringify({
+        type: 'e2e_output',
+        ...encrypted
+    }));
+}
+
+// Decrypt input from client
+function decryptInput(ws, encrypted) {
+    if (!ws.e2e || !ws.e2e.ready) {
+        return null;
+    }
+    return decryptMessage(encrypted, ws.e2e.sessionKey);
+}
+
 // 1. GUI SETUP
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -148,6 +325,9 @@ function createTray() {
             toggleWindow();
         });
 
+        // Initialize tray context menu
+        updateTrayMenu();
+
         console.log('Tray created successfully');
     } catch (err) {
         console.error('Failed to create tray:', err);
@@ -174,6 +354,35 @@ function showWindow() {
     mainWindow.setPosition(x, y, false);
     mainWindow.show();
     mainWindow.focus();
+}
+
+// Update tray context menu (called when E2E fingerprint changes)
+function updateTrayMenu() {
+    if (!tray) return;
+
+    const menuItems = [
+        { label: 'Pocket Bridge', enabled: false },
+        { type: 'separator' }
+    ];
+
+    // Add fingerprint if E2E is active
+    if (currentFingerprint) {
+        menuItems.push({
+            label: `E2E: ${currentFingerprint}`,
+            enabled: false,
+            toolTip: 'Verify this matches your client device'
+        });
+        menuItems.push({ type: 'separator' });
+    }
+
+    menuItems.push(
+        { label: 'Show Window', click: () => showWindow() },
+        { type: 'separator' },
+        { label: 'Quit', click: () => app.quit() }
+    );
+
+    const contextMenu = Menu.buildFromTemplate(menuItems);
+    tray.setContextMenu(contextMenu);
 }
 
 app.whenReady().then(async () => {
@@ -555,6 +764,8 @@ function handleConnection(ws, req) {
                 ws.authenticated = true;
                 clearTimeout(ws.authTimeout);
                 ws.send(JSON.stringify({ type: 'auth_success' }));
+                // Initiate E2E key exchange
+                initE2EKeyExchange(ws);
                 startPty(ws);
             } else {
                 logDebug(`[WS] Auth PENDING: ${m.keyId.substring(0, 8)}`);
@@ -578,7 +789,44 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Input - only from authenticated clients
+        // E2E: Receive client's ECDH public key
+        if (ws.authenticated && m.type === 'e2e_client_key') {
+            if (m.publicKey && typeof m.publicKey === 'string') {
+                completeE2EKeyExchange(ws, m.publicKey);
+            } else {
+                logDebug('[E2E] Invalid client key format');
+            }
+            return;
+        }
+
+        // E2E Encrypted Input - only from authenticated clients with E2E
+        if (ws.authenticated && m.type === 'e2e_input') {
+            if (!ws.e2e || !ws.e2e.ready) {
+                logDebug('[E2E] Received encrypted input but E2E not ready');
+                return;
+            }
+
+            const decrypted = decryptInput(ws, { iv: m.iv, data: m.data, tag: m.tag });
+            if (decrypted === null) {
+                logDebug('[E2E] Failed to decrypt input');
+                return;
+            }
+
+            // Limit input size
+            let inputData = decrypted;
+            if (inputData.length > MAX_INPUT_SIZE) {
+                logDebug('[SECURITY] E2E Input too large, truncating');
+                inputData = inputData.substring(0, MAX_INPUT_SIZE);
+            }
+
+            if (ptyProcess) {
+                logDebug(`[PTY] Writing E2E input (len: ${inputData.length})`);
+                ptyProcess.write(inputData);
+            }
+            return;
+        }
+
+        // Input - only from authenticated clients (unencrypted fallback)
         if (ws.authenticated && m.type === 'input') {
             // Validate input
             if (typeof m.data !== 'string') {
@@ -655,7 +903,8 @@ function startPty(ws) {
     // If PTY already exists, just send the buffer
     if (ptyProcess) {
         logDebug(`[PTY] PTY exists. Sending buffer (size: ${outputBuffer.length})`);
-        ws.send(JSON.stringify({ type: 'output', data: outputBuffer }));
+        // Use encrypted output if E2E is ready, otherwise unencrypted
+        sendEncryptedOutput(ws, outputBuffer);
         return;
     }
 
@@ -742,8 +991,7 @@ function startPty(ws) {
         // SECURITY: Sanitize dangerous ANSI escape sequences
         filtered = sanitizeTerminalOutput(filtered);
 
-        // Broadcast to all authenticated clients
-        const msg = JSON.stringify({ type: 'output', data: filtered });
+        // Broadcast to all authenticated clients (encrypted if E2E ready)
         outputBuffer += filtered;
         if (outputBuffer.length > 50000) {
             outputBuffer = outputBuffer.slice(-50000);
@@ -751,7 +999,7 @@ function startPty(ws) {
 
         for (let client of activeClients) {
             if (client.readyState === WebSocket.OPEN) {
-                client.send(msg);
+                sendEncryptedOutput(client, filtered);
             }
         }
     });
@@ -850,6 +1098,8 @@ ipcMain.handle('REGISTER_KEY', (event, { kid, jwk }) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.authenticated = true;
         ws.send(JSON.stringify({ type: 'auth_success' }));
+        // Initiate E2E key exchange
+        initE2EKeyExchange(ws);
         startPty(ws);
     }
     pendingConns.delete(kid);
