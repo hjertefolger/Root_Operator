@@ -45,8 +45,7 @@ function SettingsView({ onBack, tunnelState }) {
     }
   };
 
-  const handleBack = async () => {
-    await invoke('RESIZE_WINDOW', 80);
+  const handleBack = () => {
     onBack();
   };
 

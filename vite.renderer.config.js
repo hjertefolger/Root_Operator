@@ -9,6 +9,9 @@ export default defineConfig({
   // Critical for Electron: use relative paths for file:// protocol
   base: './',
 
+  // Public directory for static assets (fonts, etc.)
+  publicDir: 'public',
+
   build: {
     outDir: 'ui/dist',
     emptyOutDir: true,

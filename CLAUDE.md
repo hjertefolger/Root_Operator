@@ -12,7 +12,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies (triggers automatic native rebuild)
 npm install
 
-# Start app in development mode
+# Start app in development mode with HMR (recommended)
+npm run dev:app
+
+# Start app without HMR (loads built files)
 npm start
 
 # Rebuild native modules (node-pty, keytar) after node/electron version changes
@@ -24,6 +27,14 @@ npm run build:unsigned
 # Build for macOS (requires Apple Developer credentials)
 npm run build
 ```
+
+### Development with HMR
+
+The `npm run dev:app` command starts:
+1. Vite dev server on port 5174 (with HMR)
+2. Electron loading from the dev server
+
+Changes to React components in `src/renderer/` are reflected immediately without rebuilding.
 
 ## Architecture Overview
 
@@ -37,9 +48,11 @@ npm run build
 - E2E encryption layer using ECDH key exchange + AES-256-GCM
 - Secure credential storage via `keytar` (macOS Keychain)
 
-**Renderer Process** (`ui/index.html`):
-- UI for tunnel management (start/stop, settings, QR code display)
-- No UI JavaScript - all logic in inline `<script>` tags within the HTML
+**Renderer Process** (`src/renderer/`):
+- React + Tailwind + shadcn/ui components
+- Entry point: `renderer.html` (built to `ui/dist/renderer.html`)
+- Main app: `src/renderer/App.jsx`
+- Components in `src/renderer/components/` (MainView, SettingsView, etc.)
 - Communicates with main process via IPC (see `preload.js` for channel whitelist)
 
 **Client/PWA** (`public/client.js`):
@@ -105,13 +118,22 @@ npm run build
 ### File Structure
 
 ```
-main.js              Main process (Electron, server, tunnel, PTY, E2E)
-preload.js           IPC bridge with channel whitelist
-ui/index.html        Renderer UI (inline styles and scripts)
-public/client.js     PWA client (terminal + E2E + auth)
-public/bip39-words.json  BIP39 wordlist for fingerprints
+main.js                     Main process (Electron, server, tunnel, PTY, E2E)
+preload.js                  IPC bridge with channel whitelist
+renderer.html               Renderer entry point (React)
+src/renderer/               Electron renderer (React + Tailwind)
+  App.jsx                   Main React app
+  main.jsx                  React entry point
+  index.css                 Tailwind styles
+  components/               React components (MainView, SettingsView, etc.)
+  hooks/                    React hooks (useElectron)
+src/components/ui/          shadcn/ui components (Button, Switch, etc.)
+src/client/                 PWA client source (React)
+public/client.js            PWA client (terminal + E2E + auth)
+public/bip39-words.json     BIP39 wordlist for fingerprints
+ui/dist/                    Built renderer output
 build/entitlements.mac.plist  macOS entitlements for signing
-scripts/notarize.js  Notarization script (currently disabled)
+scripts/notarize.js         Notarization script (currently disabled)
 ```
 
 ## Key Implementation Details

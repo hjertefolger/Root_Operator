@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useElectron } from './hooks/useElectron';
 import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
@@ -14,6 +14,28 @@ function App() {
     fingerprint: null
   });
   const [pendingAuth, setPendingAuth] = useState(null);
+  const containerRef = useRef(null);
+
+  // Auto-resize window to fit content
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const resizeWindow = () => {
+      const height = containerRef.current.scrollHeight;
+      if (height > 0) {
+        invoke('RESIZE_WINDOW', height);
+      }
+    };
+
+    const observer = new ResizeObserver(() => {
+      resizeWindow();
+    });
+
+    observer.observe(containerRef.current);
+    resizeWindow(); // Initial resize
+
+    return () => observer.disconnect();
+  }, [invoke]);
 
   // Apply dark mode
   useEffect(() => {
@@ -107,7 +129,6 @@ function App() {
       fingerprint: null
     });
     await invoke('SET_TRAY_ICON', false);
-    await invoke('RESIZE_WINDOW', 80);
   };
 
   const handleApproveDevice = async () => {
@@ -121,7 +142,7 @@ function App() {
   };
 
   return (
-    <div className="h-full flex flex-col p-3">
+    <div ref={containerRef} className="flex flex-col">
       {view === 'main' && (
         <MainView
           tunnelState={tunnelState}

@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { useElectron } from '../hooks/useElectron';
+import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader } from 'lucide-react';
 import { Button } from "@/components/ui/button";
-import PowerButton from './PowerButton';
 import FingerprintSection from './FingerprintSection';
 
 function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
-  const { invoke, send } = useElectron();
   const [fingerprintVisible, setFingerprintVisible] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const { active, connecting, url, fingerprint } = tunnelState;
 
@@ -21,99 +20,97 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
 
   const handleCopyLink = () => {
     if (!url) return;
-
     navigator.clipboard.writeText(url).then(() => {
-      // Could add visual feedback here
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     });
   };
 
-  const handleToggleFingerprint = async () => {
+  const handleToggleFingerprint = () => {
     if (!fingerprint) return;
-
-    if (fingerprintVisible) {
-      setFingerprintVisible(false);
-      await invoke('RESIZE_WINDOW', 80);
-    } else {
-      setFingerprintVisible(true);
-      await invoke('RESIZE_WINDOW', 180);
-    }
-  };
-
-  const handleShowSettings = async () => {
-    await invoke('RESIZE_WINDOW', 320);
-    onShowSettings();
-  };
-
-  const handleQuit = () => {
-    send('QUIT');
+    setFingerprintVisible(!fingerprintVisible);
   };
 
   return (
-    <div className="flex flex-col justify-between h-full">
-      {/* Row 1: Branding + Toggle */}
+    <div className="flex flex-col gap-1 pl-5 pr-4 py-2">
+      {/* Row 1: App Name + Settings */}
       <div className="flex justify-between items-center">
-        <div className="flex items-center gap-2">
-          <div className="flex items-center justify-center text-sm">◆</div>
-          <span className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">POCKET</span>
-        </div>
-
-        <PowerButton
-          active={active}
-          connecting={connecting}
-          onClick={handleToggle}
-        />
+        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+          ROOT_OPERATOR
+        </span>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={onShowSettings}
+          className="rounded-full text-muted-foreground transition-colors duration-200"
+        >
+          <Settings2 strokeWidth={2} />
+        </Button>
       </div>
 
-      {/* Row 2: Settings + Icons */}
-      <div className="flex justify-between items-center min-h-[22px]">
-        <div className="flex gap-3 items-center">
+      {/* Row 2: Lock/Copy Icons + Play/Pause Button */}
+      <div className="flex justify-between items-center pb-0.5">
+        <div className="flex gap-1 -ml-2">
           <Button
             variant="ghost"
-            size="sm"
-            onClick={handleQuit}
-            className="text-xs uppercase tracking-wide h-auto p-0"
-          >
-            Quit
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleShowSettings}
-            className="text-xs uppercase tracking-wide h-auto p-0"
-          >
-            Settings
-          </Button>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {/* Lock icon - E2E encrypted */}
-          <button
+            size="icon-sm"
             onClick={handleToggleFingerprint}
             disabled={!fingerprint}
-            className={`p-0 bg-transparent border-none cursor-pointer transition-opacity ${fingerprint ? 'opacity-60 hover:opacity-100' : 'opacity-60 cursor-default'
-              }`}
-            title={fingerprint ? "E2E Encrypted - Click to verify" : ""}
+            className="rounded-full transition-colors duration-200"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={fingerprint ? 'text-foreground' : 'text-muted'}>
-              <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-            </svg>
-          </button>
+            {fingerprint ? (
+              <ShieldCheck strokeWidth={2} className="text-[#4B5AFF] transition-colors duration-200" />
+            ) : (
+              <Shield strokeWidth={2} className="transition-colors duration-200" />
+            )}
+          </Button>
 
-          {/* Copy icon */}
-          <button
+          <Button
+            variant="ghost"
+            size="icon-sm"
             onClick={handleCopyLink}
             disabled={!url}
-            className={`p-0 bg-transparent border-none cursor-pointer transition-opacity ${url ? 'opacity-60 hover:opacity-100' : 'opacity-60 cursor-default'
-              }`}
-            title={url ? "Copy tunnel link" : ""}
+            className="rounded-full transition-colors duration-200"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={url ? 'text-foreground' : 'text-muted'}>
-              <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
-              <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
-            </svg>
-          </button>
+            {copied ? (
+              <Check strokeWidth={2} className="text-[#4B5AFF] transition-colors duration-200" />
+            ) : (
+              <Copy strokeWidth={2} className={`transition-colors duration-200 ${url ? 'text-[#4B5AFF]' : ''}`} />
+            )}
+          </Button>
         </div>
+
+        {connecting ? (
+          <Button
+            variant="default"
+            size="sm"
+            disabled
+            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
+          >
+            Connecting
+            <Loader strokeWidth={2} className="animate-spin" />
+          </Button>
+        ) : active ? (
+          <Button
+            variant="default"
+            size="sm"
+            onClick={handleToggle}
+            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90 transition-colors duration-200"
+          >
+            Pause
+            <CirclePause strokeWidth={2} />
+          </Button>
+        ) : (
+          <Button
+            variant="default"
+            size="sm"
+            onClick={handleToggle}
+            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
+          >
+            Start
+            <CirclePlay strokeWidth={2} />
+          </Button>
+        )}
       </div>
 
       {/* Fingerprint section */}

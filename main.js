@@ -18,6 +18,7 @@ const keytar = require('keytar');
 
 let store;
 const INTERNAL_PORT = 22000;
+const isDev = !app.isPackaged;
 
 // Secure credential storage constants
 const KEYTAR_SERVICE = 'RootOperator';
@@ -502,13 +503,15 @@ async function getCachedTunnelCredentials() {
 // 1. GUI SETUP
 function createWindow() {
     mainWindow = new BrowserWindow({
-        width: 280, height: 80,
+        width: 280,
+        height: 400,
+        maxHeight: 500,
         show: false,
         frame: false,
         fullscreenable: false,
         resizable: false,
         transparent: true,
-        backgroundColor: '#000000',
+        useContentSize: true,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -517,13 +520,26 @@ function createWindow() {
         }
     });
 
-    mainWindow.loadFile('ui/dist/renderer.html');
+    // In development, load from Vite dev server for HMR
+    // In production, load from built file
+    if (isDev) {
+        mainWindow.loadURL('http://localhost:5174/renderer.html');
+        // Open DevTools in dev mode for debugging
+        // mainWindow.webContents.openDevTools({ mode: 'detach' });
+    } else {
+        mainWindow.loadFile('ui/dist/renderer.html');
+    }
 
     // Hide when it loses focus
     mainWindow.on('blur', () => {
         if (!mainWindow.webContents.isDevToolsOpened()) {
             mainWindow.hide();
         }
+    });
+
+    // Sync state when renderer reloads
+    mainWindow.webContents.on('did-finish-load', () => {
+        syncStateWithRenderer();
     });
 }
 
