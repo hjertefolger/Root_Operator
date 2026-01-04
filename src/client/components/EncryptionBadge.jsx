@@ -10,9 +10,7 @@ function EncryptionBadge({ fingerprint }) {
       {/* Lock icon button */}
       <button
         onClick={() => setShowModal(true)}
-        onMouseOver={(e) => e.currentTarget.querySelector('svg').style.stroke = '#007AFF'}
-        onMouseOut={(e) => e.currentTarget.querySelector('svg').style.stroke = '#fff'}
-        className="fixed top-2 right-2 p-2 cursor-pointer z-[1000] bg-transparent border-none"
+        className="fixed top-2 right-2 p-2 cursor-pointer z-[1000] bg-transparent border-none text-foreground hover:text-primary transition-colors"
         title="E2E Encrypted - Click to verify fingerprint"
       >
         <svg
@@ -21,7 +19,7 @@ function EncryptionBadge({ fingerprint }) {
           height="20"
           viewBox="0 0 24 24"
           fill="none"
-          stroke="#fff"
+          stroke="currentColor"
           strokeWidth="2"
           strokeLinecap="round"
           strokeLinejoin="round"
@@ -33,14 +31,14 @@ function EncryptionBadge({ fingerprint }) {
 
       {/* Modal */}
       {showModal && (
-        <div className="fixed inset-0 bg-black z-[2000] flex flex-col p-5">
+        <div className="fixed inset-0 bg-background z-[2000] flex flex-col p-5">
           <div className="flex justify-between items-center mb-5">
-            <span className="text-xs font-semibold text-white uppercase tracking-wider">
+            <span className="text-xs font-semibold text-foreground uppercase tracking-wider">
               E2E Fingerprint
             </span>
             <button
               onClick={() => setShowModal(false)}
-              className="bg-transparent border-none text-[#007AFF] text-xs cursor-pointer"
+              className="bg-transparent border-none text-primary text-xs cursor-pointer hover:underline"
             >
               Close
             </button>
@@ -52,17 +50,17 @@ function EncryptionBadge({ fingerprint }) {
               return (
                 <div
                   key={i}
-                  className="bg-[#1c1c1e] px-3 py-2 rounded-lg inline-flex items-center gap-2"
+                  className="bg-secondary px-3 py-2 rounded-lg inline-flex items-center gap-2"
                   style={{ minWidth: `${longestWord.length * 9 + 40}px` }}
                 >
-                  <span className="text-[11px] text-gray-500 font-mono">{i + 1}.</span>
-                  <span className="text-[13px] text-white font-mono">{word}</span>
+                  <span className="text-xs text-muted-foreground font-mono">{i + 1}.</span>
+                  <span className="text-sm text-foreground font-mono">{word}</span>
                 </div>
               );
             })}
           </div>
 
-          <p className="text-[11px] text-gray-500 mt-5 text-center">
+          <p className="text-xs text-muted-foreground mt-5 text-center">
             Verify these words match your Mac
           </p>
         </div>

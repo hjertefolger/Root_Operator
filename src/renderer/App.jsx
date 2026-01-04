@@ -15,6 +15,11 @@ function App() {
   });
   const [pendingAuth, setPendingAuth] = useState(null);
 
+  // Apply dark mode
+  useEffect(() => {
+    document.documentElement.classList.add('dark');
+  }, []);
+
   // Load initial settings
   useEffect(() => {
     async function loadInitialState() {

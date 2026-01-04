@@ -85,12 +85,12 @@ function SettingsView({ onBack, tunnelState }) {
     <div className="flex flex-col gap-4 opacity-100 transition-opacity">
       {/* Header */}
       <div className="flex justify-between items-center pb-3 border-b border-border">
-        <span className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">SETTINGS</span>
+        <span className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">SETTINGS</span>
         <Button
           variant="ghost"
           size="sm"
           onClick={handleBack}
-          className="text-[9px] uppercase tracking-wide h-auto p-0"
+          className="text-xs uppercase tracking-wide h-auto p-0"
         >
           Back
         </Button>
@@ -100,7 +100,7 @@ function SettingsView({ onBack, tunnelState }) {
       <div className="flex flex-col gap-3">
         {/* Subdomain customization */}
         <div className="mb-2 space-y-2">
-          <Label htmlFor="subdomain" className="text-[9px] text-muted-foreground uppercase tracking-wide">
+          <Label htmlFor="subdomain" className="text-xs text-muted-foreground uppercase tracking-wide">
             Your Tunnel Address
           </Label>
           <div className="flex items-center gap-1">
@@ -110,21 +110,21 @@ function SettingsView({ onBack, tunnelState }) {
               value={subdomain}
               onChange={(e) => setSubdomain(e.target.value)}
               placeholder="your-name"
-              className="text-[10px] text-right h-8"
+              className="text-sm text-right h-8"
             />
-            <span className="text-[10px] text-muted-foreground">.v0x.one</span>
+            <span className="text-sm text-muted-foreground">.v0x.one</span>
           </div>
           <Button
             onClick={handleChangeSubdomain}
             disabled={subdomainLoading}
-            className="w-full text-[9px] uppercase tracking-wide rounded-full"
+            className="w-full text-xs uppercase tracking-wide rounded-full"
             size="sm"
           >
             {subdomainLoading ? 'Updating...' : 'Update Address'}
           </Button>
           {subdomainStatus && (
-            <div className={`text-[9px] text-center ${
-              subdomainStatus.startsWith('✓') ? 'text-green-500' : 'text-destructive'
+            <div className={`text-xs text-center ${
+              subdomainStatus.startsWith('✓') ? 'text-primary' : 'text-destructive'
             }`}>
               {subdomainStatus}
             </div>
@@ -133,7 +133,7 @@ function SettingsView({ onBack, tunnelState }) {
 
         {/* Legacy settings */}
         <div className="border-t border-border pt-3 mt-1 space-y-3">
-          <Label className="text-[9px] text-muted-foreground uppercase tracking-wide">
+          <Label className="text-xs text-muted-foreground uppercase tracking-wide">
             Legacy Settings
           </Label>
           <div className="space-y-2">
@@ -142,21 +142,21 @@ function SettingsView({ onBack, tunnelState }) {
               value={token}
               onChange={(e) => setToken(e.target.value)}
               placeholder="Cloudflare Token (optional)"
-              className="text-[10px] h-8"
+              className="text-sm h-8"
             />
             <Input
               type="text"
               value={domain}
               onChange={(e) => setDomain(e.target.value)}
               placeholder="Custom Domain (optional)"
-              className="text-[10px] h-8"
+              className="text-sm h-8"
             />
           </div>
         </div>
 
         {/* Debug logging toggle */}
         <div className="flex justify-between items-center py-2">
-          <Label htmlFor="debug-logging" className="text-[10px]">
+          <Label htmlFor="debug-logging" className="text-sm">
             Debug Logging
           </Label>
           <Switch
@@ -169,7 +169,7 @@ function SettingsView({ onBack, tunnelState }) {
         {/* Save button */}
         <Button
           onClick={handleSave}
-          className="w-full text-[9px] uppercase tracking-wide rounded-full mt-2"
+          className="w-full text-xs uppercase tracking-wide rounded-full mt-2"
           size="sm"
         >
           Save Changes

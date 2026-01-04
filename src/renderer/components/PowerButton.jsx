@@ -8,7 +8,7 @@ function PowerButton({ active, connecting, onClick }) {
         variant="outline"
         size="sm"
         disabled
-        className="rounded-full text-[9px] uppercase tracking-wide"
+        className="rounded-full text-xs uppercase tracking-wide"
       >
         <Loader2 className="h-3 w-3 animate-spin" />
         CONNECTING
@@ -22,7 +22,7 @@ function PowerButton({ active, connecting, onClick }) {
         variant="default"
         size="sm"
         onClick={onClick}
-        className="rounded-full text-[9px] uppercase tracking-wide"
+        className="rounded-full text-xs uppercase tracking-wide"
       >
         <Square className="h-3 w-3 fill-current" />
         CONNECTED
@@ -35,7 +35,7 @@ function PowerButton({ active, connecting, onClick }) {
       variant="outline"
       size="sm"
       onClick={onClick}
-      className="rounded-full text-[9px] uppercase tracking-wide"
+      className="rounded-full text-xs uppercase tracking-wide"
     >
       START
     </Button>
