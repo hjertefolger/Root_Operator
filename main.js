@@ -517,7 +517,7 @@ function createWindow() {
         }
     });
 
-    mainWindow.loadFile('ui/index.html');
+    mainWindow.loadFile('ui/dist/renderer.html');
 
     // Hide when it loses focus
     mainWindow.on('blur', () => {
@@ -1359,8 +1359,9 @@ function servePWA(req, res) {
         basePath = path.join(__dirname, 'public');
         filePath = path.join(__dirname, urlPath);
     } else {
-        basePath = path.join(__dirname, 'public');
-        filePath = path.join(__dirname, 'public', urlPath);
+        // Serve from Vite build output (public/dist) for the PWA client
+        basePath = path.join(__dirname, 'public', 'dist');
+        filePath = path.join(__dirname, 'public', 'dist', urlPath);
     }
 
     // CRITICAL: Normalize paths and prevent path traversal

@@ -1,0 +1,85 @@
+/* Import xterm.css - must be before @tailwind */
+@import 'xterm/css/xterm.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 10%;
+    --foreground: 0 0% 94%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 94%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 0 0% 94%;
+    --primary: 0 0% 100%;
+    --primary-foreground: 0 0% 0%;
+    --secondary: 0 0% 17%;
+    --secondary-foreground: 0 0% 94%;
+    --muted: 0 0% 17%;
+    --muted-foreground: 0 0% 53%;
+    --accent: 0 0% 17%;
+    --accent-foreground: 0 0% 94%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 94%;
+    --border: 0 0% 13%;
+    --input: 0 0% 17%;
+    --ring: 0 0% 83%;
+    --radius: 0.5rem;
+  }
+}
+
+/* Global styles */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #1a1a1a;
+  color: #f0f0f0;
+}
+
+/* Terminal container tweaks */
+.terminal-container {
+  height: 100%;
+  width: 100%;
+}
+
+.xterm {
+  height: 100%;
+  padding: 8px;
+}
+
+/* Custom scrollbar for terminal */
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: #1a1a1a;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 4px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: #777;
+}
