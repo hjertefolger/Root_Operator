@@ -1,6 +1,6 @@
 {
-  "name": "pocket-bridge",
-  "productName": "Pocket Bridge",
+  "name": "root-operator",
+  "productName": "Root Operator",
   "version": "1.0.0",
   "description": "Remote terminal access via Cloudflare Tunnel",
   "main": "main.js",
@@ -18,7 +18,7 @@
     "cloudflare",
     "tunnel"
   ],
-  "author": "stellarwings",
+  "author": "Hjertefølger",
   "license": "ISC",
   "dependencies": {
     "cloudflared": "^0.7.1",
@@ -41,9 +41,9 @@
     "electron-rebuild": "^3.2.9"
   },
   "build": {
-    "appId": "com.stellarwings.pocketbridge",
-    "productName": "Pocket Bridge",
-    "copyright": "Copyright © 2024 stellarwings",
+    "appId": "com.hjertefolger.rootoperator",
+    "productName": "Root Operator",
+    "copyright": "Copyright © 2026 Hjertefølger",
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [

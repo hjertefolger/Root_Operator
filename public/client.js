@@ -1,5 +1,5 @@
 /**
- * POCKET BRIDGE - CLIENT (iOS PWA)
+ * ROOT OPERATOR - CLIENT (iOS PWA)
  */
 
 let socket;
@@ -21,13 +21,16 @@ let e2eState = {
     fingerprint: null
 };
 
-// Word list for fingerprint (must match server)
-const FINGERPRINT_WORDS = [
-    'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
-    'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
-    'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray',
-    'yankee', 'zulu', 'amber', 'bronze', 'coral', 'dune', 'ember', 'frost'
-];
+// BIP39 wordlist - loaded from server (2048 words, 11 bits each)
+let BIP39_WORDS = null;
+
+// Load BIP39 wordlist
+async function loadBIP39Words() {
+    if (BIP39_WORDS) return BIP39_WORDS;
+    const response = await fetch('/public/bip39-words.json');
+    BIP39_WORDS = await response.json();
+    return BIP39_WORDS;
+}
 
 // E2E Helper Functions
 function base64ToArrayBuffer(base64) {
@@ -96,7 +99,7 @@ async function handleE2EInit(serverPublicKey, saltBase64) {
                 name: 'HKDF',
                 hash: 'SHA-256',
                 salt: salt,
-                info: new TextEncoder().encode('pocket-bridge-e2e-v1')
+                info: new TextEncoder().encode('root-operator-e2e-v1')
             },
             sharedSecretKey,
             { name: 'AES-GCM', length: 256 },
@@ -104,17 +107,30 @@ async function handleE2EInit(serverPublicKey, saltBase64) {
             ['encrypt', 'decrypt']
         );
 
-        // Generate fingerprint (must match server algorithm)
+        // Generate fingerprint (must match server algorithm - 12 words = 132 bits)
         const combined = new Uint8Array(sharedSecretBits.byteLength + salt.byteLength);
         combined.set(new Uint8Array(sharedSecretBits), 0);
         combined.set(new Uint8Array(salt), sharedSecretBits.byteLength);
         const hash = await window.crypto.subtle.digest('SHA-256', combined);
         const hashBytes = new Uint8Array(hash);
 
+        // Load BIP39 wordlist
+        const wordlist = await loadBIP39Words();
+
+        // Use 11 bits per word to select from 2048-word BIP39 list
         const words = [];
-        for (let i = 0; i < 4; i++) {
-            const index = hashBytes[i] % FINGERPRINT_WORDS.length;
-            words.push(FINGERPRINT_WORDS[index]);
+        let bitBuffer = 0;
+        let bitsInBuffer = 0;
+        let byteIndex = 0;
+
+        for (let i = 0; i < 12; i++) {
+            while (bitsInBuffer < 11 && byteIndex < hashBytes.length) {
+                bitBuffer = (bitBuffer << 8) | hashBytes[byteIndex++];
+                bitsInBuffer += 8;
+            }
+            bitsInBuffer -= 11;
+            const index = (bitBuffer >> bitsInBuffer) & 0x7FF;
+            words.push(wordlist[index]);
         }
         e2eState.fingerprint = words.join('-');
 
@@ -220,31 +236,77 @@ function sendInput(data) {
 
 // Show fingerprint in UI for verification
 function showFingerprintUI() {
-    // Create or update fingerprint display
-    let fpEl = document.getElementById('e2e-fingerprint');
-    if (!fpEl) {
-        fpEl = document.createElement('div');
-        fpEl.id = 'e2e-fingerprint';
-        fpEl.style.cssText = `
+    // Create lock icon button
+    let fpBtn = document.getElementById('e2e-fingerprint');
+    if (!fpBtn) {
+        fpBtn = document.createElement('button');
+        fpBtn.id = 'e2e-fingerprint';
+        fpBtn.style.cssText = `
             position: fixed;
             top: 8px;
             right: 8px;
-            background: rgba(0, 128, 0, 0.8);
-            color: white;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            font-family: monospace;
-            z-index: 1000;
+            background: none;
+            border: none;
+            padding: 8px;
             cursor: pointer;
+            z-index: 1000;
         `;
-        fpEl.title = 'E2E Encrypted - Verify this matches your Mac';
-        fpEl.onclick = () => {
-            alert('E2E Fingerprint (verify matches Mac tray):\n\n' + e2eState.fingerprint);
-        };
-        document.body.appendChild(fpEl);
+        fpBtn.title = 'E2E Encrypted - Click to verify fingerprint';
+        fpBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+        fpBtn.onmouseover = () => fpBtn.querySelector('svg').style.stroke = '#007AFF';
+        fpBtn.onmouseout = () => fpBtn.querySelector('svg').style.stroke = '#fff';
+        fpBtn.onclick = showFingerprintModal;
+        document.body.appendChild(fpBtn);
     }
-    fpEl.innerText = '🔒 ' + e2eState.fingerprint;
+
+    // Create modal if not exists
+    let modal = document.getElementById('e2e-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'e2e-modal';
+        modal.style.cssText = `
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #000;
+            z-index: 2000;
+            flex-direction: column;
+            padding: 20px;
+        `;
+        modal.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <span style="font-size: 12px; font-weight: 600; color: #fff; text-transform: uppercase; letter-spacing: 1px;">E2E Fingerprint</span>
+                <button id="e2e-modal-close" style="background: none; border: none; color: #007AFF; font-size: 12px; cursor: pointer;">Close</button>
+            </div>
+            <div id="e2e-words" style="display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;"></div>
+            <p style="font-size: 11px; color: #666; margin-top: 20px; text-align: center;">Verify these words match your Mac</p>
+        `;
+        document.body.appendChild(modal);
+        document.getElementById('e2e-modal-close').onclick = () => modal.style.display = 'none';
+    }
+}
+
+function showFingerprintModal() {
+    const modal = document.getElementById('e2e-modal');
+    const wordsContainer = document.getElementById('e2e-words');
+    if (!modal || !e2eState.fingerprint) return;
+
+    const words = e2eState.fingerprint.split('-');
+
+    // Find longest word for consistent sizing
+    const longestWord = words.reduce((a, b) => a.length > b.length ? a : b);
+
+    wordsContainer.innerHTML = words.map((word, i) =>
+        `<div style="background: #1c1c1e; padding: 8px 12px; border-radius: 8px; display: inline-flex; align-items: center; gap: 8px; min-width: ${longestWord.length * 9 + 40}px;">
+            <span style="font-size: 11px; color: #666; font-family: monospace;">${i + 1}.</span>
+            <span style="font-size: 13px; color: #fff; font-family: -apple-system, monospace;">${word}</span>
+        </div>`
+    ).join('');
+
+    modal.style.display = 'flex';
 }
 
 async function init() {

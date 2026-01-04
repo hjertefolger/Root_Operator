@@ -17,7 +17,7 @@
     <!-- Required for keytar (keychain access) -->
     <key>com.apple.security.keychain-access-groups</key>
     <array>
-        <string>$(AppIdentifierPrefix)com.stellarwings.pocketbridge</string>
+        <string>$(AppIdentifierPrefix)com.hjertefolger.rootoperator</string>
     </array>
 
     <!-- Network access for Cloudflare tunnel -->

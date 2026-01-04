@@ -1,6 +1,6 @@
 {
-    "name": "Pocket Bridge",
-    "short_name": "Bridge",
+    "name": "Root Operator",
+    "short_name": "RootOp",
     "start_url": "/",
     "display": "standalone",
     "background_color": "#000000",

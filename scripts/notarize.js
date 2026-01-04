@@ -16,7 +16,7 @@
  * To create an app-specific password:
  *   1. Go to https://appleid.apple.com
  *   2. Sign in and go to Security > App-Specific Passwords
- *   3. Generate a new password for "Pocket Bridge Notarization"
+ *   3. Generate a new password for "Root Operator Notarization"
  *
  * To find your Team ID:
  *   1. Go to https://developer.apple.com/account
