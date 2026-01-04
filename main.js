@@ -1,5 +1,5 @@
 /**
- * POCKET BRIDGE - MAIN PROCESS
+ * ROOT OPERATOR - MAIN PROCESS
  */
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu } = require('electron');
 const path = require('path');
@@ -20,8 +20,14 @@ let store;
 const INTERNAL_PORT = 22000;
 
 // Secure credential storage constants
-const KEYTAR_SERVICE = 'PocketBridge';
+const KEYTAR_SERVICE = 'RootOperator';
 const KEYTAR_CF_TOKEN = 'cloudflare-token';
+const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
+const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
+
+// Worker API configuration
+const WORKER_BASE_URL = 'https://root-operator-tunnel-worker.stellarwings.workers.dev'; // TODO: Update after deployment
+const WORKER_DOMAIN = 'v0x.one';
 
 // GLOBAL STATE
 let mainWindow;
@@ -34,6 +40,7 @@ let tunnelProcess;
 let wakeLock;
 let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
+let currentTunnelUrl = null; // Track tunnel URL for state sync
 
 // ANSI ESCAPE SEQUENCE SANITIZER
 // Blocks dangerous sequences while preserving normal terminal functionality
@@ -102,13 +109,8 @@ function sanitizeTerminalOutput(data) {
 // E2E ENCRYPTION MODULE
 // Provides zero-knowledge encryption using ECDH key exchange + AES-256-GCM
 
-// Word list for human-readable fingerprints (NATO phonetic-inspired)
-const FINGERPRINT_WORDS = [
-    'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
-    'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
-    'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray',
-    'yankee', 'zulu', 'amber', 'bronze', 'coral', 'dune', 'ember', 'frost'
-];
+// BIP39 wordlist for human-readable fingerprints (2048 words, 11 bits each)
+const BIP39_WORDS = require('./public/bip39-words.json');
 
 // Global state for current session fingerprint (shown in tray)
 let currentFingerprint = null;
@@ -133,21 +135,33 @@ function deriveSharedSecret(ecdh, otherPublicKeyBase64) {
 // Derive AES-256-GCM key using HKDF
 function deriveSessionKey(sharedSecret, salt) {
     // Use HKDF to derive a 256-bit key
-    const info = Buffer.from('pocket-bridge-e2e-v1');
+    const info = Buffer.from('root-operator-e2e-v1');
     const key = crypto.hkdfSync('sha256', sharedSecret, salt, info, 32);
     return Buffer.from(key);
 }
 
-// Generate human-readable fingerprint from key material
+// Generate human-readable fingerprint from key material (12 words = 132 bits)
 function generateFingerprint(sharedSecret, salt) {
     const combined = Buffer.concat([sharedSecret, salt]);
     const hash = crypto.createHash('sha256').update(combined).digest();
 
-    // Use first 4 bytes to select 4 words
+    // Use 11 bits per word to select from 2048-word BIP39 list
+    // 12 words × 11 bits = 132 bits of entropy
     const words = [];
-    for (let i = 0; i < 4; i++) {
-        const index = hash[i] % FINGERPRINT_WORDS.length;
-        words.push(FINGERPRINT_WORDS[index]);
+    let bitBuffer = 0;
+    let bitsInBuffer = 0;
+    let byteIndex = 0;
+
+    for (let i = 0; i < 12; i++) {
+        // Accumulate bits until we have at least 11
+        while (bitsInBuffer < 11 && byteIndex < hash.length) {
+            bitBuffer = (bitBuffer << 8) | hash[byteIndex++];
+            bitsInBuffer += 8;
+        }
+        // Extract 11 bits for word index
+        bitsInBuffer -= 11;
+        const index = (bitBuffer >> bitsInBuffer) & 0x7FF; // 0x7FF = 2047
+        words.push(BIP39_WORDS[index]);
     }
     return words.join('-');
 }
@@ -229,9 +243,8 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
         ws.e2e.fingerprint = generateFingerprint(sharedSecret, ws.e2e.salt);
         ws.e2e.ready = true;
 
-        // Update global fingerprint for tray display
+        // Update global fingerprint for tray display (shown in right-click menu)
         currentFingerprint = ws.e2e.fingerprint;
-        updateTrayMenu();
 
         logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
 
@@ -276,6 +289,195 @@ function decryptInput(ws, encrypted) {
     return decryptMessage(encrypted, ws.e2e.sessionKey);
 }
 
+// WORKER AUTHENTICATION MODULE
+// ECDSA P-256 key generation and signing for Worker API authentication
+
+/**
+ * Get or create machine ID (persistent UUID)
+ */
+function getMachineId() {
+    let machineId = store.get('machineId');
+    if (!machineId) {
+        machineId = crypto.randomUUID();
+        store.set('machineId', machineId);
+        logDebug(`[WORKER] Generated new machine ID: ${machineId}`);
+    }
+    return machineId;
+}
+
+/**
+ * Generate ECDSA P-256 keypair for Worker authentication
+ */
+function generateWorkerKeyPair() {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'P-256',
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    return { publicKey, privateKey };
+}
+
+/**
+ * Export public key as JWK
+ */
+function publicKeyToJWK(pemPublicKey) {
+    const keyObject = crypto.createPublicKey(pemPublicKey);
+    return keyObject.export({ format: 'jwk' });
+}
+
+/**
+ * Sign a message with ECDSA P-256 private key
+ */
+function signMessage(privateKeyPem, message) {
+    const sign = crypto.createSign('SHA256');
+    sign.update(message);
+    sign.end();
+    const signature = sign.sign(privateKeyPem);
+    return signature.toString('base64');
+}
+
+/**
+ * Get or create Worker authentication keypair
+ * Private key stored in Keychain, public key in electron-store
+ */
+async function getOrCreateWorkerKeyPair() {
+    // Try to get existing private key from Keychain
+    let privateKey = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY);
+    let publicKeyJWK = store.get('workerPublicKeyJWK');
+
+    if (privateKey && publicKeyJWK) {
+        return { privateKey, publicKeyJWK };
+    }
+
+    // Generate new keypair
+    logDebug('[WORKER] Generating new authentication keypair...');
+    const keypair = generateWorkerKeyPair();
+    publicKeyJWK = publicKeyToJWK(keypair.publicKey);
+
+    // Store private key in Keychain
+    await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY, keypair.privateKey);
+    // Store public key JWK in electron-store
+    store.set('workerPublicKeyJWK', publicKeyJWK);
+
+    logDebug('[WORKER] Authentication keypair generated and stored');
+    return { privateKey: keypair.privateKey, publicKeyJWK };
+}
+
+/**
+ * Request tunnel from Worker API
+ * Returns { tunnelToken, subdomain, hostname } on success
+ */
+async function requestTunnelFromWorker() {
+    const machineId = getMachineId();
+    const { privateKey, publicKeyJWK } = await getOrCreateWorkerKeyPair();
+
+    // Generate challenge and timestamp
+    const challenge = crypto.randomBytes(32).toString('hex');
+    const timestamp = Date.now();
+
+    // Sign: machineId:challenge:timestamp
+    const message = `${machineId}:${challenge}:${timestamp}`;
+    const signature = signMessage(privateKey, message);
+
+    logDebug(`[WORKER] Requesting tunnel for machine ${machineId.substring(0, 8)}...`);
+
+    const response = await fetch(`${WORKER_BASE_URL}/api/v1/tunnel/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            machineId,
+            publicKeyJWK,
+            signature,
+            challenge,
+            timestamp
+        })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error || `Worker API error: ${response.status}`);
+    }
+
+    if (!data.success) {
+        throw new Error(data.error || 'Unknown Worker error');
+    }
+
+    logDebug(`[WORKER] Tunnel assigned: ${data.hostname}`);
+
+    // Cache the tunnel token in Keychain
+    await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_TUNNEL_TOKEN, data.tunnelToken);
+    // Cache subdomain in store
+    store.set('tunnelSubdomain', data.subdomain);
+
+    return {
+        tunnelToken: data.tunnelToken,
+        subdomain: data.subdomain,
+        hostname: data.hostname
+    };
+}
+
+/**
+ * Customize subdomain via Worker API
+ */
+async function customizeSubdomain(newSubdomain) {
+    const machineId = getMachineId();
+    const { privateKey } = await getOrCreateWorkerKeyPair();
+
+    const challenge = crypto.randomBytes(32).toString('hex');
+    const timestamp = Date.now();
+
+    // Sign: machineId:newSubdomain:challenge:timestamp
+    const message = `${machineId}:${newSubdomain.toLowerCase()}:${challenge}:${timestamp}`;
+    const signature = signMessage(privateKey, message);
+
+    logDebug(`[WORKER] Customizing subdomain to: ${newSubdomain}`);
+
+    const response = await fetch(`${WORKER_BASE_URL}/api/v1/tunnel/customize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            machineId,
+            newSubdomain: newSubdomain.toLowerCase(),
+            signature,
+            challenge,
+            timestamp
+        })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error || `Worker API error: ${response.status}`);
+    }
+
+    // Update cached subdomain
+    store.set('tunnelSubdomain', data.subdomain);
+
+    return {
+        subdomain: data.subdomain,
+        hostname: data.hostname,
+        oldSubdomain: data.oldSubdomain
+    };
+}
+
+/**
+ * Get cached tunnel credentials (for offline mode)
+ */
+async function getCachedTunnelCredentials() {
+    const tunnelToken = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_TUNNEL_TOKEN);
+    const subdomain = store.get('tunnelSubdomain');
+
+    if (tunnelToken && subdomain) {
+        return {
+            tunnelToken,
+            subdomain,
+            hostname: `${subdomain}.${WORKER_DOMAIN}`
+        };
+    }
+    return null;
+}
+
 // 1. GUI SETUP
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -317,16 +519,20 @@ function createTray() {
         }
 
         tray = new Tray(iconPath);
-        tray.setToolTip('Pocket Bridge');
+        tray.setToolTip('Root Operator');
         tray.setIgnoreDoubleClickEvents(true);
 
+        // Left click: toggle window only
         tray.on('click', () => {
             console.log('Tray clicked');
             toggleWindow();
         });
 
-        // Initialize tray context menu
-        updateTrayMenu();
+        // Right click: show context menu
+        tray.on('right-click', () => {
+            const contextMenu = buildTrayMenu();
+            tray.popUpContextMenu(contextMenu);
+        });
 
         console.log('Tray created successfully');
     } catch (err) {
@@ -354,14 +560,25 @@ function showWindow() {
     mainWindow.setPosition(x, y, false);
     mainWindow.show();
     mainWindow.focus();
+
+    // Sync state with renderer
+    syncStateWithRenderer();
 }
 
-// Update tray context menu (called when E2E fingerprint changes)
-function updateTrayMenu() {
-    if (!tray) return;
+function syncStateWithRenderer() {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('SYNC_STATE', {
+            active: !!server,
+            url: currentTunnelUrl,
+            fingerprint: currentFingerprint
+        });
+    }
+}
 
+// Build tray context menu (shown on right-click)
+function buildTrayMenu() {
     const menuItems = [
-        { label: 'Pocket Bridge', enabled: false },
+        { label: 'Root Operator', enabled: false },
         { type: 'separator' }
     ];
 
@@ -381,8 +598,7 @@ function updateTrayMenu() {
         { label: 'Quit', click: () => app.quit() }
     );
 
-    const contextMenu = Menu.buildFromTemplate(menuItems);
-    tray.setContextMenu(contextMenu);
+    return Menu.buildFromTemplate(menuItems);
 }
 
 app.whenReady().then(async () => {
@@ -480,6 +696,33 @@ ipcMain.handle('DELETE_SECURE_TOKEN', async () => {
     }
 });
 
+// Subdomain customization
+ipcMain.handle('CUSTOMIZE_SUBDOMAIN', async (event, newSubdomain) => {
+    try {
+        const result = await customizeSubdomain(newSubdomain);
+        // Update current tunnel URL
+        currentTunnelUrl = `https://${result.hostname}`;
+        // Notify UI
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('TUNNEL_LIVE', currentTunnelUrl);
+        }
+        return { success: true, ...result };
+    } catch (e) {
+        console.error('Failed to customize subdomain:', e.message);
+        return { success: false, error: e.message };
+    }
+});
+
+// Get current subdomain
+ipcMain.handle('GET_SUBDOMAIN', () => {
+    return store.get('tunnelSubdomain') || null;
+});
+
+// Get machine ID (for display in settings)
+ipcMain.handle('GET_MACHINE_ID', () => {
+    return getMachineId();
+});
+
 // Logging with rotation and sensitive data redaction
 const LOG_MAX_SIZE = 1024 * 1024; // 1MB max log size
 const LOG_MAX_FILES = 3; // Keep 3 rotated files
@@ -549,6 +792,11 @@ function isOriginAllowed(origin, cfSettings) {
         return true;
     }
 
+    // Allow Worker-assigned domain (v0x.one and subdomains)
+    if (origin.includes(WORKER_DOMAIN)) {
+        return true;
+    }
+
     // Allow configured custom domain
     if (cfSettings && cfSettings.domain) {
         const domain = cfSettings.domain.replace(/^https?:\/\//, '');
@@ -561,8 +809,8 @@ function isOriginAllowed(origin, cfSettings) {
 }
 
 async function startBridge(cfSettings) {
-    // Store settings for origin validation
-    const storedCfSettings = cfSettings;
+    // Store settings for origin validation (include Worker domain)
+    const storedCfSettings = { ...cfSettings, domain: cfSettings?.domain || WORKER_DOMAIN };
 
     // A. Start HTTP/WebSocket Server
     server = http.createServer((req, res) => servePWA(req, res));
@@ -585,25 +833,67 @@ async function startBridge(cfSettings) {
 
     server.listen(INTERNAL_PORT);
 
-    // B. Start Tunnel (Cloudflare)
-    if (cfSettings && cfSettings.token) {
-        // Stable Tunnel with Token
-        console.log('Starting Stable Tunnel with token...');
+    // B. Start Tunnel - Use Worker API to get dedicated tunnel
+    let tunnelToken = null;
+    let tunnelHostname = null;
+
+    // Try to get tunnel from Worker API
+    try {
+        console.log('Requesting tunnel from Worker API...');
+        const tunnelInfo = await requestTunnelFromWorker();
+        tunnelToken = tunnelInfo.tunnelToken;
+        tunnelHostname = tunnelInfo.hostname;
+        console.log(`Tunnel assigned: ${tunnelHostname}`);
+    } catch (workerError) {
+        console.log('Worker API unavailable:', workerError.message);
+
+        // Try cached credentials (offline mode)
+        const cached = await getCachedTunnelCredentials();
+        if (cached) {
+            console.log('Using cached tunnel credentials');
+            tunnelToken = cached.tunnelToken;
+            tunnelHostname = cached.hostname;
+            // Notify UI about offline mode
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('CF_LOG', 'Using cached tunnel (offline mode)');
+            }
+        }
+    }
+
+    // Start tunnel with Worker-assigned token, or fall back to Quick Tunnel
+    if (tunnelToken) {
+        // Worker-assigned tunnel
+        console.log('Starting Worker-assigned tunnel...');
+        tunnelProcess = cloudflared.tunnel({ '--token': tunnelToken });
+
+        // Notify UI with the hostname immediately
+        if (tunnelHostname) {
+            const url = `https://${tunnelHostname}`;
+            currentTunnelUrl = url;
+            setTimeout(() => mainWindow.webContents.send('TUNNEL_LIVE', url), 1000);
+        }
+    } else if (cfSettings && cfSettings.token) {
+        // Legacy: Stable Tunnel with user-provided Token
+        console.log('Starting Stable Tunnel with user token...');
         tunnelProcess = cloudflared.tunnel({ '--token': cfSettings.token });
 
-        // If they provided a custom domain, notify the UI immediately
         if (cfSettings.domain) {
             const url = cfSettings.domain.startsWith('http') ? cfSettings.domain : `https://${cfSettings.domain}`;
+            currentTunnelUrl = url;
             setTimeout(() => mainWindow.webContents.send('TUNNEL_LIVE', url), 1000);
         }
     } else {
-        // Quick Tunnel Fallback
-        console.log('Starting Quick Tunnel...');
+        // Quick Tunnel Fallback (trycloudflare.com)
+        console.log('Starting Quick Tunnel (fallback)...');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('CF_LOG', 'Worker unavailable - using temporary Quick Tunnel');
+        }
         tunnelProcess = cloudflared.tunnel(['tunnel', '--url', `localhost:${INTERNAL_PORT}`]);
     }
 
     tunnelProcess.on('url', (url) => {
         logDebug(`[CF] Tunnel Live: ${url}`);
+        currentTunnelUrl = url;
         if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('TUNNEL_LIVE', url);
         }
@@ -667,6 +957,8 @@ function stopBridge() {
     ptyProcess = null;
     outputBuffer = "";
     activeClients.clear();
+    currentTunnelUrl = null;
+    currentFingerprint = null;
     logDebug('[SYSTEM] Bridge stopped.');
 }
 
@@ -1112,6 +1404,7 @@ function checkManualUrl(data) {
     const match = str.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
     if (match) {
         console.log('TUNNEL_LIVE [Manual]:', match[0]);
+        currentTunnelUrl = match[0];
         mainWindow.webContents.send('TUNNEL_LIVE', match[0]);
     }
 }

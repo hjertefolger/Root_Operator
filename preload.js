@@ -1,5 +1,5 @@
 /**
- * POCKET BRIDGE - PRELOAD SCRIPT
+ * ROOT OPERATOR - PRELOAD SCRIPT
  * Provides secure IPC bridge between renderer and main process
  * with context isolation enabled.
  */
@@ -16,7 +16,10 @@ const VALID_INVOKE_CHANNELS = [
     'REGISTER_KEY',
     'GET_SECURE_TOKEN',
     'SET_SECURE_TOKEN',
-    'DELETE_SECURE_TOKEN'
+    'DELETE_SECURE_TOKEN',
+    'CUSTOMIZE_SUBDOMAIN',
+    'GET_SUBDOMAIN',
+    'GET_MACHINE_ID'
 ];
 
 const VALID_SEND_CHANNELS = [
@@ -26,7 +29,9 @@ const VALID_SEND_CHANNELS = [
 const VALID_RECEIVE_CHANNELS = [
     'TUNNEL_LIVE',
     'AUTH_FAILED',
-    'CF_LOG'
+    'CF_LOG',
+    'E2E_FINGERPRINT',
+    'SYNC_STATE'
 ];
 
 // Expose protected methods that only allow specific channels
