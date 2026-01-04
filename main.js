@@ -26,7 +26,7 @@ const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 
 // Worker API configuration
-const WORKER_BASE_URL = 'https://root-operator-tunnel-worker.stellarwings.workers.dev'; // TODO: Update after deployment
+const WORKER_BASE_URL = 'https://cf.v0x.one';
 const WORKER_DOMAIN = 'v0x.one';
 
 // GLOBAL STATE
@@ -306,61 +306,82 @@ function getMachineId() {
 }
 
 /**
- * Generate ECDSA P-256 keypair for Worker authentication
+ * Generate ECDSA P-256 keypair for Worker authentication using Web Crypto API
  */
-function generateWorkerKeyPair() {
-    const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
-        namedCurve: 'P-256',
-        publicKeyEncoding: { type: 'spki', format: 'pem' },
-        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-    });
-    return { publicKey, privateKey };
+async function generateWorkerKeyPair() {
+    const { publicKey, privateKey } = await crypto.webcrypto.subtle.generateKey(
+        {
+            name: 'ECDSA',
+            namedCurve: 'P-256'
+        },
+        true,
+        ['sign', 'verify']
+    );
+
+    // Export keys as JWK
+    const publicKeyJWK = await crypto.webcrypto.subtle.exportKey('jwk', publicKey);
+    const privateKeyJWK = await crypto.webcrypto.subtle.exportKey('jwk', privateKey);
+
+    return { publicKeyJWK, privateKeyJWK };
 }
 
 /**
- * Export public key as JWK
+ * Sign a message with ECDSA P-256 private key using Web Crypto API
  */
-function publicKeyToJWK(pemPublicKey) {
-    const keyObject = crypto.createPublicKey(pemPublicKey);
-    return keyObject.export({ format: 'jwk' });
-}
+async function signMessage(privateKeyJWK, message) {
+    // Import the private key
+    const privateKey = await crypto.webcrypto.subtle.importKey(
+        'jwk',
+        privateKeyJWK,
+        {
+            name: 'ECDSA',
+            namedCurve: 'P-256'
+        },
+        false,
+        ['sign']
+    );
 
-/**
- * Sign a message with ECDSA P-256 private key
- */
-function signMessage(privateKeyPem, message) {
-    const sign = crypto.createSign('SHA256');
-    sign.update(message);
-    sign.end();
-    const signature = sign.sign(privateKeyPem);
-    return signature.toString('base64');
+    // Sign the message
+    const encoder = new TextEncoder();
+    const data = encoder.encode(message);
+    const signature = await crypto.webcrypto.subtle.sign(
+        {
+            name: 'ECDSA',
+            hash: 'SHA-256'
+        },
+        privateKey,
+        data
+    );
+
+    // Convert ArrayBuffer to base64
+    return Buffer.from(signature).toString('base64');
 }
 
 /**
  * Get or create Worker authentication keypair
- * Private key stored in Keychain, public key in electron-store
+ * Private key stored in Keychain as JSON, public key in electron-store
  */
 async function getOrCreateWorkerKeyPair() {
     // Try to get existing private key from Keychain
-    let privateKey = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY);
+    const privateKeyJson = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY);
     let publicKeyJWK = store.get('workerPublicKeyJWK');
 
-    if (privateKey && publicKeyJWK) {
-        return { privateKey, publicKeyJWK };
+    if (privateKeyJson && publicKeyJWK) {
+        const privateKeyJWK = JSON.parse(privateKeyJson);
+        return { privateKeyJWK, publicKeyJWK };
     }
 
     // Generate new keypair
     logDebug('[WORKER] Generating new authentication keypair...');
-    const keypair = generateWorkerKeyPair();
-    publicKeyJWK = publicKeyToJWK(keypair.publicKey);
+    const keypair = await generateWorkerKeyPair();
 
-    // Store private key in Keychain
-    await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY, keypair.privateKey);
+    // Store private key JWK in Keychain as JSON
+    await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_WORKER_PRIVATE_KEY, JSON.stringify(keypair.privateKeyJWK));
     // Store public key JWK in electron-store
-    store.set('workerPublicKeyJWK', publicKeyJWK);
+    store.set('workerPublicKeyJWK', keypair.publicKeyJWK);
 
     logDebug('[WORKER] Authentication keypair generated and stored');
-    return { privateKey: keypair.privateKey, publicKeyJWK };
+    return { privateKeyJWK: keypair.privateKeyJWK, publicKeyJWK: keypair.publicKeyJWK };
 }
 
 /**
@@ -369,7 +390,7 @@ async function getOrCreateWorkerKeyPair() {
  */
 async function requestTunnelFromWorker() {
     const machineId = getMachineId();
-    const { privateKey, publicKeyJWK } = await getOrCreateWorkerKeyPair();
+    const { privateKeyJWK, publicKeyJWK } = await getOrCreateWorkerKeyPair();
 
     // Generate challenge and timestamp
     const challenge = crypto.randomBytes(32).toString('hex');
@@ -377,7 +398,7 @@ async function requestTunnelFromWorker() {
 
     // Sign: machineId:challenge:timestamp
     const message = `${machineId}:${challenge}:${timestamp}`;
-    const signature = signMessage(privateKey, message);
+    const signature = await signMessage(privateKeyJWK, message);
 
     logDebug(`[WORKER] Requesting tunnel for machine ${machineId.substring(0, 8)}...`);
 
@@ -422,14 +443,14 @@ async function requestTunnelFromWorker() {
  */
 async function customizeSubdomain(newSubdomain) {
     const machineId = getMachineId();
-    const { privateKey } = await getOrCreateWorkerKeyPair();
+    const { privateKeyJWK } = await getOrCreateWorkerKeyPair();
 
     const challenge = crypto.randomBytes(32).toString('hex');
     const timestamp = Date.now();
 
     // Sign: machineId:newSubdomain:challenge:timestamp
     const message = `${machineId}:${newSubdomain.toLowerCase()}:${challenge}:${timestamp}`;
-    const signature = signMessage(privateKey, message);
+    const signature = await signMessage(privateKeyJWK, message);
 
     logDebug(`[WORKER] Customizing subdomain to: ${newSubdomain}`);
 

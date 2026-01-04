@@ -25,7 +25,8 @@ const RESERVED_SUBDOMAINS = new Set([
 ]);
 
 // Rate limit: max requests per machine per hour
-const RATE_LIMIT_REQUESTS = 5;
+const RATE_LIMIT_TUNNEL_REQUESTS = 100; // Getting/creating tunnel (high for testing)
+const RATE_LIMIT_CUSTOMIZE_REQUESTS = 100; // Changing subdomain (high for testing)
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 // Challenge timestamp validity window
@@ -100,8 +101,9 @@ function base64ToArrayBuffer(base64) {
 /**
  * Check rate limit for a machine
  */
-async function checkRateLimit(env, machineId) {
-  const key = `ratelimit:${machineId}`;
+async function checkRateLimit(env, machineId, type = 'tunnel') {
+  const maxRequests = type === 'customize' ? RATE_LIMIT_CUSTOMIZE_REQUESTS : RATE_LIMIT_TUNNEL_REQUESTS;
+  const key = `ratelimit:${type}:${machineId}`;
   const data = await env.MACHINES.get(key, { type: 'json' });
 
   if (!data) {
@@ -123,7 +125,7 @@ async function checkRateLimit(env, machineId) {
     return true;
   }
 
-  if (data.count >= RATE_LIMIT_REQUESTS) {
+  if (data.count >= maxRequests) {
     return false; // Rate limited
   }
 
@@ -248,8 +250,8 @@ async function handleTunnelRequest(request, env) {
     return jsonResponse({ error: 'Challenge expired' }, 400);
   }
 
-  // Check rate limit
-  if (!await checkRateLimit(env, machineId)) {
+  // Check rate limit (tunnel type)
+  if (!await checkRateLimit(env, machineId, 'tunnel')) {
     return jsonResponse({ error: 'Rate limited. Try again later.' }, 429);
   }
 
@@ -376,8 +378,8 @@ async function handleTunnelCustomize(request, env) {
     return jsonResponse({ error: 'Challenge expired' }, 400);
   }
 
-  // Check rate limit
-  if (!await checkRateLimit(env, machineId)) {
+  // Check rate limit (customize type)
+  if (!await checkRateLimit(env, machineId, 'customize')) {
     return jsonResponse({ error: 'Rate limited. Try again later.' }, 429);
   }
 
