@@ -21,7 +21,7 @@ function arrayBufferToBase64(buffer) {
 
 // Load BIP39 wordlist
 async function loadBIP39Words() {
-  const response = await fetch('/public/bip39-words.json');
+  const response = await fetch('/bip39-words.json');
   return await response.json();
 }
 

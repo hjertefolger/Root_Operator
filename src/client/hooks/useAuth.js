@@ -6,16 +6,31 @@ const RSA_PSS_PARAMS = {
   hash: "SHA-256"
 };
 
-const RSA_PSS_SIGN_PARAMS = {
-  name: "RSA-PSS",
-  saltLength: 32
-};
+// Pairing code characters (no ambiguous chars)
+const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+// Generate 6-character pairing code
+function generatePairingCode() {
+  const array = new Uint8Array(6);
+  crypto.getRandomValues(array);
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += PAIRING_CODE_CHARS[array[i] % PAIRING_CODE_CHARS.length];
+  }
+  return code;
+}
 
 export function useAuth(socket) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [pairingCode, setPairingCode] = useState(null);
+  const [pairingStatus, setPairingStatus] = useState('connecting'); // connecting, waiting, paired
+  const [pairingError, setPairingError] = useState(null);
+  const [keysReady, setKeysReady] = useState(false);
+  const [serverReady, setServerReady] = useState(false);
   const keyPairRef = useRef(null);
   const keyIdRef = useRef(null);
+  const pairingInitiatedRef = useRef(false);
 
   // Setup or load RSA-PSS keys
   useEffect(() => {
@@ -45,6 +60,7 @@ export function useAuth(socket) {
 
           keyPairRef.current = { privateKey, publicKey };
           console.log('[AUTH] Loaded existing keypair');
+          setKeysReady(true);
           setIsLoading(false);
           return;
         } catch (e) {
@@ -83,26 +99,11 @@ export function useAuth(socket) {
       }));
 
       console.log('[AUTH] Generated and stored new keypair');
+      setKeysReady(true);
       setIsLoading(false);
     }
 
     setupKeys();
-  }, []);
-
-  // Sign challenge
-  const signChallenge = useCallback(async (challenge) => {
-    if (!keyPairRef.current) {
-      throw new Error('Keys not initialized');
-    }
-
-    const encoder = new TextEncoder();
-    const data = encoder.encode(challenge);
-    const signature = await window.crypto.subtle.sign(
-      RSA_PSS_SIGN_PARAMS,
-      keyPairRef.current.privateKey,
-      data
-    );
-    return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
   }, []);
 
   // Export public key as JWK
@@ -113,31 +114,44 @@ export function useAuth(socket) {
     return await window.crypto.subtle.exportKey("jwk", keyPairRef.current.publicKey);
   }, []);
 
-  // Handle auth challenge from server
-  const handleAuthChallenge = useCallback(async (challenge) => {
-    if (!socket || !keyPairRef.current) {
-      console.error('[AUTH] Cannot respond to challenge: socket or keys not ready');
+  // Send pairing request
+  const sendPairingRequest = useCallback(async () => {
+    if (!socket || !keyPairRef.current || pairingInitiatedRef.current) {
       return;
     }
 
+    pairingInitiatedRef.current = true;
+
     try {
-      const signature = await signChallenge(challenge);
+      const code = generatePairingCode();
+      setPairingCode(code);
+
       const publicJwk = await exportPublicKey();
 
       socket.send(JSON.stringify({
-        type: 'auth_response',
+        type: 'pairing_request',
+        code: code,
         keyId: keyIdRef.current,
-        signature: signature,
         jwk: publicJwk
       }));
 
-      console.log('[AUTH] Sent auth response');
+      console.log('[AUTH] Sent pairing request with code:', code);
     } catch (e) {
-      console.error('[AUTH] Failed to respond to challenge:', e);
+      console.error('[AUTH] Failed to send pairing request:', e);
+      setPairingError('Failed to initiate pairing');
+      pairingInitiatedRef.current = false;
     }
-  }, [socket, signChallenge, exportPublicKey]);
+  }, [socket, exportPublicKey]);
 
-  // Listen for auth success
+  // Initiate pairing when both server and keys are ready
+  useEffect(() => {
+    if (serverReady && keysReady && socket && socket.readyState === WebSocket.OPEN) {
+      console.log('[AUTH] Both server and keys ready, initiating pairing');
+      sendPairingRequest();
+    }
+  }, [serverReady, keysReady, socket, sendPairingRequest]);
+
+  // Listen for WebSocket messages
   useEffect(() => {
     if (!socket) return;
 
@@ -149,13 +163,42 @@ export function useAuth(socket) {
         return;
       }
 
-      if (msg.type === 'auth_success') {
-        console.log('[AUTH] Authentication successful');
+      // Server ready - mark server as ready
+      if (msg.type === 'connected') {
+        console.log('[AUTH] Server connected');
+        setServerReady(true);
+      }
+
+      // Pairing request accepted - show code
+      if (msg.type === 'pairing_pending') {
+        console.log('[AUTH] Pairing pending, showing code');
+        setPairingStatus('waiting');
+      }
+
+      // Pairing successful
+      if (msg.type === 'pairing_success') {
+        console.log('[AUTH] Pairing successful');
+        setPairingStatus('paired');
         setIsAuthenticated(true);
       }
 
-      if (msg.type === 'registered') {
-        console.log("[AUTH] Device registered successfully");
+      // Already registered - direct auth success
+      if (msg.type === 'auth_success') {
+        console.log('[AUTH] Already registered, auth successful');
+        setPairingStatus('paired');
+        setIsAuthenticated(true);
+      }
+
+      // Pairing expired
+      if (msg.type === 'pairing_expired') {
+        console.log('[AUTH] Pairing code expired');
+        setPairingError('Pairing code expired. Please refresh to try again.');
+      }
+
+      // Pairing error
+      if (msg.type === 'pairing_error') {
+        console.log('[AUTH] Pairing error:', msg.message);
+        setPairingError(msg.message || 'Pairing failed');
       }
     };
 
@@ -166,6 +209,8 @@ export function useAuth(socket) {
   return {
     isAuthenticated,
     isLoading,
-    handleAuthChallenge
+    pairingCode,
+    pairingStatus,
+    pairingError
   };
 }

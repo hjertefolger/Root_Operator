@@ -193,6 +193,8 @@ body {
 .terminal-container {
   height: 100%;
   width: 100%;
+  position: relative;
+  overflow: hidden;
 }
 
 .xterm {
@@ -200,20 +202,41 @@ body {
   padding: 8px;
 }
 
+/* Enable touch scrolling - viewport handles scroll */
+.xterm .xterm-viewport {
+  -webkit-overflow-scrolling: touch;
+  overflow-y: scroll !important;
+}
+
+/* Helper textarea - keep functional but invisible */
+.xterm .xterm-helper-textarea {
+  opacity: 0 !important;
+}
+
 /* Custom scrollbar for terminal */
 .xterm .xterm-viewport::-webkit-scrollbar {
-  width: 8px;
+  width: 6px;
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar-track {
-  background: #1a1a1a;
+  background: transparent;
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar-thumb {
-  background: #555;
-  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: #777;
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Floating toolbar with smooth animation */
+.toolbar {
+  transition: bottom 0.15s ease-out;
+}
+
+/* Smooth button interactions */
+button {
+  -webkit-tap-highlight-color: transparent;
 }

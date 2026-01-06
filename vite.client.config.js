@@ -2,24 +2,26 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
-// https://vitejs.dev/config/
+// Vite config for PWA client (mobile terminal)
 export default defineConfig({
   plugins: [react()],
 
-  // Critical for Electron: use relative paths for file:// protocol
+  // Use relative paths for serving from tunnel
   base: './',
+
+  // Static assets from public folder (fonts, bip39, manifest)
+  publicDir: 'public',
 
   build: {
     outDir: 'public/dist',
     emptyOutDir: true,
-
-    // Generate sourcemaps for debugging
     sourcemap: true,
 
-    // Rollup options for optimization
     rollupOptions: {
+      input: {
+        client: path.resolve(__dirname, 'client.html')
+      },
       output: {
-        // Manual chunking for better caching
         manualChunks: {
           'react-vendor': ['react', 'react-dom'],
           'xterm-vendor': ['xterm', 'xterm-addon-fit', 'xterm-addon-web-links']
@@ -27,20 +29,27 @@ export default defineConfig({
       }
     },
 
-    // Target modern browsers (ES2020+)
     target: 'es2020'
   },
 
   // Development server config
   server: {
-    port: 5173,
-    strictPort: false,
+    port: 5175,
+    strictPort: true,
+    // Allow connections from any host (for tunnel access)
+    host: true,
+    cors: true,
+    // Allow tunnel domains
+    allowedHosts: ['localhost', '.v0x.one', '.trycloudflare.com']
   },
+
+  // Rewrite rules for SPA
+  appType: 'mpa',
 
   // Resolve aliases
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src/client')
+      '@': path.resolve(__dirname, './src')
     }
   }
 });

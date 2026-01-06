@@ -15,10 +15,12 @@ export function useWebSocket() {
     const ws = new WebSocket(wsUrl);
     socketRef.current = ws;
 
+    // Set socket immediately so message listeners can attach before 'connected' arrives
+    setSocket(ws);
+
     ws.onopen = () => {
       console.log('[WS] Connected');
       setIsReady(true);
-      setSocket(ws);
     };
 
     ws.onclose = () => {

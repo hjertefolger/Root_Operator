@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useElectron } from './hooks/useElectron';
 import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
-import AuthModal from './components/AuthModal';
 
 function App() {
   const { invoke, on } = useElectron();
@@ -13,7 +12,6 @@ function App() {
     url: '',
     fingerprint: null
   });
-  const [pendingAuth, setPendingAuth] = useState(null);
   const containerRef = useRef(null);
 
   // Auto-resize window to fit content
@@ -75,10 +73,6 @@ function App() {
         setTunnelState(prev => ({ ...prev, fingerprint }));
       }),
 
-      on('AUTH_FAILED', (data) => {
-        setPendingAuth(data);
-      }),
-
       on('SYNC_STATE', (state) => {
         setTunnelState({
           active: state.active || false,
@@ -131,16 +125,6 @@ function App() {
     await invoke('SET_TRAY_ICON', false);
   };
 
-  const handleApproveDevice = async () => {
-    if (pendingAuth) {
-      await invoke('REGISTER_KEY', {
-        kid: pendingAuth.kid,
-        jwk: pendingAuth.jwk
-      });
-      setPendingAuth(null);
-    }
-  };
-
   return (
     <div ref={containerRef} className="flex flex-col">
       {view === 'main' && (
@@ -156,13 +140,6 @@ function App() {
         <SettingsView
           onBack={() => setView('main')}
           tunnelState={tunnelState}
-        />
-      )}
-
-      {pendingAuth && (
-        <AuthModal
-          device={pendingAuth}
-          onApprove={handleApproveDevice}
         />
       )}
     </div>

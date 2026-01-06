@@ -19,6 +19,7 @@ const keytar = require('keytar');
 let store;
 const INTERNAL_PORT = 22000;
 const isDev = !app.isPackaged;
+const VITE_CLIENT_PORT = 5175;
 
 // Secure credential storage constants
 const KEYTAR_SERVICE = 'RootOperator';
@@ -42,6 +43,12 @@ let wakeLock;
 let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
 let currentTunnelUrl = null; // Track tunnel URL for state sync
+
+// Pairing system state
+let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
+const PAIRING_CODE_EXPIRY_MS = 120000; // 2 minutes
+const MAX_PENDING_PAIRINGS = 5;
+const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // No ambiguous chars
 
 // ANSI ESCAPE SEQUENCE SANITIZER
 // Blocks dangerous sequences while preserving normal terminal functionality
@@ -207,6 +214,9 @@ function decryptMessage(encrypted, sessionKey) {
     }
 }
 
+// E2E setup timeout (10 seconds)
+const E2E_SETUP_TIMEOUT_MS = 10000;
+
 // Initialize E2E for a WebSocket connection
 function initE2EKeyExchange(ws) {
     const keyPair = generateECDHKeyPair();
@@ -220,6 +230,14 @@ function initE2EKeyExchange(ws) {
         fingerprint: null,
         ready: false
     };
+
+    // Set E2E setup timeout - disconnect if not completed in time
+    ws.e2eTimeout = setTimeout(() => {
+        if (!ws.e2e?.ready) {
+            logDebug('[SECURITY] E2E setup timeout, closing connection');
+            ws.close(1008, 'E2E setup timeout');
+        }
+    }, E2E_SETUP_TIMEOUT_MS);
 
     // Send our public key and salt to client
     ws.send(JSON.stringify({
@@ -244,10 +262,25 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
         ws.e2e.fingerprint = generateFingerprint(sharedSecret, ws.e2e.salt);
         ws.e2e.ready = true;
 
+        // Clear E2E setup timeout
+        if (ws.e2eTimeout) {
+            clearTimeout(ws.e2eTimeout);
+            ws.e2eTimeout = null;
+        }
+
         // Update global fingerprint for tray display (shown in right-click menu)
         currentFingerprint = ws.e2e.fingerprint;
 
         logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
+
+        // Flush any buffered output now that E2E is ready
+        if (ws.pendingOutput && ws.pendingOutput.length > 0) {
+            logDebug(`[E2E] Flushing ${ws.pendingOutput.length} buffered messages`);
+            for (const data of ws.pendingOutput) {
+                sendEncryptedOutput(ws, data);
+            }
+            ws.pendingOutput = [];
+        }
 
         // Notify client that E2E is ready
         ws.send(JSON.stringify({
@@ -270,8 +303,10 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
 // Send encrypted output to client
 function sendEncryptedOutput(ws, data) {
     if (!ws.e2e || !ws.e2e.ready) {
-        // Fallback to unencrypted if E2E not ready
-        ws.send(JSON.stringify({ type: 'output', data: data }));
+        // Buffer output until E2E is ready - NO UNENCRYPTED FALLBACK
+        if (!ws.pendingOutput) ws.pendingOutput = [];
+        ws.pendingOutput.push(data);
+        logDebug(`[E2E] Buffering output (${data.length} bytes) until E2E ready`);
         return;
     }
 
@@ -1016,6 +1051,32 @@ function isRateLimited() {
     return connectionAttempts.length >= MAX_CONNECTIONS_PER_MINUTE;
 }
 
+// Generate 6-character pairing code
+function generatePairingCode() {
+    let code = '';
+    const randomBytes = crypto.randomBytes(6);
+    for (let i = 0; i < 6; i++) {
+        code += PAIRING_CODE_CHARS[randomBytes[i] % PAIRING_CODE_CHARS.length];
+    }
+    return code;
+}
+
+// Cleanup expired pairing codes
+function cleanupExpiredPairings() {
+    const now = Date.now();
+    for (const [code, data] of pendingPairings.entries()) {
+        if (now - data.createdAt > PAIRING_CODE_EXPIRY_MS) {
+            if (data.ws && data.ws.readyState === WebSocket.OPEN) {
+                data.ws.send(JSON.stringify({ type: 'pairing_expired' }));
+            }
+            pendingPairings.delete(code);
+        }
+    }
+}
+
+// Run cleanup every 30 seconds
+setInterval(cleanupExpiredPairings, 30000);
+
 function handleConnection(ws, req) {
     // Rate limiting check
     if (isRateLimited()) {
@@ -1028,22 +1089,17 @@ function handleConnection(ws, req) {
     // Track auth attempts per connection
     ws.authAttempts = 0;
 
-    // Send Challenge with timestamp for expiration
-    const challenge = crypto.randomBytes(32).toString('hex');
-    const challengeTime = Date.now();
-    ws.challenge = challenge;
-    ws.challengeTime = challengeTime;
-
-    console.log('[WS] Handshaking with challenge:', challenge.substring(0, 8));
-    ws.send(JSON.stringify({ type: 'auth_challenge', data: challenge }));
-
-    // Set connection timeout - close if not authenticated within 60 seconds
+    // Set connection timeout - close if not authenticated within 3 minutes (for pairing flow)
     ws.authTimeout = setTimeout(() => {
         if (!ws.authenticated) {
             logDebug('[SECURITY] Authentication timeout, closing connection');
             ws.close(1008, 'Authentication timeout');
         }
-    }, 60000);
+    }, 180000);
+
+    // Send connected message - client will initiate pairing or auth
+    console.log('[WS] Client connected, waiting for pairing/auth request');
+    ws.send(JSON.stringify({ type: 'connected' }));
 
     ws.on('error', (err) => {
         console.error('[WS] Error:', err);
@@ -1062,7 +1118,67 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Auth Response
+        // Pairing Request - new device pairing flow
+        if (!ws.authenticated && m.type === 'pairing_request') {
+            // Validate required fields
+            if (!m.code || typeof m.code !== 'string' ||
+                !m.keyId || typeof m.keyId !== 'string' ||
+                !m.jwk || typeof m.jwk !== 'object' || m.jwk.kty !== 'RSA') {
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid request' }));
+                return;
+            }
+
+            // Normalize code (uppercase)
+            const code = m.code.toUpperCase();
+
+            // Validate code format
+            if (code.length !== 6 || !/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/.test(code)) {
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid code format' }));
+                return;
+            }
+
+            // Check if device is already registered
+            const authorized = store.get('keys', []);
+            if (authorized.find(k => k.kid === m.keyId)) {
+                // Already registered - proceed to auth
+                logDebug(`[PAIRING] Device already registered: ${m.keyId.substring(0, 8)}`);
+                ws.authenticated = true;
+                clearTimeout(ws.authTimeout);
+                ws.send(JSON.stringify({ type: 'auth_success' }));
+                initE2EKeyExchange(ws);
+                startPty(ws);
+                return;
+            }
+
+            // Cleanup expired pairings first
+            cleanupExpiredPairings();
+
+            // Check max pending pairings limit
+            if (pendingPairings.size >= MAX_PENDING_PAIRINGS) {
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Too many pending requests' }));
+                return;
+            }
+
+            // Check for duplicate codes
+            if (pendingPairings.has(code)) {
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Code already in use' }));
+                return;
+            }
+
+            // Store pairing request
+            pendingPairings.set(code, {
+                ws,
+                kid: m.keyId,
+                jwk: m.jwk,
+                createdAt: Date.now()
+            });
+
+            ws.send(JSON.stringify({ type: 'pairing_pending', code }));
+            logDebug(`[PAIRING] New pairing request with code: ${code}`);
+            return;
+        }
+
+        // Auth Response - for returning devices (legacy flow, kept for compatibility)
         if (!ws.authenticated && m.type === 'auth_response') {
             // Check auth attempt limit
             ws.authAttempts++;
@@ -1072,8 +1188,8 @@ function handleConnection(ws, req) {
                 return;
             }
 
-            // Check challenge expiration
-            if (Date.now() - ws.challengeTime > CHALLENGE_EXPIRY_MS) {
+            // Check challenge expiration (if challenge was sent)
+            if (ws.challengeTime && Date.now() - ws.challengeTime > CHALLENGE_EXPIRY_MS) {
                 logDebug('[SECURITY] Challenge expired, rejecting auth');
                 ws.send(JSON.stringify({ type: 'auth_error', message: 'Challenge expired' }));
                 ws.close(1008, 'Challenge expired');
@@ -1097,14 +1213,8 @@ function handleConnection(ws, req) {
                 initE2EKeyExchange(ws);
                 startPty(ws);
             } else {
-                logDebug(`[WS] Auth PENDING: ${m.keyId.substring(0, 8)}`);
-                // Validate JWK before storing in pending
-                if (m.jwk && typeof m.jwk === 'object' && m.jwk.kty === 'RSA') {
-                    pendingConns.set(m.keyId, ws);
-                    mainWindow.webContents.send('AUTH_FAILED', { kid: m.keyId, jwk: m.jwk });
-                } else {
-                    logDebug('[SECURITY] Invalid JWK format in auth response');
-                }
+                logDebug(`[WS] Auth FAILED: ${m.keyId.substring(0, 8)}`);
+                ws.send(JSON.stringify({ type: 'auth_error', message: 'Authentication failed' }));
             }
             return;
         }
@@ -1155,26 +1265,8 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Input - only from authenticated clients (unencrypted fallback)
-        if (ws.authenticated && m.type === 'input') {
-            // Validate input
-            if (typeof m.data !== 'string') {
-                logDebug('[SECURITY] Invalid input type');
-                return;
-            }
-            // Limit input size
-            if (m.data.length > MAX_INPUT_SIZE) {
-                logDebug('[SECURITY] Input too large, truncating');
-                m.data = m.data.substring(0, MAX_INPUT_SIZE);
-            }
-
-            if (ptyProcess) {
-                logDebug(`[PTY] Writing input (len: ${m.data.length})`);
-                ptyProcess.write(m.data);
-            } else {
-                logDebug('[PTY] Error: Input received but ptyProcess is null');
-            }
-        }
+        // NOTE: Unencrypted 'input' handler removed for security
+        // All terminal input MUST go through e2e_input after E2E is established
 
         // Resize - validate dimensions
         if (ws.authenticated && m.type === 'resize') {
@@ -1193,6 +1285,10 @@ function handleConnection(ws, req) {
         // Cleanup pending conns if any
         for (let [kid, pWs] of pendingConns.entries()) {
             if (pWs === ws) pendingConns.delete(kid);
+        }
+        // Cleanup pending pairings if any
+        for (const [code, data] of pendingPairings.entries()) {
+            if (data.ws === ws) pendingPairings.delete(code);
         }
     });
 }
@@ -1229,10 +1325,9 @@ function startPty(ws) {
     logDebug(`[PTY] Attaching client. Total: ${activeClients.size + 1}`);
     activeClients.add(ws);
 
-    // If PTY already exists, just send the buffer
+    // If PTY already exists, just send the buffer (will be buffered until E2E ready)
     if (ptyProcess) {
         logDebug(`[PTY] PTY exists. Sending buffer (size: ${outputBuffer.length})`);
-        // Use encrypted output if E2E is ready, otherwise unencrypted
         sendEncryptedOutput(ws, outputBuffer);
         return;
     }
@@ -1248,7 +1343,7 @@ function startPty(ws) {
 
     if (!fs.existsSync(shellPath)) {
         logDebug(`[PTY] FATAL: No shell found`);
-        ws.send(JSON.stringify({ type: 'output', data: '\r\n[SYSTEM] No shell found\r\n' }));
+        sendEncryptedOutput(ws, '\r\n[SYSTEM] No shell found\r\n');
         return;
     }
 
@@ -1295,7 +1390,7 @@ function startPty(ws) {
     } catch (err) {
         console.error('PTY Spawn Error:', err);
         mainWindow.webContents.send('CF_LOG', 'PTY ERROR: ' + err.message);
-        ws.send(JSON.stringify({ type: 'output', data: '\r\n[SYSTEM] Failed to spawn shell: ' + err.message + '\r\n' }));
+        sendEncryptedOutput(ws, '\r\n[SYSTEM] Failed to spawn shell: ' + err.message + '\r\n');
         return;
     }
 
@@ -1332,10 +1427,50 @@ function startPty(ws) {
             }
         }
     });
+
+    ptyProcess.on('exit', (exitCode, signal) => {
+        logDebug(`[PTY] Process exited with code ${exitCode}, signal ${signal}`);
+        ptyProcess = null;
+    });
 }
 
 // 5. ASSET SERVER (Serves the PWA code)
 function servePWA(req, res) {
+    // In development mode, proxy to Vite dev server for HMR
+    if (isDev) {
+        // Rewrite root path to client.html for Vite
+        let proxyPath = req.url;
+        if (proxyPath === '/' || proxyPath === '') {
+            proxyPath = '/client.html';
+        }
+
+        const proxyReq = http.request({
+            hostname: 'localhost',
+            port: VITE_CLIENT_PORT,
+            path: proxyPath,
+            method: req.method,
+            headers: req.headers
+        }, (proxyRes) => {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(res);
+        });
+
+        proxyReq.on('error', (err) => {
+            // Vite dev server not running - serve static files as fallback
+            console.log('[DEV] Vite client dev server not running, serving static files');
+            serveStaticPWA(req, res);
+        });
+
+        req.pipe(proxyReq);
+        return;
+    }
+
+    // Production mode: serve static files
+    serveStaticPWA(req, res);
+}
+
+// Static file server for production
+function serveStaticPWA(req, res) {
     // Security headers for all responses
     const securityHeaders = {
         'X-Content-Type-Options': 'nosniff',
@@ -1347,7 +1482,7 @@ function servePWA(req, res) {
 
     // Parse URL and strip query strings
     let urlPath = req.url.split('?')[0];
-    if (urlPath === '/') urlPath = '/index.html';
+    if (urlPath === '/') urlPath = '/client.html';
 
     // Decode URL and check for null bytes (path traversal attack vector)
     try {
@@ -1434,6 +1569,67 @@ ipcMain.handle('REGISTER_KEY', (event, { kid, jwk }) => {
     }
     pendingConns.delete(kid);
 
+    return { success: true };
+});
+
+// Verify pairing code and approve device
+ipcMain.handle('VERIFY_PAIRING_CODE', (event, code) => {
+    const normalizedCode = code.toUpperCase().replace(/[^ABCDEFGHJKMNPQRSTUVWXYZ23456789]/g, '');
+
+    if (normalizedCode.length !== 6) {
+        return { success: false, error: 'Invalid code format' };
+    }
+
+    const pairing = pendingPairings.get(normalizedCode);
+    if (!pairing) {
+        return { success: false, error: 'Code not found or expired' };
+    }
+
+    // Check expiry
+    if (Date.now() - pairing.createdAt > PAIRING_CODE_EXPIRY_MS) {
+        pendingPairings.delete(normalizedCode);
+        return { success: false, error: 'Code expired' };
+    }
+
+    // Save the key
+    const keys = store.get('keys', []);
+    if (!keys.find(k => k.kid === pairing.kid)) {
+        keys.push({ kid: pairing.kid, jwk: pairing.jwk });
+        store.set('keys', keys);
+    }
+
+    // Notify the client
+    const ws = pairing.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.authenticated = true;
+        clearTimeout(ws.authTimeout);
+        ws.send(JSON.stringify({ type: 'pairing_success' }));
+        initE2EKeyExchange(ws);
+        startPty(ws);
+    }
+
+    pendingPairings.delete(normalizedCode);
+    logDebug(`[PAIRING] Device paired successfully with code: ${normalizedCode}`);
+
+    return { success: true };
+});
+
+// Get list of paired devices
+ipcMain.handle('GET_PAIRED_DEVICES', () => {
+    const keys = store.get('keys', []);
+    // Return only kid (truncated for display), not the full JWK
+    return keys.map(k => ({
+        kid: k.kid,
+        displayId: k.kid.substring(0, 12)
+    }));
+});
+
+// Remove a paired device
+ipcMain.handle('REMOVE_PAIRED_DEVICE', (event, kid) => {
+    const keys = store.get('keys', []);
+    const filtered = keys.filter(k => k.kid !== kid);
+    store.set('keys', filtered);
+    logDebug(`[PAIRING] Device removed: ${kid.substring(0, 8)}`);
     return { success: true };
 });
 

@@ -31,10 +31,13 @@ npm run build
 ### Development with HMR
 
 The `npm run dev:app` command starts:
-1. Vite dev server on port 5174 (with HMR)
-2. Electron loading from the dev server
+1. Vite dev server for renderer on port 5174 (tray app HMR)
+2. Vite dev server for client on port 5175 (PWA client HMR)
+3. Electron loading from the dev servers
 
-Changes to React components in `src/renderer/` are reflected immediately without rebuilding.
+Changes to React components are reflected immediately:
+- `src/renderer/` - Tray app components (hot reload)
+- `src/client/` - PWA client components (hot reload via proxy)
 
 ## Architecture Overview
 
@@ -55,11 +58,15 @@ Changes to React components in `src/renderer/` are reflected immediately without
 - Components in `src/renderer/components/` (MainView, SettingsView, etc.)
 - Communicates with main process via IPC (see `preload.js` for channel whitelist)
 
-**Client/PWA** (`public/client.js`):
-- Standalone web client that connects via WebSocket to the bridge server
-- Implements xterm.js terminal emulator with fit and web-links addons
-- E2E encryption with fingerprint verification (12-word BIP39 phrases)
-- Authentication using public key signatures (Web Crypto API)
+**Client/PWA** (`src/client/`):
+- React + Tailwind + shadcn/ui (same stack as renderer)
+- Entry point: `client.html` (built to `public/dist/client.html`)
+- Main app: `src/client/App.jsx`
+- Components: PairingScreen, Terminal, EncryptionBadge
+- Hooks: useWebSocket, useAuth, useE2E
+- xterm.js terminal with fit and web-links addons
+- E2E encryption with fingerprint verification (12-word BIP39)
+- RSA-PSS authentication with 6-character pairing codes
 - Can be added to iOS home screen as PWA
 
 ### Security Architecture
@@ -120,17 +127,28 @@ Changes to React components in `src/renderer/` are reflected immediately without
 ```
 main.js                     Main process (Electron, server, tunnel, PTY, E2E)
 preload.js                  IPC bridge with channel whitelist
-renderer.html               Renderer entry point (React)
+renderer.html               Renderer entry point (tray app)
+client.html                 Client entry point (PWA)
+vite.renderer.config.js     Vite config for tray app (port 5174)
+vite.client.config.js       Vite config for PWA client (port 5175)
 src/renderer/               Electron renderer (React + Tailwind)
   App.jsx                   Main React app
   main.jsx                  React entry point
   index.css                 Tailwind styles
   components/               React components (MainView, SettingsView, etc.)
   hooks/                    React hooks (useElectron)
-src/components/ui/          shadcn/ui components (Button, Switch, etc.)
-src/client/                 PWA client source (React)
-public/client.js            PWA client (terminal + E2E + auth)
-public/bip39-words.json     BIP39 wordlist for fingerprints
+src/client/                 PWA client (React + Tailwind)
+  App.jsx                   Main React app
+  main.jsx                  React entry point
+  index.css                 Tailwind styles
+  components/               React components (PairingScreen, Terminal, etc.)
+  hooks/                    React hooks (useWebSocket, useAuth, useE2E)
+src/components/ui/          shadcn/ui components (Button, Switch, Input OTP, etc.)
+public/                     Static assets
+  bip39-words.json          BIP39 wordlist for fingerprints
+  fonts/                    Geist fonts
+  manifest.json             PWA manifest
+public/dist/                Built client output
 ui/dist/                    Built renderer output
 build/entitlements.mac.plist  macOS entitlements for signing
 scripts/notarize.js         Notarization script (currently disabled)

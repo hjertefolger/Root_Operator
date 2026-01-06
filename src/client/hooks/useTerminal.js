@@ -1,15 +1,21 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { WebLinksAddon } from 'xterm-addon-web-links';
 
-export function useTerminal(containerRef, socket, encryptInput, e2eReady) {
+export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange) {
   const termRef = useRef(null);
   const fitAddonRef = useRef(null);
+  const socketRef = useRef(socket);
   const outputQueueRef = useRef([]);
   const [isReady, setIsReady] = useState(false);
 
-  // Initialize terminal
+  // Keep socket ref updated
+  useEffect(() => {
+    socketRef.current = socket;
+  }, [socket]);
+
+  // Initialize terminal - only depends on containerRef, NOT socket
   useEffect(() => {
     if (!containerRef.current || termRef.current) return;
 
@@ -22,7 +28,12 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady) {
         selectionBackground: '#333'
       },
       fontSize: 14,
-      fontFamily: 'Menlo, Monaco, "Courier New", monospace'
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      allowTransparency: false,
+      drawBoldTextInBrightColors: true,
+      scrollback: 5000,
+      // Mobile optimizations
+      rendererType: 'dom', // DOM renderer handles touch scrolling better than canvas
     });
 
     const fitAddon = new FitAddon();
@@ -35,16 +46,22 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady) {
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    // Fit terminal after a short delay
-    setTimeout(() => {
+    // Helper to sync terminal size with backend
+    const syncSize = () => {
       fitAddon.fit();
-      if (socket) {
-        socket.send(JSON.stringify({
+      const dims = fitAddon.proposeDimensions();
+      if (dims && socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({
           type: 'resize',
-          cols: term.cols,
-          rows: term.rows
+          cols: dims.cols,
+          rows: dims.rows
         }));
       }
+    };
+
+    // Fit terminal after a short delay
+    setTimeout(() => {
+      syncSize();
       term.focus();
 
       // Flush output queue
@@ -55,27 +72,46 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady) {
       setIsReady(true);
     }, 100);
 
-    // Suppress iOS keyboard accessory bar
+    // Configure textarea for terminal input
     function refineTextarea() {
       const textarea = containerRef.current?.querySelector('.xterm-helper-textarea');
       if (textarea) {
         textarea.setAttribute('autocomplete', 'off');
         textarea.setAttribute('autocorrect', 'off');
-        textarea.setAttribute('autocapitalize', 'off');
+        textarea.setAttribute('autocapitalize', 'none');
         textarea.setAttribute('spellcheck', 'false');
-        textarea.setAttribute('inputmode', 'email');
-        textarea.setAttribute('enterkeyhint', 'send');
+        // Disable predictive text and suggestions to minimize accessory bar
+        textarea.setAttribute('data-gramm', 'false');
+        textarea.setAttribute('data-gramm_editor', 'false');
+        textarea.setAttribute('data-enable-grammarly', 'false');
       }
     }
 
-    const intervalId = setInterval(refineTextarea, 1000);
+    // Run once immediately, then periodically in case xterm recreates textarea
+    refineTextarea();
+    const intervalId = setInterval(refineTextarea, 2000);
 
-    // Handle Visual Viewport for mobile keyboards
+    // Mobile: Force focus on touch to bring up keyboard
+    const handleTouch = () => {
+      term.focus();
+    };
+    containerRef.current.addEventListener('touchstart', handleTouch, { passive: true });
+
+    // Handle Visual Viewport for mobile keyboards - simplified to avoid flickering
+    let lastHeight = 0;
     const handleViewportResize = () => {
-      if (containerRef.current && window.visualViewport) {
-        containerRef.current.style.height = `${window.visualViewport.height}px`;
+      if (!containerRef.current || !window.visualViewport) return;
+
+      const toolbarHeight = 48;
+      const newHeight = Math.floor(window.visualViewport.height - toolbarHeight);
+
+      // Only resize if height changed significantly (avoid micro-adjustments)
+      if (Math.abs(newHeight - lastHeight) > 20) {
+        lastHeight = newHeight;
+        containerRef.current.style.height = `${newHeight}px`;
         window.scrollTo(0, 0);
-        fitAddon.fit();
+        // Delay fit and sync to let CSS settle
+        setTimeout(syncSize, 50);
       }
     };
 
@@ -83,84 +119,111 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady) {
       window.visualViewport.addEventListener('resize', handleViewportResize);
     }
 
-    // Cleanup
+    // Store container for cleanup
+    const container = containerRef.current;
+
+    // Cleanup - only when component unmounts, not on socket change
     return () => {
       clearInterval(intervalId);
       if (window.visualViewport) {
         window.visualViewport.removeEventListener('resize', handleViewportResize);
       }
+      if (container) {
+        container.removeEventListener('touchstart', handleTouch);
+      }
       term.dispose();
       termRef.current = null;
     };
-  }, [containerRef, socket]);
+  }, [containerRef]); // Removed socket from dependencies!
 
-  // Handle input from terminal
+  // Handle input from terminal - use refs to avoid stale closures
   useEffect(() => {
-    if (!termRef.current || !socket) return;
+    if (!termRef.current) return;
 
     const term = termRef.current;
 
     const handleData = async (data) => {
-      if (e2eReady && encryptInput) {
-        const encrypted = await encryptInput(data);
-        if (encrypted) {
-          socket.send(JSON.stringify({
-            type: 'e2e_input',
-            ...encrypted
-          }));
+      // Use refs for current values to avoid stale closures on reconnect
+      const currentSocket = socketRef.current;
+
+      // Block ALL input until E2E is ready and socket is open
+      if (!currentSocket || currentSocket.readyState !== WebSocket.OPEN) {
+        console.log('[TERMINAL] Ignoring input - socket not ready');
+        return;
+      }
+
+      if (!e2eReady || !encryptInput) {
+        console.log('[TERMINAL] Ignoring input - E2E not ready');
+        return;
+      }
+
+      // Apply modifier keys from toolbar
+      let modifiedData = data;
+      if (ctrlRef?.current && data.length === 1) {
+        const char = data.toLowerCase();
+        if (char >= 'a' && char <= 'z') {
+          // Convert to control character (Ctrl+A = 0x01, Ctrl+B = 0x02, etc.)
+          modifiedData = String.fromCharCode(char.charCodeAt(0) - 96);
+          // Ctrl stays active (sticky) - user must tap ^ again to release
         }
-      } else {
-        socket.send(JSON.stringify({ type: 'input', data }));
+      }
+
+      const encrypted = await encryptInput(modifiedData);
+      if (encrypted && socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({
+          type: 'e2e_input',
+          ...encrypted
+        }));
       }
     };
 
     const disposable = term.onData(handleData);
     return () => disposable.dispose();
-  }, [socket, encryptInput, e2eReady]);
+  }, [encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
 
   // Handle window resize
   useEffect(() => {
-    if (!fitAddonRef.current || !socket) return;
+    if (!fitAddonRef.current) return;
 
     const handleResize = () => {
       fitAddonRef.current.fit();
-      const term = termRef.current;
-      if (term) {
-        socket.send(JSON.stringify({
+      // Use proposeDimensions for accurate frontend/backend sync
+      const dims = fitAddonRef.current.proposeDimensions();
+      if (dims && socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({
           type: 'resize',
-          cols: term.cols,
-          rows: term.rows
+          cols: dims.cols,
+          rows: dims.rows
         }));
       }
     };
 
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [socket]);
+  }, []); // No dependencies - uses refs
 
   // Write to terminal
   const write = (data) => {
     if (termRef.current) {
       termRef.current.write(data);
+      // Always scroll to bottom on new output
+      termRef.current.scrollToBottom();
     } else {
       outputQueueRef.current.push(data);
     }
   };
 
-  // Send special input
+  // Send special input - only when E2E is ready
   const sendSpecial = async (data) => {
-    if (!socket) return;
+    // Block ALL input until E2E is ready - no unencrypted fallback
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN || !e2eReady || !encryptInput) return;
 
-    if (e2eReady && encryptInput) {
-      const encrypted = await encryptInput(data);
-      if (encrypted) {
-        socket.send(JSON.stringify({
-          type: 'e2e_input',
-          ...encrypted
-        }));
-      }
-    } else {
-      socket.send(JSON.stringify({ type: 'input', data }));
+    const encrypted = await encryptInput(data);
+    if (encrypted) {
+      socketRef.current.send(JSON.stringify({
+        type: 'e2e_input',
+        ...encrypted
+      }));
     }
   };
 
