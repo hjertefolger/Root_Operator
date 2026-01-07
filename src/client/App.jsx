@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import Terminal from './components/Terminal';
 import PairingScreen from './components/PairingScreen';
-import EncryptionBadge from './components/EncryptionBadge';
+import Header from './components/Header';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useE2E } from './hooks/useE2E';
 import { useAuth } from './hooks/useAuth';
@@ -59,8 +59,8 @@ function App() {
   // Show loading state while keys are being set up
   if (isLoading) {
     return (
-      <div className="h-full w-full flex items-center justify-center bg-background">
-        <p className="text-sm text-muted-foreground">Initializing...</p>
+      <div className="h-dvh w-full flex items-center justify-center bg-black">
+        <p className="text-sm text-white/50">Initializing...</p>
       </div>
     );
   }
@@ -79,10 +79,10 @@ function App() {
   // Show securing screen when authenticated but E2E not yet ready
   if (!e2eReady) {
     return (
-      <div className="h-full w-full flex items-center justify-center bg-background">
+      <div className="h-dvh w-full flex items-center justify-center bg-black">
         <div className="text-center space-y-3">
-          <div className="w-6 h-6 mx-auto border-2 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-muted-foreground">Securing connection...</p>
+          <div className="w-6 h-6 mx-auto border-2 border-white border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-white/50">Securing connection...</p>
         </div>
       </div>
     );
@@ -90,16 +90,16 @@ function App() {
 
   // Show terminal when authenticated and E2E is ready
   return (
-    <div className="h-full w-full bg-background">
+    <div className="h-dvh w-full flex flex-col bg-zinc-900">
+      {/* Top safe area */}
+      <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
+      <Header fingerprint={fingerprint} />
       <Terminal
         socket={socket}
         encryptInput={encryptInput}
         decryptOutput={decryptOutput}
         e2eReady={e2eReady}
       />
-      {fingerprint && (
-        <EncryptionBadge fingerprint={fingerprint} />
-      )}
     </div>
   );
 }

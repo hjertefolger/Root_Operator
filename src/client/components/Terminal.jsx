@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback, memo } from 'react';
 import { useTerminal } from '../hooks/useTerminal';
+import { Button } from '@/components/ui/button';
 import {
   ArrowUp,
   ArrowDown,
@@ -9,62 +10,15 @@ import {
   ChevronRight,
   Clipboard
 } from 'lucide-react';
+import { cn } from '@/lib/utils';
 
 function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   const containerRef = useRef(null);
   const ctrlRef = useRef(false);
   const shiftRef = useRef(false);
   const [modifierState, setModifierState] = useState({ ctrl: false, shift: false });
-  const [toolbarBottom, setToolbarBottom] = useState(12);
-  const lastKeyboardHeight = useRef(0);
 
-  // Track keyboard height to position toolbar above it
-  useEffect(() => {
-    if (!window.visualViewport) return;
-
-    const updateToolbarPosition = () => {
-      const viewport = window.visualViewport;
-      const windowHeight = window.innerHeight;
-      const viewportHeight = viewport.height;
-      const keyboardHeight = Math.max(0, windowHeight - viewportHeight - viewport.offsetTop);
-
-      // Only update if keyboard height actually changed (avoid unnecessary re-renders)
-      if (Math.abs(keyboardHeight - lastKeyboardHeight.current) > 10) {
-        lastKeyboardHeight.current = keyboardHeight;
-        setToolbarBottom(keyboardHeight > 50 ? keyboardHeight + 8 : 12);
-      }
-    };
-
-    // Use requestAnimationFrame for smooth updates
-    const handleViewportChange = () => {
-      requestAnimationFrame(updateToolbarPosition);
-    };
-
-    window.visualViewport.addEventListener('resize', handleViewportChange);
-    window.visualViewport.addEventListener('scroll', handleViewportChange);
-
-    // Also listen for focus/blur as backup for keyboard detection
-    const handleFocus = () => setTimeout(handleViewportChange, 100);
-    const handleBlur = () => {
-      // When blurring, keyboard is closing - reset to bottom after short delay
-      setTimeout(() => {
-        lastKeyboardHeight.current = 0;
-        setToolbarBottom(12);
-      }, 50);
-    };
-
-    document.addEventListener('focusin', handleFocus);
-    document.addEventListener('focusout', handleBlur);
-
-    return () => {
-      window.visualViewport.removeEventListener('resize', handleViewportChange);
-      window.visualViewport.removeEventListener('scroll', handleViewportChange);
-      document.removeEventListener('focusin', handleFocus);
-      document.removeEventListener('focusout', handleBlur);
-    };
-  }, []);
-
-  // Callback for when modifiers auto-release (e.g., after Ctrl+C)
+  // Callback for when modifiers auto-release
   const handleModifierChange = useCallback((state) => {
     setModifierState(state);
   }, []);
@@ -91,22 +45,20 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
         return;
       }
 
-      // E2E encrypted output ONLY - no unencrypted fallback
+      // E2E encrypted output ONLY
       if (msg.type === 'e2e_output') {
         const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
         if (plaintext !== null) {
           write(plaintext);
         }
       }
-      // NOTE: Unencrypted 'output' handler removed for security
-      // Server buffers output until E2E is ready, then sends encrypted
     };
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, decryptOutput, write]);
 
-  // Focus terminal on tap (container handles this since canvas has pointer-events: none)
+  // Focus terminal on tap
   const handleContainerClick = useCallback(() => {
     if (terminal) {
       terminal.focus();
@@ -119,7 +71,6 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
-        // Send pasted text through the encrypted channel
         sendSpecial(text);
       }
     } catch (err) {
@@ -166,86 +117,90 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   }, [terminal, sendSpecial]);
 
   return (
-    <div className="h-full w-full relative">
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+      {/* Terminal container - flex-1 to fill available space */}
       <div
         ref={containerRef}
-        className="absolute inset-0 pb-14 terminal-container"
+        className="flex-1 min-h-0 px-3 py-2 bg-black [&_.xterm]:h-full [&_.xterm-viewport]:!overflow-y-auto"
         onClick={handleContainerClick}
       />
 
-      {/* Floating toolbar for mobile */}
-      <div
-        className="toolbar fixed left-3 right-3 bg-[#1c1c1e]/90 backdrop-blur-sm rounded-full px-3 py-1 flex gap-0 justify-around items-center shadow-lg border border-white/10"
-        style={{ bottom: `${toolbarBottom}px` }}
-      >
+      {/* Toolbar */}
+      <div className="flex-shrink-0 h-12 flex items-center justify-around px-4 bg-zinc-900">
         <ToolbarButton
-          icon={<CornerDownLeft size={14} />}
+          icon={<CornerDownLeft size={16} />}
           onClick={() => handleToolbarClick('esc')}
+          label="ESC"
         />
         <ToolbarButton
-          icon={<ChevronRight size={14} />}
+          icon={<ChevronRight size={16} />}
           onClick={() => handleToolbarClick('tab')}
+          label="TAB"
         />
         <ToolbarButton
-          label="⇧"
+          text="⇧"
           active={modifierState.shift}
           onClick={() => handleToolbarClick('shift')}
+          label="Shift"
         />
         <ToolbarButton
-          label="^"
+          text="^"
           active={modifierState.ctrl}
           onClick={() => handleToolbarClick('ctrl')}
+          label="Ctrl"
         />
         <ToolbarButton
-          icon={<Clipboard size={14} />}
+          icon={<Clipboard size={16} />}
           onClick={handlePaste}
+          label="Paste"
         />
-        <div className="w-px h-4 bg-white/10" />
+
+        <div className="w-px h-5 bg-white/10" />
+
         <ToolbarButton
-          icon={<ArrowUp size={14} />}
+          icon={<ArrowUp size={16} />}
           onClick={() => handleToolbarClick('up')}
+          label="Up"
         />
         <ToolbarButton
-          icon={<ArrowDown size={14} />}
+          icon={<ArrowDown size={16} />}
           onClick={() => handleToolbarClick('down')}
+          label="Down"
         />
         <ToolbarButton
-          icon={<ArrowLeft size={14} />}
+          icon={<ArrowLeft size={16} />}
           onClick={() => handleToolbarClick('left')}
+          label="Left"
         />
         <ToolbarButton
-          icon={<ArrowRight size={14} />}
+          icon={<ArrowRight size={16} />}
           onClick={() => handleToolbarClick('right')}
+          label="Right"
         />
       </div>
     </div>
   );
 }
 
-const ToolbarButton = memo(function ToolbarButton({ icon, label, active, onClick }) {
+const ToolbarButton = memo(function ToolbarButton({ icon, text, active, onClick, label }) {
   return (
-    <button
-      // Prevent blur/focus loss when tapping buttons
-      onTouchStart={(e) => {
-        e.preventDefault();
-      }}
-      onMouseDown={(e) => {
-        e.preventDefault();
-      }}
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      onTouchStart={(e) => e.preventDefault()}
+      onMouseDown={(e) => e.preventDefault()}
       onClick={(e) => {
         e.preventDefault();
         onClick();
       }}
-      className={`
-        w-7 h-7 flex items-center justify-center rounded-md text-xs font-medium select-none
-        ${active
-          ? 'text-[#007AFF]'
-          : 'text-gray-400 active:text-white'
-        }
-      `}
+      className={cn(
+        "rounded-lg touch-manipulation",
+        active && "text-[#4B5AFF] bg-[#4B5AFF]/10"
+      )}
+      title={label}
     >
-      {icon || label}
-    </button>
+      {icon || <span className="text-base font-medium">{text}</span>}
+    </Button>
   );
 });
 
