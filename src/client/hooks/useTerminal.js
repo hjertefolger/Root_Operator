@@ -58,14 +58,16 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       termRef.current = term;
       fitAddonRef.current = fitAddon;
 
-      // Configure textarea once (disable autocorrect, etc.)
+      // Configure textarea - suppress native keyboard on mobile
       const textarea = containerRef.current.querySelector('.xterm-helper-textarea');
       if (textarea) {
         textarea.setAttribute('autocomplete', 'off');
         textarea.setAttribute('autocorrect', 'off');
         textarea.setAttribute('autocapitalize', 'off');
         textarea.setAttribute('spellcheck', 'false');
-        textarea.setAttribute('inputmode', 'text');
+        // inputmode="none" suppresses native keyboard on iOS/Android
+        // Users will use the custom toolbar for input
+        textarea.setAttribute('inputmode', 'none');
       }
 
       // Helper to sync terminal size with backend

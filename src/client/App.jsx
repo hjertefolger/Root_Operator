@@ -90,7 +90,7 @@ function App() {
 
   // Show terminal when authenticated and E2E is ready
   return (
-    <div className="h-dvh w-full flex flex-col bg-zinc-900 pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+    <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
       {/* Top safe area */}
       <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
       <Header fingerprint={fingerprint} />
