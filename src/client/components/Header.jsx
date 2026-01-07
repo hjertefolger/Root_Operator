@@ -14,11 +14,11 @@ function Header({ fingerprint }) {
   return (
     <>
       {/* Header bar matching tray app style */}
-      <header className="flex-shrink-0 h-11 flex items-center justify-between pl-5 pr-4 bg-black">
+      <header className="flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
         <span className="font-mono text-xs font-normal tracking-wider text-foreground">
           ROOT_OPERATOR
         </span>
-        <div className="flex items-center gap-1 -mr-2">
+        <div className="flex items-center gap-1">
           <Button
             variant="ghost"
             size="icon-sm"

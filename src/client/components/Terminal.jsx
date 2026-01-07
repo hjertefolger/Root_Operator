@@ -121,12 +121,13 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
       {/* Terminal container - flex-1 to fill available space */}
       <div
         ref={containerRef}
-        className="flex-1 min-h-0 px-3 py-2 bg-black [&_.xterm]:h-full [&_.xterm-viewport]:!overflow-y-auto"
+        className="flex-1 min-h-0 bg-black [&_.xterm]:h-full [&_.xterm-viewport]:!overflow-y-auto"
+        style={{ paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 }}
         onClick={handleContainerClick}
       />
 
       {/* Toolbar */}
-      <div className="flex-shrink-0 h-12 flex items-center justify-around px-4 bg-zinc-900">
+      <div className="flex-shrink-0 h-12 flex items-center justify-around bg-zinc-900" style={{ paddingLeft: 12, paddingRight: 12 }}>
         <ToolbarButton
           icon={<CornerDownLeft size={16} />}
           onClick={() => handleToolbarClick('esc')}
