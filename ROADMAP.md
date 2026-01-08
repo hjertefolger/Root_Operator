@@ -1,6 +1,6 @@
 # Root Operator - Development Roadmap
 
-Last updated: 2026-01-08
+Last updated: 2026-01-08 (Security Audit Added)
 
 ---
 
@@ -100,7 +100,342 @@ Terminal:
 - ✅ MITM protection (fingerprint verification)
 - ✅ Replay protection (unique IV per message)
 
+### Security Audit Findings (2026-01-08)
+
+**Audit performed:** Comprehensive code review of main.js, preload.js, and client hooks.
+**Overall Rating:** 7.5/10 - Strong foundations, needs critical fixes before production.
+
+---
+
+#### CRITICAL Issues (Must Fix Before Production)
+
+##### 1. Null Origin Attack Vector
+
+**Location:** `main.js:854-856`
+```javascript
+function isOriginAllowed(origin, cfSettings) {
+    if (!origin) return true; // ← CRITICAL FLAW
+```
+
+**Impact:** Attackers can bypass origin validation by:
+- Using non-browser tools (curl, websocket clients)
+- Proxies that strip Origin headers
+- `file://` URLs
+
+**Risk Level:** Critical - Allows unauthorized WebSocket connections
+
+**Fix:**
+```javascript
+function isOriginAllowed(origin, cfSettings) {
+    // Only allow null origin in development mode
+    if (!origin) {
+        return isDev; // Reject in production
+    }
+    // ... rest of validation
+}
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 2. Hardened Runtime Disabled
+
+**Location:** `package.json:97-98`
+```json
+"hardenedRuntime": false,
+"gatekeeperAssess": false,
+```
+
+**Impact:** Without hardened runtime:
+- Code injection attacks are easier
+- Library validation is bypassed
+- macOS security protections are disabled
+
+**Risk Level:** Critical for macOS distribution
+
+**Fix:** For production builds:
+```json
+"hardenedRuntime": true,
+"gatekeeperAssess": true,
+"identity": "Developer ID Application: Your Name (TEAM_ID)"
+```
+
+**Status:** [ ] Intentionally disabled for development (requires Apple Developer account)
+
+---
+
+##### 3. Content Security Policy Gaps
+
+**Location:** `main.js:1502`
+```javascript
+"Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:;"
+```
+
+**Missing directives:**
+- `frame-ancestors 'none'` - clickjacking protection
+- `object-src 'none'` - plugin blocking
+- `base-uri 'self'` - base tag injection protection
+- `form-action 'self'` - form redirect protection
+- `upgrade-insecure-requests` - force HTTPS
+
+**Risk Level:** High - XSS amplification, clickjacking
+
+**Fix:**
+```javascript
+"Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self';"
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+#### HIGH Priority Issues
+
+##### 4. Client Private Keys in localStorage
+
+**Location:** `src/client/hooks/useAuth.js:97-101`
+```javascript
+localStorage.setItem('pocket_bridge_keys', JSON.stringify({
+    privateJwk,
+    publicJwk,
+    kid
+}));
+```
+
+**Impact:**
+- Any XSS attack can steal the private key
+- localStorage is accessible to all scripts on the same origin
+- Private key should never be extractable
+
+**Risk Level:** High - Complete device impersonation on XSS
+
+**Fix Options:**
+1. Generate keys with `extractable: false` (prevents export)
+2. Use IndexedDB with CryptoKey objects (non-serializable)
+3. Use sessionStorage (clears on tab close, reduces exposure window)
+
+**Recommended Implementation:**
+```javascript
+// Generate non-extractable keys
+const keyPair = await window.crypto.subtle.generateKey(
+    { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([0x01, 0x00, 0x01]), hash: "SHA-256" },
+    false, // extractable = false
+    ["sign", "verify"]
+);
+// Store public JWK only; private key stays in CryptoKey object
+// Use IndexedDB to persist the CryptoKey reference
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 5. No Key Rotation Mechanism
+
+**Impact:**
+- Compromised keys remain valid indefinitely
+- No remote revocation capability
+- No key expiration policy
+
+**Recommended Features:**
+- [ ] Device key expiration (e.g., 90 days)
+- [ ] Remote key revocation via IPC
+- [ ] Key rotation on security events
+- [ ] "Sign out all devices" functionality
+
+**Status:** [ ] Planned
+
+---
+
+##### 6. Session Key Never Rotates
+
+**Location:** E2E session key persists for entire connection lifetime
+
+**Impact:**
+- Long sessions increase exposure if key is compromised
+- No forward secrecy within a session
+
+**Best Practice:** Rotate session keys:
+- Every N messages (e.g., 10,000)
+- Every N minutes (e.g., 30)
+- Every N bytes transferred (e.g., 100MB)
+
+**Status:** [ ] Planned
+
+---
+
+##### 7. WebSocket Message Size Limit
+
+**Location:** `main.js:1111-1115`
+```javascript
+if (msg.length > 65536) { // 64KB
+    logDebug('[SECURITY] Message too large, ignoring');
+    return;
+}
+```
+
+**Issue:** 64KB JSON parsing is expensive. Check occurs after receiving full message.
+
+**Fix Options:**
+- Lower limit to 16KB or 32KB
+- Use streaming parser for large messages
+- Add ws `maxPayload` option at server level
+
+**Status:** [ ] Not fixed
+
+---
+
+#### MEDIUM Priority Issues
+
+##### 8. Debug Logging May Leak Sensitive Data
+
+**Locations:**
+- `main.js:274` - logs fingerprints
+- `main.js:298` - logs key exchange details
+- Various connection details logged
+
+**Fix:** Sanitize or redact sensitive fields before logging:
+```javascript
+function logDebug(msg, sensitiveFields = []) {
+    let sanitized = msg;
+    for (const field of sensitiveFields) {
+        sanitized = sanitized.replace(new RegExp(field, 'g'), '[REDACTED]');
+    }
+    // ... write to log
+}
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 9. Missing HSTS Header
+
+**Location:** `main.js:1497-1503`
+
+**Fix:** Add to security headers:
+```javascript
+'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
+```
+
+**Note:** Traffic goes through Cloudflare (which adds HSTS), but defense in depth recommends adding it locally too.
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 10. Timing Side-Channel in Auth Verification
+
+**Location:** `main.js:1316-1342`
+```javascript
+function verifySignature(kid, signature, challenge) {
+    const key = authorized.find(k => k.kid === kid);
+    if (!key) return false; // ← Early return leaks timing info
+```
+
+**Impact:** Attackers can enumerate valid key IDs by measuring response time
+
+**Fix:** Use constant-time comparison or add artificial delay:
+```javascript
+function verifySignature(kid, signature, challenge) {
+    const authorized = store.get('keys', []);
+    const key = authorized.find(k => k.kid === kid);
+
+    // Always perform full verification flow
+    const dummyKey = { jwk: generateDummyJWK() };
+    const keyToVerify = key || dummyKey;
+
+    try {
+        // ... verification logic
+        return key ? isValid : false;
+    } catch {
+        return false;
+    }
+}
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 11. Worker API Timestamp Validation
+
+**Location:** `main.js:434-436`
+```javascript
+const timestamp = Date.now();
+const message = `${machineId}:${challenge}:${timestamp}`;
+```
+
+**Issue:** Client controls timestamp. Server must validate timestamp freshness (e.g., within 5 minutes).
+
+**Status:** [ ] Depends on Worker API implementation
+
+---
+
+#### LOW Priority Issues
+
+##### 12. Encrypted Payload Size Check Order
+
+**Location:** `main.js:1268-1279`
+```javascript
+const decrypted = decryptInput(ws, { iv: m.iv, data: m.data, tag: m.tag });
+// ... later ...
+if (inputData.length > MAX_INPUT_SIZE) {
+```
+
+**Issue:** Large encrypted payloads are fully decrypted before size validation.
+
+**Fix:** Check base64 encoded size before decryption:
+```javascript
+const estimatedSize = (m.data.length * 3) / 4; // base64 -> bytes
+if (estimatedSize > MAX_INPUT_SIZE * 1.5) {
+    logDebug('[SECURITY] Encrypted payload too large');
+    return;
+}
+```
+
+**Status:** [ ] Not fixed
+
+---
+
+##### 13. Pairing Code Brute Force Window
+
+**Current:** 6 chars from 31-char alphabet = ~887M combinations, 2-minute expiry
+
+**Analysis:** With rate limiting (20 conn/min, 3 attempts/conn), max 60 attempts in 2 minutes. Probability of success: 60/887M ≈ 0.000007%
+
+**Verdict:** Acceptable risk. No change needed.
+
+**Status:** [x] Acceptable
+
+---
+
+### Missing Security Features Checklist
+
+| Feature | Priority | Status | Notes |
+|---------|----------|--------|-------|
+| Fix null origin validation | Critical | [ ] | Required for production |
+| Enable hardened runtime | Critical | [ ] | Requires Apple Developer |
+| Strengthen CSP | High | [ ] | Add missing directives |
+| Non-extractable client keys | High | [ ] | Use IndexedDB + CryptoKey |
+| Key rotation mechanism | High | [ ] | Device + session keys |
+| Device naming/identification | Medium | [ ] | UX improvement for revocation |
+| Connection audit logging | Medium | [ ] | IP, timestamp, device forensics |
+| New device notifications | Medium | [ ] | Alert on pairing |
+| Certificate pinning | Low | [ ] | Pin Worker API certs |
+| HSTS header | Low | [ ] | Defense in depth |
+| Constant-time auth | Low | [ ] | Prevent enumeration |
+
+---
+
 ### Planned Security Improvements
+
+#### Priority 1: Critical Fixes (Before Production)
+
+- [ ] **Fix origin validation** - Reject null origins in production
+- [ ] **Strengthen CSP** - Add frame-ancestors, object-src, base-uri, form-action
+- [ ] **Non-extractable keys** - Migrate to IndexedDB + CryptoKey
 
 #### Priority 2: Infrastructure Hardening
 
@@ -120,7 +455,20 @@ Terminal:
   - Cloudflare Access integration
 - **Status:** Planned
 
+**Key Management** (High priority)
+- [ ] Key expiration policy (90 days)
+- [ ] Remote revocation capability
+- [ ] Session key rotation
+- [ ] "Sign out all devices" feature
+
 #### Priority 3: Enterprise Features
+
+**Code Signing & Hardened Runtime** (Required for distribution)
+- **Current:** Disabled for easier local development
+- **Risk:** Users cannot run app without security warnings
+- **Fix:** Enable hardened runtime, code signing, notarization
+- **Requires:** Apple Developer account ($99/year)
+- **Status:** Planned for v1.2
 
 **Auto-Updates** (Medium priority)
 - **Current:** Manual updates required
