@@ -74,19 +74,8 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       const syncSize = () => {
         if (!fitAddon || cancelled) return;
         try {
-          // Check if user is at bottom before resize
-          const viewport = containerRef.current?.querySelector('.xterm-viewport');
-          const wasAtBottom = viewport
-            ? viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 10
-            : true;
-
           fitAddon.fit();
-
-          // Only scroll to bottom if user was already there
-          if (wasAtBottom) {
-            term.scrollToBottom();
-          }
-
+          term.scrollToBottom();
           const dims = fitAddon.proposeDimensions();
           if (dims && socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({

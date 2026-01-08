@@ -254,7 +254,7 @@ button {
   flex: 1;
   min-height: 0;
   background: #000;
-  padding: 4px 6px;
+  padding: 4px 4px 20px;
 }
 
 /* Keyboard wrapper - CSS Grid for smooth 0 to auto height */
