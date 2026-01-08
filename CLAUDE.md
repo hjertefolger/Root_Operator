@@ -62,11 +62,13 @@ Changes to React components are reflected immediately:
 - React + Tailwind + shadcn/ui (same stack as renderer)
 - Entry point: `client.html` (built to `public/dist/client.html`)
 - Main app: `src/client/App.jsx`
-- Components: PairingScreen, Terminal, EncryptionBadge
-- Hooks: useWebSocket, useAuth, useE2E
+- Components: PairingScreen, Terminal, Header, VirtualKeyboard, EncryptionBadge
+- Hooks: useWebSocket, useAuth, useE2E, useTerminal, useTerminalPersistence
 - xterm.js terminal with fit and web-links addons
 - E2E encryption with fingerprint verification (12-word BIP39)
 - RSA-PSS authentication with 6-character pairing codes
+- WebSocket auto-reconnection with exponential backoff
+- Terminal content persistence via sessionStorage
 - Can be added to iOS home screen as PWA
 
 ### Security Architecture
@@ -90,17 +92,33 @@ Changes to React components are reflected immediately:
 6. User verifies fingerprint match between desktop tray menu and iOS client
 7. All terminal I/O encrypted with AES-256-GCM (random IV per message)
 
-**Authentication**:
-- Public key authentication using ECDSA (P-256 curve)
-- Client generates keypair on first connection
-- Server challenges client with random nonce
-- Client signs challenge, server verifies signature
-- Approved keys stored in electron-store
-- Rate limiting: max 5 auth attempts per minute
+**Authentication** (`main.js`, `src/client/hooks/useAuth.js`):
+- RSA-PSS (2048-bit) public key authentication
+- New devices: 6-character pairing code displayed on client, user enters on desktop to approve
+- Returning devices: Server sends random challenge, client signs with private key, server verifies
+- Challenge-response enforced for ALL reconnections (proves key possession, not just key ID)
+- Approved keys stored in electron-store as `{kid, jwk}` pairs
+- Rate limiting: max 5 auth attempts per connection
+- Challenge expiry: 30 seconds
 
 **Origin Validation**:
 - WebSocket connections validated against Cloudflare tunnel URL
 - Blocks connections from unauthorized origins
+
+**WebSocket Reconnection** (`src/client/hooks/useWebSocket.js`):
+- Automatic reconnection with exponential backoff (1s → 30s max)
+- Jitter factor (±20%) to prevent thundering herd
+- Heartbeat ping/pong every 25s to detect dead connections
+- Handles network online/offline events
+- Handles iOS PWA visibility changes (background/foreground)
+- Server output buffer (1MB) preserves terminal history across reconnects
+
+**Terminal Persistence** (`src/client/hooks/useTerminalPersistence.js`):
+- Saves terminal content to sessionStorage (debounced 500ms)
+- Restores on page reload before server buffer arrives
+- Server buffer takes precedence as source of truth
+- Auto-saves on page hide (iOS PWA backgrounding)
+- Max 1MB content, uses sessionStorage for security (clears on tab close)
 
 ### State Management
 
@@ -141,8 +159,8 @@ src/client/                 PWA client (React + Tailwind)
   App.jsx                   Main React app
   main.jsx                  React entry point
   index.css                 Tailwind styles
-  components/               React components (PairingScreen, Terminal, etc.)
-  hooks/                    React hooks (useWebSocket, useAuth, useE2E)
+  components/               React components (PairingScreen, Terminal, Header, VirtualKeyboard)
+  hooks/                    React hooks (useWebSocket, useAuth, useE2E, useTerminal, useTerminalPersistence)
 src/components/ui/          shadcn/ui components (Button, Switch, Input OTP, etc.)
 public/                     Static assets
   bip39-words.json          BIP39 wordlist for fingerprints

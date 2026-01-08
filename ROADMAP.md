@@ -1,153 +1,57 @@
 # Root Operator - Development Roadmap
 
-Last updated: 2026-01-04
+Last updated: 2026-01-08
 
 ---
 
 ## Tech Stack Roadmap
 
-### Phase 1: Modern Frontend Migration (Planned)
+### Phase 1: Modern Frontend Migration ✅ COMPLETED
 
 **Goal:** Migrate from vanilla JS to React + Vite + Tailwind to support multiple terminal tabs and better scalability.
 
-**Timeline:** ~10-15 hours
-
-#### Why Migrate?
-
-- **Multiple tabs support** (planned feature)
-- Better state management as features grow
-- Component reusability
-- Modern development experience
-- Tailwind for rapid UI iteration
-
-#### Tech Stack
+#### Tech Stack (Implemented)
 
 ```bash
 Build System:
 - Vite (fast builds, HMR, Electron-compatible)
+- Dual Vite configs: renderer (port 5174) + client (port 5175)
 
 Frontend:
-- React (component model for tabs/sessions)
-- Tailwind CSS (rapid UI development)
-- Zustand or Jotai (lightweight state management)
+- React 18
+- Tailwind CSS
+- shadcn/ui components
+- Lucide React icons
 
 Terminal:
-- xterm.js (keep existing)
+- xterm.js
 - xterm-addon-fit
 - xterm-addon-web-links
 ```
 
-#### Implementation Steps
+#### Completed Steps
 
-**Step 1: Setup Build System** (2-3 hours)
-- [ ] Install Vite, React, Tailwind
-- [ ] Configure Vite for Electron (`base: './'` for file:// protocol)
-- [ ] Setup Tailwind config
-- [ ] Update package.json scripts:
-  ```json
-  {
-    "dev": "vite",
-    "build:client": "vite build",
-    "prebuild": "npm run build:client",
-    "start": "electron ."
-  }
-  ```
+- [x] Setup Vite build system with HMR
+- [x] Create `src/client/` and `src/renderer/` directory structure
+- [x] Convert WebSocket connection logic to `useWebSocket` hook
+- [x] Convert E2E encryption to `useE2E` hook
+- [x] Convert terminal to `Terminal` component
+- [x] Migrate authentication flow to `useAuth` hook
+- [x] Add `useTerminal` hook for terminal management
+- [x] Add `useTerminalPersistence` hook for session storage
+- [x] Build Header component with encryption badge
+- [x] Build VirtualKeyboard component for iOS
+- [x] Build PairingScreen component
+- [x] Electron build produces working .app
+- [x] PWA works on iOS
 
-**Step 2: Project Restructure** (1-2 hours)
-- [ ] Create `src/client/` directory structure
-- [ ] Move current client.js logic to src
-- [ ] Setup component structure:
-  ```
-  src/client/
-  ├── App.jsx
-  ├── components/
-  │   ├── Terminal.jsx
-  │   ├── TabBar.jsx
-  │   ├── ConnectionStatus.jsx
-  │   └── EncryptionBadge.jsx
-  ├── hooks/
-  │   ├── useWebSocket.js
-  │   ├── useE2E.js
-  │   └── useTerminal.js
-  ├── store/
-  │   └── sessionStore.js
-  └── main.jsx
-  ```
+### Phase 2: Multiple Terminal Tabs (Planned)
 
-**Step 3: Migrate Existing Features** (4-6 hours)
-- [ ] Convert WebSocket connection logic to `useWebSocket` hook
-- [ ] Convert E2E encryption to `useE2E` hook
-- [ ] Convert terminal to `Terminal` component
-- [ ] Migrate authentication flow
-- [ ] Migrate connection status UI
-- [ ] Migrate encryption badge
-
-**Step 4: Add Tab Functionality** (3-4 hours)
-
-**Client Side:**
-- [ ] Create Zustand store for session management:
-  ```jsx
-  const useSessionStore = create((set) => ({
-    sessions: [],
-    activeId: null,
-    addSession: () => set((state) => ({ ... })),
-    closeSession: (id) => set((state) => ({ ... })),
-    setActive: (id) => set({ activeId: id })
-  }));
-  ```
-- [ ] Build `TabBar` component (tabs, close buttons, new tab)
-- [ ] Implement tab switching logic
-- [ ] Add keyboard shortcuts (Cmd+T, Cmd+W, Cmd+1-9)
-
-**Server Side (main.js):**
+- [ ] Create session store for tab management
+- [ ] Build TabBar component
 - [ ] Modify WebSocket handler to support multiple sessions
-- [ ] Create session map: `sessionId -> { ptyProcess, e2e }`
-- [ ] Route messages by sessionId
-- [ ] Handle session creation/cleanup
-- [ ] Update protocol to include sessionId in messages
-
-**Step 5: Polish & Testing** (2-3 hours)
-- [ ] Test E2E encryption with multiple tabs
-- [ ] Test tab switching, creation, deletion
-- [ ] Test PTY cleanup on tab close
-- [ ] Update UI styling with Tailwind
-- [ ] Test Electron build with Vite output
-- [ ] Verify PWA still works on iOS
-
-#### Updated File Serving
-
-**main.js changes:**
-```javascript
-function servePWA(req, res) {
-  // Serve from Vite build output
-  const publicDir = path.join(__dirname, 'public', 'dist');
-  // ... rest of logic
-}
-```
-
-**electron-builder config:**
-```json
-{
-  "files": [
-    "main.js",
-    "preload.js",
-    "ui/**/*",
-    "public/dist/**/*",        // Vite output
-    "public/bip39-words.json",
-    "!public/src"              // Exclude source
-  ]
-}
-```
-
-#### Success Criteria
-
-- [ ] Multiple terminal tabs working
-- [ ] Each tab has independent PTY process
-- [ ] E2E encryption works per session
-- [ ] Clean tab UI with Tailwind
-- [ ] Electron build produces working .app
-- [ ] Bundle size < 500KB gzipped
-- [ ] PWA loads in < 2 seconds on mobile
+- [ ] Session-based E2E encryption
+- [ ] Tab persistence (optional)
 
 ---
 
@@ -158,14 +62,16 @@ function servePWA(req, res) {
 | Area | Implementation | Date |
 |------|----------------|------|
 | Electron security | Context isolation, sandbox, preload | 2026-01 |
-| Authentication | RSA-PSS challenge-response | 2026-01 |
-| Rate limiting | Connection + attempt limits | 2026-01 |
+| Authentication | RSA-PSS 2048-bit with 6-char pairing codes | 2026-01 |
+| **Challenge-Response** | **Enforced for ALL reconnections (proves key possession)** | **2026-01-08** |
+| Rate limiting | Connection + attempt limits, 30s challenge expiry | 2026-01 |
 | Path traversal | Protected | 2026-01 |
 | Origin validation | WebSocket verifyClient | 2026-01 |
 | Secrets storage | OS keychain (keytar) | 2026-01 |
 | Security headers | CSP, X-Frame-Options | 2026-01 |
 | ANSI escape filtering | Blocks OSC 52, title changes, DCS/APC/PM/SOS | 2026-01 |
-| **E2E Encryption** | ECDH + AES-256-GCM + fingerprint verification | **2026-01** |
+| **E2E Encryption** | ECDH P-256 + AES-256-GCM + BIP39 fingerprint | **2026-01** |
+| **Connection Resilience** | Auto-reconnect with backoff, heartbeat ping/pong | **2026-01-08** |
 
 ### E2E Encryption Architecture
 
@@ -263,18 +169,38 @@ function servePWA(req, res) {
 
 ## Feature Roadmap
 
+### Completed ✅
+
+**Modern React Stack** (2026-01)
+- [x] React + Vite + Tailwind migration
+- [x] shadcn/ui component library
+- [x] Hot module replacement (HMR) for development
+- [x] Dual build system (renderer + client)
+
+**PWA Client Improvements** (2026-01-08)
+- [x] WebSocket auto-reconnection with exponential backoff
+- [x] Heartbeat ping/pong (25s interval, 5s timeout)
+- [x] Network online/offline detection
+- [x] iOS PWA visibility change handling
+- [x] Terminal content persistence (sessionStorage)
+- [x] Server output buffer (1MB) for history preservation
+- [x] Custom virtual keyboard for iOS
+- [x] Reconnecting/Authenticating overlay states
+
+**Authentication UX** (2026-01-08)
+- [x] Quick "Authenticating..." state for returning devices
+- [x] Proper challenge-response for security
+- [x] Graceful fallback to pairing code on auth failure
+
 ### Near Term
 
 **Multiple Terminal Tabs** (Next major feature)
-- Tech stack migration to React (see above)
 - Tab management UI
 - Multiple PTY processes
 - Session-based E2E encryption
 - Tab persistence (optional)
 
 **UI/UX Improvements**
-- Modern UI with Tailwind
-- Responsive design
 - Dark/light theme toggle
 - Keyboard shortcuts
 - Terminal customization (fonts, colors)
@@ -313,19 +239,25 @@ function servePWA(req, res) {
 
 ### v1.0 (Current)
 - ✅ Single terminal session
-- ✅ E2E encryption
-- ✅ Public key authentication
-- ✅ Cloudflare tunnel
-- ✅ macOS app
+- ✅ E2E encryption (ECDH + AES-256-GCM)
+- ✅ RSA-PSS authentication with challenge-response
+- ✅ Cloudflare tunnel integration
+- ✅ macOS Electron app
+- ✅ iOS PWA client
 
-### v1.1 (Next)
-- React + Vite + Tailwind migration
+### v1.1 (Current) ✅
+- ✅ React + Vite + Tailwind migration
+- ✅ WebSocket auto-reconnection
+- ✅ Terminal persistence
+- ✅ Virtual keyboard for iOS
+- ✅ Improved authentication UX
+
+### v1.2 (Next)
 - Multiple terminal tabs
-- Improved UI/UX
 - Tab persistence
-
-### v1.2
 - Session management
+
+### v1.3
 - File transfer
 - Auto-updates
 
