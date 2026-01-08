@@ -24,10 +24,11 @@ export function useAuth(socket) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [pairingCode, setPairingCode] = useState(null);
-  const [pairingStatus, setPairingStatus] = useState('connecting'); // connecting, waiting, paired
+  const [pairingStatus, setPairingStatus] = useState('connecting'); // connecting, authenticating, waiting, paired
   const [pairingError, setPairingError] = useState(null);
   const [keysReady, setKeysReady] = useState(false);
   const [serverReady, setServerReady] = useState(false);
+  const [isReturningDevice, setIsReturningDevice] = useState(false);
   const keyPairRef = useRef(null);
   const keyIdRef = useRef(null);
   const pairingInitiatedRef = useRef(false);
@@ -59,7 +60,8 @@ export function useAuth(socket) {
           );
 
           keyPairRef.current = { privateKey, publicKey };
-          console.log('[AUTH] Loaded existing keypair');
+          console.log('[AUTH] Loaded existing keypair - returning device');
+          setIsReturningDevice(true);
           setKeysReady(true);
           setIsLoading(false);
           return;
@@ -126,6 +128,12 @@ export function useAuth(socket) {
       const code = generatePairingCode();
       setPairingCode(code);
 
+      // For returning devices, show "authenticating" instead of pairing code
+      // Server will respond with auth_success if device is registered
+      if (isReturningDevice) {
+        setPairingStatus('authenticating');
+      }
+
       const publicJwk = await exportPublicKey();
 
       socket.send(JSON.stringify({
@@ -141,7 +149,7 @@ export function useAuth(socket) {
       setPairingError('Failed to initiate pairing');
       pairingInitiatedRef.current = false;
     }
-  }, [socket, exportPublicKey]);
+  }, [socket, exportPublicKey, isReturningDevice]);
 
   // Initiate pairing when both server and keys are ready
   useEffect(() => {
@@ -211,6 +219,7 @@ export function useAuth(socket) {
     isLoading,
     pairingCode,
     pairingStatus,
-    pairingError
+    pairingError,
+    isReturningDevice
   };
 }

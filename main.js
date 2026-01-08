@@ -1118,6 +1118,12 @@ function handleConnection(ws, req) {
             return;
         }
 
+        // Heartbeat - respond to ping immediately (no auth required)
+        if (m.type === 'ping') {
+            ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
+            return;
+        }
+
         // Pairing Request - new device pairing flow
         if (!ws.authenticated && m.type === 'pairing_request') {
             // Validate required fields
@@ -1416,9 +1422,11 @@ function startPty(ws) {
         filtered = sanitizeTerminalOutput(filtered);
 
         // Broadcast to all authenticated clients (encrypted if E2E ready)
+        // Buffer size: 1MB to match standard terminal scrollback (~5000 lines)
+        const MAX_OUTPUT_BUFFER = 1024 * 1024;
         outputBuffer += filtered;
-        if (outputBuffer.length > 50000) {
-            outputBuffer = outputBuffer.slice(-50000);
+        if (outputBuffer.length > MAX_OUTPUT_BUFFER) {
+            outputBuffer = outputBuffer.slice(-MAX_OUTPUT_BUFFER);
         }
 
         for (let client of activeClients) {

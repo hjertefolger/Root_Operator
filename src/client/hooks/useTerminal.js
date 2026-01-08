@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { WebLinksAddon } from 'xterm-addon-web-links';
+import { useTerminalPersistence } from './useTerminalPersistence';
 
 export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange) {
   const termRef = useRef(null);
@@ -9,6 +10,14 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
   const socketRef = useRef(socket);
   const outputQueueRef = useRef([]);
   const [isReady, setIsReady] = useState(false);
+
+  // Content tracking for persistence
+  const contentBufferRef = useRef('');
+  const hasReceivedServerBufferRef = useRef(false);
+  const hasRestoredFromStorageRef = useRef(false);
+
+  // Persistence hook
+  const { saveContent, loadContent, markServerBufferReceived } = useTerminalPersistence();
 
   // Keep socket ref updated
   useEffect(() => {
@@ -98,6 +107,19 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
         // Flush output queue
         while (outputQueueRef.current.length > 0) {
           term.write(outputQueueRef.current.shift());
+        }
+
+        // Restore from sessionStorage on page reload (only if no server buffer yet)
+        // This handles the case where user reloads the page
+        if (!hasReceivedServerBufferRef.current && !hasRestoredFromStorageRef.current) {
+          const storedContent = loadContent();
+          if (storedContent) {
+            console.log('[Terminal] Restoring content from sessionStorage');
+            hasRestoredFromStorageRef.current = true;
+            contentBufferRef.current = storedContent;
+            term.write(storedContent);
+            term.scrollToBottom();
+          }
         }
 
         setIsReady(true);
@@ -193,15 +215,46 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     return () => disposable.dispose();
   }, [isReady, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
 
-  // Write to terminal
+  // Write to terminal with content tracking for persistence
   const write = useCallback((data) => {
     if (termRef.current) {
       termRef.current.write(data);
       termRef.current.scrollToBottom();
+
+      // Track content for persistence
+      contentBufferRef.current += data;
+      // Limit buffer size to 1MB
+      if (contentBufferRef.current.length > 1024 * 1024) {
+        contentBufferRef.current = contentBufferRef.current.slice(-1024 * 1024);
+      }
+      saveContent(contentBufferRef.current);
     } else {
       outputQueueRef.current.push(data);
     }
-  }, []);
+  }, [saveContent]);
+
+  // Write server buffer (initial data on connect/reconnect)
+  // Server buffer is source of truth - marks that we should ignore sessionStorage
+  const writeServerBuffer = useCallback((data) => {
+    if (!data) return;
+
+    // Mark that we received server buffer - don't use stale sessionStorage
+    hasReceivedServerBufferRef.current = true;
+    markServerBufferReceived();
+
+    // Reset content buffer and write server data
+    contentBufferRef.current = data;
+
+    if (termRef.current) {
+      // Don't clear terminal - just write (content appends)
+      // For reconnection, server sends the buffer which we just write
+      termRef.current.write(data);
+      termRef.current.scrollToBottom();
+      saveContent(data);
+    } else {
+      outputQueueRef.current.push(data);
+    }
+  }, [saveContent, markServerBufferReceived]);
 
   // Send special input (toolbar buttons)
   const sendSpecial = useCallback(async (data) => {
@@ -234,6 +287,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     terminal: termRef.current,
     isReady,
     write,
+    writeServerBuffer,
     sendSpecial,
     refit
   };

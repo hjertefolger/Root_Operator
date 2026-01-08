@@ -2,13 +2,19 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { useTerminal } from '../hooks/useTerminal';
 import VirtualKeyboard from './VirtualKeyboard';
 
-function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
+function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionState }) {
   const containerRef = useRef(null);
   const ctrlRef = useRef(false);
   const shiftRef = useRef(false);
   const [showKeyboard, setShowKeyboard] = useState(false);
 
-  const { terminal, write, sendSpecial } = useTerminal(
+  // Track if we've received the initial server buffer after E2E ready
+  const hasReceivedInitialBufferRef = useRef(false);
+
+  // Show overlay when reconnecting or disconnected
+  const showReconnectingOverlay = connectionState === 'reconnecting' || connectionState === 'connecting';
+
+  const { terminal, write, writeServerBuffer, sendSpecial } = useTerminal(
     containerRef,
     socket,
     encryptInput,
@@ -18,6 +24,13 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
     null
   );
 
+  // Reset initial buffer flag when E2E becomes not ready (reconnection)
+  useEffect(() => {
+    if (!e2eReady) {
+      hasReceivedInitialBufferRef.current = false;
+    }
+  }, [e2eReady]);
+
   useEffect(() => {
     if (!socket) return;
     const handleMessage = async (event) => {
@@ -25,12 +38,20 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
       try { msg = JSON.parse(event.data); } catch (e) { return; }
       if (msg.type === 'e2e_output') {
         const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
-        if (plaintext !== null) write(plaintext);
+        if (plaintext !== null) {
+          // First output after E2E ready is the server buffer
+          if (!hasReceivedInitialBufferRef.current) {
+            hasReceivedInitialBufferRef.current = true;
+            writeServerBuffer(plaintext);
+          } else {
+            write(plaintext);
+          }
+        }
       }
     };
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, decryptOutput, write]);
+  }, [socket, decryptOutput, write, writeServerBuffer]);
 
   const handleContainerClick = useCallback(() => {
     terminal?.focus();
@@ -51,9 +72,21 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
       {/* Terminal - fluid, takes remaining space */}
       <div
         ref={containerRef}
-        className="terminal-area"
+        className="terminal-area relative"
         onClick={handleContainerClick}
-      />
+      >
+        {/* Reconnection overlay */}
+        {showReconnectingOverlay && (
+          <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-10 pointer-events-none">
+            <div className="text-center space-y-2">
+              <div className="w-5 h-5 mx-auto border-2 border-white/50 border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm text-white/70">
+                {connectionState === 'reconnecting' ? 'Reconnecting...' : 'Connecting...'}
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Keyboard - grid animation for smooth 0 to auto */}
       <div

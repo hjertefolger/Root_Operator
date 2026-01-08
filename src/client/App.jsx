@@ -8,7 +8,7 @@ import { useAuth } from './hooks/useAuth';
 
 function App() {
   // Initialize WebSocket connection
-  const { socket, isReady } = useWebSocket();
+  const { socket, isReady, connectionState } = useWebSocket();
 
   // Initialize E2E encryption
   const {
@@ -65,7 +65,19 @@ function App() {
     );
   }
 
-  // Show pairing screen when not authenticated
+  // Show quick authenticating screen for returning devices
+  if (!isAuthenticated && pairingStatus === 'authenticating') {
+    return (
+      <div className="h-dvh w-full flex items-center justify-center bg-black">
+        <div className="text-center space-y-3">
+          <div className="w-6 h-6 mx-auto border-2 border-white border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-white/50">Authenticating...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show pairing screen when not authenticated (new device)
   if (!isAuthenticated) {
     return (
       <PairingScreen
@@ -99,6 +111,7 @@ function App() {
         encryptInput={encryptInput}
         decryptOutput={decryptOutput}
         e2eReady={e2eReady}
+        connectionState={connectionState}
       />
     </div>
   );
