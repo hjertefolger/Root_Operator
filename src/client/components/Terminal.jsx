@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { useTerminal } from '../hooks/useTerminal';
 import VirtualKeyboard from './VirtualKeyboard';
 
@@ -78,8 +79,8 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionSta
         {/* Reconnection overlay */}
         {showReconnectingOverlay && (
           <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-10 pointer-events-none">
-            <div className="text-center space-y-2">
-              <div className="w-5 h-5 mx-auto border-2 border-white/50 border-t-transparent rounded-full animate-spin" />
+            <div className="flex flex-col items-center gap-2">
+              <Loader2 className="w-5 h-5 text-white/70 animate-spin" />
               <p className="text-sm text-white/70">
                 {connectionState === 'reconnecting' ? 'Reconnecting...' : 'Connecting...'}
               </p>

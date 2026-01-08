@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { Loader2 } from 'lucide-react';
 import Terminal from './components/Terminal';
 import PairingScreen from './components/PairingScreen';
 import Header from './components/Header';
@@ -69,8 +70,8 @@ function App() {
   if (!isAuthenticated && pairingStatus === 'authenticating') {
     return (
       <div className="h-dvh w-full flex items-center justify-center bg-black">
-        <div className="text-center space-y-3">
-          <div className="w-6 h-6 mx-auto border-2 border-white border-t-transparent rounded-full animate-spin" />
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-6 h-6 text-white animate-spin" />
           <p className="text-sm text-white/50">Authenticating...</p>
         </div>
       </div>
@@ -92,8 +93,8 @@ function App() {
   if (!e2eReady) {
     return (
       <div className="h-dvh w-full flex items-center justify-center bg-black">
-        <div className="text-center space-y-3">
-          <div className="w-6 h-6 mx-auto border-2 border-white border-t-transparent rounded-full animate-spin" />
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-6 h-6 text-white animate-spin" />
           <p className="text-sm text-white/50">Securing connection...</p>
         </div>
       </div>

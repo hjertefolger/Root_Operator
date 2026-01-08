@@ -116,6 +116,24 @@ export function useAuth(socket) {
     return await window.crypto.subtle.exportKey("jwk", keyPairRef.current.publicKey);
   }, []);
 
+  // Sign a challenge with the private key
+  const signChallenge = useCallback(async (challenge) => {
+    if (!keyPairRef.current?.privateKey) {
+      throw new Error('Private key not available');
+    }
+    const encoder = new TextEncoder();
+    const data = encoder.encode(challenge);
+    const signature = await window.crypto.subtle.sign(
+      { name: "RSA-PSS", saltLength: 32 },
+      keyPairRef.current.privateKey,
+      data
+    );
+    // Convert to hex (server expects hex format)
+    return Array.from(new Uint8Array(signature))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }, []);
+
   // Send pairing request
   const sendPairingRequest = useCallback(async () => {
     if (!socket || !keyPairRef.current || pairingInitiatedRef.current) {
@@ -190,9 +208,28 @@ export function useAuth(socket) {
         setIsAuthenticated(true);
       }
 
-      // Already registered - direct auth success
+      // Challenge for returning device - sign and respond
+      if (msg.type === 'auth_challenge' && msg.challenge) {
+        console.log('[AUTH] Received challenge, signing...');
+        (async () => {
+          try {
+            const signature = await signChallenge(msg.challenge);
+            socket.send(JSON.stringify({
+              type: 'auth_response',
+              keyId: keyIdRef.current,
+              signature
+            }));
+            console.log('[AUTH] Sent signed challenge response');
+          } catch (e) {
+            console.error('[AUTH] Failed to sign challenge:', e);
+            setPairingError('Authentication failed');
+          }
+        })();
+      }
+
+      // Auth success (after challenge-response or new pairing)
       if (msg.type === 'auth_success') {
-        console.log('[AUTH] Already registered, auth successful');
+        console.log('[AUTH] Authentication successful');
         setPairingStatus('paired');
         setIsAuthenticated(true);
       }
@@ -208,11 +245,18 @@ export function useAuth(socket) {
         console.log('[AUTH] Pairing error:', msg.message);
         setPairingError(msg.message || 'Pairing failed');
       }
+
+      // Auth error (challenge-response failed)
+      if (msg.type === 'auth_error') {
+        console.log('[AUTH] Auth error:', msg.message);
+        setPairingError(msg.message || 'Authentication failed');
+        setPairingStatus('waiting'); // Fall back to showing pairing code
+      }
     };
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket]);
+  }, [socket, signChallenge]);
 
   return {
     isAuthenticated,

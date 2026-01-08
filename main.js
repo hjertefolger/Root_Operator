@@ -1146,13 +1146,13 @@ function handleConnection(ws, req) {
             // Check if device is already registered
             const authorized = store.get('keys', []);
             if (authorized.find(k => k.kid === m.keyId)) {
-                // Already registered - proceed to auth
-                logDebug(`[PAIRING] Device already registered: ${m.keyId.substring(0, 8)}`);
-                ws.authenticated = true;
-                clearTimeout(ws.authTimeout);
-                ws.send(JSON.stringify({ type: 'auth_success' }));
-                initE2EKeyExchange(ws);
-                startPty(ws);
+                // Already registered - send challenge for proof of key possession
+                logDebug(`[PAIRING] Device registered, sending challenge: ${m.keyId.substring(0, 8)}`);
+                const challenge = crypto.randomBytes(32).toString('hex');
+                ws.challenge = challenge;
+                ws.challengeTime = Date.now();
+                ws.challengeKeyId = m.keyId;
+                ws.send(JSON.stringify({ type: 'auth_challenge', challenge }));
                 return;
             }
 
@@ -1184,7 +1184,7 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Auth Response - for returning devices (legacy flow, kept for compatibility)
+        // Auth Response - returning device responds to challenge
         if (!ws.authenticated && m.type === 'auth_response') {
             // Check auth attempt limit
             ws.authAttempts++;
@@ -1194,8 +1194,15 @@ function handleConnection(ws, req) {
                 return;
             }
 
-            // Check challenge expiration (if challenge was sent)
-            if (ws.challengeTime && Date.now() - ws.challengeTime > CHALLENGE_EXPIRY_MS) {
+            // Verify challenge was issued
+            if (!ws.challenge || !ws.challengeTime) {
+                logDebug('[SECURITY] Auth response without challenge');
+                ws.send(JSON.stringify({ type: 'auth_error', message: 'No challenge issued' }));
+                return;
+            }
+
+            // Check challenge expiration
+            if (Date.now() - ws.challengeTime > CHALLENGE_EXPIRY_MS) {
                 logDebug('[SECURITY] Challenge expired, rejecting auth');
                 ws.send(JSON.stringify({ type: 'auth_error', message: 'Challenge expired' }));
                 ws.close(1008, 'Challenge expired');
@@ -1206,6 +1213,13 @@ function handleConnection(ws, req) {
             if (!m.keyId || typeof m.keyId !== 'string' ||
                 !m.signature || typeof m.signature !== 'string') {
                 logDebug('[SECURITY] Invalid auth response format');
+                return;
+            }
+
+            // Verify keyId matches the challenged device
+            if (ws.challengeKeyId && m.keyId !== ws.challengeKeyId) {
+                logDebug('[SECURITY] KeyId mismatch in auth response');
+                ws.send(JSON.stringify({ type: 'auth_error', message: 'Key mismatch' }));
                 return;
             }
 
