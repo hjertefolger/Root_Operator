@@ -8,7 +8,7 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   const shiftRef = useRef(false);
   const [showKeyboard, setShowKeyboard] = useState(false);
 
-  const { terminal, isReady, write, sendSpecial } = useTerminal(
+  const { terminal, write, sendSpecial } = useTerminal(
     containerRef,
     socket,
     encryptInput,
@@ -32,7 +32,6 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, decryptOutput, write]);
 
-  // Toggle keyboard on terminal tap
   const handleContainerClick = useCallback(() => {
     terminal?.focus();
     setShowKeyboard(prev => !prev);
@@ -48,21 +47,26 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   }, [sendSpecial]);
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <div className="terminal-layout">
+      {/* Terminal - fluid, takes remaining space */}
       <div
         ref={containerRef}
-        className="flex-1 min-h-0 bg-black"
-        style={{ padding: '8px 12px' }}
+        className="terminal-area"
         onClick={handleContainerClick}
       />
 
-      {/* Animated Virtual Keyboard */}
-      <div className={`vkb-container ${showKeyboard ? 'visible' : ''}`}>
-        <VirtualKeyboard
-          onInput={handleInput}
-          onSpecialKey={handleSpecialKey}
-          onPaste={handlePaste}
-        />
+      {/* Keyboard - grid animation for smooth 0 to auto */}
+      <div
+        className={`keyboard-wrapper ${showKeyboard ? 'visible' : ''}`}
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="keyboard-inner">
+          <VirtualKeyboard
+            onInput={handleInput}
+            onSpecialKey={handleSpecialKey}
+            onPaste={handlePaste}
+          />
+        </div>
       </div>
     </div>
   );

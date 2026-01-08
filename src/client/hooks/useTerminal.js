@@ -74,7 +74,19 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       const syncSize = () => {
         if (!fitAddon || cancelled) return;
         try {
+          // Check if user is at bottom before resize
+          const viewport = containerRef.current?.querySelector('.xterm-viewport');
+          const wasAtBottom = viewport
+            ? viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 10
+            : true;
+
           fitAddon.fit();
+
+          // Only scroll to bottom if user was already there
+          if (wasAtBottom) {
+            term.scrollToBottom();
+          }
+
           const dims = fitAddon.proposeDimensions();
           if (dims && socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({
@@ -102,20 +114,23 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
         setIsReady(true);
       });
 
-      // Handle window resize
-      handleResize = () => {
+      // ResizeObserver for smooth auto-refit when container size changes
+      const resizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(syncSize);
-      };
+      });
+      resizeObserver.observe(containerRef.current);
 
-      // iOS keyboard handling - only listen to resize, not scroll (scroll causes keyboard jumping)
-      handleViewportResize = () => {
-        requestAnimationFrame(syncSize);
-      };
+      // Also handle window/viewport resize
+      handleResize = () => requestAnimationFrame(syncSize);
+      handleViewportResize = () => requestAnimationFrame(syncSize);
 
       window.addEventListener('resize', handleResize);
       if (window.visualViewport) {
         window.visualViewport.addEventListener('resize', handleViewportResize);
       }
+
+      // Store for cleanup
+      containerRef.current._resizeObserver = resizeObserver;
 
       // Mobile: Focus on touch to bring up keyboard
       handleTouch = () => {
@@ -127,6 +142,9 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     return () => {
       cancelled = true;
       cancelAnimationFrame(initFrame);
+      if (container?._resizeObserver) {
+        container._resizeObserver.disconnect();
+      }
       if (handleResize) {
         window.removeEventListener('resize', handleResize);
       }
@@ -211,10 +229,23 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     }
   }, [e2eReady, encryptInput]);
 
+  // Refit terminal to container
+  const refit = useCallback(() => {
+    if (fitAddonRef.current && termRef.current) {
+      try {
+        fitAddonRef.current.fit();
+        termRef.current.scrollToBottom();
+      } catch (e) {
+        // Ignore fit errors
+      }
+    }
+  }, []);
+
   return {
     terminal: termRef.current,
     isReady,
     write,
-    sendSpecial
+    sendSpecial,
+    refit
   };
 }
