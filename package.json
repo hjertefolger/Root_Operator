@@ -11,14 +11,17 @@
     "build:client": "vite build --config vite.client.config.js",
     "build:renderer": "vite build --config vite.renderer.config.js",
     "build:all": "npm run build:client && npm run build:renderer",
-    "prebuild": "npm run build:all",
-    "prebuild:unsigned": "npm run build:all",
+    "prebuild": "npm run security:audit && npm run build:all",
+    "prebuild:unsigned": "npm run security:audit && npm run build:all",
     "start": "electron .",
     "build": "electron-builder --mac",
     "build:unsigned": "electron-builder --mac -c.mac.identity=null",
     "rebuild": "electron-rebuild -f -w node-pty keytar",
     "postinstall": "electron-rebuild -f -w node-pty keytar",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "security:audit": "npm audit --audit-level=high",
+    "security:audit:fix": "npm audit fix",
+    "security:check": "npm audit && echo '✅ No known vulnerabilities'"
   },
   "keywords": [
     "terminal",

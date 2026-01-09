@@ -50,6 +50,56 @@ const PAIRING_CODE_EXPIRY_MS = 120000; // 2 minutes
 const MAX_PENDING_PAIRINGS = 5;
 const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // No ambiguous chars
 
+// CSRF Protection for WebSocket
+// Prevents Cross-Site WebSocket Hijacking (CSWSH) attacks
+const CSRF_TOKEN_EXPIRY_MS = 300000; // 5 minutes
+let csrfSecret = null; // Generated on app start
+
+function initCsrfSecret() {
+    csrfSecret = crypto.randomBytes(32);
+    logDebug('[SECURITY] CSRF secret initialized');
+}
+
+function generateCsrfToken() {
+    const timestamp = Date.now().toString(36);
+    const random = crypto.randomBytes(16).toString('hex');
+    const payload = `${timestamp}.${random}`;
+    const signature = crypto.createHmac('sha256', csrfSecret)
+        .update(payload)
+        .digest('hex');
+    return `${payload}.${signature}`;
+}
+
+function validateCsrfToken(token) {
+    if (!token || typeof token !== 'string') return false;
+
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+
+    const [timestamp, random, signature] = parts;
+
+    // Verify signature
+    const payload = `${timestamp}.${random}`;
+    const expectedSig = crypto.createHmac('sha256', csrfSecret)
+        .update(payload)
+        .digest('hex');
+
+    // Constant-time comparison to prevent timing attacks
+    if (!crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expectedSig, 'hex'))) {
+        logDebug('[SECURITY] CSRF token signature mismatch');
+        return false;
+    }
+
+    // Check expiration
+    const tokenTime = parseInt(timestamp, 36);
+    if (Date.now() - tokenTime > CSRF_TOKEN_EXPIRY_MS) {
+        logDebug('[SECURITY] CSRF token expired');
+        return false;
+    }
+
+    return true;
+}
+
 // ANSI ESCAPE SEQUENCE SANITIZER
 // Blocks dangerous sequences while preserving normal terminal functionality
 // Reference: https://www.cyberark.com/resources/threat-research-blog/dont-trust-this-title-abusing-terminal-emulators-with-ansi-escape-characters
@@ -681,6 +731,9 @@ app.whenReady().then(async () => {
     store = new ES();
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
 
+    // Initialize CSRF secret for WebSocket protection
+    initCsrfSecret();
+
     await fixPath();
     createWindow();
     createTray();
@@ -852,7 +905,17 @@ function logDebug(msg) {
 // Allowed origins for WebSocket connections
 // In production with Cloudflare tunnel, origin will be the tunnel URL
 function isOriginAllowed(origin, cfSettings) {
-    if (!origin) return true; // Allow connections without origin (CLI tools, etc.)
+    // SECURITY: Reject null/empty origins in production
+    // Null origins can come from: file:// URLs, proxies stripping headers, CLI tools
+    // Only allow in development mode for easier testing
+    if (!origin) {
+        if (isDev) {
+            logDebug('[SECURITY] Allowing null origin in development mode');
+            return true;
+        }
+        logDebug('[SECURITY] Rejecting null origin in production mode');
+        return false;
+    }
 
     // Allow localhost for local development
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
@@ -887,9 +950,12 @@ async function startBridge(cfSettings) {
     // A. Start HTTP/WebSocket Server
     server = http.createServer((req, res) => servePWA(req, res));
 
-    // WebSocket server with origin verification
+    // WebSocket server with origin verification and payload limits
+    // SECURITY: maxPayload prevents DoS attacks via large messages
+    // 32KB is sufficient for terminal I/O (typical commands are <1KB)
     wss = new WebSocket.Server({
         server,
+        maxPayload: 32 * 1024, // 32KB max message size (enforced at server level)
         verifyClient: (info, callback) => {
             const origin = info.origin || info.req.headers.origin;
             if (isOriginAllowed(origin, storedCfSettings)) {
@@ -1089,6 +1155,18 @@ function handleConnection(ws, req) {
     // Track auth attempts per connection
     ws.authAttempts = 0;
 
+    // CSRF token validation state
+    // Client must send valid CSRF token as first message
+    ws.csrfValidated = false;
+
+    // Set CSRF validation timeout - must validate within 10 seconds
+    ws.csrfTimeout = setTimeout(() => {
+        if (!ws.csrfValidated) {
+            logDebug('[SECURITY] CSRF validation timeout, closing connection');
+            ws.close(1008, 'CSRF validation timeout');
+        }
+    }, 10000);
+
     // Set connection timeout - close if not authenticated within 3 minutes (for pairing flow)
     ws.authTimeout = setTimeout(() => {
         if (!ws.authenticated) {
@@ -1097,9 +1175,10 @@ function handleConnection(ws, req) {
         }
     }, 180000);
 
-    // Send connected message - client will initiate pairing or auth
-    console.log('[WS] Client connected, waiting for pairing/auth request');
-    ws.send(JSON.stringify({ type: 'connected' }));
+    // Send connected message with CSRF requirement flag
+    // Client will respond with CSRF token before any other messages
+    console.log('[WS] Client connected, waiting for CSRF validation');
+    ws.send(JSON.stringify({ type: 'connected', requireCsrf: true }));
 
     ws.on('error', (err) => {
         console.error('[WS] Error:', err);
@@ -1108,8 +1187,9 @@ function handleConnection(ws, req) {
     ws.on('message', (msg) => {
         let m;
         try {
-            // Limit message size to prevent DoS
-            if (msg.length > 65536) {
+            // SECURITY: Message size limit (defense in depth - maxPayload already enforces at WebSocket level)
+            // 32KB matches the maxPayload setting
+            if (msg.length > 32768) {
                 logDebug('[SECURITY] Message too large, ignoring');
                 return;
             }
@@ -1118,9 +1198,36 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Heartbeat - respond to ping immediately (no auth required)
+        // Heartbeat - respond to ping immediately (no auth required, but CSRF must be validated)
         if (m.type === 'ping') {
-            ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
+            if (ws.csrfValidated) {
+                ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
+            }
+            return;
+        }
+
+        // CSRF Token Validation - must be first message after connection
+        if (m.type === 'csrf_token') {
+            if (ws.csrfValidated) {
+                // Already validated, ignore
+                return;
+            }
+
+            if (validateCsrfToken(m.token)) {
+                ws.csrfValidated = true;
+                clearTimeout(ws.csrfTimeout);
+                logDebug('[SECURITY] CSRF token validated successfully');
+                ws.send(JSON.stringify({ type: 'csrf_validated' }));
+            } else {
+                logDebug('[SECURITY] Invalid CSRF token, closing connection');
+                ws.close(1008, 'Invalid CSRF token');
+            }
+            return;
+        }
+
+        // Block all other messages until CSRF is validated
+        if (!ws.csrfValidated) {
+            logDebug('[SECURITY] Message received before CSRF validation, ignoring');
             return;
         }
 
@@ -1265,13 +1372,20 @@ function handleConnection(ws, req) {
                 return;
             }
 
+            // SECURITY: Check encrypted payload size BEFORE decryption to prevent resource exhaustion
+            // Base64 encoded data is ~33% larger than raw, so check against 1.5x MAX_INPUT_SIZE
+            if (m.data && m.data.length > MAX_INPUT_SIZE * 2) {
+                logDebug('[SECURITY] Encrypted payload too large, rejecting before decryption');
+                return;
+            }
+
             const decrypted = decryptInput(ws, { iv: m.iv, data: m.data, tag: m.tag });
             if (decrypted === null) {
                 logDebug('[E2E] Failed to decrypt input');
                 return;
             }
 
-            // Limit input size
+            // Limit input size (defense in depth - also checked above before decryption)
             let inputData = decrypted;
             if (inputData.length > MAX_INPUT_SIZE) {
                 logDebug('[SECURITY] E2E Input too large, truncating');
@@ -1301,6 +1415,7 @@ function handleConnection(ws, req) {
 
     ws.on('close', () => {
         clearTimeout(ws.authTimeout);
+        clearTimeout(ws.csrfTimeout);
         activeClients.delete(ws);
         // Cleanup pending conns if any
         for (let [kid, pWs] of pendingConns.entries()) {
@@ -1313,17 +1428,28 @@ function handleConnection(ws, req) {
     });
 }
 
+// SECURITY: Constant-time signature verification to prevent timing side-channel attacks
+// Always performs full verification flow regardless of whether key exists
 function verifySignature(kid, signature, challenge) {
     const authorized = store.get('keys', []);
     const key = authorized.find(k => k.kid === kid);
 
-    if (!key) return false;
+    // Always perform cryptographic operations to prevent timing-based key ID enumeration
+    // Use a dummy key if the requested key doesn't exist
+    const dummyJwk = {
+        kty: 'RSA',
+        n: 'sXchDaQebSXKcvLb2qxgRuHN6oJFVnVPzIyYzU5jJ1xH7SZdZsSTgkmU8tJYRjpfUJR4u3F6m1l4nxbJgz4qCtJM3vZakXlqXP0nQHJEFg8TU2FJhCwk6aJj0E0xlP4Zs4w0L2QLnv2YGdJaXBcTX0BGZ3xLJtFkJvWZJmjSfJVFrLIvvlD5yLr5XHTYmTnQd4HgxjGQh0kLNTvBVHfBgGJQCJN3BNkNSxGCsHPlqCFfVQCLbPUJFcLYUHJmMY6JGCxE1NJBB2cwf7kQvQ7p3DHsZYQHVbPKhFUQVLnCaM0TVhLmxJM7EapVdRDbMfJxJDhQ0aGYEHJFhK8qQvQwQ',
+        e: 'AQAB'
+    };
+
+    const keyToVerify = key ? key.jwk : dummyJwk;
+    let isValid = false;
 
     try {
-        const pubKey = crypto.createPublicKey({ key: key.jwk, format: 'jwk' });
+        const pubKey = crypto.createPublicKey({ key: keyToVerify, format: 'jwk' });
 
         // Use RSA-PSS verification (more secure than PKCS#1 v1.5)
-        const isValid = crypto.verify(
+        isValid = crypto.verify(
             'sha256',
             Buffer.from(challenge),
             {
@@ -1333,12 +1459,14 @@ function verifySignature(kid, signature, challenge) {
             },
             Buffer.from(signature, 'hex')
         );
-
-        return isValid;
     } catch (e) {
-        console.error('Signature verification failed:', e);
-        return false;
+        // Log error but continue to return false
+        logDebug(`[SECURITY] Signature verification error: ${e.message}`);
+        isValid = false;
     }
+
+    // Only return true if key existed AND signature was valid
+    return key ? isValid : false;
 }
 
 function startPty(ws) {
@@ -1458,6 +1586,19 @@ function startPty(ws) {
 
 // 5. ASSET SERVER (Serves the PWA code)
 function servePWA(req, res) {
+    // CSRF Token API endpoint
+    // Returns a signed token that client must send when connecting to WebSocket
+    if (req.url === '/api/csrf-token' && req.method === 'GET') {
+        const token = generateCsrfToken();
+        res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+            'X-Content-Type-Options': 'nosniff'
+        });
+        res.end(JSON.stringify({ token }));
+        return;
+    }
+
     // In development mode, proxy to Vite dev server for HMR
     if (isDev) {
         // Rewrite root path to client.html for Vite
@@ -1494,12 +1635,20 @@ function servePWA(req, res) {
 // Static file server for production
 function serveStaticPWA(req, res) {
     // Security headers for all responses
+    // SECURITY: Comprehensive CSP to prevent XSS, clickjacking, and other attacks
     const securityHeaders = {
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY',
         'X-XSS-Protection': '1; mode=block',
         'Referrer-Policy': 'strict-origin-when-cross-origin',
-        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:;"
+        // CSP with all recommended directives:
+        // - frame-ancestors 'none': Prevents clickjacking (replaces X-Frame-Options in modern browsers)
+        // - object-src 'none': Blocks plugins (Flash, Java applets)
+        // - base-uri 'self': Prevents base tag injection attacks
+        // - form-action 'self': Prevents form hijacking to external URLs
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self';",
+        // HSTS: Force HTTPS for 1 year (defense in depth - Cloudflare also adds this)
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
     };
 
     // Parse URL and strip query strings

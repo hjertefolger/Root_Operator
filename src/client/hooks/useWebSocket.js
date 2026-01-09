@@ -8,6 +8,21 @@ const RECONNECT_CONFIG = {
   jitterFactor: 0.2,       // ±20%
 };
 
+// Fetch CSRF token from server before WebSocket connection
+async function fetchCsrfToken() {
+  try {
+    const response = await fetch('/api/csrf-token');
+    if (!response.ok) {
+      throw new Error(`CSRF token fetch failed: ${response.status}`);
+    }
+    const data = await response.json();
+    return data.token;
+  } catch (e) {
+    console.error('[WS] Failed to fetch CSRF token:', e);
+    return null;
+  }
+}
+
 // Heartbeat configuration
 const HEARTBEAT_CONFIG = {
   interval: 25000,         // Send ping every 25 seconds
@@ -32,6 +47,7 @@ export function useWebSocket() {
   const [isReady, setIsReady] = useState(false);
   const [connectionState, setConnectionState] = useState('disconnected');
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [csrfValidated, setCsrfValidated] = useState(false);
 
   // Refs for managing connection lifecycle
   const socketRef = useRef(null);
@@ -41,6 +57,7 @@ export function useWebSocket() {
   const heartbeatTimeoutRef = useRef(null);
   const messageQueueRef = useRef([]);
   const wsUrlRef = useRef(null);
+  const csrfTokenRef = useRef(null);
 
   /**
    * Clear all heartbeat timers
@@ -107,7 +124,23 @@ export function useWebSocket() {
   /**
    * Create and connect WebSocket
    */
-  const connect = useCallback(() => {
+  const connect = useCallback(async () => {
+    // Fetch CSRF token before connecting
+    console.log('[WS] Fetching CSRF token...');
+    setConnectionState('fetching_csrf');
+    const csrfToken = await fetchCsrfToken();
+    if (!csrfToken) {
+      console.error('[WS] Failed to get CSRF token, will retry...');
+      setConnectionState('reconnecting');
+      const delay = getReconnectDelay(reconnectAttempt);
+      reconnectTimeoutRef.current = setTimeout(() => {
+        setReconnectAttempt((prev) => prev + 1);
+        connect();
+      }, delay);
+      return;
+    }
+    csrfTokenRef.current = csrfToken;
+
     // Determine WebSocket URL (calculate once and cache)
     if (!wsUrlRef.current) {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -116,6 +149,7 @@ export function useWebSocket() {
 
     console.log(`[WS] Connecting to: ${wsUrlRef.current} (attempt ${reconnectAttempt + 1})`);
     setConnectionState('connecting');
+    setCsrfValidated(false);
 
     const ws = new WebSocket(wsUrlRef.current);
     socketRef.current = ws;
@@ -124,22 +158,29 @@ export function useWebSocket() {
     setSocket(ws);
 
     ws.onopen = () => {
-      console.log('[WS] Connected');
-      setIsReady(true);
-      setConnectionState('connected');
-      setReconnectAttempt(0);
+      console.log('[WS] Connected, sending CSRF token...');
       intentionalCloseRef.current = false;
 
-      // Start heartbeat
-      startHeartbeat(ws);
-
-      // Note: Message queue is flushed after E2E is established, not here
-      // The terminal hook will call flushMessageQueue when ready
+      // Send CSRF token as first message
+      ws.send(JSON.stringify({ type: 'csrf_token', token: csrfTokenRef.current }));
     };
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+
+        // Handle CSRF validation response
+        if (msg.type === 'csrf_validated') {
+          console.log('[WS] CSRF validated, connection ready');
+          setCsrfValidated(true);
+          setIsReady(true);
+          setConnectionState('connected');
+          setReconnectAttempt(0);
+          // Start heartbeat after CSRF validation
+          startHeartbeat(ws);
+          return;
+        }
+
         // Handle pong internally
         if (msg.type === 'pong') {
           handlePong();
@@ -153,6 +194,7 @@ export function useWebSocket() {
       console.log(`[WS] Disconnected (code: ${event.code}, reason: ${event.reason || 'none'})`);
       clearHeartbeat();
       setIsReady(false);
+      setCsrfValidated(false);
       setSocket(null);
 
       // Check if server intentionally closed (bridge stopped)
@@ -304,6 +346,7 @@ export function useWebSocket() {
     isReady,
     connectionState,
     reconnectAttempt,
+    csrfValidated,
     disconnect,
     forceReconnect,
     queueMessage,
