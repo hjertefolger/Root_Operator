@@ -1704,7 +1704,7 @@ ipcMain.handle('REGISTER_KEY', (event, { kid, jwk }) => {
 });
 
 // Verify pairing code and approve device
-ipcMain.handle('VERIFY_PAIRING_CODE', (event, code) => {
+ipcMain.handle('VERIFY_PAIRING_CODE', (event, code, deviceName) => {
     const normalizedCode = code.toUpperCase().replace(/[^ABCDEFGHJKMNPQRSTUVWXYZ23456789]/g, '');
 
     if (normalizedCode.length !== 6) {
@@ -1722,10 +1722,10 @@ ipcMain.handle('VERIFY_PAIRING_CODE', (event, code) => {
         return { success: false, error: 'Code expired' };
     }
 
-    // Save the key
+    // Save the key with device name
     const keys = store.get('keys', []);
     if (!keys.find(k => k.kid === pairing.kid)) {
-        keys.push({ kid: pairing.kid, jwk: pairing.jwk });
+        keys.push({ kid: pairing.kid, jwk: pairing.jwk, name: deviceName });
         store.set('keys', keys);
     }
 
@@ -1748,11 +1748,17 @@ ipcMain.handle('VERIFY_PAIRING_CODE', (event, code) => {
 // Get list of paired devices
 ipcMain.handle('GET_PAIRED_DEVICES', () => {
     const keys = store.get('keys', []);
-    // Return only kid (truncated for display), not the full JWK
+    // Return kid and name (with fallback for legacy devices without name)
     return keys.map(k => ({
         kid: k.kid,
-        displayId: k.kid.substring(0, 12)
+        name: k.name || k.kid.substring(0, 12)
     }));
+});
+
+// Check if device name already exists
+ipcMain.handle('CHECK_DEVICE_NAME_EXISTS', (event, name) => {
+    const keys = store.get('keys', []);
+    return keys.some(k => k.name === name);
 });
 
 // Remove a paired device

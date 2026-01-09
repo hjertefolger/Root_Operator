@@ -3,6 +3,9 @@ import { Loader2 } from 'lucide-react';
 import { useTerminal } from '../hooks/useTerminal';
 import VirtualKeyboard from './VirtualKeyboard';
 
+// Detect mobile device
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
 function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionState }) {
   const containerRef = useRef(null);
   const ctrlRef = useRef(false);
@@ -56,7 +59,10 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionSta
 
   const handleContainerClick = useCallback(() => {
     terminal?.focus();
-    setShowKeyboard(prev => !prev);
+    // Only toggle virtual keyboard on mobile
+    if (isMobile) {
+      setShowKeyboard(prev => !prev);
+    }
   }, [terminal]);
 
   const handleInput = useCallback((char) => sendSpecial(char), [sendSpecial]);
@@ -89,19 +95,21 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionSta
         )}
       </div>
 
-      {/* Keyboard - grid animation for smooth 0 to auto */}
-      <div
-        className={`keyboard-wrapper ${showKeyboard ? 'visible' : ''}`}
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="keyboard-inner">
-          <VirtualKeyboard
-            onInput={handleInput}
-            onSpecialKey={handleSpecialKey}
-            onPaste={handlePaste}
-          />
+      {/* Keyboard - only on mobile */}
+      {isMobile && (
+        <div
+          className={`keyboard-wrapper ${showKeyboard ? 'visible' : ''}`}
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="keyboard-inner">
+            <VirtualKeyboard
+              onInput={handleInput}
+              onSpecialKey={handleSpecialKey}
+              onPaste={handlePaste}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -276,7 +276,7 @@ function SettingsView({ onBack, tunnelState }) {
                       className="flex justify-between items-center py-1.5 px-2 bg-muted/30 rounded"
                     >
                       <span className="font-mono text-xs text-muted-foreground">
-                        {device.displayId}...
+                        {device.name}
                       </span>
                       <Button
                         variant="ghost"

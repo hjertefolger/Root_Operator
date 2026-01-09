@@ -28,6 +28,7 @@ async function loadBIP39Words() {
 export function useE2E(socket) {
   const [e2eReady, setE2eReady] = useState(false);
   const [fingerprint, setFingerprint] = useState(null);
+  const fingerprintRef = useRef(null);
   const sessionKeyRef = useRef(null);
 
   // Handle E2E key exchange initiation from server
@@ -117,6 +118,7 @@ export function useE2E(socket) {
         words.push(wordlist[index]);
       }
       const fp = words.join('-');
+      fingerprintRef.current = fp;  // Set ref immediately for race-free comparison
       setFingerprint(fp);
 
       console.log('[E2E] Fingerprint:', fp);
@@ -134,16 +136,17 @@ export function useE2E(socket) {
   }, [socket]);
 
   // Handle E2E ready confirmation from server
+  // Uses ref for comparison to avoid race condition with React state updates
   const handleE2EReady = useCallback((serverFingerprint) => {
-    if (serverFingerprint === fingerprint) {
+    if (serverFingerprint === fingerprintRef.current) {
       setE2eReady(true);
-      console.log('[E2E] Encryption active! Fingerprint verified:', fingerprint);
+      console.log('[E2E] Encryption active! Fingerprint verified:', fingerprintRef.current);
     } else {
       console.error('[E2E] FINGERPRINT MISMATCH! Possible MITM attack.');
       console.error('  Server:', serverFingerprint);
-      console.error('  Client:', fingerprint);
+      console.error('  Client:', fingerprintRef.current);
     }
-  }, [fingerprint]);
+  }, []);
 
   // Encrypt message for sending
   const encryptInput = useCallback(async (plaintext) => {

@@ -67,16 +67,18 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       termRef.current = term;
       fitAddonRef.current = fitAddon;
 
-      // Configure textarea - suppress native keyboard on mobile
+      // Configure textarea
       const textarea = containerRef.current.querySelector('.xterm-helper-textarea');
       if (textarea) {
         textarea.setAttribute('autocomplete', 'off');
         textarea.setAttribute('autocorrect', 'off');
         textarea.setAttribute('autocapitalize', 'off');
         textarea.setAttribute('spellcheck', 'false');
-        // inputmode="none" suppresses native keyboard on iOS/Android
-        // Users will use the custom toolbar for input
-        textarea.setAttribute('inputmode', 'none');
+        // On mobile: suppress native keyboard, use custom VirtualKeyboard instead
+        // On desktop: allow native keyboard input
+        if (isMobile) {
+          textarea.setAttribute('inputmode', 'none');
+        }
       }
 
       // Helper to sync terminal size with backend
@@ -213,7 +215,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
 
     const disposable = term.onData(handleData);
     return () => disposable.dispose();
-  }, [isReady, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
+  }, [isReady, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
 
   // Write to terminal with content tracking for persistence
   const write = useCallback((data) => {
