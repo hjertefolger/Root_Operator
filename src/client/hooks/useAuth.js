@@ -280,9 +280,12 @@ export function useAuth(socket) {
         return;
       }
 
-      // Server ready - mark server as ready
+      // Server ready - reset for fresh auth on this connection
       if (msg.type === 'connected') {
         console.log('[AUTH] Server connected');
+        // Reset pairing state for this connection (fixes reconnection re-pairing bug)
+        pairingInitiatedRef.current = false;
+        setPairingError(null);
         setServerReady(true);
       }
 

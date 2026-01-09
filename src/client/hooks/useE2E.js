@@ -34,6 +34,9 @@ export function useE2E(socket) {
   const handleE2EInit = useCallback(async (serverPublicKey, saltBase64) => {
     if (!socket) return;
 
+    // Reset E2E ready state - starting fresh key exchange (fixes reconnection state)
+    setE2eReady(false);
+
     try {
       console.log('[E2E] Received server public key, starting key exchange');
 
