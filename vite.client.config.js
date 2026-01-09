@@ -40,7 +40,7 @@ export default defineConfig({
     host: true,
     cors: true,
     // Allow tunnel domains
-    allowedHosts: ['localhost', '.v0x.one', '.trycloudflare.com']
+    allowedHosts: ['localhost', '.rootoperator.dev', '.trycloudflare.com']
   },
 
   // Rewrite rules for SPA

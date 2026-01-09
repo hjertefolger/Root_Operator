@@ -28,8 +28,8 @@ const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 
 // Worker API configuration
-const WORKER_BASE_URL = 'https://cf.v0x.one';
-const WORKER_DOMAIN = 'v0x.one';
+const WORKER_BASE_URL = 'https://cf.rootoperator.dev';
+const WORKER_DOMAIN = 'rootoperator.dev';
 
 // GLOBAL STATE
 let mainWindow;
@@ -50,56 +50,6 @@ let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
 const PAIRING_CODE_EXPIRY_MS = 120000; // 2 minutes
 const MAX_PENDING_PAIRINGS = 5;
 const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // No ambiguous chars
-
-// CSRF Protection for WebSocket
-// Prevents Cross-Site WebSocket Hijacking (CSWSH) attacks
-const CSRF_TOKEN_EXPIRY_MS = 300000; // 5 minutes
-let csrfSecret = null; // Generated on app start
-
-function initCsrfSecret() {
-    csrfSecret = crypto.randomBytes(32);
-    logDebug('[SECURITY] CSRF secret initialized');
-}
-
-function generateCsrfToken() {
-    const timestamp = Date.now().toString(36);
-    const random = crypto.randomBytes(16).toString('hex');
-    const payload = `${timestamp}.${random}`;
-    const signature = crypto.createHmac('sha256', csrfSecret)
-        .update(payload)
-        .digest('hex');
-    return `${payload}.${signature}`;
-}
-
-function validateCsrfToken(token) {
-    if (!token || typeof token !== 'string') return false;
-
-    const parts = token.split('.');
-    if (parts.length !== 3) return false;
-
-    const [timestamp, random, signature] = parts;
-
-    // Verify signature
-    const payload = `${timestamp}.${random}`;
-    const expectedSig = crypto.createHmac('sha256', csrfSecret)
-        .update(payload)
-        .digest('hex');
-
-    // Constant-time comparison to prevent timing attacks
-    if (!crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expectedSig, 'hex'))) {
-        logDebug('[SECURITY] CSRF token signature mismatch');
-        return false;
-    }
-
-    // Check expiration
-    const tokenTime = parseInt(timestamp, 36);
-    if (Date.now() - tokenTime > CSRF_TOKEN_EXPIRY_MS) {
-        logDebug('[SECURITY] CSRF token expired');
-        return false;
-    }
-
-    return true;
-}
 
 // ANSI ESCAPE SEQUENCE SANITIZER
 // Blocks dangerous sequences while preserving normal terminal functionality
@@ -739,9 +689,6 @@ app.whenReady().then(async () => {
     store = new ES();
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
 
-    // Initialize CSRF secret for WebSocket protection
-    initCsrfSecret();
-
     await fixPath();
     createWindow();
     createTray();
@@ -834,14 +781,29 @@ ipcMain.handle('DELETE_SECURE_TOKEN', async () => {
 
 // Subdomain customization
 ipcMain.handle('CUSTOMIZE_SUBDOMAIN', async (event, newSubdomain) => {
+    console.log('[SUBDOMAIN] CUSTOMIZE_SUBDOMAIN called with:', newSubdomain);
+
+    // Check if tunnel is currently running BEFORE making any changes
+    const wasTunnelRunning = !!(tunnelProcess && server);
+    console.log('[SUBDOMAIN] Tunnel was running:', wasTunnelRunning);
+
     try {
-        const result = await customizeSubdomain(newSubdomain);
-        // Update current tunnel URL
-        currentTunnelUrl = `https://${result.hostname}`;
-        // Notify UI
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('TUNNEL_LIVE', currentTunnelUrl);
+        // If tunnel is running, stop it first
+        if (wasTunnelRunning) {
+            console.log('[SUBDOMAIN] Stopping tunnel before subdomain change...');
+            stopBridge();
         }
+
+        // Save the new subdomain via Worker API
+        const result = await customizeSubdomain(newSubdomain);
+        console.log('[SUBDOMAIN] customizeSubdomain result:', result);
+
+        // If tunnel WAS running, restart it with new subdomain
+        if (wasTunnelRunning) {
+            console.log('[SUBDOMAIN] Restarting tunnel with new subdomain...');
+            await startBridge({});
+        }
+
         return { success: true, ...result };
     } catch (e) {
         console.error('Failed to customize subdomain:', e.message);
@@ -938,7 +900,7 @@ function isOriginAllowed(origin, cfSettings) {
         return true;
     }
 
-    // Allow Worker-assigned domain (v0x.one and subdomains)
+    // Allow Worker-assigned domain (rootoperator.dev and subdomains)
     if (origin.includes(WORKER_DOMAIN)) {
         return true;
     }
@@ -1208,18 +1170,6 @@ function handleConnection(ws, req) {
     // Track auth attempts per connection
     ws.authAttempts = 0;
 
-    // CSRF token validation state
-    // Client must send valid CSRF token as first message
-    ws.csrfValidated = false;
-
-    // Set CSRF validation timeout - must validate within 10 seconds
-    ws.csrfTimeout = setTimeout(() => {
-        if (!ws.csrfValidated) {
-            logDebug('[SECURITY] CSRF validation timeout, closing connection');
-            ws.close(1008, 'CSRF validation timeout');
-        }
-    }, 10000);
-
     // Set connection timeout - close if not authenticated within 3 minutes (for pairing flow)
     ws.authTimeout = setTimeout(() => {
         if (!ws.authenticated) {
@@ -1228,10 +1178,8 @@ function handleConnection(ws, req) {
         }
     }, 180000);
 
-    // Send connected message with CSRF requirement flag
-    // Client will respond with CSRF token before any other messages
-    console.log('[WS] Client connected, waiting for CSRF validation');
-    ws.send(JSON.stringify({ type: 'connected', requireCsrf: true }));
+    console.log('[WS] Client connected');
+    ws.send(JSON.stringify({ type: 'connected' }));
 
     ws.on('error', (err) => {
         console.error('[WS] Error:', err);
@@ -1251,36 +1199,9 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Heartbeat - respond to ping immediately (no auth required, but CSRF must be validated)
+        // Heartbeat - respond to ping immediately
         if (m.type === 'ping') {
-            if (ws.csrfValidated) {
-                ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
-            }
-            return;
-        }
-
-        // CSRF Token Validation - must be first message after connection
-        if (m.type === 'csrf_token') {
-            if (ws.csrfValidated) {
-                // Already validated, ignore
-                return;
-            }
-
-            if (validateCsrfToken(m.token)) {
-                ws.csrfValidated = true;
-                clearTimeout(ws.csrfTimeout);
-                logDebug('[SECURITY] CSRF token validated successfully');
-                ws.send(JSON.stringify({ type: 'csrf_validated' }));
-            } else {
-                logDebug('[SECURITY] Invalid CSRF token, closing connection');
-                ws.close(1008, 'Invalid CSRF token');
-            }
-            return;
-        }
-
-        // Block all other messages until CSRF is validated
-        if (!ws.csrfValidated) {
-            logDebug('[SECURITY] Message received before CSRF validation, ignoring');
+            ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
             return;
         }
 
@@ -1468,7 +1389,6 @@ function handleConnection(ws, req) {
 
     ws.on('close', () => {
         clearTimeout(ws.authTimeout);
-        clearTimeout(ws.csrfTimeout);
         activeClients.delete(ws);
         // Cleanup pending conns if any
         for (let [kid, pWs] of pendingConns.entries()) {
@@ -1639,19 +1559,6 @@ function startPty(ws) {
 
 // 5. ASSET SERVER (Serves the PWA code)
 function servePWA(req, res) {
-    // CSRF Token API endpoint
-    // Returns a signed token that client must send when connecting to WebSocket
-    if (req.url === '/api/csrf-token' && req.method === 'GET') {
-        const token = generateCsrfToken();
-        res.writeHead(200, {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-store, no-cache, must-revalidate',
-            'X-Content-Type-Options': 'nosniff'
-        });
-        res.end(JSON.stringify({ token }));
-        return;
-    }
-
     // In development mode, proxy to Vite dev server for HMR
     if (isDev) {
         // Rewrite root path to client.html for Vite

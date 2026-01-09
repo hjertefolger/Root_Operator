@@ -417,7 +417,10 @@ async function handleTunnelCustomize(request, env) {
     const oldHostname = `${existingData.subdomain}.${env.DOMAIN}`;
     const newHostname = `${subdomain}.${env.DOMAIN}`;
 
-    // Delete old DNS record
+    // Create new DNS record FIRST (before deleting old one to avoid NXDOMAIN cache)
+    const newDnsRecord = await createDnsRecord(env, subdomain, existingData.tunnelId);
+
+    // Delete old DNS record AFTER new one is created
     if (existingData.dnsRecordId) {
       try {
         await deleteDnsRecord(env, existingData.dnsRecordId);
@@ -425,9 +428,6 @@ async function handleTunnelCustomize(request, env) {
         console.log('Could not delete old DNS record:', e.message);
       }
     }
-
-    // Create new DNS record
-    const newDnsRecord = await createDnsRecord(env, subdomain, existingData.tunnelId);
 
     // Update tunnel ingress config
     await configureTunnel(env, existingData.tunnelId, newHostname);
