@@ -40,15 +40,28 @@ function App() {
     document.documentElement.classList.add('dark');
   }, []);
 
-  // Load initial settings
+  // Load initial settings and sync tunnel state
   useEffect(() => {
     async function loadInitialState() {
       try {
-        const [token, settings] = await Promise.all([
+        // Request authoritative tunnel state from main process
+        // This eliminates race conditions with SYNC_STATE event
+        const [tunnelStateFromMain] = await Promise.all([
+          invoke('GET_TUNNEL_STATE'),
           invoke('GET_SECURE_TOKEN'),
           invoke('GET_STORE', 'cfSettings')
         ]);
-        // Settings loaded (stored in state if needed later)
+
+        if (tunnelStateFromMain) {
+          setTunnelState({
+            active: tunnelStateFromMain.active || false,
+            connecting: tunnelStateFromMain.connecting || false,
+            url: tunnelStateFromMain.url || '',
+            fingerprint: tunnelStateFromMain.fingerprint || null
+          });
+          // Sync tray icon with actual state
+          invoke('SET_TRAY_ICON', tunnelStateFromMain.active);
+        }
       } catch (e) {
         console.error('Failed to load initial state:', e);
       }
@@ -76,10 +89,12 @@ function App() {
       on('SYNC_STATE', (state) => {
         setTunnelState({
           active: state.active || false,
-          connecting: false,
+          connecting: state.connecting || false,
           url: state.url || '',
           fingerprint: state.fingerprint || null
         });
+        // Sync tray icon with authoritative state
+        invoke('SET_TRAY_ICON', state.active || false);
       })
     ];
 

@@ -1,6 +1,6 @@
 # Root Operator - Development Roadmap
 
-Last updated: 2026-01-09 (Anti-CSRF, Supply Chain Security, Tunnel Token Policy Added)
+Last updated: 2026-01-09 (Tunnel State Sync Architecture Added)
 
 ---
 
@@ -79,6 +79,7 @@ Terminal:
 | **DoS Protection** | WebSocket maxPayload (32KB), payload size pre-check | **2026-01-09** |
 | **Anti-CSRF for WebSocket** | HMAC-signed tokens with 5-min expiry, validated before auth | **2026-01-09** |
 | **Supply Chain Protection** | npm audit in build pipeline, prebuild security check | **2026-01-09** |
+| **Tunnel State Sync** | Authoritative state in main process, explicit request on mount | **2026-01-09** |
 
 ### E2E Encryption Architecture
 
@@ -469,6 +470,80 @@ Cross-Site WebSocket Hijacking (CSWSH) occurs when a malicious site establishes 
 - `main.js:1548-1558` - `/api/csrf-token` endpoint
 - `main.js:1209-1232` - WebSocket CSRF validation
 - `src/client/hooks/useWebSocket.js:11-24` - Client token fetching
+
+---
+
+### Tunnel State Synchronization Architecture (2026-01-09)
+
+**Problem Solved:** Renderer reload (Cmd+R) caused state mismatch where tunnel was running but UI showed "Start" button.
+
+**Root Cause:** The `SYNC_STATE` event was sent on `did-finish-load`, which could fire before React's `useEffect` listeners were registered, causing a race condition.
+
+**Solution Architecture:**
+
+```
+Main Process (Source of Truth)         Renderer (UI)
+┌─────────────────────────────┐        ┌─────────────────────────┐
+│ isConnecting                │        │ tunnelState.connecting  │
+│ currentTunnelUrl            │───────▶│ tunnelState.url         │
+│ tunnelProcess               │        │ tunnelState.active      │
+│ server                      │        │                         │
+│ currentFingerprint          │        │ tunnelState.fingerprint │
+└─────────────────────────────┘        └─────────────────────────┘
+         │                                        ▲
+         │  GET_TUNNEL_STATE (invoke)             │
+         │◀───────────────────────────────────────│ (on mount)
+         │                                        │
+         │  SYNC_STATE / TUNNEL_LIVE (events)     │
+         │───────────────────────────────────────▶│ (ongoing)
+```
+
+**Implementation Details:**
+
+1. **Authoritative State Function** (`main.js:697-706`)
+   ```javascript
+   function getTunnelState() {
+       const active = !!(server && (currentTunnelUrl || tunnelProcess));
+       return { active, connecting: isConnecting, url, fingerprint };
+   }
+   ```
+
+2. **Explicit State Request** (`GET_TUNNEL_STATE` IPC handler)
+   - Renderer calls `invoke('GET_TUNNEL_STATE')` on mount
+   - Request/response pattern guarantees state arrives after listeners ready
+   - Eliminates race condition entirely
+
+3. **Connecting State Tracking** (`isConnecting` flag)
+   - Set `true` at start of `startBridge()`
+   - Set `false` when tunnel URL received or on error/close
+   - Reset in `stopBridge()`
+
+4. **Crash/Error Handling**
+   - `tunnelProcess.on('error')` - clears connecting, syncs state
+   - `tunnelProcess.on('close')` - cleans up state on unexpected exit
+   - Safe setTimeout callbacks capture process reference to handle rapid start/stop
+
+5. **Tray Icon Sync**
+   - Icon synced with authoritative state on mount, SYNC_STATE, TUNNEL_LIVE, and stop
+
+**Files Modified:**
+- `main.js:46` - Added `isConnecting` flag
+- `main.js:697-706` - Added `getTunnelState()` function
+- `main.js:765` - Added `GET_TUNNEL_STATE` IPC handler
+- `main.js:1078-1107` - Added error/close handlers
+- `preload.js:26` - Whitelisted `GET_TUNNEL_STATE` channel
+- `src/renderer/App.jsx:49-64` - Explicit state request on mount
+
+**Edge Cases Handled:**
+| Scenario | Behavior |
+|----------|----------|
+| Renderer reload while tunnel running | Explicit invoke gets correct state |
+| Tunnel crashes | 'close' handler syncs state |
+| Tunnel error during startup | 'error' handler clears connecting |
+| Rapid start/stop/start | setTimeout validates process reference |
+| stopBridge() during connecting | removeAllListeners() prevents stale handlers |
+
+**Production Readiness:** ✅ Complete
 
 ---
 

@@ -43,6 +43,7 @@ let wakeLock;
 let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
 let currentTunnelUrl = null; // Track tunnel URL for state sync
+let isConnecting = false; // Track if tunnel is in the process of starting
 
 // Pairing system state
 let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
@@ -689,12 +690,19 @@ function showWindow() {
 
 function syncStateWithRenderer() {
     if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('SYNC_STATE', {
-            active: !!server,
-            url: currentTunnelUrl,
-            fingerprint: currentFingerprint
-        });
+        mainWindow.webContents.send('SYNC_STATE', getTunnelState());
     }
+}
+
+function getTunnelState() {
+    // Active requires both server running AND tunnel established (has URL or process)
+    const active = !!(server && (currentTunnelUrl || tunnelProcess));
+    return {
+        active,
+        connecting: isConnecting,
+        url: currentTunnelUrl || '',
+        fingerprint: currentFingerprint
+    };
 }
 
 // Build tray context menu (shown on right-click)
@@ -752,6 +760,9 @@ ipcMain.handle('START', async (event, cfSettings) => {
 
 ipcMain.handle('GET_STORE', (event, key) => store.get(key));
 ipcMain.handle('SET_STORE', (event, key, val) => store.set(key, val));
+
+// Authoritative tunnel state - renderer requests this on mount to avoid race conditions
+ipcMain.handle('GET_TUNNEL_STATE', () => getTunnelState());
 
 ipcMain.handle('STOP', () => {
     stopBridge();
@@ -944,6 +955,8 @@ function isOriginAllowed(origin, cfSettings) {
 }
 
 async function startBridge(cfSettings) {
+    isConnecting = true;
+
     // Store settings for origin validation (include Worker domain)
     const storedCfSettings = { ...cfSettings, domain: cfSettings?.domain || WORKER_DOMAIN };
 
@@ -1008,7 +1021,16 @@ async function startBridge(cfSettings) {
         if (tunnelHostname) {
             const url = `https://${tunnelHostname}`;
             currentTunnelUrl = url;
-            setTimeout(() => mainWindow.webContents.send('TUNNEL_LIVE', url), 1000);
+            const currentProcess = tunnelProcess; // Capture reference for callback
+            setTimeout(() => {
+                // Only update if this is still the active tunnel (handles rapid start/stop)
+                if (tunnelProcess === currentProcess && isConnecting) {
+                    isConnecting = false;
+                    if (mainWindow && !mainWindow.isDestroyed()) {
+                        mainWindow.webContents.send('TUNNEL_LIVE', url);
+                    }
+                }
+            }, 1000);
         }
     } else if (cfSettings && cfSettings.token) {
         // Legacy: Stable Tunnel with user-provided Token
@@ -1018,7 +1040,16 @@ async function startBridge(cfSettings) {
         if (cfSettings.domain) {
             const url = cfSettings.domain.startsWith('http') ? cfSettings.domain : `https://${cfSettings.domain}`;
             currentTunnelUrl = url;
-            setTimeout(() => mainWindow.webContents.send('TUNNEL_LIVE', url), 1000);
+            const currentProcess = tunnelProcess; // Capture reference for callback
+            setTimeout(() => {
+                // Only update if this is still the active tunnel (handles rapid start/stop)
+                if (tunnelProcess === currentProcess && isConnecting) {
+                    isConnecting = false;
+                    if (mainWindow && !mainWindow.isDestroyed()) {
+                        mainWindow.webContents.send('TUNNEL_LIVE', url);
+                    }
+                }
+            }, 1000);
         }
     } else {
         // Quick Tunnel Fallback (trycloudflare.com)
@@ -1032,6 +1063,7 @@ async function startBridge(cfSettings) {
     tunnelProcess.on('url', (url) => {
         logDebug(`[CF] Tunnel Live: ${url}`);
         currentTunnelUrl = url;
+        isConnecting = false;
         if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('TUNNEL_LIVE', url);
         }
@@ -1053,8 +1085,25 @@ async function startBridge(cfSettings) {
 
     tunnelProcess.on('error', (err) => {
         logDebug(`[CF] Tunnel Error: ${err}`);
+        isConnecting = false;
         if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('CF_LOG', 'ERR: ' + err.toString());
+            syncStateWithRenderer();
+        }
+    });
+
+    // Handle tunnel process exit (crash or unexpected termination)
+    tunnelProcess.on('close', (code) => {
+        logDebug(`[CF] Tunnel process exited with code: ${code}`);
+        // Only clean up if this is still the active tunnel process
+        if (tunnelProcess) {
+            isConnecting = false;
+            currentTunnelUrl = null;
+            tunnelProcess = null;
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('CF_LOG', `Tunnel exited (code: ${code})`);
+                syncStateWithRenderer();
+            }
         }
     });
 
@@ -1092,11 +1141,15 @@ function stopBridge() {
     tunnelProcess = null;
     wakeLock = null;
     server = null;
+    wss = null;
     ptyProcess = null;
     outputBuffer = "";
     activeClients.clear();
+    pendingConns.clear();
+    pendingPairings.clear();
     currentTunnelUrl = null;
     currentFingerprint = null;
+    isConnecting = false;
     logDebug('[SYSTEM] Bridge stopped.');
 }
 
