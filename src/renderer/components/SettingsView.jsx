@@ -228,7 +228,7 @@ function SettingsView({ onBack, tunnelState }) {
       </div>
 
       {/* Content */}
-      <div className="px-5 py-2">
+      <div className="px-5 pb-2">
         <Accordion type="multiple" className="w-full">
           {/* Section 1: Operator URL */}
           <AccordionItem value="operator-url" className="border-none">

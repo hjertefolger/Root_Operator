@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronRight } from 'lucide-react';
+import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -9,9 +9,9 @@ import FingerprintSection from './FingerprintSection';
 // Only allow valid pairing code characters
 const PAIRING_CODE_REGEXP = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]*$/;
 
-// Device name validation (same rules as subdomain)
+// Device name validation
 const MAX_NAME_LENGTH = 10;
-const NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const NAME_PATTERN = /^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$/;
 
 function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const { invoke } = useElectron();
@@ -70,11 +70,10 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
     setPairingError('');
   };
 
-  // Sanitize device name input (same rules as subdomain)
+  // Sanitize device name input
   const sanitizeName = (value) => {
     return value
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '')
+      .replace(/[^a-zA-Z0-9-]/g, '')
       .replace(/--+/g, '-')
       .replace(/^-/, '')
       .slice(0, MAX_NAME_LENGTH);
@@ -165,11 +164,14 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             <Button
               onClick={handleNameSubmit}
               disabled={deviceName.length < 3}
-              className="rounded-full text-xs px-3 h-7 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 text-white transition-colors duration-200 gap-1"
+              className={`rounded-full text-xs px-3 h-7 transition-colors duration-200 ${
+                deviceName.length < 3
+                  ? 'bg-muted text-muted-foreground'
+                  : 'bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 text-white'
+              }`}
               size="sm"
             >
               Next
-              <ChevronRight strokeWidth={2} className="h-3 w-3" />
             </Button>
             <Button
               variant="ghost"
@@ -188,10 +190,10 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             type="text"
             value={deviceName}
             onChange={handleNameChange}
-            placeholder="my-iphone"
+            placeholder="My-iPhone"
             maxLength={MAX_NAME_LENGTH}
             autoFocus
-            className="font-mono text-sm text-center w-32 h-10"
+            className="font-mono text-sm text-center w-32 h-10 border-0 border-b-2 border-border rounded-none bg-transparent focus-visible:ring-0 focus-visible:border-[#4B5AFF]"
           />
 
           <p className="text-xs text-muted-foreground mt-2">
