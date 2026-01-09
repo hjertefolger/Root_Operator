@@ -11,6 +11,7 @@ const fixPath = async () => {
 const WebSocket = require('ws');
 const pty = require('node-pty');
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const crypto = require('crypto');
 const cloudflared = require('cloudflared');
@@ -928,21 +929,54 @@ async function startBridge(cfSettings) {
     // WebSocket server with origin verification and payload limits
     // SECURITY: maxPayload prevents DoS attacks via large messages
     // 32KB is sufficient for terminal I/O (typical commands are <1KB)
+    // Using noServer: true to manually handle upgrades (needed for Vite HMR proxy in dev)
     wss = new WebSocket.Server({
-        server,
-        maxPayload: 32 * 1024, // 32KB max message size (enforced at server level)
-        verifyClient: (info, callback) => {
-            const origin = info.origin || info.req.headers.origin;
-            if (isOriginAllowed(origin, storedCfSettings)) {
-                callback(true);
-            } else {
-                logDebug(`[SECURITY] Rejected WebSocket from unauthorized origin: ${origin}`);
-                callback(false, 403, 'Forbidden');
-            }
-        }
+        noServer: true,
+        maxPayload: 32 * 1024 // 32KB max message size (enforced at server level)
     });
 
     wss.on('connection', (ws, req) => handleConnection(ws, req));
+
+    // Handle WebSocket upgrades manually
+    server.on('upgrade', (req, socket, head) => {
+        const pathname = req.url;
+
+        // In dev mode, proxy Vite HMR WebSocket requests to Vite dev server
+        // Vite is configured to use /__vite_hmr path for HMR WebSocket
+        if (isDev && pathname && pathname.startsWith('/__vite_hmr')) {
+            const viteSocket = net.connect(VITE_CLIENT_PORT, 'localhost', () => {
+                // Forward the original upgrade request to Vite
+                const headers = Object.entries(req.headers)
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join('\r\n');
+                viteSocket.write(
+                    `GET ${pathname} HTTP/1.1\r\n` +
+                    `Host: localhost:${VITE_CLIENT_PORT}\r\n` +
+                    `${headers}\r\n` +
+                    `\r\n`
+                );
+                // Pipe data bidirectionally
+                socket.pipe(viteSocket);
+                viteSocket.pipe(socket);
+            });
+            viteSocket.on('error', () => socket.destroy());
+            socket.on('error', () => viteSocket.destroy());
+            return;
+        }
+
+        // Regular WebSocket: verify origin and handle with wss
+        const origin = req.headers.origin;
+        if (!isOriginAllowed(origin, storedCfSettings)) {
+            logDebug(`[SECURITY] Rejected WebSocket from unauthorized origin: ${origin}`);
+            socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    });
 
     server.listen(INTERNAL_PORT);
 

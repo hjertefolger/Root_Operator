@@ -63,7 +63,7 @@ function Header({ fingerprint }) {
           {/* Modal header matching main terminal header */}
           <div className="flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
             <span className="font-mono text-xs font-normal tracking-wider text-white">
-              E2E_FINGERPRINT
+              E2E_BIP39_FINGERPRINT
             </span>
             <Button
               variant="ghost"

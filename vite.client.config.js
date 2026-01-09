@@ -40,7 +40,11 @@ export default defineConfig({
     host: true,
     cors: true,
     // Allow tunnel domains
-    allowedHosts: ['localhost', '.rootoperator.dev', '.trycloudflare.com']
+    allowedHosts: ['localhost', '.rootoperator.dev', '.trycloudflare.com'],
+    // HMR WebSocket uses a dedicated path so it can be proxied through main server
+    hmr: {
+      path: '/__vite_hmr'
+    }
   },
 
   // Rewrite rules for SPA
