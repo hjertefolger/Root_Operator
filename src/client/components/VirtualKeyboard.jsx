@@ -1,4 +1,4 @@
-import { useState, useCallback, memo } from 'react';
+import { useState, useCallback, useRef, memo } from 'react';
 import Keyboard from 'react-simple-keyboard';
 import {
   Delete,
@@ -92,20 +92,73 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
     }
   }, [shiftActive, onSpecialKey]);
 
+  // Track touched button for immediate visual feedback
+  const touchedRef = useRef(null);
+
+  // Touch handler for toolbar buttons - fires on touchstart for instant response
+  const handleTouch = useCallback((action) => (e) => {
+    e.preventDefault();
+    // Add visual feedback immediately
+    e.currentTarget.classList.add('touching');
+    touchedRef.current = e.currentTarget;
+    action();
+  }, []);
+
+  // Clear touch feedback
+  const handleTouchEnd = useCallback((e) => {
+    if (touchedRef.current) {
+      touchedRef.current.classList.remove('touching');
+      touchedRef.current = null;
+    }
+  }, []);
+
   return (
     <div className="vkb">
       {/* Terminal toolbar row */}
-      <div className="vkb-toolbar">
-        <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b'); }}>esc</button>
-        <button onMouseDown={e => { e.preventDefault(); handleTab(); }}>tab</button>
-        <button className={ctrlActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setCtrlActive(p => !p); }}>ctrl</button>
-        <button className={altActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setAltActive(p => !p); }}>alt</button>
-        <button className={cmdActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setCmdActive(p => !p); }}>cmd</button>
-        <button onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[A', 'A'); }}><ArrowUp size={16} /></button>
-        <button onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[B', 'B'); }}><ArrowDown size={16} /></button>
-        <button onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[D', 'D'); }}><ArrowLeft size={16} /></button>
-        <button onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[C', 'C'); }}><ArrowRight size={16} /></button>
-        <button onMouseDown={e => { e.preventDefault(); onPaste?.(); }}><Clipboard size={16} /></button>
+      <div className="vkb-toolbar" onTouchEnd={handleTouchEnd} onTouchCancel={handleTouchEnd}>
+        <button
+          onTouchStart={handleTouch(() => onSpecialKey?.('\x1b'))}
+          onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b'); }}
+        >esc</button>
+        <button
+          onTouchStart={handleTouch(handleTab)}
+          onMouseDown={e => { e.preventDefault(); handleTab(); }}
+        >tab</button>
+        <button
+          className={ctrlActive ? 'active' : ''}
+          onTouchStart={handleTouch(() => setCtrlActive(p => !p))}
+          onMouseDown={e => { e.preventDefault(); setCtrlActive(p => !p); }}
+        >ctrl</button>
+        <button
+          className={altActive ? 'active' : ''}
+          onTouchStart={handleTouch(() => setAltActive(p => !p))}
+          onMouseDown={e => { e.preventDefault(); setAltActive(p => !p); }}
+        >alt</button>
+        <button
+          className={cmdActive ? 'active' : ''}
+          onTouchStart={handleTouch(() => setCmdActive(p => !p))}
+          onMouseDown={e => { e.preventDefault(); setCmdActive(p => !p); }}
+        >cmd</button>
+        <button
+          onTouchStart={handleTouch(() => sendSpecialWithModifiers('\x1b[A', 'A'))}
+          onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[A', 'A'); }}
+        ><ArrowUp size={16} /></button>
+        <button
+          onTouchStart={handleTouch(() => sendSpecialWithModifiers('\x1b[B', 'B'))}
+          onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[B', 'B'); }}
+        ><ArrowDown size={16} /></button>
+        <button
+          onTouchStart={handleTouch(() => sendSpecialWithModifiers('\x1b[D', 'D'))}
+          onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[D', 'D'); }}
+        ><ArrowLeft size={16} /></button>
+        <button
+          onTouchStart={handleTouch(() => sendSpecialWithModifiers('\x1b[C', 'C'))}
+          onMouseDown={e => { e.preventDefault(); sendSpecialWithModifiers('\x1b[C', 'C'); }}
+        ><ArrowRight size={16} /></button>
+        <button
+          onTouchStart={handleTouch(() => onPaste?.())}
+          onMouseDown={e => { e.preventDefault(); onPaste?.(); }}
+        ><Clipboard size={16} /></button>
       </div>
 
       {/* Main keyboard */}
