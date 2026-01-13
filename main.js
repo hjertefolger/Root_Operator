@@ -1,6 +1,8 @@
 /**
  * ROOT OPERATOR - MAIN PROCESS
  */
+require('dotenv').config();
+
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');

@@ -40,6 +40,7 @@
     "class-variance-authority": "^0.7.1",
     "cloudflared": "^0.7.1",
     "clsx": "^2.1.1",
+    "dotenv": "^17.2.3",
     "electron-store": "^11.0.2",
     "fix-path": "^5.0.0",
     "geist": "^1.5.1",
