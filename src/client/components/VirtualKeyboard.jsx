@@ -1,6 +1,5 @@
 import { useState, useCallback, memo } from 'react';
 import Keyboard from 'react-simple-keyboard';
-import 'react-simple-keyboard/build/css/index.css';
 import {
   Delete,
   CornerDownLeft,
@@ -18,9 +17,12 @@ import {
 function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
   const [layoutName, setLayoutName] = useState('default');
   const [ctrlActive, setCtrlActive] = useState(false);
+  const [altActive, setAltActive] = useState(false);
+  const [cmdActive, setCmdActive] = useState(false);
 
   const handleKeyPress = useCallback((button) => {
     if (button === '{numbers}') { setLayoutName('numbers'); return; }
+    if (button === '{symbols}') { setLayoutName('symbols'); return; }
     if (button === '{abc}') { setLayoutName('default'); return; }
     if (button === '{shift}') {
       setLayoutName(prev => prev === 'default' ? 'shift' : 'default');
@@ -49,12 +51,12 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b'); }}>esc</button>
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x09'); }}>tab</button>
         <button className={ctrlActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setCtrlActive(p => !p); }}>ctrl</button>
-        <div className="vkb-toolbar-sep" />
+        <button className={altActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setAltActive(p => !p); }}>alt</button>
+        <button className={cmdActive ? 'active' : ''} onMouseDown={e => { e.preventDefault(); setCmdActive(p => !p); }}>cmd</button>
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b[A'); }}><ArrowUp size={16} /></button>
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b[B'); }}><ArrowDown size={16} /></button>
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b[D'); }}><ArrowLeft size={16} /></button>
         <button onMouseDown={e => { e.preventDefault(); onSpecialKey?.('\x1b[C'); }}><ArrowRight size={16} /></button>
-        <div className="vkb-toolbar-sep" />
         <button onMouseDown={e => { e.preventDefault(); onPaste?.(); }}><Clipboard size={16} /></button>
       </div>
 
@@ -75,13 +77,13 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
           ],
           numbers: [
             '1 2 3 4 5 6 7 8 9 0',
-            '- / : ; ( ) $ & @',
+            '- / : ; ( ) $ & @ "',
             '{symbols} . , ? ! \' {bksp}',
             '{abc} {space} {enter}'
           ],
           symbols: [
             '[ ] { } # % ^ * + =',
-            '_ \\ | ~ < > ` "',
+            '_ \\ | ~ < > € £ ¥ ·',
             '{numbers} . , ? ! \' {bksp}',
             '{abc} {space} {enter}'
           ]
