@@ -30,6 +30,7 @@ export function useE2E(socket) {
   const [fingerprint, setFingerprint] = useState(null);
   const fingerprintRef = useRef(null);
   const sessionKeyRef = useRef(null);
+  const e2eReadyRef = useRef(false);  // Ref to avoid stale closure in callbacks
 
   // Reset E2E state when socket changes (handles reconnection)
   // This ensures we don't use stale keys from a previous session
@@ -37,6 +38,7 @@ export function useE2E(socket) {
     if (socket === null) {
       // Socket disconnected - reset E2E state
       setE2eReady(false);
+      e2eReadyRef.current = false;
       setFingerprint(null);
       fingerprintRef.current = null;
       sessionKeyRef.current = null;
@@ -49,6 +51,7 @@ export function useE2E(socket) {
 
     // Reset E2E ready state - starting fresh key exchange (fixes reconnection state)
     setE2eReady(false);
+    e2eReadyRef.current = false;
 
     try {
       console.log('[E2E] Received server public key, starting key exchange');
@@ -151,6 +154,8 @@ export function useE2E(socket) {
   // Uses ref for comparison to avoid race condition with React state updates
   const handleE2EReady = useCallback((serverFingerprint) => {
     if (serverFingerprint === fingerprintRef.current) {
+      // Set ref FIRST so decryptOutput can use it immediately (before React re-render)
+      e2eReadyRef.current = true;
       setE2eReady(true);
       console.log('[E2E] Encryption active! Fingerprint verified:', fingerprintRef.current);
     } else {
@@ -161,8 +166,9 @@ export function useE2E(socket) {
   }, []);
 
   // Encrypt message for sending
+  // Uses ref (e2eReadyRef) to avoid stale closure issue during React re-render
   const encryptInput = useCallback(async (plaintext) => {
-    if (!e2eReady || !sessionKeyRef.current) {
+    if (!e2eReadyRef.current || !sessionKeyRef.current) {
       return null;
     }
 
@@ -185,11 +191,12 @@ export function useE2E(socket) {
       data: arrayBufferToBase64(data),
       tag: arrayBufferToBase64(tag)
     };
-  }, [e2eReady]);
+  }, []);  // No deps - uses refs for real-time values
 
   // Decrypt message from server
+  // Uses ref (e2eReadyRef) to avoid stale closure issue during React re-render
   const decryptOutput = useCallback(async (encrypted) => {
-    if (!e2eReady || !sessionKeyRef.current) {
+    if (!e2eReadyRef.current || !sessionKeyRef.current) {
       return null;
     }
 
@@ -214,7 +221,7 @@ export function useE2E(socket) {
       console.error('[E2E] Decryption failed:', e);
       return null;
     }
-  }, [e2eReady]);
+  }, []);  // No deps - uses refs for real-time values
 
   return {
     e2eReady,

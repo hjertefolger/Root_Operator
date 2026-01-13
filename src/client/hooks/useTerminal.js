@@ -236,7 +236,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
   }, [saveContent]);
 
   // Write server buffer (initial data on connect/reconnect)
-  // Server buffer is source of truth - marks that we should ignore sessionStorage
+  // Server buffer is source of truth - clears terminal and writes fresh content
   const writeServerBuffer = useCallback((data) => {
     if (!data) return;
 
@@ -244,12 +244,12 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     hasReceivedServerBufferRef.current = true;
     markServerBufferReceived();
 
-    // Reset content buffer and write server data
+    // Reset content buffer to server data
     contentBufferRef.current = data;
 
     if (termRef.current) {
-      // Don't clear terminal - just write (content appends)
-      // For reconnection, server sends the buffer which we just write
+      // Clear terminal and write server buffer (prevents duplication on reconnect)
+      termRef.current.clear();
       termRef.current.write(data);
       termRef.current.scrollToBottom();
       saveContent(data);

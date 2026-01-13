@@ -268,6 +268,20 @@ export function useAuth(socket) {
     }
   }, [serverReady, keysReady, socket, sendPairingRequest]);
 
+  // Reset auth state when socket disconnects (handles reconnection)
+  // This ensures clean state for the next connection attempt
+  useEffect(() => {
+    if (socket === null) {
+      setServerReady(false);
+      setIsAuthenticated(false);
+      setPairingStatus('connecting');
+      pairingInitiatedRef.current = false;
+      setPairingError(null);
+      // Note: Do NOT reset isReturningDevice - it's a permanent device characteristic
+      // Note: Do NOT reset keysReady - keys persist across connections
+    }
+  }, [socket]);
+
   // Listen for WebSocket messages
   useEffect(() => {
     if (!socket) return;
