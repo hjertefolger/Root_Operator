@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 
 // Helper functions
 function base64ToArrayBuffer(base64) {
@@ -30,6 +30,18 @@ export function useE2E(socket) {
   const [fingerprint, setFingerprint] = useState(null);
   const fingerprintRef = useRef(null);
   const sessionKeyRef = useRef(null);
+
+  // Reset E2E state when socket changes (handles reconnection)
+  // This ensures we don't use stale keys from a previous session
+  useEffect(() => {
+    if (socket === null) {
+      // Socket disconnected - reset E2E state
+      setE2eReady(false);
+      setFingerprint(null);
+      fingerprintRef.current = null;
+      sessionKeyRef.current = null;
+    }
+  }, [socket]);
 
   // Handle E2E key exchange initiation from server
   const handleE2EInit = useCallback(async (serverPublicKey, saltBase64) => {

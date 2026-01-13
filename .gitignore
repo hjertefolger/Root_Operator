@@ -23,6 +23,9 @@ Thumbs.db
 .env
 .env.local
 
+# Worker config (contains KV IDs and domain)
+worker/wrangler.toml
+
 # Electron
 *.asar
 

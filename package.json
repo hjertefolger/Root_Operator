@@ -30,7 +30,7 @@
     "tunnel"
   ],
   "author": "Hjertefølger",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
     "@radix-ui/react-accordion": "^1.2.12",

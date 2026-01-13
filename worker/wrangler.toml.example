@@ -1,0 +1,62 @@
+name = "root-operator-tunnel-worker"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# Custom domain for Worker - UPDATE THIS to your domain
+routes = [
+    { pattern = "cf.your-domain.com", custom_domain = true }
+]
+
+# KV Namespaces - Create with:
+#   wrangler kv namespace create MACHINES
+#   wrangler kv namespace create SUBDOMAINS
+# Then replace the IDs below with the returned values
+
+[[kv_namespaces]]
+binding = "MACHINES"
+id = "your-machines-kv-id"
+preview_id = "your-machines-preview-kv-id"
+
+[[kv_namespaces]]
+binding = "SUBDOMAINS"
+id = "your-subdomains-kv-id"
+preview_id = "your-subdomains-preview-kv-id"
+
+# Environment Variables
+# Set secrets with: wrangler secret put CLOUDFLARE_API_TOKEN
+# Or use the Cloudflare dashboard
+
+[vars]
+DOMAIN = "your-domain.com"
+# These should be set as secrets (not in this file) for security:
+# CLOUDFLARE_API_TOKEN - API token with Tunnel Edit + DNS Edit permissions
+# CLOUDFLARE_ACCOUNT_ID - Your Cloudflare account ID
+# CLOUDFLARE_ZONE_ID - Zone ID for the domain (find in Cloudflare dashboard)
+
+# Deployment Setup Instructions:
+#
+# 1. Install Wrangler: npm install -g wrangler
+#
+# 2. Login to Cloudflare: wrangler login
+#
+# 3. Create KV namespaces:
+#    wrangler kv namespace create MACHINES
+#    wrangler kv namespace create SUBDOMAINS
+#    wrangler kv namespace create MACHINES --preview
+#    wrangler kv namespace create SUBDOMAINS --preview
+#
+# 4. Update the KV namespace IDs above with the returned values
+#
+# 5. Create API token at https://dash.cloudflare.com/profile/api-tokens with:
+#    - Account > Cloudflare Tunnel > Edit
+#    - Zone > DNS > Edit
+#    - Select the specific account and zone
+#
+# 6. Set secrets:
+#    wrangler secret put CLOUDFLARE_API_TOKEN
+#    wrangler secret put CLOUDFLARE_ACCOUNT_ID
+#    wrangler secret put CLOUDFLARE_ZONE_ID
+#
+# 7. Deploy: wrangler deploy
+#
+# 8. Test locally: wrangler dev

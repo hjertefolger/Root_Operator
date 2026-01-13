@@ -18,9 +18,12 @@ const cloudflared = require('cloudflared');
 const keytar = require('keytar');
 
 let store;
-const INTERNAL_PORT = 22000;
 const isDev = !app.isPackaged;
-const VITE_CLIENT_PORT = 5175;
+
+// Server configuration (can be overridden via environment variables)
+const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT, 10) || 22000;
+const VITE_CLIENT_PORT = parseInt(process.env.VITE_CLIENT_PORT, 10) || 5175;
+const VITE_RENDERER_PORT = parseInt(process.env.VITE_RENDERER_PORT, 10) || 5174;
 
 // Secure credential storage constants
 const KEYTAR_SERVICE = 'RootOperator';
@@ -28,9 +31,9 @@ const KEYTAR_CF_TOKEN = 'cloudflare-token';
 const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 
-// Worker API configuration
-const WORKER_BASE_URL = 'https://cf.rootoperator.dev';
-const WORKER_DOMAIN = 'rootoperator.dev';
+// Worker API configuration (must be set in .env file)
+const WORKER_BASE_URL = process.env.WORKER_BASE_URL;
+const WORKER_DOMAIN = process.env.WORKER_DOMAIN;
 
 // GLOBAL STATE
 let mainWindow;
@@ -560,7 +563,7 @@ function createWindow() {
     // In development, load from Vite dev server for HMR
     // In production, load from built file
     if (isDev) {
-        mainWindow.loadURL('http://localhost:5174/renderer.html');
+        mainWindow.loadURL(`http://localhost:${VITE_RENDERER_PORT}/renderer.html`);
         // Open DevTools in dev mode for debugging
         // mainWindow.webContents.openDevTools({ mode: 'detach' });
     } else {
@@ -901,8 +904,8 @@ function isOriginAllowed(origin, cfSettings) {
         return true;
     }
 
-    // Allow Worker-assigned domain (rootoperator.dev and subdomains)
-    if (origin.includes(WORKER_DOMAIN)) {
+    // Allow Worker-assigned domain (configured via WORKER_DOMAIN env var)
+    if (WORKER_DOMAIN && origin.includes(WORKER_DOMAIN)) {
         return true;
     }
 

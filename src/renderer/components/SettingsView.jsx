@@ -18,6 +18,9 @@ import {
 const MAX_SUBDOMAIN_LENGTH = 10;
 const SUBDOMAIN_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+// Worker domain from environment (must be set in .env file)
+const WORKER_DOMAIN = import.meta.env.VITE_WORKER_DOMAIN;
+
 function SettingsView({ onBack, tunnelState }) {
   const { invoke } = useElectron();
 
@@ -251,7 +254,7 @@ function SettingsView({ onBack, tunnelState }) {
                     className="font-mono bg-transparent border-none text-sm text-foreground focus:outline-none focus:bg-muted/30 rounded py-0.5 transition-colors"
                     style={{ width: `${subdomain.length || 9}ch` }}
                   />
-                  <span className="font-mono text-sm text-muted-foreground">.rootoperator.dev</span>
+                  <span className="font-mono text-sm text-muted-foreground">.{WORKER_DOMAIN}</span>
                 </label>
                 {subdomainError && (
                   <span className="text-xs text-destructive">{subdomainError}</span>
