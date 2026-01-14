@@ -1160,7 +1160,7 @@ function stopBridge() {
 const CHALLENGE_EXPIRY_MS = 30000; // Challenge expires after 30 seconds
 const MAX_CONNECTIONS_PER_MINUTE = 20;
 const MAX_AUTH_ATTEMPTS_PER_CONNECTION = 3;
-const MAX_INPUT_SIZE = 4096; // Max bytes per input message
+const MAX_INPUT_SIZE = 65536; // Max bytes per input message (64KB)
 
 let connectionAttempts = [];
 

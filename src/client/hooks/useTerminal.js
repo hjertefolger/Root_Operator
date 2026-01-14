@@ -174,6 +174,24 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     };
   }, [containerRef]);
 
+  // Send resize when E2E becomes ready (initial connect or reconnect)
+  useEffect(() => {
+    if (!e2eReady || !fitAddonRef.current || !socketRef.current) return;
+    if (socketRef.current.readyState !== WebSocket.OPEN) return;
+
+    try {
+      fitAddonRef.current.fit();
+      const dims = fitAddonRef.current.proposeDimensions();
+      if (dims) {
+        socketRef.current.send(JSON.stringify({
+          type: 'resize',
+          cols: dims.cols,
+          rows: dims.rows
+        }));
+      }
+    } catch (e) {}
+  }, [e2eReady]);
+
   // Handle input from terminal
   // Note: isReady dependency ensures this re-runs after terminal is created
   useEffect(() => {
