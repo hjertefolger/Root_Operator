@@ -20,9 +20,20 @@ function PairingScreen({ code, status, error }) {
   const seconds = secondsLeft % 60;
   const isExpired = secondsLeft <= 0;
 
+  // Safe area wrapper for all pairing screens
+  const SafeAreaWrapper = ({ children }) => (
+    <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+      <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
+      <div className="flex-1 flex flex-col items-center justify-center p-10 bg-black">
+        {children}
+      </div>
+      <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-bottom)]" />
+    </div>
+  );
+
   if (error) {
     return (
-      <div className="h-full w-full flex flex-col items-center justify-center bg-background p-10">
+      <SafeAreaWrapper>
         <span className="font-mono text-xs font-normal tracking-wider text-foreground mb-8">
           ROOT_OPERATOR
         </span>
@@ -37,13 +48,13 @@ function PairingScreen({ code, status, error }) {
         >
           Try Again
         </button>
-      </div>
+      </SafeAreaWrapper>
     );
   }
 
   if (status === 'connecting') {
     return (
-      <div className="h-full w-full flex flex-col items-center justify-center bg-background p-10">
+      <SafeAreaWrapper>
         <span className="font-mono text-xs font-normal tracking-wider text-foreground mb-8">
           ROOT_OPERATOR
         </span>
@@ -51,44 +62,46 @@ function PairingScreen({ code, status, error }) {
         <p className="text-sm text-muted-foreground">
           Connecting...
         </p>
-      </div>
+      </SafeAreaWrapper>
     );
   }
 
   return (
-    <div className="h-full w-full flex flex-col items-center justify-center gap-8 bg-background p-10">
-      <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-        ROOT_OPERATOR
-      </span>
+    <SafeAreaWrapper>
+      <div className="flex flex-col items-center gap-8">
+        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+          ROOT_OPERATOR
+        </span>
 
-      <div className="flex flex-col items-center gap-3">
-        <h1 className="text-xl font-semibold text-foreground text-center">
-          Pair Your Device
-        </h1>
+        <div className="flex flex-col items-center gap-3">
+          <h1 className="text-xl font-semibold text-foreground text-center">
+            Pair Your Device
+          </h1>
 
-        <p className="text-sm text-muted-foreground text-center max-w-[280px] leading-relaxed">
-          Open the desktop app, tap the + icon, and enter this code
-        </p>
+          <p className="text-sm text-muted-foreground text-center max-w-[280px] leading-relaxed">
+            Open the desktop app, tap the + icon, and enter this code
+          </p>
+        </div>
+
+        <div className="font-mono text-3xl font-medium tracking-[0.3em] text-foreground mt-4">
+          {codeWithSpaces}
+        </div>
+
+        <div className="flex flex-col items-center gap-3 mt-4">
+          <p className="text-xs text-muted-foreground/60 text-center">
+            {isExpired
+              ? 'Code expired'
+              : `Code expires in ${minutes}m ${seconds.toString().padStart(2, '0')}s`
+            }
+          </p>
+
+          <Button variant="ghost" size="sm" onClick={() => location.reload()}>
+            <RotateCw />
+            Refresh code
+          </Button>
+        </div>
       </div>
-
-      <div className="font-mono text-3xl font-medium tracking-[0.3em] text-foreground mt-4">
-        {codeWithSpaces}
-      </div>
-
-      <div className="flex flex-col items-center gap-3 mt-4">
-        <p className="text-xs text-muted-foreground/60 text-center">
-          {isExpired
-            ? 'Code expired'
-            : `Code expires in ${minutes}m ${seconds.toString().padStart(2, '0')}s`
-          }
-        </p>
-
-        <Button variant="ghost" size="sm" onClick={() => location.reload()}>
-          <RotateCw />
-          Refresh code
-        </Button>
-      </div>
-    </div>
+    </SafeAreaWrapper>
   );
 }
 

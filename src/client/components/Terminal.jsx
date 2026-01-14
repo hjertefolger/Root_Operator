@@ -1,12 +1,11 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
-import { Loader2 } from 'lucide-react';
 import { useTerminal } from '../hooks/useTerminal';
 import VirtualKeyboard from './VirtualKeyboard';
 
 // Detect mobile device
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionState }) {
+function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   const containerRef = useRef(null);
   const ctrlRef = useRef(false);
   const shiftRef = useRef(false);
@@ -14,9 +13,6 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionSta
 
   // Track if we've received the initial server buffer after E2E ready
   const hasReceivedInitialBufferRef = useRef(false);
-
-  // Show overlay when reconnecting or disconnected
-  const showReconnectingOverlay = connectionState === 'reconnecting' || connectionState === 'connecting';
 
   const { terminal, write, writeServerBuffer, sendSpecial } = useTerminal(
     containerRef,
@@ -79,21 +75,9 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady, connectionSta
       {/* Terminal - fluid, takes remaining space */}
       <div
         ref={containerRef}
-        className="terminal-area relative"
+        className="terminal-area"
         onClick={handleContainerClick}
-      >
-        {/* Reconnection overlay */}
-        {showReconnectingOverlay && (
-          <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-10 pointer-events-none">
-            <div className="flex flex-col items-center gap-2">
-              <Loader2 className="w-5 h-5 text-white/70 animate-spin" />
-              <p className="text-sm text-white/70">
-                {connectionState === 'reconnecting' ? 'Reconnecting...' : 'Connecting...'}
-              </p>
-            </div>
-          </div>
-        )}
-      </div>
+      />
 
       {/* Keyboard - only on mobile */}
       {isMobile && (

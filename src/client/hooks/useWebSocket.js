@@ -2,8 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 
 // Reconnection configuration
 const RECONNECT_CONFIG = {
-  initialDelay: 1000,
-  maxDelay: 30000,
+  initialDelay: 3000,
+  maxDelay: 120000,
   multiplier: 2,
   jitterFactor: 0.2,
 };

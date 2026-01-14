@@ -57,24 +57,35 @@ function App() {
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, handleE2EInit, handleE2EReady]);
 
+  // Safe area wrapper for overlay screens
+  const SafeAreaWrapper = ({ children }) => (
+    <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
+      <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
+      <div className="flex-1 flex items-center justify-center bg-black">
+        {children}
+      </div>
+      <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-bottom)]" />
+    </div>
+  );
+
   // Show loading state while keys are being set up
   if (isLoading) {
     return (
-      <div className="h-dvh w-full flex items-center justify-center bg-black">
+      <SafeAreaWrapper>
         <p className="text-sm text-white/50">Initializing...</p>
-      </div>
+      </SafeAreaWrapper>
     );
   }
 
   // Show quick authenticating screen for returning devices
   if (!isAuthenticated && pairingStatus === 'authenticating') {
     return (
-      <div className="h-dvh w-full flex items-center justify-center bg-black">
+      <SafeAreaWrapper>
         <div className="flex flex-col items-center gap-3">
           <Loader2 className="w-6 h-6 text-white animate-spin" />
           <p className="text-sm text-white/50">Authenticating...</p>
         </div>
-      </div>
+      </SafeAreaWrapper>
     );
   }
 
@@ -92,12 +103,12 @@ function App() {
   // Show securing screen when authenticated but E2E not yet ready
   if (!e2eReady) {
     return (
-      <div className="h-dvh w-full flex items-center justify-center bg-black">
+      <SafeAreaWrapper>
         <div className="flex flex-col items-center gap-3">
           <Loader2 className="w-6 h-6 text-white animate-spin" />
           <p className="text-sm text-white/50">Securing connection...</p>
         </div>
-      </div>
+      </SafeAreaWrapper>
     );
   }
 
@@ -106,13 +117,12 @@ function App() {
     <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
       {/* Top safe area */}
       <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
-      <Header fingerprint={fingerprint} />
+      <Header fingerprint={fingerprint} connectionState={connectionState} />
       <Terminal
         socket={socket}
         encryptInput={encryptInput}
         decryptOutput={decryptOutput}
         e2eReady={e2eReady}
-        connectionState={connectionState}
       />
     </div>
   );

@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { Shield, ShieldCheck, RotateCw, X } from 'lucide-react';
+import { Shield, ShieldCheck, RotateCw, X, Loader } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
-function Header({ fingerprint }) {
+function Header({ fingerprint, connectionState }) {
+  const isReconnecting = connectionState === 'reconnecting';
   const [showModal, setShowModal] = useState(false);
   const words = fingerprint ? fingerprint.split('-') : [];
   const isSecure = !!fingerprint;
@@ -19,6 +20,15 @@ function Header({ fingerprint }) {
           ROOT_OPERATOR
         </span>
         <div className="flex items-center gap-1">
+          {isReconnecting && (
+            <div className="w-8 h-8 flex items-center justify-center">
+              <Loader
+                size={16}
+                strokeWidth={2}
+                className="text-[#4B5AFF] animate-spin"
+              />
+            </div>
+          )}
           <Button
             variant="ghost"
             size="icon-sm"
