@@ -2,8 +2,6 @@ import { useState, useEffect, useRef } from 'react';
 import { X, Trash2, Loader, Check } from 'lucide-react';
 import { useElectron } from '../hooks/useElectron';
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
   Accordion,
@@ -25,8 +23,6 @@ function SettingsView({ onBack, tunnelState }) {
   const { invoke } = useElectron();
 
   // Form state
-  const [token, setToken] = useState('');
-  const [domain, setDomain] = useState('');
   const [debugLogging, setDebugLogging] = useState(false);
   const [subdomain, setSubdomain] = useState('');
   const [pairedDevices, setPairedDevices] = useState([]);
@@ -44,28 +40,21 @@ function SettingsView({ onBack, tunnelState }) {
   useEffect(() => {
     async function loadSettings() {
       try {
-        const [secureToken, settings, currentSubdomain, devices] = await Promise.all([
-          invoke('GET_SECURE_TOKEN'),
+        const [settings, currentSubdomain, devices] = await Promise.all([
           invoke('GET_STORE', 'cfSettings'),
           invoke('GET_SUBDOMAIN'),
           invoke('GET_PAIRED_DEVICES')
         ]);
 
-        const loadedToken = secureToken || '';
-        const loadedDomain = (settings && settings.domain) || '';
         const loadedDebug = (settings && settings.debugLogging) || false;
         const loadedSubdomain = currentSubdomain || '';
 
-        setToken(loadedToken);
-        setDomain(loadedDomain);
         setDebugLogging(loadedDebug);
         setSubdomain(loadedSubdomain);
         setPairedDevices(devices || []);
 
         // Store initial values for dirty checking
         initialValues.current = {
-          token: loadedToken,
-          domain: loadedDomain,
           debugLogging: loadedDebug,
           subdomain: loadedSubdomain,
         };
@@ -81,13 +70,11 @@ function SettingsView({ onBack, tunnelState }) {
     if (saveState === 'saving' || saveState === 'saved') return;
 
     const isDirty =
-      token !== initialValues.current.token ||
-      domain !== initialValues.current.domain ||
       debugLogging !== initialValues.current.debugLogging ||
       subdomain !== initialValues.current.subdomain;
 
     setSaveState(isDirty ? 'dirty' : 'idle');
-  }, [token, domain, debugLogging, subdomain, saveState]);
+  }, [debugLogging, subdomain, saveState]);
 
   const handleRemoveDevice = async (kid) => {
     try {
@@ -135,9 +122,8 @@ function SettingsView({ onBack, tunnelState }) {
     setSaveState('saving');
 
     try {
-      // Save token and settings
-      await invoke('SET_SECURE_TOKEN', token);
-      await invoke('SET_STORE', 'cfSettings', { domain, debugLogging });
+      // Save settings
+      await invoke('SET_STORE', 'cfSettings', { debugLogging });
 
       // Update subdomain if changed (already sanitized via input handler)
       if (subdomain !== initialValues.current.subdomain) {
@@ -151,8 +137,6 @@ function SettingsView({ onBack, tunnelState }) {
 
       // Update initial values
       initialValues.current = {
-        token,
-        domain,
         debugLogging,
         subdomain,
       };
@@ -296,44 +280,7 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 3: Custom Tunnel Settings */}
-          <AccordionItem value="custom-tunnel" className="border-none">
-            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
-              Custom Tunnel Settings
-            </AccordionTrigger>
-            <AccordionContent className="pb-4">
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="cf-token" className="text-xs text-muted-foreground">
-                    Cloudflare Token
-                  </Label>
-                  <Input
-                    id="cf-token"
-                    type="password"
-                    value={token}
-                    onChange={(e) => setToken(e.target.value)}
-                    placeholder="Optional"
-                    className="text-sm h-8"
-                  />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="custom-domain" className="text-xs text-muted-foreground">
-                    Custom Domain
-                  </Label>
-                  <Input
-                    id="custom-domain"
-                    type="text"
-                    value={domain}
-                    onChange={(e) => setDomain(e.target.value)}
-                    placeholder="Optional"
-                    className="text-sm h-8"
-                  />
-                </div>
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-
-          {/* Section 4: Debug Logging */}
+          {/* Section 3: Debug Logging */}
           <AccordionItem value="debug-logging" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               Debug Logging

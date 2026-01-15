@@ -1,10 +1,13 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { useElectron } from '../hooks/useElectron';
 import FingerprintSection from './FingerprintSection';
+
+// Random connecting state words
+const CONNECTING_WORDS = ['Bridging', 'Phasing', 'Warping', 'Tunneling', 'Gliding', 'Flying', 'Encoding'];
 
 // Only allow valid pairing code characters
 const PAIRING_CODE_REGEXP = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]*$/;
@@ -25,8 +28,19 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const [pairingCode, setPairingCode] = useState('');
   const [pairingError, setPairingError] = useState('');
   const [pairingLoading, setPairingLoading] = useState(false);
+  const [connectingWord, setConnectingWord] = useState(CONNECTING_WORDS[0]);
+  const wasConnectingRef = useRef(false);
 
   const { active, connecting, url, fingerprint } = tunnelState;
+
+  // Pick a random connecting word when connecting starts
+  useEffect(() => {
+    if (connecting && !wasConnectingRef.current) {
+      const randomWord = CONNECTING_WORDS[Math.floor(Math.random() * CONNECTING_WORDS.length)];
+      setConnectingWord(randomWord);
+    }
+    wasConnectingRef.current = connecting;
+  }, [connecting]);
 
   const handleToggle = () => {
     if (!active && !connecting) {
@@ -333,7 +347,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             disabled
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
           >
-            Connecting
+            {connectingWord}
             <Loader strokeWidth={2} className="animate-spin" />
           </Button>
         ) : active ? (
@@ -343,7 +357,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             onClick={handleToggle}
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90"
           >
-            Pause
+            Hover
             <CirclePause strokeWidth={2} />
           </Button>
         ) : (
@@ -353,7 +367,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             onClick={handleToggle}
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
           >
-            Start
+            Jump
             <CirclePlay strokeWidth={2} />
           </Button>
         )}

@@ -27,7 +27,8 @@ function App() {
     isLoading,
     pairingCode,
     pairingStatus,
-    pairingError
+    pairingError,
+    wasAuthenticatedThisSession
   } = useAuth(socket);
 
   // Handle WebSocket messages for E2E
@@ -77,39 +78,45 @@ function App() {
     );
   }
 
-  // Show quick authenticating screen for returning devices
-  if (!isAuthenticated && pairingStatus === 'authenticating') {
-    return (
-      <SafeAreaWrapper>
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="w-6 h-6 text-white animate-spin" />
-          <p className="text-sm text-white/50">Authenticating...</p>
-        </div>
-      </SafeAreaWrapper>
-    );
-  }
+  // If already authenticated this session, skip overlays and show terminal view
+  // (header spinner will indicate reconnection state)
+  const showTerminalView = wasAuthenticatedThisSession;
 
-  // Show pairing screen when not authenticated (new device)
-  if (!isAuthenticated) {
-    return (
-      <PairingScreen
-        code={pairingCode}
-        status={pairingStatus}
-        error={pairingError}
-      />
-    );
-  }
+  if (!showTerminalView) {
+    // Show quick authenticating screen for returning devices
+    if (!isAuthenticated && pairingStatus === 'authenticating') {
+      return (
+        <SafeAreaWrapper>
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 className="w-6 h-6 text-white animate-spin" />
+            <p className="text-sm text-white/50">Authenticating...</p>
+          </div>
+        </SafeAreaWrapper>
+      );
+    }
 
-  // Show securing screen when authenticated but E2E not yet ready
-  if (!e2eReady) {
-    return (
-      <SafeAreaWrapper>
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="w-6 h-6 text-white animate-spin" />
-          <p className="text-sm text-white/50">Securing connection...</p>
-        </div>
-      </SafeAreaWrapper>
-    );
+    // Show pairing screen when not authenticated (new device)
+    if (!isAuthenticated) {
+      return (
+        <PairingScreen
+          code={pairingCode}
+          status={pairingStatus}
+          error={pairingError}
+        />
+      );
+    }
+
+    // Show securing screen when authenticated but E2E not yet ready
+    if (!e2eReady) {
+      return (
+        <SafeAreaWrapper>
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 className="w-6 h-6 text-white animate-spin" />
+            <p className="text-sm text-white/50">Securing connection...</p>
+          </div>
+        </SafeAreaWrapper>
+      );
+    }
   }
 
   // Show terminal when authenticated and E2E is ready

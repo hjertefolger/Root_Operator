@@ -343,7 +343,7 @@ function getMachineId() {
     if (!machineId) {
         machineId = crypto.randomUUID();
         store.set('machineId', machineId);
-        logDebug(`[WORKER] Generated new machine ID: ${machineId}`);
+        logDebug(`[WORKER] Generated new machine ID: ${machineId.substring(0, 8)}...`);
     }
     return machineId;
 }
@@ -661,28 +661,125 @@ function getTunnelState() {
     };
 }
 
+// About window reference
+let aboutWindow = null;
+
+function showAboutWindow() {
+    if (aboutWindow) {
+        aboutWindow.focus();
+        return;
+    }
+
+    aboutWindow = new BrowserWindow({
+        width: 300,
+        height: 340,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        title: 'About Root_Operator',
+        show: false,
+        backgroundColor: '#1c1c1e',
+        titleBarStyle: 'hidden',
+        trafficLightPosition: { x: 12, y: 12 },
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true
+        }
+    });
+
+    const iconPath = path.join(__dirname, 'public', 'icon-512-v3.png');
+    const iconBase64 = fs.readFileSync(iconPath).toString('base64');
+    const version = app.getVersion();
+
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #1c1c1e;
+                color: #fff;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+                padding: 20px;
+                -webkit-app-region: drag;
+                user-select: none;
+            }
+            .icon {
+                width: 80px;
+                height: 80px;
+                border-radius: 16px;
+                margin-bottom: 16px;
+            }
+            .name {
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 4px;
+            }
+            .version {
+                font-size: 13px;
+                color: rgba(255,255,255,0.5);
+                margin-bottom: 20px;
+            }
+            .tagline {
+                font-size: 13px;
+                color: rgba(255,255,255,0.7);
+                margin-bottom: 8px;
+            }
+            .email {
+                font-size: 13px;
+                color: #4B5AFF;
+                text-decoration: none;
+                margin-bottom: 20px;
+                -webkit-app-region: no-drag;
+                cursor: pointer;
+            }
+            .email:hover { text-decoration: underline; }
+            .copyright {
+                font-size: 11px;
+                color: rgba(255,255,255,0.4);
+            }
+        </style>
+    </head>
+    <body>
+        <img class="icon" src="data:image/png;base64,${iconBase64}" alt="Icon">
+        <div class="name">Root_Operator</div>
+        <div class="version">Version ${version}</div>
+        <div class="tagline">Secure remote terminal access</div>
+        <a class="email" href="mailto:support@rootoperator.dev">support@rootoperator.dev</a>
+        <div class="copyright">© 2026 Root Operator</div>
+    </body>
+    </html>
+    `;
+
+    aboutWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+
+    aboutWindow.once('ready-to-show', () => {
+        aboutWindow.show();
+    });
+
+    aboutWindow.on('closed', () => {
+        aboutWindow = null;
+    });
+}
+
 // Build tray context menu (shown on right-click)
 function buildTrayMenu() {
     const menuItems = [
-        { label: 'Root Operator', enabled: false },
-        { type: 'separator' }
-    ];
-
-    // Add fingerprint if E2E is active
-    if (currentFingerprint) {
-        menuItems.push({
-            label: `E2E: ${currentFingerprint}`,
-            enabled: false,
-            toolTip: 'Verify this matches your client device'
-        });
-        menuItems.push({ type: 'separator' });
-    }
-
-    menuItems.push(
-        { label: 'Show Window', click: () => showWindow() },
+        { label: 'Root_Operator', enabled: false },
+        { type: 'separator' },
+        { label: 'About', click: () => showAboutWindow() },
+        { label: 'Website', click: () => shell.openExternal('https://rootoperator.dev') },
         { type: 'separator' },
         { label: 'Quit', click: () => app.quit() }
-    );
+    ];
 
     return Menu.buildFromTemplate(menuItems);
 }
@@ -690,6 +787,9 @@ function buildTrayMenu() {
 app.whenReady().then(async () => {
     console.log('App Ready');
     if (app.dock) app.dock.hide();
+
+    // Remove default application menu (tray-only app)
+    Menu.setApplicationMenu(null);
 
     const { default: ES } = await import('electron-store');
     store = new ES();
@@ -1300,7 +1400,7 @@ function handleConnection(ws, req) {
             });
 
             ws.send(JSON.stringify({ type: 'pairing_pending', code }));
-            logDebug(`[PAIRING] New pairing request with code: ${code}`);
+            logDebug(`[PAIRING] New pairing request initiated for key ${m.keyId.substring(0, 8)}...`);
             return;
         }
 
@@ -1556,11 +1656,6 @@ function startPty(ws) {
 
     ptyProcess.on('data', d => {
         const raw = d.toString();
-        // Log hex of the first few chars if it looks like a symbol
-        if (raw.length > 0 && (raw.charCodeAt(0) > 127 || raw.length < 10)) {
-            const hex = raw.split('').map(c => '0x' + c.charCodeAt(0).toString(16)).join(' ');
-            logDebug(`[PTY] Output Hex: ${hex}`);
-        }
 
         // Claude Code uses different circle/dot characters.
         // We force "Text Presentation" (\uFE0E) on all of them.
@@ -1779,7 +1874,7 @@ ipcMain.handle('VERIFY_PAIRING_CODE', (event, code, deviceName) => {
     }
 
     pendingPairings.delete(normalizedCode);
-    logDebug(`[PAIRING] Device paired successfully with code: ${normalizedCode}`);
+    logDebug(`[PAIRING] Device paired successfully: ${pairing.kid.substring(0, 8)}...`);
 
     return { success: true };
 });

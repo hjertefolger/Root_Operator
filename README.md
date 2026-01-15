@@ -169,7 +169,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-[MIT](LICENSE) - Copyright (c) 2026 Hjertefølger
+[MIT](LICENSE) - Copyright (c) 2026 Tomas Krajcik
 
 ## Acknowledgments
 

@@ -29,7 +29,7 @@
     "cloudflare",
     "tunnel"
   ],
-  "author": "Hjertefølger",
+  "author": "Tomas Krajcik",
   "license": "MIT",
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

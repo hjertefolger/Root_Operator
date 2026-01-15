@@ -110,6 +110,7 @@ export function useAuth(socket) {
   const [keysReady, setKeysReady] = useState(false);
   const [serverReady, setServerReady] = useState(false);
   const [isReturningDevice, setIsReturningDevice] = useState(false);
+  const [wasAuthenticatedThisSession, setWasAuthenticatedThisSession] = useState(false);
   const keyPairRef = useRef(null); // Holds CryptoKey objects (non-extractable private key)
   const keyIdRef = useRef(null);
   const publicJwkRef = useRef(null); // Cached public JWK for sending to server
@@ -314,6 +315,7 @@ export function useAuth(socket) {
         console.log('[AUTH] Pairing successful');
         setPairingStatus('paired');
         setIsAuthenticated(true);
+        setWasAuthenticatedThisSession(true);
       }
 
       // Challenge for returning device - sign and respond
@@ -340,6 +342,7 @@ export function useAuth(socket) {
         console.log('[AUTH] Authentication successful');
         setPairingStatus('paired');
         setIsAuthenticated(true);
+        setWasAuthenticatedThisSession(true);
       }
 
       // Pairing expired
@@ -372,6 +375,7 @@ export function useAuth(socket) {
     pairingCode,
     pairingStatus,
     pairingError,
-    isReturningDevice
+    isReturningDevice,
+    wasAuthenticatedThisSession
   };
 }
