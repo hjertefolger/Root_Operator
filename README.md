@@ -26,14 +26,14 @@ A secure remote terminal access app for macOS that lets you control your Mac's t
 
 ### From Release
 
-Download the latest `.dmg` from the [Releases](https://github.com/yourusername/root-operator/releases) page.
+Download the latest `.dmg` from the [Releases](https://github.com/hjertefolger/Root_Operator/releases) page.
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/root-operator.git
-cd root-operator
+git clone https://github.com/hjertefolger/Root_Operator.git
+cd Root_Operator
 
 # Install dependencies (automatically rebuilds native modules)
 npm install
@@ -68,10 +68,11 @@ cp .env.example .env
 ## Usage
 
 1. **Start the app** - Launch Root Operator from Applications or run `npm run dev:app`
-2. **Connect tunnel** - Click the tray icon and select "Connect"
-3. **Scan QR code** - Use your iPhone camera to scan the QR code
-4. **Verify fingerprint** - Confirm the 12-word fingerprint matches on both devices
-5. **Start typing** - You now have secure terminal access!
+2. **Connect tunnel** - Click "Jump" to start the secure tunnel
+3. **Copy the link** - Click the copy icon to copy the tunnel URL
+4. **Open on device** - Paste the URL in Safari on your iPhone or any browser
+5. **Verify fingerprint** - Confirm the 12-word fingerprint matches on both devices
+6. **Start typing** - You now have secure terminal access!
 
 ### Pairing New Devices
 
@@ -162,6 +163,14 @@ npm run rebuild
 ### Can't type after reconnection
 
 This is fixed in recent versions. If you experience this, update to the latest version.
+
+## Roadmap
+
+Planned features for future releases:
+
+- **Custom Tunnel Settings** - Advanced Cloudflare tunnel configuration options
+- **Terminal Tabs** - Multiple terminal sessions in a single window
+- **Team Collaboration** - Individual sessions for team members with separate access controls
 
 ## Contributing
 
