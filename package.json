@@ -108,13 +108,17 @@
     "dmg": {
       "sign": false
     },
+    "icon": "public/icon-512-v3.png",
     "files": [
       "main.js",
       "preload.js",
+      ".env",
+      "tray_*.png",
       "ui/**/*",
       "public/dist/**/*",
       "public/bip39-words.json",
       "public/fonts/**/*",
+      "public/icon-*.png",
       "!public/src",
       "node_modules/**/*",
       "!node_modules/**/*.md",
@@ -124,7 +128,8 @@
     "asar": true,
     "asarUnpack": [
       "node_modules/node-pty/**/*",
-      "node_modules/keytar/**/*"
+      "node_modules/keytar/**/*",
+      "node_modules/cloudflared/**/*"
     ],
     "afterSign": "scripts/notarize.js"
   }

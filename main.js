@@ -1,10 +1,10 @@
 /**
  * ROOT OPERATOR - MAIN PROCESS
  */
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu } = require('electron');
-const path = require('path');
 const { spawn } = require('child_process');
 const fixPath = async () => {
     const { default: fp } = await import('fix-path');
@@ -22,6 +22,15 @@ const keytar = require('keytar');
 let store;
 const isDev = !app.isPackaged;
 
+// Fix cloudflared binary path for packaged app (binary is in app.asar.unpacked)
+if (!isDev) {
+    const unpackedBin = path.join(
+        __dirname.replace('app.asar', 'app.asar.unpacked'),
+        'node_modules', 'cloudflared', 'bin', 'cloudflared'
+    );
+    cloudflared.use(unpackedBin);
+}
+
 // Server configuration (can be overridden via environment variables)
 const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT, 10) || 22000;
 const VITE_CLIENT_PORT = parseInt(process.env.VITE_CLIENT_PORT, 10) || 5175;
@@ -33,7 +42,7 @@ const KEYTAR_CF_TOKEN = 'cloudflare-token';
 const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 
-// Worker API configuration (must be set in .env file)
+// Worker API configuration (loaded from .env file)
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL;
 const WORKER_DOMAIN = process.env.WORKER_DOMAIN;
 
