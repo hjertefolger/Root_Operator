@@ -136,7 +136,11 @@ sequenceDiagram
     end
 
     S->>C: 6. AUTH_SUCCESS (encrypted)
-    C<-->S: 7. Terminal I/O (E2E encrypted)
+
+    loop Terminal Session
+        C->>S: 7. Input (E2E encrypted)
+        S->>C: 8. Output (E2E encrypted)
+    end
 ```
 
 ### Security Model
