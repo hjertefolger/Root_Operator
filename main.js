@@ -1042,11 +1042,11 @@ async function startBridge(cfSettings) {
 
     // WebSocket server with origin verification and payload limits
     // SECURITY: maxPayload prevents DoS attacks via large messages
-    // 32KB is sufficient for terminal I/O (typical commands are <1KB)
+    // 64KB supports larger clipboard pastes while remaining safe for terminal I/O
     // Using noServer: true to manually handle upgrades (needed for Vite HMR proxy in dev)
     wss = new WebSocket.Server({
         noServer: true,
-        maxPayload: 32 * 1024 // 32KB max message size (enforced at server level)
+        maxPayload: 64 * 1024 // 64KB max message size (enforced at server level)
     });
 
     wss.on('connection', (ws, req) => handleConnection(ws, req));
@@ -1269,7 +1269,7 @@ function stopBridge() {
 const CHALLENGE_EXPIRY_MS = 30000; // Challenge expires after 30 seconds
 const MAX_CONNECTIONS_PER_MINUTE = 20;
 const MAX_AUTH_ATTEMPTS_PER_CONNECTION = 3;
-const MAX_INPUT_SIZE = 65536; // Max bytes per input message (64KB)
+const MAX_INPUT_SIZE = 131072; // Max bytes per input message (128KB)
 
 let connectionAttempts = [];
 

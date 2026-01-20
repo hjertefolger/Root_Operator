@@ -9,6 +9,10 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
   const fitAddonRef = useRef(null);
   const socketRef = useRef(socket);
   const outputQueueRef = useRef([]);
+
+  // Write batching for mobile performance (reduces render storm from rapid output)
+  const writeBufferRef = useRef('');
+  const rafIdRef = useRef(null);
   const [isReady, setIsReady] = useState(false);
 
   // Content tracking for persistence
@@ -155,6 +159,11 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     return () => {
       cancelled = true;
       cancelAnimationFrame(initFrame);
+      // Cancel any pending write batch
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
       if (container?._resizeObserver) {
         container._resizeObserver.disconnect();
       }
@@ -235,21 +244,40 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     return () => disposable.dispose();
   }, [isReady, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
 
-  // Write to terminal with content tracking for persistence
+  // Write to terminal with batching for mobile performance
+  // Accumulates data and flushes once per animation frame (max 60/sec)
+  // This prevents render storm from rapid PTY output (e.g., Claude Code streaming)
   const write = useCallback((data) => {
-    if (termRef.current) {
-      termRef.current.write(data);
-      termRef.current.scrollToBottom();
-
-      // Track content for persistence
-      contentBufferRef.current += data;
-      // Limit buffer size to 1MB
-      if (contentBufferRef.current.length > 1024 * 1024) {
-        contentBufferRef.current = contentBufferRef.current.slice(-1024 * 1024);
-      }
-      saveContent(contentBufferRef.current);
-    } else {
+    if (!termRef.current) {
       outputQueueRef.current.push(data);
+      return;
+    }
+
+    // Accumulate data in buffer
+    writeBufferRef.current += data;
+
+    // Schedule flush if not already scheduled
+    if (!rafIdRef.current) {
+      rafIdRef.current = requestAnimationFrame(() => {
+        rafIdRef.current = null;
+
+        if (termRef.current && writeBufferRef.current) {
+          const buffered = writeBufferRef.current;
+          writeBufferRef.current = '';
+
+          // Single batched write + scroll
+          termRef.current.write(buffered);
+          termRef.current.scrollToBottom();
+
+          // Track content for persistence
+          contentBufferRef.current += buffered;
+          // Limit buffer size to 1MB
+          if (contentBufferRef.current.length > 1024 * 1024) {
+            contentBufferRef.current = contentBufferRef.current.slice(-1024 * 1024);
+          }
+          saveContent(contentBufferRef.current);
+        }
+      });
     }
   }, [saveContent]);
 

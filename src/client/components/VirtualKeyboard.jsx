@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, memo } from 'react';
+import { useState, useCallback, useRef, memo, useEffect } from 'react';
 import Keyboard from 'react-simple-keyboard';
 import {
   Delete,
@@ -95,6 +95,52 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
   // Track touched button for immediate visual feedback
   const touchedRef = useRef(null);
 
+  // Ref for keyboard container to add direct touch handling
+  const keyboardContainerRef = useRef(null);
+
+  // Direct touch event delegation for reliable key registration
+  // Bypasses react-simple-keyboard's touch handling which can miss events on iOS
+  useEffect(() => {
+    const container = keyboardContainerRef.current;
+    if (!container) return;
+
+    const handleTouchStart = (e) => {
+      // Find the button element (might be the target or an ancestor)
+      const button = e.target.closest('.hg-button');
+      if (!button) return;
+
+      // Get the key value from data attribute
+      const key = button.getAttribute('data-skbtn');
+      if (!key) return;
+
+      // Prevent default to stop react-simple-keyboard from also handling
+      e.preventDefault();
+
+      // Visual feedback
+      button.classList.add('hg-activeButton');
+
+      // Fire the key press
+      handleKeyPress(key);
+    };
+
+    const handleTouchEnd = (e) => {
+      // Clear visual feedback from all buttons
+      container.querySelectorAll('.hg-activeButton').forEach(btn => {
+        btn.classList.remove('hg-activeButton');
+      });
+    };
+
+    container.addEventListener('touchstart', handleTouchStart, { passive: false });
+    container.addEventListener('touchend', handleTouchEnd, { passive: true });
+    container.addEventListener('touchcancel', handleTouchEnd, { passive: true });
+
+    return () => {
+      container.removeEventListener('touchstart', handleTouchStart);
+      container.removeEventListener('touchend', handleTouchEnd);
+      container.removeEventListener('touchcancel', handleTouchEnd);
+    };
+  }, [handleKeyPress]);
+
   // Touch handler for toolbar buttons - fires on touchstart for instant response
   const handleTouch = useCallback((action) => (e) => {
     e.preventDefault();
@@ -127,9 +173,10 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
         <button onMouseDown={e => { e.preventDefault(); onPaste?.(); }}><Clipboard size={16} /></button>
       </div>
 
-      {/* Main keyboard */}
-      <Keyboard
-        layout={{
+      {/* Main keyboard - wrapped for direct touch event handling */}
+      <div ref={keyboardContainerRef}>
+        <Keyboard
+          layout={{
           default: [
             'q w e r t y u i o p',
             'a s d f g h j k l',
@@ -169,8 +216,9 @@ function VirtualKeyboard({ onInput, onSpecialKey, onPaste }) {
         useTouchEvents={true}
         preventMouseDownDefault={true}
         stopMouseDownPropagation={true}
-        physicalKeyboardHighlight={false}
-      />
+          physicalKeyboardHighlight={false}
+        />
+      </div>
     </div>
   );
 }
