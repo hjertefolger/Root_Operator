@@ -1749,7 +1749,7 @@ function serveStaticPWA(req, res) {
         // - object-src 'none': Blocks plugins (Flash, Java applets)
         // - base-uri 'self': Prevents base tag injection attacks
         // - form-action 'self': Prevents form hijacking to external URLs
-        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self';",
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self';",
         // HSTS: Force HTTPS for 1 year (defense in depth - Cloudflare also adds this)
         'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
     };
