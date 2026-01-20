@@ -91,27 +91,74 @@ You can set a custom Operator URL (e.g., `myname.rootoperator.dev`) for easier s
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph Client ["iOS/Web Client"]
+        PWA[PWA + xterm.js]
+        Keys[(RSA Keypair)]
+    end
+
+    subgraph Cloud ["Cloudflare"]
+        Tunnel[Tunnel]
+    end
+
+    subgraph Desktop ["Root_Operator"]
+        Electron[Electron App]
+        PTY[PTY Process]
+    end
+
+    PWA <-->|"E2E Encrypted<br/>AES-256-GCM"| Tunnel
+    Tunnel <-->|TLS 1.3| Electron
+    Electron <--> PTY
+    Keys -.->|Signs challenges| PWA
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   iOS Client    │────▶│ Cloudflare Tunnel│────▶│  Root_Operator  │
-│   (PWA/xterm)   │◀────│   (cloudflared)  │◀────│   (Electron)    │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                         │
-                                                         ▼
-                                                 ┌─────────────────┐
-                                                 │   PTY Process   │
-                                                 │   (node-pty)    │
-                                                 └─────────────────┘
+
+### Connection Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: 1. WebSocket Connect (via Cloudflare Tunnel)
+    S->>C: 2. ECDH Public Key + Salt
+    C->>S: 3. ECDH Public Key + Key ID
+
+    Note over C,S: Both derive AES-256-GCM session key via HKDF<br/>+ compute 12-word BIP39 fingerprint
+
+    alt New Device
+        S-->>C: 4a. Request pairing
+        Note over C: Display 6-char code
+        Note over S: User enters code to approve
+    else Known Device
+        S->>C: 4b. Challenge (random bytes)
+        C->>S: 5. RSA-PSS Signature
+    end
+
+    S->>C: 6. AUTH_SUCCESS (encrypted)
+    C<-->S: 7. Terminal I/O (E2E encrypted)
 ```
 
 ### Security Model
 
-- **Transport Security**: Cloudflare Tunnel provides TLS encryption
-- **End-to-End Encryption**: Additional AES-256-GCM encryption layer
-- **Key Exchange**: ECDH P-256 with HKDF key derivation
-- **Authentication**: RSA-PSS 2048-bit signatures with challenge-response
-- **Credential Storage**: Cloudflare tokens stored in macOS Keychain via keytar
-- **ANSI Sanitization**: Dangerous escape sequences are filtered
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| **Transport** | Cloudflare Tunnel (TLS 1.3) | Encrypted tunnel, no open ports |
+| **E2E Encryption** | AES-256-GCM + ECDH P-256 | Terminal I/O encrypted client-to-server |
+| **Key Derivation** | HKDF-SHA256 | Derives session key from ECDH shared secret |
+| **Authentication** | RSA-PSS 2048-bit | Proves device identity via challenge-response |
+| **Fingerprint** | 12-word BIP39 mnemonic | Visual verification of secure channel |
+| **Credential Storage** | macOS Keychain (keytar) | Cloudflare tokens stored securely |
+| **Input Sanitization** | ANSI filter | Blocks dangerous escape sequences (OSC 52, etc.) |
+
+### Security Features
+
+- **Zero Open Ports** - Cloudflare Tunnel eliminates need for port forwarding
+- **Challenge-Response Auth** - Every reconnection requires cryptographic proof of key possession
+- **Rate Limiting** - Max 5 auth attempts per connection, 30s challenge expiry
+- **Origin Validation** - WebSocket connections validated against tunnel URL
+- **Session Isolation** - Terminal content in sessionStorage (cleared on tab close)
+- **IPC Whitelist** - Renderer process has no direct Node.js access
 
 ## Development
 
