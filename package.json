@@ -1,6 +1,6 @@
 {
   "name": "root-operator",
-  "productName": "Root Operator",
+  "productName": "Root_Operator",
   "version": "1.0.0",
   "description": "Remote terminal access via Cloudflare Tunnel",
   "main": "main.js",
@@ -78,8 +78,8 @@
   },
   "build": {
     "appId": "com.hjertefolger.rootoperator",
-    "productName": "Root Operator",
-    "copyright": "Copyright © 2026 Hjertefølger",
+    "productName": "Root_Operator",
+    "copyright": "Copyright © 2026 Tomas Krajcik",
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [

@@ -1,4 +1,4 @@
-# Root Operator
+# Root_Operator
 
 A secure remote terminal access app for macOS that lets you control your Mac's terminal from your iPhone or any web browser. Built with Electron and powered by Cloudflare Tunnel for secure, zero-config remote access.
 
@@ -10,7 +10,7 @@ A secure remote terminal access app for macOS that lets you control your Mac's t
 - **Device Pairing** - Simple 6-character pairing code for new device authorization
 - **PWA Support** - Install on iOS home screen for native app-like experience
 - **Persistent Sessions** - Terminal state persists across reconnections
-- **Custom Subdomains** - Optional custom subdomain via Cloudflare (e.g., `yourname.yourdomain.com`)
+- **Custom Operator URL** - Set your own URL at `yourname.rootoperator.dev` for easy sharing
 
 ## Screenshots
 
@@ -19,14 +19,21 @@ A secure remote terminal access app for macOS that lets you control your Mac's t
 ## Requirements
 
 - macOS 11+ (Big Sur or later)
-- Node.js 18+
-- For custom subdomains: Cloudflare account with API token
+- Node.js 18+ (for building from source)
 
 ## Installation
 
 ### From Release
 
 Download the latest `.dmg` from the [Releases](https://github.com/hjertefolger/Root_Operator/releases) page.
+
+> **Important**
+> The app is unsigned. macOS will block it on first launch. To allow it to run, either:
+> - Go to **System Settings → Privacy & Security** and click "Open Anyway", or
+> - Run this command to sign it locally:
+>   ```bash
+>   xattr -cr /Applications/Root_Operator.app && codesign --force --deep --sign - /Applications/Root_Operator.app
+>   ```
 
 ### From Source
 
@@ -67,33 +74,26 @@ cp .env.example .env
 
 ## Usage
 
-1. **Start the app** - Launch Root Operator from Applications or run `npm run dev:app`
+1. **Start the app** - Launch Root_Operator from Applications or run `npm run dev:app`
 2. **Connect tunnel** - Click "Jump" to start the secure tunnel
 3. **Copy the link** - Click the copy icon to copy the tunnel URL
 4. **Open on device** - Paste the URL in Safari on your iPhone or any browser
-5. **Verify fingerprint** - Confirm the 12-word fingerprint matches on both devices
-6. **Start typing** - You now have secure terminal access!
+5. **Pair device** - A 6-character pairing code appears on the client; enter it in the desktop app to authorize
+6. **Verify fingerprint** - Confirm the 12-word fingerprint matches on both devices
+7. **Start typing** - You now have secure terminal access!
 
-### Pairing New Devices
+### Operator URL
 
-When connecting a new device:
-1. A 6-character pairing code appears on the client
-2. Enter this code in the desktop app when prompted
-3. The device is now authorized for future connections
-
-### Custom Subdomains
-
-To use a custom subdomain (e.g., `myname.yourdomain.com`):
+You can set a custom Operator URL (e.g., `myname.rootoperator.dev`) for easier sharing:
 1. Open Settings in the tray menu
-2. Enter your Cloudflare API token
-3. Choose your subdomain
-4. Your tunnel will now use the custom URL
+2. Enter your desired name in the Operator URL field
+3. Your tunnel will be accessible at `yourname.rootoperator.dev`
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   iOS Client    │────▶│ Cloudflare Tunnel│────▶│  Root Operator  │
+│   iOS Client    │────▶│ Cloudflare Tunnel│────▶│  Root_Operator  │
 │   (PWA/xterm)   │◀────│   (cloudflared)  │◀────│   (Electron)    │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
                                                          │
@@ -157,7 +157,7 @@ npm run rebuild
 ### Tunnel fails to connect
 
 - Check your internet connection
-- If using custom domain, verify your Cloudflare API token is valid
+- If using a custom Operator URL, try disconnecting and reconnecting
 - Check Console.app for detailed logs (enable Debug Logging in Settings)
 
 ### Can't type after reconnection

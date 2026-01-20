@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Shield, ShieldCheck, RotateCw, X, Loader } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import rabbitLogo from '../assets/rabbit.svg';
 
 function Header({ fingerprint, connectionState }) {
   const isReconnecting = connectionState === 'reconnecting';
@@ -16,9 +17,7 @@ function Header({ fingerprint, connectionState }) {
     <>
       {/* Header bar matching tray app style */}
       <header className="flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
-        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-          ROOT_OPERATOR
-        </span>
+        <img src={rabbitLogo} alt="Root Operator" style={{ height: 20 }} />
         <div className="flex items-center gap-1">
           {isReconnecting && (
             <div className="w-8 h-8 flex items-center justify-center">
