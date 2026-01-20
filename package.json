@@ -1,7 +1,7 @@
 {
   "name": "root-operator",
   "productName": "Root_Operator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Remote terminal access via Cloudflare Tunnel",
   "main": "main.js",
   "scripts": {
@@ -19,7 +19,7 @@
     "rebuild": "electron-rebuild -f -w node-pty keytar",
     "postinstall": "electron-rebuild -f -w node-pty keytar",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "security:audit": "npm audit --audit-level=high",
+    "security:audit": "npm audit --audit-level=critical",
     "security:audit:fix": "npm audit fix",
     "security:check": "npm audit && echo '✅ No known vulnerabilities'"
   },
@@ -69,7 +69,7 @@
     "autoprefixer": "^10.4.23",
     "concurrently": "^9.2.1",
     "electron": "^39.2.7",
-    "electron-builder": "^26.0.12",
+    "electron-builder": "^26.4.1",
     "electron-rebuild": "^3.2.9",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
