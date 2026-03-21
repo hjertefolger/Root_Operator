@@ -55,7 +55,11 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
         if (plaintext === null) return;
         let parsed;
         try { parsed = JSON.parse(plaintext); } catch { return; }
-        if (parsed.type === 'channel_message') {
+        if (parsed.type === 'channel_history') {
+          // Full history from server on reconnect
+          setMessages(parsed.messages || []);
+          setWaiting(false);
+        } else if (parsed.type === 'channel_message') {
           setWaiting(false);
           setMessages(prev => [...prev, {
             role: parsed.role || 'assistant',

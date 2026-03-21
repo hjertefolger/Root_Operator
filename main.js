@@ -65,6 +65,8 @@ let isConnecting = false; // Track if tunnel is in the process of starting
 let operatingMode = 'channel'; // 'terminal' | 'channel'
 let channelManager = null;
 let claudeProcess = null; // Claude Code child process
+const MAX_CHANNEL_HISTORY = 200;
+let channelHistory = []; // {role, content, ts} — persists across client reconnects
 
 // Pairing system state
 let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
@@ -879,14 +881,23 @@ function initChannelMode() {
     channelManager.connect();
 
     channelManager.on('claude_reply', (reply) => {
+        const msg = {
+            type: 'channel_message',
+            role: 'assistant',
+            content: reply.text,
+            ts: reply.ts || new Date().toISOString(),
+        };
+
+        // Store in history
+        channelHistory.push({ role: msg.role, content: msg.content, ts: msg.ts });
+        if (channelHistory.length > MAX_CHANNEL_HISTORY) {
+            channelHistory = channelHistory.slice(-MAX_CHANNEL_HISTORY);
+        }
+
+        // Send to all connected clients
         for (const client of activeClients) {
             if (client.readyState === WebSocket.OPEN) {
-                sendEncryptedOutput(client, JSON.stringify({
-                    type: 'channel_message',
-                    role: 'assistant',
-                    content: reply.text,
-                    ts: reply.ts,
-                }));
+                sendEncryptedOutput(client, JSON.stringify(msg));
             }
         }
     });
@@ -903,6 +914,7 @@ function teardownChannelMode() {
         channelManager.disconnect();
         channelManager = null;
     }
+    channelHistory = [];
 }
 
 // --- Channel mode switching ---
@@ -922,7 +934,11 @@ function setOperatingMode(mode) {
     } else {
         // Switch back to terminal mode
         teardownChannelMode();
-        // PTY will be spawned when a client connects
+        // Spawn PTY for already-connected clients
+        if (activeClients.size > 0 && !ptyProcess) {
+            const firstClient = activeClients.values().next().value;
+            startPty(firstClient);
+        }
     }
 
     // Notify connected PWA clients of mode change (plain message, non-sensitive)
@@ -1720,6 +1736,12 @@ function handleConnection(ws, req) {
                     const deviceId = ws.kid || 'unknown';
                     channelManager.sendToChannel(deviceId, inputData, deviceId);
                     logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
+
+                    // Store user message in history
+                    channelHistory.push({ role: 'user', content: inputData, ts: new Date().toISOString() });
+                    if (channelHistory.length > MAX_CHANNEL_HISTORY) {
+                        channelHistory = channelHistory.slice(-MAX_CHANNEL_HISTORY);
+                    }
                 }
             } else if (ptyProcess) {
                 // Terminal mode: write to PTY
@@ -1814,6 +1836,14 @@ function startPty(ws) {
     // In channel mode, don't spawn PTY — just track the client
     if (operatingMode === 'channel') {
         logDebug('[CHANNEL] Client attached in channel mode, skipping PTY');
+        // Send chat history once E2E is ready (buffered by sendEncryptedOutput)
+        if (channelHistory.length > 0) {
+            sendEncryptedOutput(ws, JSON.stringify({
+                type: 'channel_history',
+                messages: channelHistory,
+            }));
+            logDebug(`[CHANNEL] Sent ${channelHistory.length} history messages to client`);
+        }
         return;
     }
 
