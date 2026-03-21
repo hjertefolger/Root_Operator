@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { Shield, ShieldCheck, RotateCw, X, Loader } from 'lucide-react';
+import { Shield, ShieldCheck, RotateCw, X, Loader, MessageSquare, TerminalSquare } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
 
-function Header({ fingerprint, connectionState }) {
+function Header({ fingerprint, connectionState, clientMode, onToggleMode }) {
   const isReconnecting = connectionState === 'reconnecting';
   const [showModal, setShowModal] = useState(false);
   const words = fingerprint ? fingerprint.split('-') : [];
@@ -27,6 +27,30 @@ function Header({ fingerprint, connectionState }) {
                 className="text-[#4B5AFF] animate-spin"
               />
             </div>
+          )}
+          {/* Mode toggle: chat <-> terminal */}
+          {onToggleMode && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={onToggleMode}
+              className="rounded-full"
+              title={clientMode === 'channel' ? 'Switch to Terminal' : 'Switch to Chat'}
+            >
+              {clientMode === 'channel' ? (
+                <TerminalSquare
+                  size={16}
+                  strokeWidth={2}
+                  className="text-[#4B5AFF]"
+                />
+              ) : (
+                <MessageSquare
+                  size={16}
+                  strokeWidth={2}
+                  className="text-[#4B5AFF]"
+                />
+              )}
+            </Button>
           )}
           <Button
             variant="ghost"

@@ -18,6 +18,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const cloudflared = require('cloudflared');
 const keytar = require('keytar');
+const { ChannelManager } = require('./src/channel-manager');
 
 let store;
 const isDev = !app.isPackaged;
@@ -59,6 +60,11 @@ let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
 let currentTunnelUrl = null; // Track tunnel URL for state sync
 let isConnecting = false; // Track if tunnel is in the process of starting
+
+// Channel mode state
+let operatingMode = 'channel'; // 'terminal' | 'channel'
+let channelManager = null;
+let claudeProcess = null; // Claude Code child process
 
 // Pairing system state
 let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
@@ -302,6 +308,13 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
         ws.send(JSON.stringify({
             type: 'e2e_ready',
             fingerprint: ws.e2e.fingerprint
+        }));
+
+        // Send operating mode to client (unencrypted, non-sensitive metadata)
+        // so it knows which UI to show before any content arrives
+        ws.send(JSON.stringify({
+            type: 'operating_mode',
+            mode: operatingMode,
         }));
 
         // Notify renderer to show fingerprint
@@ -666,7 +679,9 @@ function getTunnelState() {
         active,
         connecting: isConnecting,
         url: currentTunnelUrl || '',
-        fingerprint: currentFingerprint
+        fingerprint: currentFingerprint,
+        mode: operatingMode,
+        channelConnected: !!(channelManager && channelManager.connected),
     };
 }
 
@@ -780,9 +795,176 @@ function showAboutWindow() {
 }
 
 // Build tray context menu (shown on right-click)
+// --- Claude Code lifecycle ---
+function spawnClaudeCode() {
+    if (claudeProcess) {
+        logDebug('[CLAUDE] Already running, skipping spawn');
+        return;
+    }
+
+    const projectDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
+
+    logDebug('[CLAUDE] Spawning Claude Code via PTY...');
+    try {
+        // Use node-pty (already in project) so Claude sees a real TTY
+        // and shows its confirmation prompt properly
+        claudeProcess = pty.spawn('claude', [
+            '--dangerously-skip-permissions',
+            '--dangerously-load-development-channels', 'server:root-operator',
+        ], {
+            name: 'xterm-256color',
+            cols: 80,
+            rows: 24,
+            cwd: projectDir,
+            env: {
+                ...process.env,
+                ROOT_OPERATOR_IPC: '/tmp/root-operator-channel.sock',
+            },
+        });
+
+        // Claude shows a menu: "1. I am using this for local development / 2. Exit"
+        // Option 1 is pre-selected, just need to press Enter to confirm.
+        // Send Enter after a delay to let the menu render.
+        let confirmed = false;
+        claudeProcess.on('data', (data) => {
+            const text = data.toString();
+            logDebug(`[CLAUDE] ${text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').substring(0, 200).trim()}`);
+            if (!confirmed && text.includes('Enter to confirm')) {
+                confirmed = true;
+                claudeProcess.write('\r');
+                logDebug('[CLAUDE] Pressed Enter to confirm local development');
+            }
+        });
+
+        // Fallback: press Enter after 3s if prompt wasn't detected
+        setTimeout(() => {
+            if (!confirmed && claudeProcess) {
+                confirmed = true;
+                claudeProcess.write('\r');
+                logDebug('[CLAUDE] Fallback Enter sent');
+            }
+        }, 3000);
+
+        claudeProcess.on('exit', (exitCode) => {
+            logDebug(`[CLAUDE] Exited (code: ${exitCode})`);
+            claudeProcess = null;
+        });
+    } catch (err) {
+        logDebug(`[CLAUDE] Failed to spawn: ${err.message}`);
+        claudeProcess = null;
+    }
+}
+
+function killClaudeCode() {
+    if (claudeProcess) {
+        logDebug('[CLAUDE] Stopping Claude Code...');
+        claudeProcess.kill();
+        claudeProcess = null;
+    }
+}
+
+// --- Channel mode init (shared by startup and mode switch) ---
+function initChannelMode() {
+    // Clean up any existing channel state
+    if (channelManager) {
+        channelManager.disconnect();
+        channelManager = null;
+    }
+
+    // Spawn Claude Code (auto-approves channel confirmation prompt)
+    spawnClaudeCode();
+
+    // Connect to channel bridge IPC
+    channelManager = new ChannelManager();
+    channelManager.connect();
+
+    channelManager.on('claude_reply', (reply) => {
+        for (const client of activeClients) {
+            if (client.readyState === WebSocket.OPEN) {
+                sendEncryptedOutput(client, JSON.stringify({
+                    type: 'channel_message',
+                    role: 'assistant',
+                    content: reply.text,
+                    ts: reply.ts,
+                }));
+            }
+        }
+    });
+
+    channelManager.on('connected', () => {
+        logDebug('[CHANNEL] Bridge connected');
+    });
+}
+
+function teardownChannelMode() {
+    // Only kill Claude if we spawned it
+    if (claudeProcess) killClaudeCode();
+    if (channelManager) {
+        channelManager.disconnect();
+        channelManager = null;
+    }
+}
+
+// --- Channel mode switching ---
+function setOperatingMode(mode) {
+    if (mode === operatingMode) return;
+    operatingMode = mode;
+    logDebug(`[MODE] Switching to ${mode} mode`);
+
+    if (mode === 'channel') {
+        // Stop PTY if running — channel mode doesn't use it
+        if (ptyProcess) {
+            ptyProcess.kill();
+            ptyProcess = null;
+            outputBuffer = '';
+        }
+        initChannelMode();
+    } else {
+        // Switch back to terminal mode
+        teardownChannelMode();
+        // PTY will be spawned when a client connects
+    }
+
+    // Notify connected PWA clients of mode change (plain message, non-sensitive)
+    for (const client of activeClients) {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                type: 'operating_mode',
+                mode: operatingMode,
+            }));
+        }
+    }
+
+    // Update tray menu to reflect new mode
+    if (tray) tray.setContextMenu(buildTrayMenu());
+
+    // Notify renderer of mode change
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('SYNC_STATE', getTunnelState());
+    }
+}
+
 function buildTrayMenu() {
     const menuItems = [
         { label: 'Root_Operator', enabled: false },
+        { type: 'separator' },
+        {
+            label: 'Mode',
+            submenu: [
+                {
+                    label: 'Terminal',
+                    type: 'radio',
+                    checked: operatingMode === 'terminal',
+                    click: () => setOperatingMode('terminal'),
+                },
+                {
+                    label: 'Claude Code Channel',
+                    type: 'radio',
+                    checked: operatingMode === 'channel',
+                    click: () => setOperatingMode('channel'),
+                },
+            ],
+        },
         { type: 'separator' },
         { label: 'About', click: () => showAboutWindow() },
         { label: 'Website', click: () => shell.openExternal('https://rootoperator.dev') },
@@ -825,6 +1007,16 @@ ipcMain.handle('SET_STORE', (event, key, val) => store.set(key, val));
 
 // Authoritative tunnel state - renderer requests this on mount to avoid race conditions
 ipcMain.handle('GET_TUNNEL_STATE', () => getTunnelState());
+
+ipcMain.handle('SET_OPERATING_MODE', (event, mode) => {
+    if (mode !== 'terminal' && mode !== 'channel') {
+        return { success: false, error: 'Invalid mode' };
+    }
+    setOperatingMode(mode);
+    return { success: true, mode: operatingMode };
+});
+
+ipcMain.handle('GET_OPERATING_MODE', () => operatingMode);
 
 ipcMain.handle('STOP', () => {
     stopBridge();
@@ -1094,6 +1286,11 @@ async function startBridge(cfSettings) {
 
     server.listen(INTERNAL_PORT);
 
+    // Initialize channel mode if that's the default
+    if (operatingMode === 'channel') {
+        initChannelMode();
+    }
+
     // B. Start Tunnel - Use Worker API to get dedicated tunnel
     let tunnelToken = null;
     let tunnelHostname = null;
@@ -1244,6 +1441,7 @@ function stopBridge() {
             ptyProcess.kill();
             ptyProcess = null;
         }
+        teardownChannelMode();
     } catch (e) {
         logDebug('[SYSTEM] Error during cleanup: ' + e.message);
     }
@@ -1260,6 +1458,7 @@ function stopBridge() {
     currentTunnelUrl = null;
     currentFingerprint = null;
     isConnecting = false;
+    // Don't reset operatingMode — preserve user's choice across bridge restarts
     logDebug('[SYSTEM] Bridge stopped.');
 }
 
@@ -1456,6 +1655,7 @@ function handleConnection(ws, req) {
             if (verifySignature(m.keyId, m.signature, ws.challenge)) {
                 logDebug(`[WS] Auth SUCCESS: ${m.keyId.substring(0, 8)}`);
                 ws.authenticated = true;
+                ws.kid = m.keyId;
                 clearTimeout(ws.authTimeout);
                 ws.send(JSON.stringify({ type: 'auth_success' }));
                 // Initiate E2E key exchange
@@ -1514,7 +1714,15 @@ function handleConnection(ws, req) {
                 inputData = inputData.substring(0, MAX_INPUT_SIZE);
             }
 
-            if (ptyProcess) {
+            if (operatingMode === 'channel') {
+                // Channel mode: forward to Claude Code via channel bridge
+                if (channelManager) {
+                    const deviceId = ws.kid || 'unknown';
+                    channelManager.sendToChannel(deviceId, inputData, deviceId);
+                    logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
+                }
+            } else if (ptyProcess) {
+                // Terminal mode: write to PTY
                 logDebug(`[PTY] Writing E2E input (len: ${inputData.length})`);
                 ptyProcess.write(inputData);
             }
@@ -1593,6 +1801,12 @@ function verifySignature(kid, signature, challenge) {
 function startPty(ws) {
     logDebug(`[PTY] Attaching client. Total: ${activeClients.size + 1}`);
     activeClients.add(ws);
+
+    // In channel mode, don't spawn PTY — just track the client
+    if (operatingMode === 'channel') {
+        logDebug('[CHANNEL] Client attached in channel mode, skipping PTY');
+        return;
+    }
 
     // If PTY already exists, just send the buffer (will be buffered until E2E ready)
     if (ptyProcess) {
@@ -1836,6 +2050,7 @@ ipcMain.handle('REGISTER_KEY', (event, { kid, jwk }) => {
     const ws = pendingConns.get(kid);
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.authenticated = true;
+        ws.kid = kid;
         ws.send(JSON.stringify({ type: 'auth_success' }));
         // Initiate E2E key exchange
         initE2EKeyExchange(ws);
@@ -1876,6 +2091,7 @@ ipcMain.handle('VERIFY_PAIRING_CODE', (event, code, deviceName) => {
     const ws = pairing.ws;
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.authenticated = true;
+        ws.kid = pairing.kid;
         clearTimeout(ws.authTimeout);
         ws.send(JSON.stringify({ type: 'pairing_success' }));
         initE2EKeyExchange(ws);

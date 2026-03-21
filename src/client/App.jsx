@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Loader2 } from 'lucide-react';
 import Terminal from './components/Terminal';
+import ChannelChat from './components/ChannelChat';
 import PairingScreen from './components/PairingScreen';
 import Header from './components/Header';
 import { useWebSocket } from './hooks/useWebSocket';
@@ -8,6 +9,9 @@ import { useE2E } from './hooks/useE2E';
 import { useAuth } from './hooks/useAuth';
 
 function App() {
+  // Operating mode: 'terminal' or 'channel' (default matches server default)
+  const [clientMode, setClientMode] = useState('channel');
+
   // Initialize WebSocket connection
   const { socket, isReady, connectionState } = useWebSocket();
 
@@ -31,7 +35,12 @@ function App() {
     wasAuthenticatedThisSession
   } = useAuth(socket);
 
-  // Handle WebSocket messages for E2E
+  // Toggle between channel and terminal mode (client-side view switch)
+  const handleToggleMode = useCallback(() => {
+    setClientMode(prev => prev === 'channel' ? 'terminal' : 'channel');
+  }, []);
+
+  // Handle WebSocket messages for E2E and operating mode
   useEffect(() => {
     if (!socket) return;
 
@@ -51,6 +60,11 @@ function App() {
       // E2E ready
       if (msg.type === 'e2e_ready') {
         handleE2EReady(msg.fingerprint);
+      }
+
+      // Operating mode from server (sent after E2E ready, or on mode switch)
+      if (msg.type === 'operating_mode') {
+        setClientMode(msg.mode);
       }
     };
 
@@ -78,11 +92,11 @@ function App() {
     );
   }
 
-  // If already authenticated this session, skip overlays and show terminal view
+  // If already authenticated this session, skip overlays and show main view
   // (header spinner will indicate reconnection state)
-  const showTerminalView = wasAuthenticatedThisSession;
+  const showMainView = wasAuthenticatedThisSession;
 
-  if (!showTerminalView) {
+  if (!showMainView) {
     // Show quick authenticating screen for returning devices
     if (!isAuthenticated && pairingStatus === 'authenticating') {
       return (
@@ -119,18 +133,32 @@ function App() {
     }
   }
 
-  // Show terminal when authenticated and E2E is ready
+  // Main view: Terminal or Channel Chat based on server mode
   return (
     <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
       {/* Top safe area */}
       <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
-      <Header fingerprint={fingerprint} connectionState={connectionState} />
-      <Terminal
-        socket={socket}
-        encryptInput={encryptInput}
-        decryptOutput={decryptOutput}
-        e2eReady={e2eReady}
+      <Header
+        fingerprint={fingerprint}
+        connectionState={connectionState}
+        clientMode={clientMode}
+        onToggleMode={handleToggleMode}
       />
+      {clientMode === 'channel' ? (
+        <ChannelChat
+          socket={socket}
+          encryptInput={encryptInput}
+          decryptOutput={decryptOutput}
+          e2eReady={e2eReady}
+        />
+      ) : (
+        <Terminal
+          socket={socket}
+          encryptInput={encryptInput}
+          decryptOutput={decryptOutput}
+          e2eReady={e2eReady}
+        />
+      )}
     </div>
   );
 }

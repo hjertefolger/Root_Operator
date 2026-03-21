@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "root-operator": {
+      "command": "npx",
+      "args": ["tsx", "./channel-bridge.ts"],
+      "env": {
+        "ROOT_OPERATOR_IPC": "/tmp/root-operator-channel.sock"
+      }
+    }
+  }
+}
