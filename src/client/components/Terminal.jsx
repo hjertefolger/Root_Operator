@@ -1,28 +1,44 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useTerminal } from '../hooks/useTerminal';
-import VirtualKeyboard from './VirtualKeyboard';
+import TerminalToolbar from './TerminalToolbar';
 
 // Detect mobile device
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
 function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
   const containerRef = useRef(null);
+  const inputProxyRef = useRef(null);
   const ctrlRef = useRef(false);
-  const shiftRef = useRef(false);
-  const [showKeyboard, setShowKeyboard] = useState(false);
+  const altRef = useRef(false);
+  const cmdRef = useRef(false);
+  const [ctrlActive, setCtrlActive] = useState(false);
+  const [altActive, setAltActive] = useState(false);
+  const [cmdActive, setCmdActive] = useState(false);
 
   // Track if we've received the initial server buffer after E2E ready
   const hasReceivedInitialBufferRef = useRef(false);
 
-  const { terminal, write, writeServerBuffer, sendSpecial } = useTerminal(
+  const { terminal, write, writeServerBuffer, sendInput, sendSpecial } = useTerminal(
     containerRef,
     socket,
     encryptInput,
     e2eReady,
     ctrlRef,
-    shiftRef,
-    null
+    altRef,
+    cmdRef
   );
+
+  useEffect(() => {
+    ctrlRef.current = ctrlActive;
+  }, [ctrlActive]);
+
+  useEffect(() => {
+    altRef.current = altActive;
+  }, [altActive]);
+
+  useEffect(() => {
+    cmdRef.current = cmdActive;
+  }, [cmdActive]);
 
   // Reset initial buffer flag when E2E becomes not ready (reconnection)
   useEffect(() => {
@@ -53,22 +69,83 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, decryptOutput, write, writeServerBuffer]);
 
-  const handleContainerClick = useCallback(() => {
-    terminal?.focus();
-    // Only toggle virtual keyboard on mobile
-    if (isMobile) {
-      setShowKeyboard(prev => !prev);
+  const clearInputProxy = useCallback(() => {
+    if (inputProxyRef.current) {
+      inputProxyRef.current.value = '';
     }
+  }, []);
+
+  const focusTerminalInput = useCallback(() => {
+    if (isMobile && inputProxyRef.current) {
+      inputProxyRef.current.focus();
+      inputProxyRef.current.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      return;
+    }
+
+    terminal?.focus();
   }, [terminal]);
 
-  const handleInput = useCallback((char) => sendSpecial(char), [sendSpecial]);
+  const handleContainerPointerDown = useCallback((event) => {
+    if (isMobile) {
+      event.preventDefault();
+    }
+
+    focusTerminalInput();
+  }, [focusTerminalInput]);
+
+  const handleContainerClick = useCallback(() => {
+    if (!isMobile) {
+      focusTerminalInput();
+    }
+  }, [focusTerminalInput]);
+
   const handleSpecialKey = useCallback((seq) => sendSpecial(seq), [sendSpecial]);
   const handlePaste = useCallback(async () => {
+    focusTerminalInput();
     try {
       const text = await navigator.clipboard.readText();
       if (text) sendSpecial(text);
     } catch (err) {}
-  }, [sendSpecial]);
+  }, [focusTerminalInput, sendSpecial]);
+
+  const handleProxyChange = useCallback((event) => {
+    const value = event.currentTarget.value;
+    if (!value) return;
+
+    sendInput(value.replace(/\r?\n/g, '\r'));
+    clearInputProxy();
+  }, [sendInput, clearInputProxy]);
+
+  const handleProxyKeyDown = useCallback((event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      sendInput('\r');
+      clearInputProxy();
+      return;
+    }
+
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      handleSpecialKey('\x09');
+      clearInputProxy();
+      return;
+    }
+
+    if (event.key === 'Backspace' && !event.currentTarget.value) {
+      event.preventDefault();
+      handleSpecialKey('\x7f');
+      return;
+    }
+  }, [sendInput, clearInputProxy, handleSpecialKey]);
+
+  const handleProxyPaste = useCallback((event) => {
+    event.preventDefault();
+    const text = event.clipboardData?.getData('text');
+    if (text) {
+      sendSpecial(text);
+    }
+    clearInputProxy();
+  }, [sendSpecial, clearInputProxy]);
 
   return (
     <div className="terminal-layout">
@@ -76,23 +153,27 @@ function Terminal({ socket, encryptInput, decryptOutput, e2eReady }) {
       <div
         ref={containerRef}
         className="terminal-area"
+        onPointerDown={handleContainerPointerDown}
         onClick={handleContainerClick}
       />
 
-      {/* Keyboard - only on mobile */}
+      {/* Special keys toolbar - only on mobile */}
       {isMobile && (
-        <div
-          className={`keyboard-wrapper ${showKeyboard ? 'visible' : ''}`}
-          onClick={e => e.stopPropagation()}
-        >
-          <div className="keyboard-inner">
-            <VirtualKeyboard
-              onInput={handleInput}
-              onSpecialKey={handleSpecialKey}
-              onPaste={handlePaste}
-            />
-          </div>
-        </div>
+        <TerminalToolbar
+          terminal={terminal}
+          inputProxyRef={inputProxyRef}
+          onProxyChange={handleProxyChange}
+          onProxyKeyDown={handleProxyKeyDown}
+          onProxyPaste={handleProxyPaste}
+          onSpecialKey={handleSpecialKey}
+          onPaste={handlePaste}
+          ctrlActive={ctrlActive}
+          altActive={altActive}
+          cmdActive={cmdActive}
+          onToggleCtrl={() => setCtrlActive(prev => !prev)}
+          onToggleAlt={() => setAltActive(prev => !prev)}
+          onToggleCmd={() => setCmdActive(prev => !prev)}
+        />
       )}
     </div>
   );

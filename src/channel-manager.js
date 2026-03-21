@@ -16,6 +16,8 @@ class ChannelManager extends EventEmitter {
         this.connected = false;
         this.reconnectTimer = null;
         this._destroyed = false;
+        this.pendingMessages = [];
+        this.maxPendingMessages = 100;
     }
 
     connect() {
@@ -30,6 +32,7 @@ class ChannelManager extends EventEmitter {
 
         this.socket = net.createConnection(this.ipcPath, () => {
             this.connected = true;
+            this._flushPending();
             this.emit('connected');
             console.log('[ChannelManager] Connected to channel bridge');
         });
@@ -56,11 +59,13 @@ class ChannelManager extends EventEmitter {
             this.connected = false;
             if (wasConnected) {
                 console.log('[ChannelManager] Disconnected from bridge');
+                this.emit('disconnected');
             }
             this._scheduleReconnect();
         });
 
-        this.socket.on('error', () => {
+        this.socket.on('error', (error) => {
+            this.emit('socket_error', error);
             // Swallow — close fires after error and handles retry
         });
     }
@@ -68,6 +73,7 @@ class ChannelManager extends EventEmitter {
     _scheduleReconnect() {
         if (this._destroyed) return;
         this._clearReconnect();
+        this.emit('reconnecting');
         this.reconnectTimer = setTimeout(() => this.connect(), 3000);
     }
 
@@ -85,23 +91,52 @@ class ChannelManager extends EventEmitter {
                 text: msg.text,
                 ts: msg.ts,
             });
+            return;
+        }
+
+        if (msg.type === 'claude_activity') {
+            this.emit('claude_activity', {
+                phase: msg.phase,
+                label: msg.label,
+                detail: msg.detail,
+                toolName: msg.toolName || '',
+                ts: msg.ts,
+            });
+        }
+    }
+
+    _queuePayload(payload) {
+        if (this.pendingMessages.length >= this.maxPendingMessages) {
+            this.pendingMessages.shift();
+        }
+        this.pendingMessages.push(payload);
+    }
+
+    _flushPending() {
+        if (!this.socket || !this.connected || this.pendingMessages.length === 0) {
+            return;
+        }
+
+        while (this.pendingMessages.length > 0) {
+            this.socket.write(this.pendingMessages.shift());
         }
     }
 
     sendToChannel(chatId, content, userId) {
-        if (!this.socket || !this.connected) {
-            return false;
-        }
-
         const payload = JSON.stringify({
             type: 'client_message',
             chat_id: chatId,
             content,
             user_id: userId || chatId,
             ts: new Date().toISOString(),
-        });
+        }) + '\n';
 
-        this.socket.write(payload + '\n');
+        if (!this.socket || !this.connected) {
+            this._queuePayload(payload);
+            return false;
+        }
+
+        this.socket.write(payload);
         return true;
     }
 

@@ -3,11 +3,83 @@ import { Shield, ShieldCheck, RotateCw, X, Loader, MessageCircle, Terminal } fro
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
 
-function Header({ fingerprint, connectionState, clientMode, onToggleMode }) {
+const STATUS_COLORS = {
+  green: '#34d399',
+  orange: '#f59e0b',
+  red: '#d44d69',
+};
+
+function getClientStatus(systemState, connectionState, e2eReady, clientMode) {
+  const overall = systemState?.health?.overall;
+  const modeLabel = clientMode === 'channel' ? 'Chat' : 'Terminal';
+
+  if (connectionState === 'server_stopped') {
+    return {
+      level: 'red',
+      label: `${modeLabel} stopped`,
+      detail: 'The desktop app stopped the bridge, so this client cannot send input.',
+    };
+  }
+
+  if (connectionState === 'disconnected') {
+    return {
+      level: 'orange',
+      label: 'Connecting',
+      detail: 'This device is opening a connection to the desktop app.',
+    };
+  }
+
+  if (connectionState === 'connecting' || connectionState === 'reconnecting') {
+    return {
+      level: overall?.level === 'red' ? 'red' : 'orange',
+      label: 'Reconnecting',
+      detail: 'The client connection is being re-established.',
+    };
+  }
+
+  if (!e2eReady) {
+    return {
+      level: overall?.level === 'red' ? 'red' : 'orange',
+      label: 'Securing session',
+      detail: 'The encrypted session is still being established.',
+    };
+  }
+
+  return overall || {
+    level: 'orange',
+    label: 'Loading status',
+    detail: 'Waiting for the desktop app to report its readiness.',
+  };
+}
+
+function buildStatusTooltip(status, systemState, clientMode) {
+  const lines = [
+    `${clientMode === 'channel' ? 'Chat' : 'Terminal'}: ${status.label}`,
+    status.detail,
+  ];
+
+  if (systemState?.health?.tunnel?.label) {
+    lines.push(`Tunnel: ${systemState.health.tunnel.label}`);
+  }
+
+  if (systemState?.health?.channel?.label) {
+    lines.push(`Claude: ${systemState.health.channel.label}`);
+  }
+
+  if (systemState?.health?.channel?.activity?.label) {
+    lines.push(`Activity: ${systemState.health.channel.activity.label}`);
+  }
+
+  return lines.filter(Boolean).join('\n');
+}
+
+function Header({ fingerprint, connectionState, clientMode, onToggleMode, systemState, e2eReady }) {
   const isReconnecting = connectionState === 'reconnecting';
   const [showModal, setShowModal] = useState(false);
   const words = fingerprint ? fingerprint.split('-') : [];
   const isSecure = !!fingerprint;
+  const status = getClientStatus(systemState, connectionState, e2eReady, clientMode);
+  const statusTooltip = buildStatusTooltip(status, systemState, clientMode);
 
   const handleReload = () => {
     window.location.reload();
@@ -17,7 +89,25 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode }) {
     <>
       {/* Header bar matching tray app style */}
       <header className="flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
-        <img src={rabbitLogo} alt="Root Operator" style={{ height: 20 }} />
+        <div
+          className="inline-flex items-center"
+          title={statusTooltip}
+          aria-label={statusTooltip}
+          style={{ gap: 8 }}
+        >
+          <img src={rabbitLogo} alt="Root Operator" style={{ height: 20 }} />
+          <span
+            aria-hidden="true"
+            style={{
+              width: 6,
+              height: 6,
+              flexShrink: 0,
+              borderRadius: '9999px',
+              backgroundColor: STATUS_COLORS[status.level] || STATUS_COLORS.orange,
+              boxShadow: `0 0 0 1px #000, 0 0 8px ${STATUS_COLORS[status.level] || STATUS_COLORS.orange}40`,
+            }}
+          />
+        </div>
         <div className="flex items-center gap-1">
           {isReconnecting && (
             <div className="w-8 h-8 flex items-center justify-center">

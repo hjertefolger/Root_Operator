@@ -54,7 +54,6 @@
     "qrcode": "^1.5.4",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "react-simple-keyboard": "^3.8.141",
     "tailwind-merge": "^3.4.0",
     "ws": "^8.18.3",
     "xterm": "^5.3.0",
@@ -114,6 +113,9 @@
     "files": [
       "main.js",
       "preload.js",
+      "channel-bridge.cjs",
+      "src/channel-manager.js",
+      "src/chat-store.js",
       ".env",
       "tray_*.png",
       "ui/**/*",
@@ -129,6 +131,7 @@
     ],
     "asar": true,
     "asarUnpack": [
+      "channel-bridge.cjs",
       "node_modules/node-pty/**/*",
       "node_modules/keytar/**/*",
       "node_modules/cloudflared/**/*"

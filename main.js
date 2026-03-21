@@ -67,6 +67,32 @@ let operatingMode = 'channel'; // 'terminal' | 'channel'
 let channelManager = null;
 let claudeProcess = null; // Claude Code child process
 let chatStore = null; // initialized after app.whenReady()
+const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
+const CHANNEL_STARTUP_TIMEOUT_MS = 15000;
+const CHANNEL_RESTART_DELAY_MS = 2500;
+let channelStartupTimer = null;
+let channelRestartTimer = null;
+let channelConfirmTimers = [];
+let channelStartupAttempt = 0;
+let isAppQuitting = false;
+let channelReplyPending = false;
+let latestChannelActivity = null;
+let lastChannelActivityKey = '';
+let lastChannelActivityAt = 0;
+let claudeDebugFilePath = '';
+let claudeDebugPollTimer = null;
+let claudeDebugReadOffset = 0;
+let claudeDebugLineBuffer = '';
+let channelRuntime = {
+    phase: 'stopped',
+    level: 'red',
+    label: 'Chat offline',
+    detail: 'Claude Code is not running.',
+    attempt: 0,
+    claudeRunning: false,
+    bridgeConnected: false,
+    lastError: '',
+};
 
 // Pairing system state
 let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
@@ -638,6 +664,7 @@ function createTray() {
             tray.popUpContextMenu(contextMenu);
         });
 
+        syncStateWithRenderer();
         console.log('Tray created successfully');
     } catch (err) {
         console.error('Failed to create tray:', err);
@@ -669,15 +696,357 @@ function showWindow() {
     syncStateWithRenderer();
 }
 
+function clearChannelConfirmTimers() {
+    for (const timer of channelConfirmTimers) {
+        clearTimeout(timer);
+    }
+    channelConfirmTimers = [];
+}
+
+function clearChannelStartupTimer() {
+    if (channelStartupTimer) {
+        clearTimeout(channelStartupTimer);
+        channelStartupTimer = null;
+    }
+}
+
+function clearChannelRestartTimer() {
+    if (channelRestartTimer) {
+        clearTimeout(channelRestartTimer);
+        channelRestartTimer = null;
+    }
+}
+
+function removeChannelSocket() {
+    try {
+        if (fs.existsSync(CHANNEL_IPC_PATH)) {
+            fs.unlinkSync(CHANNEL_IPC_PATH);
+        }
+    } catch (error) {
+        logDebug(`[CHANNEL] Failed to remove socket: ${error.message}`);
+    }
+}
+
+function sendEncryptedChannelPayload(payload) {
+    const body = JSON.stringify(payload);
+    for (const client of activeClients) {
+        if (client.readyState === WebSocket.OPEN) {
+            sendEncryptedOutput(client, body);
+        }
+    }
+}
+
+function formatClaudeToolLabel(toolName) {
+    if (!toolName) {
+        return 'Tool';
+    }
+
+    const alias = {
+        Bash: 'Shell',
+        MultiEdit: 'Multi Edit',
+        TodoRead: 'Todo',
+        TodoWrite: 'Todo',
+        WebFetch: 'Web Fetch',
+        WebSearch: 'Web Search',
+        reply: 'Reply',
+    };
+
+    const shortName = toolName.split('__').pop() || toolName;
+    if (alias[shortName]) {
+        return alias[shortName];
+    }
+
+    return shortName
+        .replace(/[-_]+/g, ' ')
+        .trim()
+        .split(/\s+/)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
+function resetChannelActivity() {
+    channelReplyPending = false;
+    latestChannelActivity = null;
+    lastChannelActivityKey = '';
+    lastChannelActivityAt = 0;
+    syncStateWithRenderer();
+}
+
+function setChannelActivity(activity, options = {}) {
+    const {
+        force = false,
+        broadcast = true,
+    } = options;
+
+    const normalized = {
+        phase: activity.phase || 'idle',
+        label: activity.label || 'Idle',
+        detail: activity.detail || '',
+        toolName: activity.toolName || '',
+        ts: activity.ts || new Date().toISOString(),
+        active: activity.phase !== 'idle',
+    };
+
+    const activityKey = `${normalized.phase}:${normalized.label}:${normalized.toolName}`;
+    const now = Date.now();
+    if (!force && activityKey === lastChannelActivityKey && now - lastChannelActivityAt < 900) {
+        return;
+    }
+
+    lastChannelActivityKey = activityKey;
+    lastChannelActivityAt = now;
+    latestChannelActivity = normalized.phase === 'idle' ? null : normalized;
+
+    if (broadcast) {
+        sendEncryptedChannelPayload({
+            type: 'channel_activity',
+            activity: normalized,
+        });
+    }
+
+    syncStateWithRenderer();
+}
+
+function stopClaudeDebugWatcher() {
+    if (claudeDebugPollTimer) {
+        clearInterval(claudeDebugPollTimer);
+        claudeDebugPollTimer = null;
+    }
+    claudeDebugReadOffset = 0;
+    claudeDebugLineBuffer = '';
+    claudeDebugFilePath = '';
+}
+
+function handleClaudeDebugLine(line) {
+    if (!channelReplyPending) {
+        return;
+    }
+
+    if (line.includes('Stream started - received first chunk')) {
+        setChannelActivity({
+            phase: 'thinking',
+            label: 'Claude is working',
+            detail: 'Claude started generating a response.',
+        });
+        return;
+    }
+
+    const toolMatch = line.match(/executePreToolHooks called for tool:\s+(.+)$/);
+    if (!toolMatch) {
+        return;
+    }
+
+    const rawToolName = toolMatch[1].trim();
+    if (!rawToolName) {
+        return;
+    }
+
+    if (rawToolName === 'mcp__root-operator__reply') {
+        setChannelActivity({
+            phase: 'replying',
+            label: 'Preparing reply',
+            detail: 'Claude is packaging the final response for chat.',
+            toolName: rawToolName,
+        });
+        return;
+    }
+
+    const toolLabel = formatClaudeToolLabel(rawToolName);
+    setChannelActivity({
+        phase: 'tool',
+        label: `Running ${toolLabel}`,
+        detail: `Claude started using ${toolLabel}.`,
+        toolName: rawToolName,
+    });
+}
+
+function pollClaudeDebugWatcher() {
+    if (!claudeDebugFilePath) {
+        return;
+    }
+
+    try {
+        const stats = fs.statSync(claudeDebugFilePath);
+        if (stats.size < claudeDebugReadOffset) {
+            claudeDebugReadOffset = 0;
+            claudeDebugLineBuffer = '';
+        }
+
+        if (stats.size === claudeDebugReadOffset) {
+            return;
+        }
+
+        const length = stats.size - claudeDebugReadOffset;
+        const fd = fs.openSync(claudeDebugFilePath, 'r');
+        try {
+            const buffer = Buffer.alloc(length);
+            const bytesRead = fs.readSync(fd, buffer, 0, length, claudeDebugReadOffset);
+            claudeDebugReadOffset += bytesRead;
+
+            const chunk = claudeDebugLineBuffer + buffer.toString('utf8', 0, bytesRead);
+            const lines = chunk.split(/\r?\n/);
+            claudeDebugLineBuffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (line) {
+                    handleClaudeDebugLine(line);
+                }
+            }
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            logDebug(`[CLAUDE] Failed reading debug log: ${error.message}`);
+        }
+    }
+}
+
+function startClaudeDebugWatcher(filePath) {
+    stopClaudeDebugWatcher();
+    claudeDebugFilePath = filePath;
+    claudeDebugReadOffset = 0;
+    claudeDebugLineBuffer = '';
+    claudeDebugPollTimer = setInterval(pollClaudeDebugWatcher, 700);
+    pollClaudeDebugWatcher();
+}
+
+function setChannelRuntime(phase, detail, extra = {}) {
+    const phaseConfig = {
+        stopped: { level: 'red', label: 'Chat offline' },
+        starting: { level: 'orange', label: 'Starting Claude' },
+        waiting_confirm: { level: 'orange', label: 'Waiting for confirmation' },
+        waiting_bridge: { level: 'orange', label: 'Waiting for chat bridge' },
+        retrying: { level: 'orange', label: 'Retrying chat startup' },
+        ready: { level: 'green', label: 'Chat ready' },
+        error: { level: 'red', label: 'Chat unavailable' },
+    };
+
+    channelRuntime = {
+        ...channelRuntime,
+        ...phaseConfig[phase],
+        ...extra,
+        phase,
+        detail,
+        claudeRunning: !!claudeProcess,
+        bridgeConnected: !!(channelManager && channelManager.connected),
+    };
+
+    syncStateWithRenderer();
+}
+
+function getChannelStatus() {
+    return {
+        ...channelRuntime,
+        claudeRunning: !!claudeProcess,
+        bridgeConnected: !!(channelManager && channelManager.connected),
+        socketExists: fs.existsSync(CHANNEL_IPC_PATH),
+        activity: latestChannelActivity,
+    };
+}
+
+function getTunnelHealth() {
+    if (currentTunnelUrl) {
+        return {
+            level: 'green',
+            label: 'Tunnel live',
+            detail: `Remote clients can reach ${currentTunnelUrl}.`,
+        };
+    }
+
+    if (isConnecting || tunnelProcess || server) {
+        return {
+            level: 'orange',
+            label: 'Starting tunnel',
+            detail: 'Root Operator is still bringing the remote tunnel online.',
+        };
+    }
+
+    return {
+        level: 'red',
+        label: 'Tunnel offline',
+        detail: 'Remote clients cannot reach this machine until the tunnel starts.',
+    };
+}
+
+function getOverallHealth(tunnelHealth, channelHealth) {
+    if (operatingMode === 'channel') {
+        if (tunnelHealth.level !== 'green') {
+            return {
+                level: tunnelHealth.level,
+                label: tunnelHealth.label,
+                detail: tunnelHealth.detail,
+            };
+        }
+
+        return {
+            level: channelHealth.level,
+            label: channelHealth.label,
+            detail: channelHealth.detail,
+        };
+    }
+
+    if (tunnelHealth.level === 'green') {
+        return {
+            level: 'green',
+            label: 'Terminal ready',
+            detail: 'The tunnel is live and terminal clients can attach normally.',
+        };
+    }
+
+    if (tunnelHealth.level === 'orange') {
+        return {
+            level: 'orange',
+            label: 'Starting terminal tunnel',
+            detail: tunnelHealth.detail,
+        };
+    }
+
+    return {
+        level: 'red',
+        label: 'Terminal offline',
+        detail: tunnelHealth.detail,
+    };
+}
+
+function formatTrayTooltip(state) {
+    const modeLabel = state.mode === 'channel' ? 'Chat' : 'Terminal';
+    return [
+        'Root Operator',
+        `Mode: ${modeLabel}`,
+        `Status: ${state.health.overall.label}`,
+        `Tunnel: ${state.health.tunnel.label}`,
+        `Chat: ${state.health.channel.label}`,
+        state.health.channel.activity?.label ? `Activity: ${state.health.channel.activity.label}` : null,
+    ].filter(Boolean).join('\n');
+}
+
 function syncStateWithRenderer() {
+    const state = getTunnelState();
+
+    if (tray) {
+        tray.setToolTip(formatTrayTooltip(state));
+    }
+
     if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('SYNC_STATE', getTunnelState());
+        mainWindow.webContents.send('SYNC_STATE', state);
+    }
+
+    for (const client of activeClients) {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                type: 'system_status',
+                state,
+            }));
+        }
     }
 }
 
 function getTunnelState() {
     // Active requires both server running AND tunnel established (has URL or process)
     const active = !!(server && (currentTunnelUrl || tunnelProcess));
+    const tunnelHealth = getTunnelHealth();
+    const channelHealth = getChannelStatus();
     return {
         active,
         connecting: isConnecting,
@@ -685,6 +1054,11 @@ function getTunnelState() {
         fingerprint: currentFingerprint,
         mode: operatingMode,
         channelConnected: !!(channelManager && channelManager.connected),
+        health: {
+            overall: getOverallHealth(tunnelHealth, channelHealth),
+            tunnel: tunnelHealth,
+            channel: channelHealth,
+        },
     };
 }
 
@@ -799,87 +1173,226 @@ function showAboutWindow() {
 
 // Build tray context menu (shown on right-click)
 // --- Claude Code lifecycle ---
+function normalizeClaudeBootstrapText(text) {
+    return text
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+}
+
+function scheduleClaudeRestart(reason) {
+    if (operatingMode !== 'channel' || isAppQuitting) {
+        return;
+    }
+
+    clearChannelRestartTimer();
+    setChannelRuntime('retrying', reason, { lastError: reason });
+    if (channelReplyPending) {
+        setChannelActivity({
+            phase: 'retrying',
+            label: 'Restarting Claude',
+            detail: reason,
+        }, { force: true });
+    }
+
+    channelRestartTimer = setTimeout(() => {
+        channelRestartTimer = null;
+        if (operatingMode !== 'channel' || isAppQuitting || claudeProcess) {
+            return;
+        }
+
+        spawnClaudeCode();
+        if (channelManager && !channelManager.connected) {
+            channelManager.connect();
+        }
+    }, CHANNEL_RESTART_DELAY_MS);
+}
+
 function spawnClaudeCode() {
     if (claudeProcess) {
         logDebug('[CLAUDE] Already running, skipping spawn');
         return;
     }
 
-    const projectDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
+    const runtimeRootDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
+    const bridgePath = path.join(runtimeRootDir, 'channel-bridge.cjs');
+    const mcpConfigPath = path.join(app.getPath('userData'), 'root-operator-mcp.json');
+    const debugFilePath = path.join(app.getPath('userData'), 'claude-channel-debug.log');
+    channelStartupAttempt += 1;
+    clearChannelRestartTimer();
+    clearChannelStartupTimer();
+    clearChannelConfirmTimers();
+    removeChannelSocket();
+    resetChannelActivity();
+    setChannelRuntime('starting', 'Launching Claude Code for the chat channel.', {
+        attempt: channelStartupAttempt,
+        lastError: '',
+    });
+
+    fs.writeFileSync(mcpConfigPath, JSON.stringify({
+        mcpServers: {
+            'root-operator': {
+                command: 'node',
+                args: [bridgePath],
+                env: {
+                    ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
+                },
+            },
+        },
+    }, null, 2));
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
+        fs.writeFileSync(debugFilePath, '');
+        startClaudeDebugWatcher(debugFilePath);
+
         // Use node-pty (already in project) so Claude sees a real TTY
         // and shows its confirmation prompt properly
         claudeProcess = pty.spawn('claude', [
             '--dangerously-skip-permissions',
+            '--debug-file', debugFilePath,
+            '--mcp-config', mcpConfigPath,
             '--dangerously-load-development-channels', 'server:root-operator',
         ], {
             name: 'xterm-256color',
             cols: 80,
             rows: 24,
-            cwd: projectDir,
+            cwd: runtimeRootDir,
             env: {
                 ...process.env,
-                ROOT_OPERATOR_IPC: '/tmp/root-operator-channel.sock',
+                ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
             },
         });
 
-        // Claude shows a menu: "1. I am using this for local development / 2. Exit"
-        // Option 1 is pre-selected, just need to press Enter to confirm.
-        // Send Enter after a delay to let the menu render.
-        let confirmed = false;
+        setChannelRuntime('waiting_confirm', 'Waiting for Claude to confirm local development access.', {
+            attempt: channelStartupAttempt,
+        });
+
+        const sendConfirm = (chars, reason) => {
+            if (!claudeProcess || (channelManager && channelManager.connected)) {
+                return false;
+            }
+
+            try {
+                claudeProcess.write(chars);
+                logDebug(`[CLAUDE] ${reason}`);
+                setChannelRuntime('waiting_bridge', 'Claude is running. Waiting for the chat bridge to come online.', {
+                    attempt: channelStartupAttempt,
+                });
+                return true;
+            } catch (error) {
+                logDebug(`[CLAUDE] Failed to send confirmation: ${error.message}`);
+                return false;
+            }
+        };
+
         claudeProcess.on('data', (data) => {
             const text = data.toString();
             logDebug(`[CLAUDE] ${text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').substring(0, 200).trim()}`);
-            if (!confirmed && text.includes('Enter to confirm')) {
-                confirmed = true;
-                claudeProcess.write('\r');
-                logDebug('[CLAUDE] Pressed Enter to confirm local development');
+
+            const normalized = normalizeClaudeBootstrapText(text);
+            const waitingForConfirmation =
+                normalized.includes('entertoconfirm') ||
+                normalized.includes('iamusingthisforlocaldevelopment') ||
+                normalized.includes('1iamusingthisforlocaldevelopment');
+
+            if (waitingForConfirmation) {
+                sendConfirm('\r', 'Pressed Enter to confirm local development');
             }
         });
 
-        // Fallback: press Enter after 3s if prompt wasn't detected
-        setTimeout(() => {
-            if (!confirmed && claudeProcess) {
-                confirmed = true;
-                claudeProcess.write('\r');
-                logDebug('[CLAUDE] Fallback Enter sent');
+        // Keep nudging the confirmation flow until the bridge is actually connected.
+        channelConfirmTimers = [
+            setTimeout(() => sendConfirm('\r', 'Fallback Enter sent after 2s'), 2000),
+            setTimeout(() => sendConfirm('\r', 'Second fallback Enter sent after 5s'), 5000),
+            setTimeout(() => sendConfirm('1\r', 'Final fallback selection sent after 8s'), 8000),
+        ];
+
+        channelStartupTimer = setTimeout(() => {
+            if (channelManager && channelManager.connected) {
+                return;
             }
-        }, 3000);
+
+            const timeoutMessage = 'Claude never brought the chat bridge online.';
+            setChannelRuntime('error', timeoutMessage, {
+                attempt: channelStartupAttempt,
+                lastError: timeoutMessage,
+            });
+
+            if (claudeProcess) {
+                logDebug('[CLAUDE] Startup timed out; terminating stuck process');
+                claudeProcess.kill();
+            } else {
+                scheduleClaudeRestart('Chat bridge startup timed out. Retrying.');
+            }
+        }, CHANNEL_STARTUP_TIMEOUT_MS);
 
         claudeProcess.on('exit', (exitCode) => {
             logDebug(`[CLAUDE] Exited (code: ${exitCode})`);
+            clearChannelStartupTimer();
+            clearChannelConfirmTimers();
+            stopClaudeDebugWatcher();
             claudeProcess = null;
+            removeChannelSocket();
+
+            if (operatingMode === 'channel' && !isAppQuitting) {
+                const exitMessage = exitCode === 0
+                    ? 'Claude exited before the chat bridge was ready.'
+                    : `Claude exited with code ${exitCode}.`;
+                setChannelRuntime('error', exitMessage, {
+                    attempt: channelStartupAttempt,
+                    lastError: exitMessage,
+                });
+                if (channelReplyPending) {
+                    setChannelActivity({
+                        phase: 'error',
+                        label: 'Claude stopped',
+                        detail: exitMessage,
+                    }, { force: true });
+                } else {
+                    resetChannelActivity();
+                }
+                scheduleClaudeRestart('Claude exited unexpectedly. Retrying.');
+                return;
+            }
+
+            resetChannelActivity();
+            setChannelRuntime('stopped', 'Claude chat is not running.');
         });
     } catch (err) {
         logDebug(`[CLAUDE] Failed to spawn: ${err.message}`);
+        stopClaudeDebugWatcher();
         claudeProcess = null;
+        setChannelRuntime('error', `Failed to launch Claude: ${err.message}`, {
+            attempt: channelStartupAttempt,
+            lastError: err.message,
+        });
+        scheduleClaudeRestart('Failed to launch Claude. Retrying.');
     }
 }
 
 function killClaudeCode() {
     if (claudeProcess) {
         logDebug('[CLAUDE] Stopping Claude Code...');
+        clearChannelStartupTimer();
+        clearChannelConfirmTimers();
+        stopClaudeDebugWatcher();
         claudeProcess.kill();
-        claudeProcess = null;
     }
 }
 
 // --- Channel mode init (shared by startup and mode switch) ---
 function initChannelMode() {
+    clearChannelRestartTimer();
+
     // Clean up any existing channel state
     if (channelManager) {
         channelManager.disconnect();
         channelManager = null;
     }
 
-    // Spawn Claude Code (auto-approves channel confirmation prompt)
-    spawnClaudeCode();
-
     // Connect to channel bridge IPC
     channelManager = new ChannelManager();
-    channelManager.connect();
 
     channelManager.on('claude_reply', (reply) => {
         const msg = {
@@ -898,20 +1411,102 @@ function initChannelMode() {
                 sendEncryptedOutput(client, JSON.stringify(msg));
             }
         }
+
+        channelReplyPending = false;
+        setChannelActivity({
+            phase: 'idle',
+            label: 'Idle',
+            detail: 'Claude is ready for the next message.',
+        }, { force: true });
     });
 
     channelManager.on('connected', () => {
         logDebug('[CHANNEL] Bridge connected');
+        clearChannelStartupTimer();
+        clearChannelConfirmTimers();
+        setChannelRuntime('ready', 'Claude is connected and ready to send replies.', {
+            attempt: channelStartupAttempt,
+            lastError: '',
+        });
     });
+
+    channelManager.on('disconnected', () => {
+        if (operatingMode !== 'channel' || isAppQuitting) {
+            return;
+        }
+
+        const detail = claudeProcess
+            ? 'The chat bridge dropped. Waiting for Claude to bring it back.'
+            : 'The chat bridge dropped because Claude is no longer running.';
+
+        setChannelRuntime('waiting_bridge', detail, {
+            attempt: channelStartupAttempt,
+        });
+
+        if (channelReplyPending) {
+            setChannelActivity({
+                phase: 'waiting_bridge',
+                label: 'Waiting for bridge',
+                detail,
+            }, { force: true });
+        }
+    });
+
+    channelManager.on('reconnecting', () => {
+        if (operatingMode !== 'channel' || isAppQuitting) {
+            return;
+        }
+
+        setChannelRuntime('retrying', 'Trying to reconnect the chat bridge.', {
+            attempt: channelStartupAttempt,
+        });
+
+        if (channelReplyPending) {
+            setChannelActivity({
+                phase: 'retrying',
+                label: 'Reconnecting bridge',
+                detail: 'Trying to reconnect the Claude chat bridge.',
+            }, { force: true });
+        }
+    });
+
+    channelManager.on('socket_error', (error) => {
+        if (operatingMode !== 'channel' || isAppQuitting) {
+            return;
+        }
+
+        logDebug(`[CHANNEL] Socket error: ${error.message}`);
+    });
+
+    channelManager.on('claude_activity', (activity) => {
+        if (operatingMode !== 'channel' || !activity) {
+            return;
+        }
+
+        setChannelActivity(activity);
+    });
+
+    channelManager.connect();
+
+    // Spawn Claude Code (auto-approves channel confirmation prompt)
+    spawnClaudeCode();
 }
 
 function teardownChannelMode() {
+    clearChannelRestartTimer();
+    clearChannelStartupTimer();
+    clearChannelConfirmTimers();
     // Only kill Claude if we spawned it
     if (claudeProcess) killClaudeCode();
     if (channelManager) {
         channelManager.disconnect();
         channelManager = null;
     }
+    removeChannelSocket();
+    stopClaudeDebugWatcher();
+    channelStartupAttempt = 0;
+    resetChannelActivity();
+    setChannelRuntime('stopped', 'Chat mode is not active.');
     // History intentionally NOT cleared — persists across tunnel restarts
 }
 
@@ -1038,6 +1633,7 @@ ipcMain.handle('STOP', () => {
 });
 
 ipcMain.on('QUIT', () => {
+    isAppQuitting = true;
     stopBridge();
     app.quit();
 });
@@ -1732,8 +2328,18 @@ function handleConnection(ws, req) {
                 // Channel mode: forward to Claude Code via channel bridge
                 if (channelManager) {
                     const deviceId = ws.kid || 'unknown';
-                    channelManager.sendToChannel(deviceId, inputData, deviceId);
+                    const sentToBridge = channelManager.sendToChannel(deviceId, inputData, deviceId);
                     logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
+                    channelReplyPending = true;
+                    setChannelActivity(sentToBridge ? {
+                        phase: 'bridging',
+                        label: 'Forwarding to Claude',
+                        detail: 'The chat bridge accepted your message.',
+                    } : {
+                        phase: 'queued',
+                        label: 'Queued for Claude',
+                        detail: 'Waiting for the Claude chat bridge to reconnect.',
+                    }, { force: true });
 
                     // Store user message in history (file-backed)
                     chatStore.addMessage({ role: 'user', content: inputData, ts: new Date().toISOString() });
@@ -1827,6 +2433,10 @@ function verifySignature(kid, signature, challenge) {
 function startPty(ws) {
     logDebug(`[PTY] Attaching client. Total: ${activeClients.size + 1}`);
     activeClients.add(ws);
+    ws.send(JSON.stringify({
+        type: 'system_status',
+        state: getTunnelState(),
+    }));
 
     // In channel mode, don't spawn PTY — just track the client
     if (operatingMode === 'channel') {
@@ -1839,6 +2449,12 @@ function startPty(ws) {
                 messages: history,
             }));
             logDebug(`[CHANNEL] Sent ${history.length} history messages from disk`);
+        }
+        if (latestChannelActivity) {
+            sendEncryptedOutput(ws, JSON.stringify({
+                type: 'channel_activity',
+                activity: latestChannelActivity,
+            }));
         }
         return;
     }
@@ -2178,4 +2794,9 @@ function checkManualUrl(data) {
 
 app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+    isAppQuitting = true;
+    stopBridge();
 });

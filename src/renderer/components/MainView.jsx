@@ -15,6 +15,11 @@ const PAIRING_CODE_REGEXP = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]*$/;
 // Device name validation
 const MAX_NAME_LENGTH = 10;
 const NAME_PATTERN = /^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$/;
+const STATUS_COLORS = {
+  green: '#34d399',
+  orange: '#f59e0b',
+  red: '#d44d69',
+};
 
 function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const { invoke } = useElectron();
@@ -31,7 +36,21 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const [connectingWord, setConnectingWord] = useState(CONNECTING_WORDS[0]);
   const wasConnectingRef = useRef(false);
 
-  const { active, connecting, url, fingerprint } = tunnelState;
+  const { active, connecting, url, fingerprint, mode, health } = tunnelState;
+  const overallHealth = health?.overall || {
+    level: connecting ? 'orange' : 'red',
+    label: connecting ? 'Starting tunnel' : 'Tunnel offline',
+    detail: connecting
+      ? 'Root Operator is still bringing the tunnel online.'
+      : 'Remote clients cannot reach this machine until the tunnel starts.',
+  };
+  const statusTooltip = [
+    `${mode === 'channel' ? 'Chat' : 'Terminal'}: ${overallHealth.label}`,
+    overallHealth.detail,
+    health?.tunnel?.label ? `Tunnel: ${health.tunnel.label}` : null,
+    health?.channel?.label ? `Claude: ${health.channel.label}` : null,
+    health?.channel?.activity?.label ? `Activity: ${health.channel.activity.label}` : null,
+  ].filter(Boolean).join('\n');
 
   // Pick a random connecting word when connecting starts
   useEffect(() => {
@@ -281,9 +300,19 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
     <div className="flex flex-col gap-1 pl-5 pr-4 py-2">
       {/* Row 1: App Name + Settings */}
       <div className="flex justify-between items-center">
-        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-          ROOT_OPERATOR
-        </span>
+        <div className="flex items-center gap-2" title={statusTooltip} aria-label={statusTooltip}>
+          <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+            ROOT_OPERATOR
+          </span>
+          <span
+            aria-hidden="true"
+            className="inline-flex h-1.5 w-1.5 rounded-full"
+            style={{
+              backgroundColor: STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange,
+              boxShadow: `0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 8px ${(STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange)}40`,
+            }}
+          />
+        </div>
         <Button
           variant="ghost"
           size="icon-sm"

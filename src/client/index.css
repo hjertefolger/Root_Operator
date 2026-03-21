@@ -229,6 +229,8 @@ body {
 .xterm .xterm-viewport {
   -webkit-overflow-scrolling: touch;
   overflow-y: scroll !important;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 /* Helper textarea - keep functional but invisible */
@@ -236,22 +238,11 @@ body {
   opacity: 0 !important;
 }
 
-/* Custom scrollbar for terminal */
+/* Hide terminal scrollbar while preserving scrolling */
 .xterm .xterm-viewport::-webkit-scrollbar {
-  width: 6px;
-}
-
-.xterm .xterm-viewport::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.xterm .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 3px;
-}
-
-.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 /* Floating toolbar with smooth animation */
@@ -276,203 +267,88 @@ button {
 .terminal-area {
   flex: 1;
   min-height: 0;
+  width: 100%;
   background: #000;
   padding: 4px 4px 20px;
 }
 
-/* Keyboard wrapper - CSS Grid for smooth 0 to auto height */
-.keyboard-wrapper {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
-  will-change: grid-template-rows;
-  contain: layout style;
+/* Terminal special keys toolbar */
+.terminal-toolbar-shell {
+  position: relative;
+  flex-shrink: 0;
+  width: 100%;
+  max-width: 640px;
+  align-self: center;
+  padding: 6px 16px;
+  padding-bottom: max(14px, env(safe-area-inset-bottom));
 }
 
-.keyboard-wrapper.visible {
-  grid-template-rows: 1fr;
-}
-
-.keyboard-inner {
-  overflow: hidden;
-  will-change: transform;
-  transform: translateY(100%);
-  transition: transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
-}
-
-.keyboard-wrapper.visible .keyboard-inner {
-  transform: translateY(0);
-}
-
-/* Virtual Keyboard */
-.vkb {
-  background: #000;
-  font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-  touch-action: manipulation;
-  -webkit-user-select: none;
-  user-select: none;
-  -webkit-touch-callout: none;
-}
-
-.vkb-toolbar {
-  display: flex;
-  justify-content: center;
-  gap: 2px;
-  padding: 6px;
-  background: #000;
-}
-
-.vkb-toolbar button {
-  height: 28px;
-  padding: 0 10px;
-  background: transparent;
-  color: #fff;
-  border: none;
-  border-radius: 4px;
-  font-family: 'Geist', -apple-system, sans-serif;
-  font-size: 12px;
-  font-weight: 500;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0.7;
-  touch-action: manipulation;
-}
-
-.vkb-toolbar button:active,
-.vkb-toolbar button.touching {
-  opacity: 1;
-  background: rgba(255,255,255,0.1);
-}
-
-.vkb-toolbar button.active {
-  opacity: 1;
-  color: #4B5AFF;
-}
-
-.vkb-toolbar-sep {
+.terminal-input-proxy {
+  flex: 0 0 1px;
   width: 1px;
-  background: #333;
-  margin: 4px 2px;
-}
-
-/* Keyboard */
-.vkb .simple-keyboard {
-  background: #000;
-  padding: 4px 4px 22px;
-  font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.vkb .simple-keyboard .hg-row {
-  display: flex;
-  margin-bottom: 10px;
-  justify-content: center;
+  min-width: 1px;
+  height: 30px;
   padding: 0;
-  gap: 6px;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  pointer-events: none;
+  background: transparent;
+  color: transparent;
+  overflow: hidden;
+  scroll-margin-bottom: calc(env(safe-area-inset-bottom) + 24px);
 }
 
-.vkb .simple-keyboard .hg-button {
+.terminal-toolbar-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.08);
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  scroll-behavior: smooth;
+}
+
+.terminal-toolbar-pill::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-toolbar-button {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 9999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.78);
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #333;
-  color: #fff;
-  border: none;
-  border-radius: 5px;
-  height: 46px;
-  min-width: 32px;
-  font-family: 'Geist', -apple-system, sans-serif;
-  font-size: 23px;
-  font-weight: 400;
-  box-shadow: none;
-  margin: 0;
-  flex-grow: 1;
-  max-width: 38px;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s ease, color 0.15s ease;
   touch-action: manipulation;
 }
 
-.vkb .simple-keyboard .hg-button:active {
-  background: #555;
+.terminal-toolbar-button svg {
+  flex-shrink: 0;
 }
 
-/* Third row - centered */
-.vkb .simple-keyboard .hg-row:nth-child(3) {
-  justify-content: center;
+.terminal-toolbar-button--keycap {
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 15px;
+  font-weight: 600;
 }
 
-/* Shift button - secondary style, pushed to left */
-.vkb .simple-keyboard .hg-button[data-skbtn="{shift}"] {
-  background: transparent;
-  color: rgba(255,255,255,0.7);
-  font-size: 21px;
-  margin-right: auto;
-  flex-grow: 0;
-  width: 46px;
-  max-width: 46px;
+.terminal-toolbar-button:active,
+.terminal-toolbar-button.is-active {
+  background: #4B5AFF;
+  color: #fff;
 }
 
-/* Symbols toggle (in numbers layout) - secondary style, pushed to left, wider */
-.vkb .simple-keyboard .hg-button[data-skbtn="{symbols}"] {
-  background: transparent;
-  color: rgba(255,255,255,0.7);
-  font-size: 13px;
-  margin-right: auto;
-  width: 46px;
-  max-width: 46px;
-  flex-grow: 0;
-}
-
-/* Numbers toggle in third row (in symbols layout) - secondary style, pushed to left, wider */
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn="{numbers}"] {
-  background: transparent;
-  color: rgba(255,255,255,0.7);
-  font-size: 13px;
-  margin-right: auto;
-  width: 46px;
-  max-width: 46px;
-  flex-grow: 0;
-}
-
-/* Punctuation keys in numbers/symbols third row - wider */
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn="."],
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn=","],
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn="?"],
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn="!"],
-.vkb .simple-keyboard .hg-row:nth-child(3) .hg-button[data-skbtn="'"] {
-  width: 46px;
-  max-width: 46px;
-  flex-grow: 0;
-}
-
-/* Backspace - secondary style, pushed to right */
-.vkb .simple-keyboard .hg-button[data-skbtn="{bksp}"] {
-  background: transparent;
-  color: rgba(255,255,255,0.7);
-  font-size: 21px;
-  margin-left: auto;
-  flex-grow: 0;
-  width: 46px;
-  max-width: 46px;
-}
-
-/* Space bar */
-.vkb .simple-keyboard .hg-button[data-skbtn="{space}"] {
-  max-width: none;
-  flex-grow: 5;
-  font-size: 14px;
-  text-transform: lowercase;
-}
-
-/* Bottom row buttons - ghost style */
-.vkb .simple-keyboard .hg-button[data-skbtn="{numbers}"],
-.vkb .simple-keyboard .hg-button[data-skbtn="{abc}"],
-.vkb .simple-keyboard .hg-button[data-skbtn="{symbols}"],
-.vkb .simple-keyboard .hg-button[data-skbtn="{enter}"] {
-  background: transparent;
-  color: rgba(255,255,255,0.7);
-  max-width: 70px;
-  font-size: 13px;
-  text-transform: lowercase;
+.terminal-toolbar-button:focus-visible {
+  outline: 2px solid rgba(75, 90, 255, 0.85);
+  outline-offset: 2px;
 }

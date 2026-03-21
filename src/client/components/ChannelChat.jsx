@@ -1,35 +1,86 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { Check } from 'lucide-react';
 
-// 4 dots in 2x2 grid, one lit at a time rotating clockwise
-function ThinkingIndicator() {
+function ActivityDots() {
   const [active, setActive] = useState(0);
+
   useEffect(() => {
-    const t = setInterval(() => setActive(p => (p + 1) % 4), 300);
+    const t = setInterval(() => setActive((p) => (p + 1) % 4), 260);
     return () => clearInterval(t);
   }, []);
 
-  const dot = (idx) => ({
-    width: 5,
-    height: 5,
+  const dotStyle = (idx) => ({
+    width: 4,
+    height: 4,
     borderRadius: '50%',
     background: '#4B5AFF',
-    opacity: active === idx ? 0.9 : 0.15,
-    transition: 'opacity 0.2s',
+    opacity: active === idx ? 1 : 0.16,
+    transform: active === idx ? 'scale(1)' : 'scale(0.78)',
+    transition: 'opacity 0.24s ease, transform 0.24s ease',
   });
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'flex-start', paddingLeft: 4 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '5px 5px', gap: 4, padding: 8 }}>
-        <div style={dot(0)} />
-        <div style={dot(1)} />
-        <div style={dot(3)} />
-        <div style={dot(2)} />
-      </div>
+    <div style={{ display: 'grid', gridTemplateColumns: '4px 4px', gap: 4 }}>
+      <div style={dotStyle(0)} />
+      <div style={dotStyle(1)} />
+      <div style={dotStyle(3)} />
+      <div style={dotStyle(2)} />
     </div>
   );
 }
 
-function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, waiting, setWaiting }) {
+function ActivityTimeline({ activities, waiting }) {
+  const items = activities.length > 0 ? activities : waiting ? [{
+    id: 'waiting',
+    label: 'Waiting for Claude',
+    detail: 'Claude has not emitted an activity update yet.',
+    active: true,
+    done: false,
+  }] : [];
+
+  if (items.length === 0) {
+    return null;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingLeft: 4 }}>
+      {items.map((item) => (
+        <div
+          key={item.id}
+          title={item.detail || item.label}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            minHeight: 18,
+          }}
+        >
+          {item.active ? (
+            <ActivityDots />
+          ) : (
+            <Check
+              size={13}
+              strokeWidth={2.4}
+              style={{ color: '#34d399', flexShrink: 0 }}
+            />
+          )}
+          <span
+            style={{
+              fontSize: 13,
+              lineHeight: 1.2,
+              color: item.active ? '#4B5AFF' : 'rgba(255,255,255,0.4)',
+              transition: 'color 0.2s ease',
+            }}
+          >
+            {item.label}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, activities, setActivities, waiting, setWaiting }) {
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const messagesEndRef = useRef(null);
@@ -48,13 +99,14 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
     const isBulkLoad = Math.abs(messages.length - prevLengthRef.current) > 1;
     prevLengthRef.current = messages.length;
     messagesEndRef.current?.scrollIntoView({ behavior: isBulkLoad ? 'instant' : 'smooth' });
-  }, [messages, waiting]);
-
+  }, [messages, waiting, activities]);
+  
   const sendMessage = useCallback(async () => {
     const text = input.trim();
     if (!text || !socket || !e2eReady || isSending) return;
     setIsSending(true);
     setInput('');
+    setActivities([]);
     if (textareaRef.current) textareaRef.current.style.height = '0px';
 
     setMessages(prev => [...prev, {
@@ -70,7 +122,7 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
     setWaiting(true);
     setIsSending(false);
     textareaRef.current?.focus();
-  }, [input, socket, e2eReady, encryptInput, isSending, setMessages, setWaiting]);
+  }, [input, socket, e2eReady, encryptInput, isSending, setActivities, setMessages, setWaiting]);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -83,12 +135,11 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000' }}>
-
       {/* Messages */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}>
-        {messages.length === 0 && !waiting && (
+        {messages.length === 0 && !waiting && activities.length === 0 && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <pre style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 6, lineHeight: 1.15, color: 'rgba(255,255,255,0.12)', userSelect: 'none', whiteSpace: 'pre' }}>{`
+            <pre style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 7, lineHeight: 1.12, color: 'rgba(75,90,255,0.42)', userSelect: 'none', whiteSpace: 'pre' }}>{`
  ██████╗  ██████╗  ██████╗ ████████╗
  ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝
  ██████╔╝██║   ██║██║   ██║   ██║
@@ -96,12 +147,12 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
  ██║  ██║╚██████╔╝╚██████╔╝   ██║
  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝
 
-  ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
- ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
- ██║   ██║██████╔╝█████╗  ██████╔╝███████║   ██║   ██║   ██║██████╔╝
- ██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗██╔══██║   ██║   ██║   ██║██╔══██╗
- ╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
-  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`.trimEnd()}</pre>
+██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
+██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
+██║   ██║██████╔╝█████╗  ██████╔╝███████║   ██║   ██║   ██║██████╔╝
+██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗██╔══██║   ██║   ██║   ██║██╔══██╗
+╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
+ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`.trimEnd()}</pre>
           </div>
         )}
 
@@ -119,7 +170,9 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
           </div>
         ))}
 
-        {waiting && <ThinkingIndicator />}
+        {(waiting || activities.length > 0) && (
+          <ActivityTimeline activities={activities} waiting={waiting} />
+        )}
 
         <div ref={messagesEndRef} />
       </div>

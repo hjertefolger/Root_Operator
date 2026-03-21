@@ -4,7 +4,24 @@ import { FitAddon } from 'xterm-addon-fit';
 import { WebLinksAddon } from 'xterm-addon-web-links';
 import { useTerminalPersistence } from './useTerminalPersistence';
 
-export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange) {
+function applyToolbarModifiers(data, ctrlRef, altRef, cmdRef) {
+  let modifiedData = data;
+
+  if (ctrlRef?.current && data.length === 1) {
+    const char = data.toLowerCase();
+    if (char >= 'a' && char <= 'z') {
+      modifiedData = String.fromCharCode(char.charCodeAt(0) - 96);
+    }
+  }
+
+  if ((altRef?.current || cmdRef?.current) && modifiedData.length > 0) {
+    modifiedData = `\x1b${modifiedData}`;
+  }
+
+  return modifiedData;
+}
+
+export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRef, altRef, cmdRef) {
   const termRef = useRef(null);
   const fitAddonRef = useRef(null);
   const socketRef = useRef(socket);
@@ -78,10 +95,14 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
         textarea.setAttribute('autocorrect', 'off');
         textarea.setAttribute('autocapitalize', 'off');
         textarea.setAttribute('spellcheck', 'false');
-        // On mobile: suppress native keyboard, use custom VirtualKeyboard instead
-        // On desktop: allow native keyboard input
         if (isMobile) {
           textarea.setAttribute('inputmode', 'none');
+          textarea.setAttribute('tabindex', '-1');
+          textarea.setAttribute('aria-hidden', 'true');
+        } else {
+          textarea.removeAttribute('inputmode');
+          textarea.removeAttribute('tabindex');
+          textarea.removeAttribute('aria-hidden');
         }
       }
 
@@ -89,8 +110,11 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       const syncSize = () => {
         if (!fitAddon || cancelled) return;
         try {
+          const isPinnedToBottom = term.buffer.active.viewportY >= term.buffer.active.baseY;
           fitAddon.fit();
-          term.scrollToBottom();
+          if (isPinnedToBottom) {
+            term.scrollToBottom();
+          }
           const dims = fitAddon.proposeDimensions();
           if (dims && socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({
@@ -108,7 +132,9 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       requestAnimationFrame(() => {
         if (cancelled) return;
         syncSize();
-        term.focus();
+        if (!isMobile) {
+          term.focus();
+        }
 
         // Flush output queue
         while (outputQueueRef.current.length > 0) {
@@ -149,11 +175,12 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
       // Store for cleanup
       containerRef.current._resizeObserver = resizeObserver;
 
-      // Mobile: Focus on touch to bring up keyboard
-      handleTouch = () => {
-        term.focus();
-      };
-      containerRef.current.addEventListener('touchstart', handleTouch, { passive: true });
+      if (!isMobile) {
+        handleTouch = () => {
+          term.focus();
+        };
+        containerRef.current.addEventListener('touchstart', handleTouch, { passive: true });
+      }
     });
 
     return () => {
@@ -189,7 +216,12 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     if (socketRef.current.readyState !== WebSocket.OPEN) return;
 
     try {
+      const term = termRef.current;
+      const isPinnedToBottom = !term || term.buffer.active.viewportY >= term.buffer.active.baseY;
       fitAddonRef.current.fit();
+      if (isPinnedToBottom && term) {
+        term.scrollToBottom();
+      }
       const dims = fitAddonRef.current.proposeDimensions();
       if (dims) {
         socketRef.current.send(JSON.stringify({
@@ -220,16 +252,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
         return;
       }
 
-      // Apply modifier keys from toolbar
-      let modifiedData = data;
-      if (ctrlRef?.current && data.length === 1) {
-        const char = data.toLowerCase();
-        if (char >= 'a' && char <= 'z') {
-          // Convert to control character (Ctrl+A = 0x01, Ctrl+B = 0x02, etc.)
-          modifiedData = String.fromCharCode(char.charCodeAt(0) - 96);
-          // Ctrl stays active (sticky) - user must tap ^ again to release
-        }
-      }
+      const modifiedData = applyToolbarModifiers(data, ctrlRef, altRef, cmdRef);
 
       const encrypted = await encryptInput(modifiedData);
       if (encrypted && socketRef.current?.readyState === WebSocket.OPEN) {
@@ -242,7 +265,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
 
     const disposable = term.onData(handleData);
     return () => disposable.dispose();
-  }, [isReady, socket, encryptInput, e2eReady, ctrlRef, shiftRef, onModifierChange]);
+  }, [isReady, socket, encryptInput, e2eReady, ctrlRef, altRef, cmdRef]);
 
   // Write to terminal with batching for mobile performance
   // Accumulates data and flushes once per animation frame (max 60/sec)
@@ -319,12 +342,30 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     }
   }, [e2eReady, encryptInput]);
 
+  const sendInput = useCallback(async (data) => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN || !e2eReady || !encryptInput) {
+      return;
+    }
+
+    const modifiedData = applyToolbarModifiers(data, ctrlRef, altRef, cmdRef);
+    const encrypted = await encryptInput(modifiedData);
+    if (encrypted) {
+      socketRef.current.send(JSON.stringify({
+        type: 'e2e_input',
+        ...encrypted
+      }));
+    }
+  }, [e2eReady, encryptInput, ctrlRef, altRef, cmdRef]);
+
   // Refit terminal to container
   const refit = useCallback(() => {
     if (fitAddonRef.current && termRef.current) {
       try {
+        const isPinnedToBottom = termRef.current.buffer.active.viewportY >= termRef.current.buffer.active.baseY;
         fitAddonRef.current.fit();
-        termRef.current.scrollToBottom();
+        if (isPinnedToBottom) {
+          termRef.current.scrollToBottom();
+        }
       } catch (e) {
         // Ignore fit errors
       }
@@ -336,6 +377,7 @@ export function useTerminal(containerRef, socket, encryptInput, e2eReady, ctrlRe
     isReady,
     write,
     writeServerBuffer,
+    sendInput,
     sendSpecial,
     refit
   };

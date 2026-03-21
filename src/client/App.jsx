@@ -11,10 +11,12 @@ import { useAuth } from './hooks/useAuth';
 function App() {
   // Operating mode: 'terminal' or 'channel' (default matches server default)
   const [clientMode, setClientMode] = useState('channel');
+  const [systemState, setSystemState] = useState(null);
 
   // Channel messages — managed at App level so we never miss history
   const [channelMessages, setChannelMessages] = useState([]);
   const [channelWaiting, setChannelWaiting] = useState(false);
+  const [channelActivities, setChannelActivities] = useState([]);
 
   // Initialize WebSocket connection
   const { socket, isReady, connectionState } = useWebSocket();
@@ -41,8 +43,15 @@ function App() {
 
   // Toggle between channel and terminal mode
   const handleToggleMode = useCallback(() => {
-    setClientMode(prev => prev === 'channel' ? 'terminal' : 'channel');
-  }, []);
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    const nextMode = clientMode === 'channel' ? 'terminal' : 'channel';
+    setClientMode(nextMode);
+    socket.send(JSON.stringify({
+      type: 'set_mode',
+      mode: nextMode,
+    }));
+  }, [socket, clientMode]);
 
   // Handle ALL WebSocket messages at App level — always mounted, never misses
   useEffect(() => {
@@ -71,6 +80,10 @@ function App() {
         setClientMode(msg.mode);
       }
 
+      if (msg.type === 'system_status') {
+        setSystemState(msg.state || null);
+      }
+
       // Channel messages (encrypted) — always try to decrypt
       if (msg.type === 'e2e_output') {
         const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
@@ -89,6 +102,53 @@ function App() {
             content: parsed.content,
             ts: parsed.ts || new Date().toISOString(),
           }]);
+          setChannelActivities(prev => prev.map((item) => (
+            item.active
+              ? { ...item, active: false, done: true, completedAt: parsed.ts || new Date().toISOString() }
+              : item
+          )));
+        } else if (parsed.type === 'channel_activity' && parsed.activity) {
+          const activity = parsed.activity;
+          const markerTs = activity.ts || new Date().toISOString();
+
+          if (activity.phase === 'idle') {
+            setChannelActivities(prev => prev
+              .map((item) => (
+                item.active
+                  ? { ...item, active: false, done: true, completedAt: markerTs }
+                  : item
+              ))
+              .slice(-4));
+            return;
+          }
+
+          const activityKey = `${activity.phase}:${activity.label}:${activity.toolName || ''}`;
+          setChannelActivities(prev => {
+            const next = prev
+              .map((item) => (
+                item.active
+                  ? { ...item, active: false, done: true, completedAt: markerTs }
+                  : item
+              ))
+              .filter((item, index, items) => {
+                if (index !== items.length - 1) {
+                  return true;
+                }
+                return item.key !== activityKey || item.active;
+              });
+
+            next.push({
+              id: `${markerTs}:${activityKey}`,
+              key: activityKey,
+              label: activity.label,
+              detail: activity.detail || '',
+              active: true,
+              done: false,
+              ts: markerTs,
+            });
+
+            return next.slice(-4);
+          });
         }
       }
     };
@@ -163,6 +223,8 @@ function App() {
         connectionState={connectionState}
         clientMode={clientMode}
         onToggleMode={handleToggleMode}
+        systemState={systemState}
+        e2eReady={e2eReady}
       />
       {clientMode === 'channel' ? (
         <ChannelChat
@@ -171,6 +233,8 @@ function App() {
           e2eReady={e2eReady}
           messages={channelMessages}
           setMessages={setChannelMessages}
+          activities={channelActivities}
+          setActivities={setChannelActivities}
           waiting={channelWaiting}
           setWaiting={setChannelWaiting}
         />

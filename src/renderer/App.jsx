@@ -10,7 +10,10 @@ function App() {
     active: false,
     connecting: false,
     url: '',
-    fingerprint: null
+    fingerprint: null,
+    mode: 'channel',
+    channelConnected: false,
+    health: null,
   });
   const containerRef = useRef(null);
 
@@ -57,7 +60,10 @@ function App() {
             active: tunnelStateFromMain.active || false,
             connecting: tunnelStateFromMain.connecting || false,
             url: tunnelStateFromMain.url || '',
-            fingerprint: tunnelStateFromMain.fingerprint || null
+            fingerprint: tunnelStateFromMain.fingerprint || null,
+            mode: tunnelStateFromMain.mode || 'channel',
+            channelConnected: tunnelStateFromMain.channelConnected || false,
+            health: tunnelStateFromMain.health || null,
           });
           // Sync tray icon with actual state
           invoke('SET_TRAY_ICON', tunnelStateFromMain.active);
@@ -77,7 +83,7 @@ function App() {
           ...prev,
           connecting: false,
           active: true,
-          url
+          url,
         }));
         invoke('SET_TRAY_ICON', true);
       }),
@@ -91,7 +97,10 @@ function App() {
           active: state.active || false,
           connecting: state.connecting || false,
           url: state.url || '',
-          fingerprint: state.fingerprint || null
+          fingerprint: state.fingerprint || null,
+          mode: state.mode || 'channel',
+          channelConnected: state.channelConnected || false,
+          health: state.health || null,
         });
         // Sync tray icon with authoritative state
         invoke('SET_TRAY_ICON', state.active || false);
@@ -135,7 +144,10 @@ function App() {
       active: false,
       connecting: false,
       url: '',
-      fingerprint: null
+      fingerprint: null,
+      mode: tunnelState.mode,
+      channelConnected: false,
+      health: null,
     });
     await invoke('SET_TRAY_ICON', false);
   };
