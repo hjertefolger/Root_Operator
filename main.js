@@ -815,7 +815,7 @@ function setChannelActivity(activity, options = {}) {
         detail: activity.detail || '',
         toolName: activity.toolName || '',
         ts: activity.ts || new Date().toISOString(),
-        active: activity.phase !== 'idle',
+        active: typeof activity.active === 'boolean' ? activity.active : activity.phase !== 'idle',
     };
 
     const activityKey = `${normalized.phase}:${normalized.label}:${normalized.toolName}`;
@@ -826,7 +826,7 @@ function setChannelActivity(activity, options = {}) {
 
     lastChannelActivityKey = activityKey;
     lastChannelActivityAt = now;
-    latestChannelActivity = normalized.phase === 'idle' ? null : normalized;
+    latestChannelActivity = normalized.active ? normalized : null;
     if (normalized.phase !== 'idle') {
         clearChannelIdleTimer();
     }
@@ -967,10 +967,11 @@ function handleClaudeHookLine(line) {
         clearChannelIdleTimer();
         channelReplyPending = false;
         setChannelActivity({
-            phase: 'idle',
-            label: 'Idle',
+            phase: 'finished',
+            label: 'Claude finished',
             detail: 'Claude finished this turn.',
             ts: event.ts || new Date().toISOString(),
+            active: false,
         }, { force: true });
         return;
     }
@@ -979,10 +980,11 @@ function handleClaudeHookLine(line) {
         clearChannelIdleTimer();
         channelReplyPending = false;
         setChannelActivity({
-            phase: 'idle',
-            label: 'Idle',
+            phase: 'failed',
+            label: 'Claude stopped with error',
             detail: `Claude ended the turn with ${event.error || 'an API error'}.`,
             ts: event.ts || new Date().toISOString(),
+            active: false,
         }, { force: true });
     }
 }

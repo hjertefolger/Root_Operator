@@ -110,6 +110,7 @@ function App() {
         } else if (parsed.type === 'channel_activity' && parsed.activity) {
           const activity = parsed.activity;
           const markerTs = activity.ts || new Date().toISOString();
+          const isActive = activity.active !== false;
 
           if (activity.phase === 'idle') {
             setChannelActivities(prev => prev
@@ -142,9 +143,10 @@ function App() {
               key: activityKey,
               label: activity.label,
               detail: activity.detail || '',
-              active: true,
-              done: false,
+              active: isActive,
+              done: !isActive,
               ts: markerTs,
+              completedAt: !isActive ? markerTs : undefined,
             });
 
             return next.slice(-4);
