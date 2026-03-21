@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Shield, ShieldCheck, RotateCw, X, Loader, MessageSquare, TerminalSquare } from 'lucide-react';
+import { Shield, ShieldCheck, RotateCw, X, Loader, MessageCircle, Terminal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
 
@@ -38,13 +38,13 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode }) {
               title={clientMode === 'channel' ? 'Switch to Terminal' : 'Switch to Chat'}
             >
               {clientMode === 'channel' ? (
-                <TerminalSquare
+                <Terminal
                   size={16}
                   strokeWidth={2}
                   className="text-[#4B5AFF]"
                 />
               ) : (
-                <MessageSquare
+                <MessageCircle
                   size={16}
                   strokeWidth={2}
                   className="text-[#4B5AFF]"

@@ -949,8 +949,7 @@ function setOperatingMode(mode) {
         }
     }
 
-    // Update tray menu to reflect new mode
-    if (tray) tray.setContextMenu(buildTrayMenu());
+    // Tray menu is built on right-click, no need to update here
 
     // Notify renderer of mode change
     if (mainWindow && !mainWindow.isDestroyed()) {

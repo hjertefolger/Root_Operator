@@ -359,7 +359,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90"
             title="Stop Tunnel"
           >
-            Hover
+            Pause
             <CirclePause strokeWidth={2} />
           </Button>
         ) : (

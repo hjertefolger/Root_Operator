@@ -88,9 +88,20 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, wa
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}>
         {messages.length === 0 && !waiting && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <span style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12, fontWeight: 400, letterSpacing: '0.05em', color: 'rgba(255,255,255,0.2)' }}>
-              ROOT_OPERATOR
-            </span>
+            <pre style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 6, lineHeight: 1.15, color: 'rgba(255,255,255,0.12)', userSelect: 'none', whiteSpace: 'pre' }}>{`
+ ██████╗  ██████╗  ██████╗ ████████╗
+ ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝
+ ██████╔╝██║   ██║██║   ██║   ██║
+ ██╔══██╗██║   ██║██║   ██║   ██║
+ ██║  ██║╚██████╔╝╚██████╔╝   ██║
+ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝
+
+  ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
+ ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
+ ██║   ██║██████╔╝█████╗  ██████╔╝███████║   ██║   ██║   ██║██████╔╝
+ ██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗██╔══██║   ██║   ██║   ██║██╔══██╗
+ ╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
+  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`.trimEnd()}</pre>
           </div>
         )}
 

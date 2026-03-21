@@ -71,9 +71,8 @@ function App() {
         setClientMode(msg.mode);
       }
 
-      // Channel messages (encrypted) — only decrypt in channel mode
-      // to avoid double-decryption with Terminal's own handler
-      if (msg.type === 'e2e_output' && clientMode === 'channel') {
+      // Channel messages (encrypted) — always try to decrypt
+      if (msg.type === 'e2e_output') {
         const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
         if (plaintext === null) return;
 
@@ -96,7 +95,7 @@ function App() {
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, handleE2EInit, handleE2EReady, decryptOutput, clientMode]);
+  }, [socket, handleE2EInit, handleE2EReady, decryptOutput]);
 
   // Safe area wrapper for overlay screens
   const SafeAreaWrapper = ({ children }) => (
