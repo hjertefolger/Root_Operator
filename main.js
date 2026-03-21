@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const cloudflared = require('cloudflared');
 const keytar = require('keytar');
 const { ChannelManager } = require('./src/channel-manager');
+const { ChatStore } = require('./src/chat-store');
 
 let store;
 const isDev = !app.isPackaged;
@@ -65,8 +66,7 @@ let isConnecting = false; // Track if tunnel is in the process of starting
 let operatingMode = 'channel'; // 'terminal' | 'channel'
 let channelManager = null;
 let claudeProcess = null; // Claude Code child process
-const MAX_CHANNEL_HISTORY = 200;
-let channelHistory = []; // {role, content, ts} — persists across client reconnects
+let chatStore = null; // initialized after app.whenReady()
 
 // Pairing system state
 let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
@@ -297,7 +297,21 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
 
         logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
 
-        // Flush any buffered output now that E2E is ready
+        // Notify client that E2E is ready FIRST — client needs this
+        // before it can decrypt any buffered output
+        ws.send(JSON.stringify({
+            type: 'e2e_ready',
+            fingerprint: ws.e2e.fingerprint
+        }));
+
+        // Send operating mode so client shows the right UI
+        ws.send(JSON.stringify({
+            type: 'operating_mode',
+            mode: operatingMode,
+        }));
+
+        // Flush buffered output AFTER e2e_ready — WebSocket guarantees
+        // in-order delivery, so client processes e2e_ready before these
         if (ws.pendingOutput && ws.pendingOutput.length > 0) {
             logDebug(`[E2E] Flushing ${ws.pendingOutput.length} buffered messages`);
             for (const data of ws.pendingOutput) {
@@ -305,19 +319,6 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
             }
             ws.pendingOutput = [];
         }
-
-        // Notify client that E2E is ready
-        ws.send(JSON.stringify({
-            type: 'e2e_ready',
-            fingerprint: ws.e2e.fingerprint
-        }));
-
-        // Send operating mode to client (unencrypted, non-sensitive metadata)
-        // so it knows which UI to show before any content arrives
-        ws.send(JSON.stringify({
-            type: 'operating_mode',
-            mode: operatingMode,
-        }));
 
         // Notify renderer to show fingerprint
         if (mainWindow) {
@@ -888,11 +889,8 @@ function initChannelMode() {
             ts: reply.ts || new Date().toISOString(),
         };
 
-        // Store in history
-        channelHistory.push({ role: msg.role, content: msg.content, ts: msg.ts });
-        if (channelHistory.length > MAX_CHANNEL_HISTORY) {
-            channelHistory = channelHistory.slice(-MAX_CHANNEL_HISTORY);
-        }
+        // Store in history (file-backed)
+        chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
 
         // Send to all connected clients
         for (const client of activeClients) {
@@ -914,7 +912,7 @@ function teardownChannelMode() {
         channelManager.disconnect();
         channelManager = null;
     }
-    channelHistory = [];
+    // History intentionally NOT cleared — persists across tunnel restarts
 }
 
 // --- Channel mode switching ---
@@ -1003,6 +1001,7 @@ app.whenReady().then(async () => {
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
 
     await fixPath();
+    chatStore = new ChatStore(app.getPath('userData'));
     createWindow();
     createTray();
 });
@@ -1737,11 +1736,8 @@ function handleConnection(ws, req) {
                     channelManager.sendToChannel(deviceId, inputData, deviceId);
                     logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
 
-                    // Store user message in history
-                    channelHistory.push({ role: 'user', content: inputData, ts: new Date().toISOString() });
-                    if (channelHistory.length > MAX_CHANNEL_HISTORY) {
-                        channelHistory = channelHistory.slice(-MAX_CHANNEL_HISTORY);
-                    }
+                    // Store user message in history (file-backed)
+                    chatStore.addMessage({ role: 'user', content: inputData, ts: new Date().toISOString() });
                 }
             } else if (ptyProcess) {
                 // Terminal mode: write to PTY
@@ -1836,13 +1832,14 @@ function startPty(ws) {
     // In channel mode, don't spawn PTY — just track the client
     if (operatingMode === 'channel') {
         logDebug('[CHANNEL] Client attached in channel mode, skipping PTY');
-        // Send chat history once E2E is ready (buffered by sendEncryptedOutput)
-        if (channelHistory.length > 0) {
+        // Send chat history from disk (buffered by sendEncryptedOutput until E2E ready)
+        const history = chatStore.loadMessages();
+        if (history.length > 0) {
             sendEncryptedOutput(ws, JSON.stringify({
                 type: 'channel_history',
-                messages: channelHistory,
+                messages: history,
             }));
-            logDebug(`[CHANNEL] Sent ${channelHistory.length} history messages to client`);
+            logDebug(`[CHANNEL] Sent ${history.length} history messages from disk`);
         }
         return;
     }

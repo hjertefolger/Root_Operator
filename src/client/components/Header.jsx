@@ -57,7 +57,7 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode }) {
             size="icon-sm"
             onClick={handleReload}
             className="rounded-full"
-            title="Reload"
+            title="Stop Tunnel"
           >
             <RotateCw
               size={16}

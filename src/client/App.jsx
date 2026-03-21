@@ -12,6 +12,10 @@ function App() {
   // Operating mode: 'terminal' or 'channel' (default matches server default)
   const [clientMode, setClientMode] = useState('channel');
 
+  // Channel messages — managed at App level so we never miss history
+  const [channelMessages, setChannelMessages] = useState([]);
+  const [channelWaiting, setChannelWaiting] = useState(false);
+
   // Initialize WebSocket connection
   const { socket, isReady, connectionState } = useWebSocket();
 
@@ -35,18 +39,12 @@ function App() {
     wasAuthenticatedThisSession
   } = useAuth(socket);
 
-  // Toggle between channel and terminal mode (notifies server)
+  // Toggle between channel and terminal mode
   const handleToggleMode = useCallback(() => {
-    setClientMode(prev => {
-      const newMode = prev === 'channel' ? 'terminal' : 'channel';
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'set_mode', mode: newMode }));
-      }
-      return newMode;
-    });
-  }, [socket]);
+    setClientMode(prev => prev === 'channel' ? 'terminal' : 'channel');
+  }, []);
 
-  // Handle WebSocket messages for E2E and operating mode
+  // Handle ALL WebSocket messages at App level — always mounted, never misses
   useEffect(() => {
     if (!socket) return;
 
@@ -68,15 +66,37 @@ function App() {
         handleE2EReady(msg.fingerprint);
       }
 
-      // Operating mode from server (sent after E2E ready, or on mode switch)
+      // Operating mode from server
       if (msg.type === 'operating_mode') {
         setClientMode(msg.mode);
+      }
+
+      // Channel messages (encrypted) — only decrypt in channel mode
+      // to avoid double-decryption with Terminal's own handler
+      if (msg.type === 'e2e_output' && clientMode === 'channel') {
+        const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
+        if (plaintext === null) return;
+
+        let parsed;
+        try { parsed = JSON.parse(plaintext); } catch { return; }
+
+        if (parsed.type === 'channel_history') {
+          setChannelMessages(parsed.messages || []);
+          setChannelWaiting(false);
+        } else if (parsed.type === 'channel_message') {
+          setChannelWaiting(false);
+          setChannelMessages(prev => [...prev, {
+            role: parsed.role || 'assistant',
+            content: parsed.content,
+            ts: parsed.ts || new Date().toISOString(),
+          }]);
+        }
       }
     };
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, handleE2EInit, handleE2EReady]);
+  }, [socket, handleE2EInit, handleE2EReady, decryptOutput, clientMode]);
 
   // Safe area wrapper for overlay screens
   const SafeAreaWrapper = ({ children }) => (
@@ -99,11 +119,9 @@ function App() {
   }
 
   // If already authenticated this session, skip overlays and show main view
-  // (header spinner will indicate reconnection state)
   const showMainView = wasAuthenticatedThisSession;
 
   if (!showMainView) {
-    // Show quick authenticating screen for returning devices
     if (!isAuthenticated && pairingStatus === 'authenticating') {
       return (
         <SafeAreaWrapper>
@@ -115,7 +133,6 @@ function App() {
       );
     }
 
-    // Show pairing screen when not authenticated (new device)
     if (!isAuthenticated) {
       return (
         <PairingScreen
@@ -126,7 +143,6 @@ function App() {
       );
     }
 
-    // Show securing screen when authenticated but E2E not yet ready
     if (!e2eReady) {
       return (
         <SafeAreaWrapper>
@@ -139,10 +155,9 @@ function App() {
     }
   }
 
-  // Main view: Terminal or Channel Chat based on server mode
+  // Main view
   return (
     <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
-      {/* Top safe area */}
       <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
       <Header
         fingerprint={fingerprint}
@@ -154,8 +169,11 @@ function App() {
         <ChannelChat
           socket={socket}
           encryptInput={encryptInput}
-          decryptOutput={decryptOutput}
           e2eReady={e2eReady}
+          messages={channelMessages}
+          setMessages={setChannelMessages}
+          waiting={channelWaiting}
+          setWaiting={setChannelWaiting}
         />
       ) : (
         <Terminal

@@ -289,6 +289,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
           size="icon-sm"
           onClick={onShowSettings}
           className="rounded-full text-muted-foreground transition-colors duration-200"
+          title="Settings"
         >
           <Settings2 strokeWidth={2} />
         </Button>
@@ -304,7 +305,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             onClick={handleOpenPairing}
             disabled={!url}
             className="rounded-full transition-none"
-            title="Add Device"
+            title="Pair Device"
           >
             <Plus strokeWidth={2} className={url ? 'text-[#4B5AFF]' : ''} />
           </Button>
@@ -315,7 +316,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             onClick={handleCopyLink}
             disabled={!url}
             className="rounded-full transition-none"
-            title="Copy Address"
+            title="Copy Tunnel Link"
           >
             {copied ? (
               <Check strokeWidth={2} className="text-[#4B5AFF]" />
@@ -356,6 +357,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             size="sm"
             onClick={handleToggle}
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90"
+            title="Stop Tunnel"
           >
             Hover
             <CirclePause strokeWidth={2} />
@@ -366,6 +368,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             size="sm"
             onClick={handleToggle}
             className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
+            title="Start Tunnel"
           >
             Jump
             <CirclePlay strokeWidth={2} />

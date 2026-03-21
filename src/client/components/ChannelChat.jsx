@@ -3,7 +3,6 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 // 4 dots in 2x2 grid, one lit at a time rotating clockwise
 function ThinkingIndicator() {
   const [active, setActive] = useState(0);
-  // Order: top-left(0) → top-right(1) → bottom-right(2) → bottom-left(3)
   useEffect(() => {
     const t = setInterval(() => setActive(p => (p + 1) % 4), 300);
     return () => clearInterval(t);
@@ -30,13 +29,12 @@ function ThinkingIndicator() {
   );
 }
 
-function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
-  const [messages, setMessages] = useState([]);
+function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, waiting, setWaiting }) {
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [waiting, setWaiting] = useState(false);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+  const prevLengthRef = useRef(messages.length);
 
   useEffect(() => {
     const ta = textareaRef.current;
@@ -45,36 +43,11 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
     ta.style.height = Math.min(ta.scrollHeight, 144) + 'px';
   }, [input]);
 
+  // Scroll when messages change — instant if bulk load, smooth if single new message
   useEffect(() => {
-    if (!socket || !e2eReady) return;
-    const handleMessage = async (event) => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch { return; }
-      if (msg.type === 'e2e_output') {
-        const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
-        if (plaintext === null) return;
-        let parsed;
-        try { parsed = JSON.parse(plaintext); } catch { return; }
-        if (parsed.type === 'channel_history') {
-          // Full history from server on reconnect
-          setMessages(parsed.messages || []);
-          setWaiting(false);
-        } else if (parsed.type === 'channel_message') {
-          setWaiting(false);
-          setMessages(prev => [...prev, {
-            role: parsed.role || 'assistant',
-            content: parsed.content,
-            ts: parsed.ts || new Date().toISOString(),
-          }]);
-        }
-      }
-    };
-    socket.addEventListener('message', handleMessage);
-    return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, e2eReady, decryptOutput]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const isBulkLoad = Math.abs(messages.length - prevLengthRef.current) > 1;
+    prevLengthRef.current = messages.length;
+    messagesEndRef.current?.scrollIntoView({ behavior: isBulkLoad ? 'instant' : 'smooth' });
   }, [messages, waiting]);
 
   const sendMessage = useCallback(async () => {
@@ -82,11 +55,14 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
     if (!text || !socket || !e2eReady || isSending) return;
     setIsSending(true);
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = '0px';
+
     setMessages(prev => [...prev, {
       role: 'user',
       content: text,
       ts: new Date().toISOString(),
     }]);
+
     const encrypted = await encryptInput(text);
     if (encrypted) {
       socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
@@ -94,7 +70,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
     setWaiting(true);
     setIsSending(false);
     textareaRef.current?.focus();
-  }, [input, socket, e2eReady, encryptInput, isSending]);
+  }, [input, socket, e2eReady, encryptInput, isSending, setMessages, setWaiting]);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -109,7 +85,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000' }}>
 
       {/* Messages */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}>
         {messages.length === 0 && !waiting && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <span style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12, fontWeight: 400, letterSpacing: '0.05em', color: 'rgba(255,255,255,0.2)' }}>

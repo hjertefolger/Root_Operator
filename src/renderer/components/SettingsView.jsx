@@ -190,7 +190,7 @@ function SettingsView({ onBack, tunnelState }) {
   return (
     <div className="flex flex-col max-h-[400px] overflow-y-auto">
       {/* Sticky Header */}
-      <div className="sticky top-0 flex justify-between items-center px-5 py-2 bg-background z-10">
+      <div className="sticky top-0 flex justify-between items-center pl-5 pr-4 py-2 bg-background z-10">
         <span className="font-mono text-xs font-normal tracking-wider text-foreground">
           SETTINGS
         </span>
