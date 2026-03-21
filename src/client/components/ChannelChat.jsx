@@ -1,13 +1,43 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
+// 4 dots in 2x2 grid, one lit at a time rotating clockwise
+function ThinkingIndicator() {
+  const [active, setActive] = useState(0);
+  // Order: top-left(0) → top-right(1) → bottom-right(2) → bottom-left(3)
+  useEffect(() => {
+    const t = setInterval(() => setActive(p => (p + 1) % 4), 300);
+    return () => clearInterval(t);
+  }, []);
+
+  const dot = (idx) => ({
+    width: 5,
+    height: 5,
+    borderRadius: '50%',
+    background: '#4B5AFF',
+    opacity: active === idx ? 0.9 : 0.15,
+    transition: 'opacity 0.2s',
+  });
+
+  return (
+    <div style={{ display: 'flex', justifyContent: 'flex-start', paddingLeft: 4 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '5px 5px', gap: 4, padding: 8 }}>
+        <div style={dot(0)} />
+        <div style={dot(1)} />
+        <div style={dot(3)} />
+        <div style={dot(2)} />
+      </div>
+    </div>
+  );
+}
+
 function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const [waiting, setWaiting] = useState(false);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
 
-  // Auto-resize textarea on value change
   useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
@@ -26,6 +56,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
         let parsed;
         try { parsed = JSON.parse(plaintext); } catch { return; }
         if (parsed.type === 'channel_message') {
+          setWaiting(false);
           setMessages(prev => [...prev, {
             role: parsed.role || 'assistant',
             content: parsed.content,
@@ -40,7 +71,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, waiting]);
 
   const sendMessage = useCallback(async () => {
     const text = input.trim();
@@ -56,6 +87,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
     if (encrypted) {
       socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
     }
+    setWaiting(true);
     setIsSending(false);
     textareaRef.current?.focus();
   }, [input, socket, e2eReady, encryptInput, isSending]);
@@ -74,7 +106,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
 
       {/* Messages */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
-        {messages.length === 0 && (
+        {messages.length === 0 && !waiting && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <span style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 12, fontWeight: 400, letterSpacing: '0.05em', color: 'rgba(255,255,255,0.2)' }}>
               ROOT_OPERATOR
@@ -95,6 +127,9 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
             </div>
           </div>
         ))}
+
+        {waiting && <ThinkingIndicator />}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -103,6 +138,9 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
         flexShrink: 0,
         padding: '6px 16px',
         paddingBottom: 'max(14px, env(safe-area-inset-bottom))',
+        maxWidth: 640,
+        width: '100%',
+        alignSelf: 'center',
       }}>
         <div style={{
           display: 'flex',
@@ -110,7 +148,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
           gap: 8,
           background: 'rgba(255,255,255,0.08)',
           borderRadius: 24,
-          padding: '6px 6px 6px 16px',
+          padding: '8px 8px 8px 16px',
         }}>
           <textarea
             ref={textareaRef}
@@ -129,7 +167,7 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
               fontSize: 15,
               lineHeight: '22px',
               padding: '5px 0',
-              minHeight: 32,
+              minHeight: 34,
               maxHeight: 144,
               fontFamily: 'inherit',
             }}
@@ -139,8 +177,8 @@ function ChannelChat({ socket, encryptInput, decryptOutput, e2eReady }) {
             disabled={!hasContent || isSending}
             style={{
               flexShrink: 0,
-              width: 32,
-              height: 32,
+              width: 34,
+              height: 34,
               borderRadius: '50%',
               border: 'none',
               background: hasContent ? '#4B5AFF' : 'rgba(255,255,255,0.1)',

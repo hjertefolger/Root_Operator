@@ -1732,6 +1732,15 @@ function handleConnection(ws, req) {
         // NOTE: Unencrypted 'input' handler removed for security
         // All terminal input MUST go through e2e_input after E2E is established
 
+        // Mode switch from client
+        if (ws.authenticated && m.type === 'set_mode') {
+            if (m.mode === 'terminal' || m.mode === 'channel') {
+                logDebug(`[MODE] Client requested switch to ${m.mode}`);
+                setOperatingMode(m.mode);
+            }
+            return;
+        }
+
         // Resize - validate dimensions
         if (ws.authenticated && m.type === 'resize') {
             const cols = parseInt(m.cols, 10);

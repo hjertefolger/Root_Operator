@@ -35,10 +35,16 @@ function App() {
     wasAuthenticatedThisSession
   } = useAuth(socket);
 
-  // Toggle between channel and terminal mode (client-side view switch)
+  // Toggle between channel and terminal mode (notifies server)
   const handleToggleMode = useCallback(() => {
-    setClientMode(prev => prev === 'channel' ? 'terminal' : 'channel');
-  }, []);
+    setClientMode(prev => {
+      const newMode = prev === 'channel' ? 'terminal' : 'channel';
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'set_mode', mode: newMode }));
+      }
+      return newMode;
+    });
+  }, [socket]);
 
   // Handle WebSocket messages for E2E and operating mode
   useEffect(() => {
