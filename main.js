@@ -70,6 +70,7 @@ let chatStore = null; // initialized after app.whenReady()
 const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
 const CHANNEL_STARTUP_TIMEOUT_MS = 15000;
 const CHANNEL_RESTART_DELAY_MS = 2500;
+const CHANNEL_ACTIVITY_IDLE_MS = 5000;
 let channelStartupTimer = null;
 let channelRestartTimer = null;
 let channelConfirmTimers = [];
@@ -83,6 +84,11 @@ let claudeDebugFilePath = '';
 let claudeDebugPollTimer = null;
 let claudeDebugReadOffset = 0;
 let claudeDebugLineBuffer = '';
+let claudeHookFilePath = '';
+let claudeHookPollTimer = null;
+let claudeHookReadOffset = 0;
+let claudeHookLineBuffer = '';
+let channelIdleTimer = null;
 let channelRuntime = {
     phase: 'stopped',
     level: 'red',
@@ -717,6 +723,17 @@ function clearChannelRestartTimer() {
     }
 }
 
+function clearChannelIdleTimer() {
+    if (channelIdleTimer) {
+        clearTimeout(channelIdleTimer);
+        channelIdleTimer = null;
+    }
+}
+
+function shellEscapeArg(value) {
+    return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 function removeChannelSocket() {
     try {
         if (fs.existsSync(CHANNEL_IPC_PATH)) {
@@ -765,11 +782,25 @@ function formatClaudeToolLabel(toolName) {
 }
 
 function resetChannelActivity() {
+    clearChannelIdleTimer();
     channelReplyPending = false;
     latestChannelActivity = null;
     lastChannelActivityKey = '';
     lastChannelActivityAt = 0;
     syncStateWithRenderer();
+}
+
+function scheduleChannelIdle(detail = 'Claude is ready for the next message.') {
+    clearChannelIdleTimer();
+    channelIdleTimer = setTimeout(() => {
+        channelIdleTimer = null;
+        channelReplyPending = false;
+        setChannelActivity({
+            phase: 'idle',
+            label: 'Idle',
+            detail,
+        }, { force: true });
+    }, CHANNEL_ACTIVITY_IDLE_MS);
 }
 
 function setChannelActivity(activity, options = {}) {
@@ -796,6 +827,9 @@ function setChannelActivity(activity, options = {}) {
     lastChannelActivityKey = activityKey;
     lastChannelActivityAt = now;
     latestChannelActivity = normalized.phase === 'idle' ? null : normalized;
+    if (normalized.phase !== 'idle') {
+        clearChannelIdleTimer();
+    }
 
     if (broadcast) {
         sendEncryptedChannelPayload({
@@ -815,6 +849,16 @@ function stopClaudeDebugWatcher() {
     claudeDebugReadOffset = 0;
     claudeDebugLineBuffer = '';
     claudeDebugFilePath = '';
+}
+
+function stopClaudeHookWatcher() {
+    if (claudeHookPollTimer) {
+        clearInterval(claudeHookPollTimer);
+        claudeHookPollTimer = null;
+    }
+    claudeHookReadOffset = 0;
+    claudeHookLineBuffer = '';
+    claudeHookFilePath = '';
 }
 
 function handleClaudeDebugLine(line) {
@@ -909,6 +953,89 @@ function startClaudeDebugWatcher(filePath) {
     claudeDebugLineBuffer = '';
     claudeDebugPollTimer = setInterval(pollClaudeDebugWatcher, 700);
     pollClaudeDebugWatcher();
+}
+
+function handleClaudeHookLine(line) {
+    let event;
+    try {
+        event = JSON.parse(line);
+    } catch (error) {
+        return;
+    }
+
+    if (event.hookEventName === 'Stop') {
+        clearChannelIdleTimer();
+        channelReplyPending = false;
+        setChannelActivity({
+            phase: 'idle',
+            label: 'Idle',
+            detail: 'Claude finished this turn.',
+            ts: event.ts || new Date().toISOString(),
+        }, { force: true });
+        return;
+    }
+
+    if (event.hookEventName === 'StopFailure') {
+        clearChannelIdleTimer();
+        channelReplyPending = false;
+        setChannelActivity({
+            phase: 'idle',
+            label: 'Idle',
+            detail: `Claude ended the turn with ${event.error || 'an API error'}.`,
+            ts: event.ts || new Date().toISOString(),
+        }, { force: true });
+    }
+}
+
+function pollClaudeHookWatcher() {
+    if (!claudeHookFilePath) {
+        return;
+    }
+
+    try {
+        const stats = fs.statSync(claudeHookFilePath);
+        if (stats.size < claudeHookReadOffset) {
+            claudeHookReadOffset = 0;
+            claudeHookLineBuffer = '';
+        }
+
+        if (stats.size === claudeHookReadOffset) {
+            return;
+        }
+
+        const length = stats.size - claudeHookReadOffset;
+        const fd = fs.openSync(claudeHookFilePath, 'r');
+        try {
+            const buffer = Buffer.alloc(length);
+            const bytesRead = fs.readSync(fd, buffer, 0, length, claudeHookReadOffset);
+            claudeHookReadOffset += bytesRead;
+
+            const chunk = claudeHookLineBuffer + buffer.toString('utf8', 0, bytesRead);
+            const lines = chunk.split(/\r?\n/);
+            claudeHookLineBuffer = lines.pop() || '';
+
+            for (const hookLine of lines) {
+                if (hookLine) {
+                    handleClaudeHookLine(hookLine);
+                }
+            }
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            logDebug(`[CLAUDE] Failed reading hook log: ${error.message}`);
+        }
+    }
+}
+
+function startClaudeHookWatcher(filePath) {
+    stopClaudeHookWatcher();
+    claudeHookFilePath = filePath;
+    claudeHookReadOffset = 0;
+    claudeHookLineBuffer = '';
+    claudeHookPollTimer = setInterval(pollClaudeHookWatcher, 400);
+    pollClaudeHookWatcher();
 }
 
 function setChannelRuntime(phase, detail, extra = {}) {
@@ -1216,8 +1343,11 @@ function spawnClaudeCode() {
 
     const runtimeRootDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
     const bridgePath = path.join(runtimeRootDir, 'channel-bridge.cjs');
+    const hookScriptPath = path.join(runtimeRootDir, 'claude-stop-hook.cjs');
     const mcpConfigPath = path.join(app.getPath('userData'), 'root-operator-mcp.json');
+    const settingsPath = path.join(app.getPath('userData'), 'root-operator-claude-settings.json');
     const debugFilePath = path.join(app.getPath('userData'), 'claude-channel-debug.log');
+    const hookLogPath = path.join(app.getPath('userData'), 'claude-channel-hooks.jsonl');
     channelStartupAttempt += 1;
     clearChannelRestartTimer();
     clearChannelStartupTimer();
@@ -1241,16 +1371,44 @@ function spawnClaudeCode() {
         },
     }, null, 2));
 
+    fs.writeFileSync(settingsPath, JSON.stringify({
+        hooks: {
+            Stop: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: `node ${shellEscapeArg(hookScriptPath)}`,
+                        },
+                    ],
+                },
+            ],
+            StopFailure: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: `node ${shellEscapeArg(hookScriptPath)}`,
+                        },
+                    ],
+                },
+            ],
+        },
+    }, null, 2));
+
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
         fs.writeFileSync(debugFilePath, '');
+        fs.writeFileSync(hookLogPath, '');
         startClaudeDebugWatcher(debugFilePath);
+        startClaudeHookWatcher(hookLogPath);
 
         // Use node-pty (already in project) so Claude sees a real TTY
         // and shows its confirmation prompt properly
         claudeProcess = pty.spawn('claude', [
             '--dangerously-skip-permissions',
             '--debug-file', debugFilePath,
+            '--settings', settingsPath,
             '--mcp-config', mcpConfigPath,
             '--dangerously-load-development-channels', 'server:root-operator',
         ], {
@@ -1261,6 +1419,7 @@ function spawnClaudeCode() {
             env: {
                 ...process.env,
                 ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
+                ROOT_OPERATOR_HOOK_LOG: hookLogPath,
             },
         });
 
@@ -1332,6 +1491,7 @@ function spawnClaudeCode() {
             clearChannelStartupTimer();
             clearChannelConfirmTimers();
             stopClaudeDebugWatcher();
+            stopClaudeHookWatcher();
             claudeProcess = null;
             removeChannelSocket();
 
@@ -1362,6 +1522,7 @@ function spawnClaudeCode() {
     } catch (err) {
         logDebug(`[CLAUDE] Failed to spawn: ${err.message}`);
         stopClaudeDebugWatcher();
+        stopClaudeHookWatcher();
         claudeProcess = null;
         setChannelRuntime('error', `Failed to launch Claude: ${err.message}`, {
             attempt: channelStartupAttempt,
@@ -1377,6 +1538,7 @@ function killClaudeCode() {
         clearChannelStartupTimer();
         clearChannelConfirmTimers();
         stopClaudeDebugWatcher();
+        stopClaudeHookWatcher();
         claudeProcess.kill();
     }
 }
@@ -1411,13 +1573,7 @@ function initChannelMode() {
                 sendEncryptedOutput(client, JSON.stringify(msg));
             }
         }
-
-        channelReplyPending = false;
-        setChannelActivity({
-            phase: 'idle',
-            label: 'Idle',
-            detail: 'Claude is ready for the next message.',
-        }, { force: true });
+        scheduleChannelIdle();
     });
 
     channelManager.on('connected', () => {
@@ -1496,6 +1652,7 @@ function teardownChannelMode() {
     clearChannelRestartTimer();
     clearChannelStartupTimer();
     clearChannelConfirmTimers();
+    clearChannelIdleTimer();
     // Only kill Claude if we spawned it
     if (claudeProcess) killClaudeCode();
     if (channelManager) {
@@ -1504,6 +1661,7 @@ function teardownChannelMode() {
     }
     removeChannelSocket();
     stopClaudeDebugWatcher();
+    stopClaudeHookWatcher();
     channelStartupAttempt = 0;
     resetChannelActivity();
     setChannelRuntime('stopped', 'Chat mode is not active.');
