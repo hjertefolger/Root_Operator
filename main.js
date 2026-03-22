@@ -1662,7 +1662,7 @@ function initChannelMode() {
     spawnClaudeCode();
 }
 
-function handleSchedulerRequest(req) {
+async function handleSchedulerRequest(req) {
     if (!scheduler) {
         channelManager?.sendSchedulerResponse(req.callId, 'Scheduler not initialized', true);
         return;
@@ -1672,13 +1672,13 @@ function handleSchedulerRequest(req) {
         let result;
         switch (req.tool) {
             case 'ro_schedule':
-                result = scheduler.addJob({
+                const created = await scheduler.addJob({
                     name: req.args.name,
                     cronExpr: req.args.cron,
                     prompt: req.args.prompt,
                     chatId: req.args.chat_id,
                 });
-                result = `Job created: "${result.name}" (${result.id})\nSchedule: ${result.cron}\nNext fire at the scheduled time.`;
+                result = `Job created: "${created.name}" (${created.id})\nSchedule: ${created.cron}\nNext fire at the scheduled time.`;
                 break;
 
             case 'ro_list_schedules':
@@ -1686,20 +1686,34 @@ function handleSchedulerRequest(req) {
                 if (jobs.length === 0) {
                     result = 'No scheduled jobs.';
                 } else {
-                    result = jobs.map(j =>
-                        `${j.enabled ? '●' : '○'} ${j.name} (${j.id})\n  Schedule: ${j.cron}\n  Last run: ${j.lastRun || 'never'} (${j.lastResult || 'n/a'})\n  Prompt: ${j.prompt}`
-                    ).join('\n\n');
+                    result = jobs.map(j => {
+                        let status = j.enabled ? '●' : '○';
+                        if (j.running) status = '▶';
+                        let line = `${status} ${j.name} (${j.id})`;
+                        line += `\n  Schedule: ${j.cron}`;
+                        line += `\n  Last run: ${j.lastRun || 'never'}`;
+                        if (j.lastResult) line += ` (${j.lastResult})`;
+                        if (j.lastError) line += `\n  Last error: ${j.lastError}`;
+                        if (j.consecutiveErrors > 0) line += `\n  Consecutive errors: ${j.consecutiveErrors}`;
+                        line += `\n  Prompt: ${j.prompt}`;
+                        return line;
+                    }).join('\n\n');
                 }
                 break;
 
             case 'ro_delete_schedule':
-                scheduler.removeJob(req.args.id);
+                await scheduler.removeJob(req.args.id);
                 result = `Job ${req.args.id} deleted.`;
                 break;
 
             case 'ro_toggle_schedule':
-                const toggled = scheduler.toggleJob(req.args.id, req.args.enabled);
+                const toggled = await scheduler.toggleJob(req.args.id, req.args.enabled);
                 result = `Job "${toggled.name}" is now ${toggled.enabled ? 'enabled' : 'disabled'}.`;
+                break;
+
+            case 'ro_run_now':
+                await scheduler.runNow(req.args.id);
+                result = `Job ${req.args.id} triggered manually.`;
                 break;
 
             default:

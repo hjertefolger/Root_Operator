@@ -109,6 +109,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['id', 'enabled'],
       },
     },
+    {
+      name: 'ro_run_now',
+      description: 'Manually trigger a scheduled job immediately, regardless of its cron schedule.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Job ID to trigger' },
+        },
+        required: ['id'],
+      },
+    },
   ],
 }));
 
@@ -152,7 +163,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   // --- Scheduler tools: forward to Electron and await response ---
-  const schedulerTools = ['ro_schedule', 'ro_list_schedules', 'ro_delete_schedule', 'ro_toggle_schedule'];
+  const schedulerTools = ['ro_schedule', 'ro_list_schedules', 'ro_delete_schedule', 'ro_toggle_schedule', 'ro_run_now'];
   if (schedulerTools.includes(request.params.name)) {
     return handleSchedulerTool(request.params.name, request.params.arguments || {});
   }
