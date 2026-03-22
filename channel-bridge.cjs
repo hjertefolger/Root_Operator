@@ -67,6 +67,48 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'text'],
       },
     },
+    {
+      name: 'ro_schedule',
+      description: 'Create a persistent scheduled job in Root Operator. Unlike built-in cron, these jobs survive session rotation, context compression, and restarts. The job fires by injecting the prompt into the Claude channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Human-readable job name' },
+          cron: { type: 'string', description: 'Standard 5-field cron expression (minute hour day-of-month month day-of-week). All times are local timezone.' },
+          prompt: { type: 'string', description: 'The prompt to inject when the job fires' },
+          chat_id: { type: 'string', description: 'Optional device to notify on completion. Omit to broadcast.' },
+        },
+        required: ['name', 'cron', 'prompt'],
+      },
+    },
+    {
+      name: 'ro_list_schedules',
+      description: 'List all persistent scheduled jobs in Root Operator.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'ro_delete_schedule',
+      description: 'Delete a persistent scheduled job in Root Operator.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Job ID to delete' },
+        },
+        required: ['id'],
+      },
+    },
+    {
+      name: 'ro_toggle_schedule',
+      description: 'Enable or disable a persistent scheduled job in Root Operator without deleting it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Job ID' },
+          enabled: { type: 'boolean', description: 'Whether the job should be enabled' },
+        },
+        required: ['id', 'enabled'],
+      },
+    },
   ],
 }));
 
@@ -109,6 +151,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
+  // --- Scheduler tools: forward to Electron and await response ---
+  const schedulerTools = ['ro_schedule', 'ro_list_schedules', 'ro_delete_schedule', 'ro_toggle_schedule'];
+  if (schedulerTools.includes(request.params.name)) {
+    return handleSchedulerTool(request.params.name, request.params.arguments || {});
+  }
+
   return {
     content: [
       {
@@ -119,6 +167,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     isError: true,
   };
 });
+
+// --- Scheduler tool forwarding ---
+let schedulerCallbacks = new Map();
+let schedulerCallId = 0;
+
+function handleSchedulerTool(toolName, args) {
+  return new Promise((resolve) => {
+    if (!electronSocket || electronSocket.destroyed) {
+      resolve({
+        content: [{ type: 'text', text: 'Error: No Electron connection available' }],
+        isError: true,
+      });
+      return;
+    }
+
+    const callId = ++schedulerCallId;
+    const timeout = setTimeout(() => {
+      schedulerCallbacks.delete(callId);
+      resolve({
+        content: [{ type: 'text', text: 'Error: Scheduler request timed out' }],
+        isError: true,
+      });
+    }, 10000);
+
+    schedulerCallbacks.set(callId, { resolve, timeout });
+
+    emitToElectron({
+      type: 'scheduler_request',
+      callId,
+      tool: toolName,
+      args,
+      ts: new Date().toISOString(),
+    });
+  });
+}
 
 function startIPCServer() {
   try {
@@ -203,6 +286,19 @@ function shutdown(signal = 'shutdown') {
 }
 
 async function handleElectronMessage(msg) {
+  if (msg.type === 'scheduler_response') {
+    const cb = schedulerCallbacks.get(msg.callId);
+    if (cb) {
+      clearTimeout(cb.timeout);
+      schedulerCallbacks.delete(msg.callId);
+      cb.resolve({
+        content: [{ type: 'text', text: msg.result }],
+        isError: msg.isError || false,
+      });
+    }
+    return;
+  }
+
   if (msg.type === 'client_message') {
     const content = `<channel source="root-operator" chat_id="${msg.chat_id}">${msg.content}</channel>`;
 

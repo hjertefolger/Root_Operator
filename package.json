@@ -49,6 +49,7 @@
     "is-electron": "^2.2.2",
     "keytar": "^7.9.0",
     "lucide-react": "^0.562.0",
+    "node-cron": "^4.2.1",
     "node-pty": "^1.1.0",
     "phosphor-icons": "^1.4.2",
     "qrcode": "^1.5.4",

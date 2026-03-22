@@ -102,6 +102,16 @@ class ChannelManager extends EventEmitter {
                 toolName: msg.toolName || '',
                 ts: msg.ts,
             });
+            return;
+        }
+
+        if (msg.type === 'scheduler_request') {
+            this.emit('scheduler_request', {
+                callId: msg.callId,
+                tool: msg.tool,
+                args: msg.args,
+                ts: msg.ts,
+            });
         }
     }
 
@@ -133,6 +143,22 @@ class ChannelManager extends EventEmitter {
 
         if (!this.socket || !this.connected) {
             this._queuePayload(payload);
+            return false;
+        }
+
+        this.socket.write(payload);
+        return true;
+    }
+
+    sendSchedulerResponse(callId, result, isError = false) {
+        const payload = JSON.stringify({
+            type: 'scheduler_response',
+            callId,
+            result,
+            isError,
+        }) + '\n';
+
+        if (!this.socket || !this.connected) {
             return false;
         }
 

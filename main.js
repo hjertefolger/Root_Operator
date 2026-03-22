@@ -20,6 +20,7 @@ const cloudflared = require('cloudflared');
 const keytar = require('keytar');
 const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
+const { Scheduler } = require('./src/scheduler');
 
 let store;
 const isDev = !app.isPackaged;
@@ -65,6 +66,7 @@ let isConnecting = false; // Track if tunnel is in the process of starting
 // Channel mode state
 let operatingMode = 'channel'; // 'terminal' | 'channel'
 let channelManager = null;
+let scheduler = null;
 let claudeProcess = null; // Claude Code child process
 let chatStore = null; // initialized after app.whenReady()
 const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
@@ -1644,10 +1646,70 @@ function initChannelMode() {
         setChannelActivity(activity);
     });
 
+    channelManager.on('scheduler_request', (req) => {
+        handleSchedulerRequest(req);
+    });
+
     channelManager.connect();
+
+    // Start persistent scheduler (survives session rotation)
+    if (store) {
+        scheduler = new Scheduler(store, channelManager);
+        scheduler.start();
+    }
 
     // Spawn Claude Code (auto-approves channel confirmation prompt)
     spawnClaudeCode();
+}
+
+function handleSchedulerRequest(req) {
+    if (!scheduler) {
+        channelManager?.sendSchedulerResponse(req.callId, 'Scheduler not initialized', true);
+        return;
+    }
+
+    try {
+        let result;
+        switch (req.tool) {
+            case 'ro_schedule':
+                result = scheduler.addJob({
+                    name: req.args.name,
+                    cronExpr: req.args.cron,
+                    prompt: req.args.prompt,
+                    chatId: req.args.chat_id,
+                });
+                result = `Job created: "${result.name}" (${result.id})\nSchedule: ${result.cron}\nNext fire at the scheduled time.`;
+                break;
+
+            case 'ro_list_schedules':
+                const jobs = scheduler.listJobs();
+                if (jobs.length === 0) {
+                    result = 'No scheduled jobs.';
+                } else {
+                    result = jobs.map(j =>
+                        `${j.enabled ? '●' : '○'} ${j.name} (${j.id})\n  Schedule: ${j.cron}\n  Last run: ${j.lastRun || 'never'} (${j.lastResult || 'n/a'})\n  Prompt: ${j.prompt}`
+                    ).join('\n\n');
+                }
+                break;
+
+            case 'ro_delete_schedule':
+                scheduler.removeJob(req.args.id);
+                result = `Job ${req.args.id} deleted.`;
+                break;
+
+            case 'ro_toggle_schedule':
+                const toggled = scheduler.toggleJob(req.args.id, req.args.enabled);
+                result = `Job "${toggled.name}" is now ${toggled.enabled ? 'enabled' : 'disabled'}.`;
+                break;
+
+            default:
+                result = `Unknown scheduler tool: ${req.tool}`;
+        }
+
+        channelManager?.sendSchedulerResponse(req.callId, result, false);
+    } catch (error) {
+        channelManager?.sendSchedulerResponse(req.callId, `Error: ${error.message}`, true);
+    }
 }
 
 function teardownChannelMode() {
@@ -1655,6 +1717,11 @@ function teardownChannelMode() {
     clearChannelStartupTimer();
     clearChannelConfirmTimers();
     clearChannelIdleTimer();
+    // Stop scheduler timers (jobs persist in store for next startup)
+    if (scheduler) {
+        scheduler.stopAll();
+        scheduler = null;
+    }
     // Only kill Claude if we spawned it
     if (claudeProcess) killClaudeCode();
     if (channelManager) {
