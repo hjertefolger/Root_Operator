@@ -61,7 +61,7 @@ function ActivityTimeline({ activities, waiting }) {
             <Check
               size={13}
               strokeWidth={2.4}
-              style={{ color: '#34d399', flexShrink: 0 }}
+              style={{ color: '#4B5AFF', flexShrink: 0 }}
             />
           )}
           <span
