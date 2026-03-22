@@ -31,3 +31,5 @@ worker/wrangler.toml
 
 # Source images (working files)
 *_source.jpg
+channel-bridge.bundle.cjs
+runtime-config.json

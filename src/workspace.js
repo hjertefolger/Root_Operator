@@ -9,8 +9,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const WORKSPACE_DIR = path.join(os.homedir(), '.root-operator', 'workspace');
+const ROOT_OPERATOR_DIR = path.join(os.homedir(), '.root-operator');
+const WORKSPACE_DIR = path.join(ROOT_OPERATOR_DIR, 'workspace');
+const RUNTIME_DIR = path.join(ROOT_OPERATOR_DIR, 'runtime');
 const STATE_FILE = path.join(WORKSPACE_DIR, '.state.json');
+const SYSTEM_PROMPT_FILE = path.join(RUNTIME_DIR, 'system-prompt-append.md');
+const PROJECT_MCP_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
 // In packaged app, workspace-templates may be inside asar — use unpacked path
 const _baseDir = __dirname.replace('app.asar', 'app.asar.unpacked');
 const TEMPLATES_DIR = path.join(_baseDir, '..', 'workspace-templates');
@@ -22,14 +26,17 @@ const MAX_CHARS_PER_FILE = 20_000;
 const MAX_TOTAL_CHARS = 150_000;
 
 /**
- * Ensure workspace exists. Seed template files on first run.
- * Returns { workspaceDir, isFirstRun }.
+ * Ensure workspace exists. Repair missing template-backed files if needed.
+ * Returns { workspaceDir, runtimeDir, isFirstRun, repairedFiles, missingTemplateFiles }.
  */
 function ensureWorkspace() {
     const memoryDir = path.join(WORKSPACE_DIR, 'memory');
+    const repairedFiles = [];
+    const missingTemplateFiles = [];
 
     // Create directories
     fs.mkdirSync(memoryDir, { recursive: true });
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
     const state = _readState();
     const isFirstRun = !state.onboardedAt;
@@ -45,7 +52,11 @@ function ensureWorkspace() {
             const template = path.join(TEMPLATES_DIR, filename);
             if (fs.existsSync(template)) {
                 fs.copyFileSync(template, dest);
+                repairedFiles.push(filename);
                 console.log(`[Workspace] Seeded ${filename}`);
+            } else {
+                missingTemplateFiles.push(filename);
+                console.warn(`[Workspace] Missing template for ${filename}: ${template}`);
             }
         }
     }
@@ -55,7 +66,13 @@ function ensureWorkspace() {
         console.log('[Workspace] First run — workspace seeded');
     }
 
-    return { workspaceDir: WORKSPACE_DIR, isFirstRun };
+    return {
+        workspaceDir: WORKSPACE_DIR,
+        runtimeDir: RUNTIME_DIR,
+        isFirstRun,
+        repairedFiles,
+        missingTemplateFiles,
+    };
 }
 
 /**
@@ -118,19 +135,37 @@ function buildSystemPromptAppend() {
 }
 
 /**
- * Write the system prompt append file to a temp location.
+ * Write the system prompt append file to the persistent runtime directory.
  * Returns the file path.
  */
 function writeSystemPromptFile() {
     const content = buildSystemPromptAppend();
-    const tmpDir = path.join(os.tmpdir(), 'root-operator');
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    const filepath = path.join(tmpDir, 'system-prompt-append.md');
-    fs.writeFileSync(filepath, content, 'utf-8');
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    fs.writeFileSync(SYSTEM_PROMPT_FILE, content, 'utf-8');
 
     console.log(`[Workspace] System prompt append written (${content.length} chars)`);
-    return filepath;
+    return SYSTEM_PROMPT_FILE;
+}
+
+/**
+ * Write a project-scoped .mcp.json into the Claude workspace so Claude Code
+ * can discover the channel server via normal project config resolution.
+ */
+function writeProjectMcpConfig({ command, args, env }) {
+    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+    fs.writeFileSync(PROJECT_MCP_FILE, JSON.stringify({
+        mcpServers: {
+            'root-operator': {
+                type: 'stdio',
+                command,
+                args,
+                env,
+            },
+        },
+    }, null, 2), 'utf-8');
+
+    console.log(`[Workspace] Project MCP config written: ${PROJECT_MCP_FILE}`);
+    return PROJECT_MCP_FILE;
 }
 
 /**
@@ -157,6 +192,10 @@ function getWorkspaceDir() {
     return WORKSPACE_DIR;
 }
 
+function getRuntimeDir() {
+    return RUNTIME_DIR;
+}
+
 // --- Internal helpers ---
 
 function _readState() {
@@ -176,8 +215,12 @@ module.exports = {
     ensureWorkspace,
     buildSystemPromptAppend,
     writeSystemPromptFile,
+    writeProjectMcpConfig,
     markOnboarded,
     isBootstrapPending,
     getWorkspaceDir,
+    getRuntimeDir,
+    ROOT_OPERATOR_DIR,
     WORKSPACE_DIR,
+    RUNTIME_DIR,
 };

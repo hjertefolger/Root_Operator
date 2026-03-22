@@ -2,10 +2,9 @@
  * ROOT OPERATOR - MAIN PROCESS
  */
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu } = require('electron');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const fixPath = async () => {
     const { default: fp } = await import('fix-path');
     fp();
@@ -14,17 +13,38 @@ const WebSocket = require('ws');
 const pty = require('node-pty');
 const http = require('http');
 const net = require('net');
-const fs = require('fs');
 const crypto = require('crypto');
 const cloudflared = require('cloudflared');
 const keytar = require('keytar');
 const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
-const { ensureWorkspace, writeSystemPromptFile } = require('./src/workspace');
+const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig } = require('./src/workspace');
 
 let store;
 const isDev = !app.isPackaged;
+
+if (isDev) {
+    require('dotenv').config({ path: path.join(__dirname, '.env') });
+}
+
+function loadRuntimeConfig() {
+    const configPath = path.join(__dirname, 'runtime-config.json');
+
+    try {
+        if (!fs.existsSync(configPath)) {
+            return {};
+        }
+
+        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+        console.warn(`[CONFIG] Failed to load runtime-config.json: ${error.message}`);
+        return {};
+    }
+}
+
+const runtimeConfig = loadRuntimeConfig();
 
 // Fix cloudflared binary path for packaged app (binary is in app.asar.unpacked)
 if (!isDev) {
@@ -36,9 +56,9 @@ if (!isDev) {
 }
 
 // Server configuration (can be overridden via environment variables)
-const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT, 10) || 22000;
-const VITE_CLIENT_PORT = parseInt(process.env.VITE_CLIENT_PORT, 10) || 5175;
-const VITE_RENDERER_PORT = parseInt(process.env.VITE_RENDERER_PORT, 10) || 5174;
+const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT || runtimeConfig.INTERNAL_PORT, 10) || 22000;
+const VITE_CLIENT_PORT = parseInt(process.env.VITE_CLIENT_PORT || runtimeConfig.VITE_CLIENT_PORT, 10) || 5175;
+const VITE_RENDERER_PORT = parseInt(process.env.VITE_RENDERER_PORT || runtimeConfig.VITE_RENDERER_PORT, 10) || 5174;
 
 // Secure credential storage constants
 const KEYTAR_SERVICE = 'RootOperator';
@@ -47,8 +67,12 @@ const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 
 // Worker API configuration (loaded from .env file)
-const WORKER_BASE_URL = process.env.WORKER_BASE_URL;
-const WORKER_DOMAIN = process.env.WORKER_DOMAIN;
+const WORKER_BASE_URL = process.env.WORKER_BASE_URL || runtimeConfig.WORKER_BASE_URL || '';
+const WORKER_DOMAIN = process.env.WORKER_DOMAIN || runtimeConfig.WORKER_DOMAIN || '';
+
+if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
+    console.warn('[CONFIG] WORKER_BASE_URL or WORKER_DOMAIN is missing. Tunnel provisioning features will be unavailable.');
+}
 
 // GLOBAL STATE
 let mainWindow;
@@ -1340,19 +1364,90 @@ function scheduleClaudeRestart(reason) {
     }, CHANNEL_RESTART_DELAY_MS);
 }
 
+function prepareClaudeWorkspaceRuntime() {
+    const runtimeRootDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
+    const bridgeFile = isDev ? 'channel-bridge.cjs' : 'channel-bridge.bundle.cjs';
+    const bridgePath = path.join(runtimeRootDir, bridgeFile);
+    const hookScriptPath = path.join(runtimeRootDir, 'claude-stop-hook.cjs');
+    const {
+        workspaceDir,
+        runtimeDir,
+        isFirstRun,
+        repairedFiles,
+        missingTemplateFiles,
+    } = ensureWorkspace();
+    const settingsPath = path.join(runtimeDir, 'root-operator-claude-settings.json');
+    const debugFilePath = path.join(runtimeDir, 'claude-channel-debug.log');
+    const hookLogPath = path.join(runtimeDir, 'claude-channel-hooks.jsonl');
+    const systemPromptFile = writeSystemPromptFile();
+    const projectMcpPath = writeProjectMcpConfig({
+        command: process.execPath,
+        args: [bridgePath],
+        env: {
+            ELECTRON_RUN_AS_NODE: '1',
+            ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
+        },
+    });
+
+    fs.writeFileSync(settingsPath, JSON.stringify({
+        hooks: {
+            Stop: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: `/usr/bin/env ELECTRON_RUN_AS_NODE=1 ${shellEscapeArg(process.execPath)} ${shellEscapeArg(hookScriptPath)}`,
+                        },
+                    ],
+                },
+            ],
+            StopFailure: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: `/usr/bin/env ELECTRON_RUN_AS_NODE=1 ${shellEscapeArg(process.execPath)} ${shellEscapeArg(hookScriptPath)}`,
+                        },
+                    ],
+                },
+            ],
+        },
+    }, null, 2));
+
+    if (isFirstRun) {
+        logDebug('[CLAUDE] First run — workspace seeded with identity templates');
+    }
+
+    if (repairedFiles.length > 0) {
+        logDebug(`[WORKSPACE] Repaired missing files: ${repairedFiles.join(', ')}`);
+    }
+
+    if (missingTemplateFiles.length > 0) {
+        logDebug(`[WORKSPACE] Missing bundled templates: ${missingTemplateFiles.join(', ')}`);
+    }
+
+    return {
+        workspaceDir,
+        runtimeDir,
+        bridgePath,
+        hookScriptPath,
+        settingsPath,
+        debugFilePath,
+        hookLogPath,
+        systemPromptFile,
+        projectMcpPath,
+        isFirstRun,
+        repairedFiles,
+        missingTemplateFiles,
+    };
+}
+
 function spawnClaudeCode() {
     if (claudeProcess) {
         logDebug('[CLAUDE] Already running, skipping spawn');
         return;
     }
 
-    const runtimeRootDir = isDev ? __dirname : __dirname.replace('app.asar', 'app.asar.unpacked');
-    const bridgePath = path.join(runtimeRootDir, 'channel-bridge.cjs');
-    const hookScriptPath = path.join(runtimeRootDir, 'claude-stop-hook.cjs');
-    const mcpConfigPath = path.join(app.getPath('userData'), 'root-operator-mcp.json');
-    const settingsPath = path.join(app.getPath('userData'), 'root-operator-claude-settings.json');
-    const debugFilePath = path.join(app.getPath('userData'), 'claude-channel-debug.log');
-    const hookLogPath = path.join(app.getPath('userData'), 'claude-channel-hooks.jsonl');
     channelStartupAttempt += 1;
     clearChannelRestartTimer();
     clearChannelStartupTimer();
@@ -1364,49 +1459,13 @@ function spawnClaudeCode() {
         lastError: '',
     });
 
-    fs.writeFileSync(mcpConfigPath, JSON.stringify({
-        mcpServers: {
-            'root-operator': {
-                command: 'node',
-                args: [bridgePath],
-                env: {
-                    ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
-                },
-            },
-        },
-    }, null, 2));
-
-    fs.writeFileSync(settingsPath, JSON.stringify({
-        hooks: {
-            Stop: [
-                {
-                    hooks: [
-                        {
-                            type: 'command',
-                            command: `node ${shellEscapeArg(hookScriptPath)}`,
-                        },
-                    ],
-                },
-            ],
-            StopFailure: [
-                {
-                    hooks: [
-                        {
-                            type: 'command',
-                            command: `node ${shellEscapeArg(hookScriptPath)}`,
-                        },
-                    ],
-                },
-            ],
-        },
-    }, null, 2));
-
-    // Ensure workspace exists and build system prompt append
-    const { workspaceDir, isFirstRun } = ensureWorkspace();
-    const systemPromptFile = writeSystemPromptFile();
-    if (isFirstRun) {
-        logDebug('[CLAUDE] First run — workspace seeded with identity templates');
-    }
+    const {
+        workspaceDir,
+        settingsPath,
+        debugFilePath,
+        hookLogPath,
+        systemPromptFile,
+    } = prepareClaudeWorkspaceRuntime();
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
@@ -1421,14 +1480,13 @@ function spawnClaudeCode() {
             '--dangerously-skip-permissions',
             '--debug-file', debugFilePath,
             '--settings', settingsPath,
-            '--mcp-config', mcpConfigPath,
             '--append-system-prompt-file', systemPromptFile,
             '--dangerously-load-development-channels', 'server:root-operator',
         ], {
             name: 'xterm-256color',
             cols: 80,
             rows: 24,
-            cwd: runtimeRootDir,
+            cwd: workspaceDir,
             env: {
                 ...process.env,
                 ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
@@ -1846,6 +1904,23 @@ app.whenReady().then(async () => {
 
     await fixPath();
     chatStore = new ChatStore(app.getPath('userData'));
+    try {
+        const historyCount = chatStore.loadMessages().length;
+        logDebug(`[CHAT] History store ready: ${chatStore.filePath} (${historyCount} messages)`);
+    } catch (error) {
+        logDebug(`[CHAT] Failed to read history store: ${error.message}`);
+    }
+
+    try {
+        const workspaceRuntime = prepareClaudeWorkspaceRuntime();
+        if (workspaceRuntime.missingTemplateFiles.length > 0) {
+            console.warn(`[WORKSPACE] Missing bundled templates: ${workspaceRuntime.missingTemplateFiles.join(', ')}`);
+        }
+    } catch (error) {
+        console.error(`[WORKSPACE] Failed to prepare Claude workspace runtime: ${error.message}`);
+        logDebug(`[WORKSPACE] Startup preparation failed: ${error.message}`);
+    }
+
     createWindow();
     createTray();
 });

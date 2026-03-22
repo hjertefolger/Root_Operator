@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "root-operator": {
+      "type": "stdio",
       "command": "node",
       "args": ["./channel-bridge.cjs"],
       "env": {
