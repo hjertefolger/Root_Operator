@@ -1,25 +1,71 @@
-# Root_Operator
+# Root Operator
 
-A secure remote terminal access app for macOS that lets you control your Mac's terminal from your iPhone or any web browser. Built with Electron and powered by Cloudflare Tunnel for secure, zero-config remote access.
+[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](package.json)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
+[![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
 
-## Features
-
-- **Secure Remote Access** - Access your Mac's terminal from anywhere via Cloudflare Tunnel
-- **End-to-End Encryption** - All terminal I/O is encrypted with AES-256-GCM using ECDH key exchange
-- **Visual Fingerprint Verification** - 12-word BIP39 mnemonic fingerprint to verify secure connection
-- **Device Pairing** - Simple 6-character pairing code for new device authorization
-- **PWA Support** - Install on iOS home screen for native app-like experience
-- **Persistent Sessions** - Terminal state persists across reconnections
-- **Custom Operator URL** - Set your own URL at `yourname.rootoperator.dev` for easy sharing
-
-## Screenshots
+**Secure remote terminal + AI agent bridge for macOS.** Control your Mac from your phone — terminal or Claude.
 
 <!-- Add screenshots here -->
 
+## Why Root Operator?
+
+| Problem | Root Operator |
+|---------|---------------|
+| SSH is complex to set up and expose | One-click Cloudflare Tunnel — zero open ports, zero config |
+| Terminal apps lack end-to-end encryption | AES-256-GCM with ECDH key exchange on every session |
+| No way to reach Claude Code from your phone | Claude Code Channel — chat with your desktop agent from anywhere |
+| Scheduled tasks need cron + SSH + scripts | Built-in persistent scheduler with natural language cron jobs |
+| Remote tools feel disconnected from your machine | PWA that lives on your home screen like a native app |
+
+## Features
+
+### Terminal Mode
+
+Full remote shell access with military-grade encryption.
+
+- **Zero-config tunneling** — Cloudflare Tunnel creates a public URL instantly, no port forwarding
+- **End-to-end encryption** — ECDH P-256 key exchange + AES-256-GCM for all terminal I/O
+- **Visual fingerprint verification** — 12-word BIP39 mnemonic confirms secure channel on both devices
+- **Device pairing** — 6-character code for new devices, challenge-response for returning ones
+- **PWA client** — Install on iOS home screen, works like a native app with virtual keyboard
+- **Persistent sessions** — Terminal state survives reconnections with server-side output buffer
+- **ANSI sanitization** — Blocks dangerous escape sequences (clipboard hijacking, title spoofing)
+
+### Claude Code Channel
+
+Chat with Claude Code running on your Mac — from your phone.
+
+- **Markdown chat interface** — Rich message rendering with full Markdown + GFM support
+- **Live activity indicators** — See what Claude is doing in real-time (reading files, running commands)
+- **Persistent history** — File-backed JSONL message store, survives app restarts
+- **Mode switching** — Toggle between Terminal and Channel from client or tray menu
+- **MCP bridge** — Claude Code connects via stdio MCP server over Unix socket
+
+### Identity & Workspace
+
+Give Claude a persistent persona across sessions.
+
+- **Workspace files** — `IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md` define who Claude is and who you are
+- **System prompt injection** — Workspace files automatically appended to Claude's system prompt at startup
+- **First-run onboarding** — `BOOTSTRAP.md` guides initial setup, then self-deletes
+- **Fully customizable** — Edit workspace files at `~/.root-operator/workspace/`
+
+### Persistent Scheduler
+
+Cron jobs powered by natural language, managed by Claude.
+
+- **MCP tools** — `ro_schedule`, `ro_list_schedules`, `ro_delete_schedule`, `ro_toggle_schedule`, `ro_run_now`
+- **Production-grade** — Exponential backoff, auto-disable after 10 failures, stuck-run detection
+- **Persistent** — Jobs survive app restarts, stored in electron-store
+- **Limits** — Up to 50 jobs, 50KB max prompt per job, 5s refire gap
+
 ## Requirements
 
-- macOS 11+ (Big Sur or later)
-- Node.js 18+ (for building from source)
+- **macOS** 11+ (Big Sur or later) — Apple Silicon and Intel
+- **Node.js** 18+ (for building from source)
+- **Claude Code** (for Channel mode)
 
 ## Installation
 
@@ -27,90 +73,62 @@ A secure remote terminal access app for macOS that lets you control your Mac's t
 
 Download the latest `.dmg` from the [Releases](https://github.com/hjertefolger/Root_Operator/releases) page.
 
-> **Important**
-> The app is unsigned. macOS will block it on first launch. To allow it to run, either:
-> - Go to **System Settings → Privacy & Security** and click "Open Anyway", or
-> - Run this command to sign it locally:
->   ```bash
->   xattr -cr /Applications/Root_Operator.app && codesign --force --deep --sign - /Applications/Root_Operator.app
->   ```
+The app is signed and notarized — macOS will allow it to run without extra steps.
 
 ### From Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/hjertefolger/Root_Operator.git
 cd Root_Operator
-
-# Install dependencies (automatically rebuilds native modules)
-npm install
-
-# Start in development mode
-npm run dev:app
-
-# Or build for production
-npm run build:unsigned
+npm install        # Installs deps + rebuilds native modules
+npm run dev:app    # Start with hot reload
 ```
 
-## Configuration
+## Quick Start
 
-Copy `.env.example` to `.env` and configure your domain:
+1. **Launch** Root Operator — it lives in your menu bar
+2. **Click "Jump"** to start the Cloudflare Tunnel
+3. **Scan the QR code** or copy the tunnel URL
+4. **Open on your phone** — Safari, Chrome, or add to home screen as PWA
+5. **Pair** — enter the 6-character code shown on your phone into the desktop app
+6. **Verify** — confirm the 12-word fingerprint matches on both devices
+7. **Go** — encrypted terminal access from anywhere
 
-```bash
-cp .env.example .env
-# Edit .env with your domain settings
-```
-
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `WORKER_BASE_URL` | Yes | Cloudflare Worker API URL (e.g., `https://cf.yourdomain.com`) |
-| `WORKER_DOMAIN` | Yes | Your domain for custom subdomains (e.g., `yourdomain.com`) |
-| `VITE_WORKER_DOMAIN` | Yes | Same as WORKER_DOMAIN (for UI display) |
-| `INTERNAL_PORT` | No | Local HTTP/WebSocket server port (default: 22000) |
-| `VITE_RENDERER_PORT` | No | Vite dev server port for tray app (default: 5174) |
-| `VITE_CLIENT_PORT` | No | Vite dev server port for PWA client (default: 5175) |
-
-## Usage
-
-1. **Start the app** - Launch Root_Operator from Applications or run `npm run dev:app`
-2. **Connect tunnel** - Click "Jump" to start the secure tunnel
-3. **Copy the link** - Click the copy icon to copy the tunnel URL
-4. **Open on device** - Paste the URL in Safari on your iPhone or any browser
-5. **Pair device** - A 6-character pairing code appears on the client; enter it in the desktop app to authorize
-6. **Verify fingerprint** - Confirm the 12-word fingerprint matches on both devices
-7. **Start typing** - You now have secure terminal access!
-
-### Operator URL
-
-You can set a custom Operator URL (e.g., `myname.rootoperator.dev`) for easier sharing:
-1. Open Settings in the tray menu
-2. Enter your desired name in the Operator URL field
-3. Your tunnel will be accessible at `yourname.rootoperator.dev`
+To use **Claude Code Channel**, right-click the tray icon and switch to Channel mode. Messages from your phone will route to Claude Code.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph Client ["iOS/Web Client"]
-        PWA[PWA + xterm.js]
-        Keys[(RSA Keypair)]
-    end
-
-    subgraph Cloud ["Cloudflare"]
-        Tunnel[Tunnel]
-    end
-
-    subgraph Desktop ["Root_Operator"]
-        Electron[Electron App]
-        PTY[PTY Process]
-    end
-
-    PWA <-->|"E2E Encrypted<br/>AES-256-GCM"| Tunnel
-    Tunnel <-->|TLS 1.3| Electron
-    Electron <--> PTY
-    Keys -.->|Signs challenges| PWA
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        iOS / Web Client                         │
+│                     PWA + xterm.js + React                      │
+│              Terminal Mode  ←→  Channel Mode                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ E2E Encrypted (AES-256-GCM)
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                      Cloudflare Tunnel                          │
+│                   TLS 1.3 · Zero Open Ports                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                    Root Operator (Electron)                      │
+│                                                                  │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │  PTY Shell  │  │  HTTP Server │  │  Channel Manager       │  │
+│  │  (node-pty) │  │  (port 22000)│  │  (Unix socket bridge)  │  │
+│  └──────┬──────┘  └──────┬───────┘  └──────────┬─────────────┘  │
+│         │                │                      │                │
+│         │                │               ┌──────▼─────────────┐  │
+│         │                │               │  Claude Code CLI   │  │
+│         │                │               │  (MCP stdio)       │  │
+│         │                │               └──────┬─────────────┘  │
+│         │                │                      │                │
+│  ┌──────▼──────┐  ┌──────▼───────┐  ┌──────────▼─────────────┐  │
+│  │  Terminal   │  │   WebSocket  │  │  Scheduler · Identity  │  │
+│  │  I/O        │  │   E2E Layer  │  │  Chat Store            │  │
+│  └─────────────┘  └──────────────┘  └────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Connection Flow
@@ -143,7 +161,7 @@ sequenceDiagram
     end
 ```
 
-### Security Model
+## Security
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
@@ -152,88 +170,142 @@ sequenceDiagram
 | **Key Derivation** | HKDF-SHA256 | Derives session key from ECDH shared secret |
 | **Authentication** | RSA-PSS 2048-bit | Proves device identity via challenge-response |
 | **Fingerprint** | 12-word BIP39 mnemonic | Visual verification of secure channel |
-| **Credential Storage** | macOS Keychain (keytar) | Cloudflare tokens stored securely |
-| **Input Sanitization** | ANSI filter | Blocks dangerous escape sequences (OSC 52, etc.) |
+| **Credential Storage** | macOS Keychain (keytar) | Cloudflare tokens stored in system keychain |
+| **Input Sanitization** | ANSI filter | Blocks dangerous escape sequences (OSC 52, DCS, APC) |
 
-### Security Features
+### Security Highlights
 
-- **Zero Open Ports** - Cloudflare Tunnel eliminates need for port forwarding
-- **Challenge-Response Auth** - Every reconnection requires cryptographic proof of key possession
-- **Rate Limiting** - Max 5 auth attempts per connection, 30s challenge expiry
-- **Origin Validation** - WebSocket connections validated against tunnel URL
-- **Session Isolation** - Terminal content in sessionStorage (cleared on tab close)
-- **IPC Whitelist** - Renderer process has no direct Node.js access
+- **Zero open ports** — Cloudflare Tunnel eliminates port forwarding entirely
+- **Challenge-response on every reconnect** — cryptographic proof of key possession, not just key ID
+- **Rate limiting** — 5 auth attempts per connection, 30-second challenge expiry
+- **Origin validation** — WebSocket connections verified against tunnel URL
+- **Session isolation** — terminal content in sessionStorage, cleared on tab close
+- **IPC whitelist** — renderer process has no direct Node.js access (context isolation)
+- **Hardened runtime** — macOS hardened runtime enabled for signed build
+
+## MCP Tools
+
+Root Operator exposes tools to Claude Code via the MCP bridge:
+
+| Tool | Purpose |
+|------|---------|
+| `reply(chat_id, text)` | Send a response back to a connected device |
+| `ro_schedule(name, cron, prompt, chat_id)` | Create a persistent cron job |
+| `ro_list_schedules()` | List all scheduled jobs with status |
+| `ro_delete_schedule(id)` | Delete a scheduled job |
+| `ro_toggle_schedule(id, enabled)` | Enable or disable a job |
+| `ro_run_now(id)` | Trigger a job immediately |
+
+## Configuration
+
+### Custom Operator URL
+
+Set a custom URL (e.g., `yourname.rootoperator.dev`) for easy sharing:
+
+1. Open Settings from the tray menu
+2. Enter your desired subdomain
+3. Your tunnel will be accessible at `yourname.rootoperator.dev`
+
+Requires deploying the optional Cloudflare Worker — see `worker/` directory and `.env.example`.
+
+### Environment Variables
+
+Copy `.env.example` to `.env` for custom domain support:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `WORKER_BASE_URL` | For custom domains | Cloudflare Worker API URL |
+| `WORKER_DOMAIN` | For custom domains | Your domain for custom subdomains |
+| `VITE_WORKER_DOMAIN` | For custom domains | Same as WORKER_DOMAIN (for UI) |
+| `INTERNAL_PORT` | No | Local server port (default: 22000) |
+
+### Identity Workspace
+
+Customize Claude's persona by editing files in `~/.root-operator/workspace/`:
+
+| File | Purpose |
+|------|---------|
+| `IDENTITY.md` | Who Claude is in the system |
+| `SOUL.md` | Persona, tone, values, decision-making style |
+| `AGENTS.md` | Agent definitions, roles, capabilities |
+| `USER.md` | Your profile — name, location, preferences |
+| `MEMORY.md` | Persistent memory (user-maintained) |
+
+Files are automatically injected into Claude's system prompt at startup. Max 150KB total, 20KB per file.
 
 ## Development
 
 ```bash
-# Start with hot reload (recommended)
-npm run dev:app
-
-# Build client and renderer
-npm run build:all
-
-# Rebuild native modules after Node/Electron update
-npm run rebuild
-
-# Run security audit
-npm run security:check
+npm run dev:app          # Start with hot reload (recommended)
+npm run build:all        # Build client + renderer
+npm run rebuild          # Rebuild native modules (node-pty, keytar)
+npm run build            # Production build (signed)
+npm run build:unsigned   # Production build (unsigned, local dev)
+npm run security:check   # Run security audit
 ```
 
 ### Project Structure
 
 ```
-├── main.js                 # Electron main process
-├── preload.js              # IPC bridge with security whitelist
+├── main.js                  # Electron main process (server, tunnel, PTY, E2E)
+├── preload.js               # IPC bridge with security whitelist
+├── channel-bridge.cjs       # MCP server — bridges Electron ↔ Claude Code
+├── claude-stop-hook.cjs     # Claude session cleanup hook
 ├── src/
-│   ├── renderer/           # Tray app (React)
+│   ├── channel-manager.js   # IPC client for channel bridge (Unix socket)
+│   ├── chat-store.js        # JSONL message persistence (200-msg rotation)
+│   ├── scheduler.js         # Persistent cron scheduler (node-cron)
+│   ├── workspace.js         # Identity workspace manager
+│   ├── renderer/            # Tray app (React + Tailwind + shadcn/ui)
 │   │   ├── App.jsx
-│   │   └── components/
-│   └── client/             # PWA client (React)
+│   │   └── components/      # MainView, SettingsView, PowerButton, etc.
+│   └── client/              # PWA client (React + Tailwind + shadcn/ui)
 │       ├── App.jsx
-│       ├── components/
-│       └── hooks/
-├── worker/                 # Cloudflare Worker (optional)
-└── public/                 # Static assets
+│       ├── components/      # Terminal, ChannelChat, PairingScreen, Header
+│       └── hooks/           # useWebSocket, useAuth, useE2E, useTerminal
+├── workspace-templates/     # Default identity files (seeded on first run)
+├── worker/                  # Cloudflare Worker for custom subdomains (optional)
+└── public/                  # Static assets, fonts, PWA manifest
 ```
+
+### Native Dependencies
+
+| Module | Purpose |
+|--------|---------|
+| `node-pty` | Shell/PTY spawning |
+| `keytar` | macOS Keychain access |
+| `cloudflared` | Cloudflare Tunnel binary |
+
+All three are unpacked from asar for native module compatibility.
 
 ## Troubleshooting
 
 ### Native modules fail to build
-
 ```bash
 npm run rebuild
 ```
 
-### Tunnel fails to connect
-
-- Check your internet connection
+### Tunnel won't connect
+- Check internet connection
 - If using a custom Operator URL, try disconnecting and reconnecting
-- Check Console.app for detailed logs (enable Debug Logging in Settings)
+- Enable Debug Logging in Settings, then check `~/Library/Logs/RootOperator/`
 
-### Can't type after reconnection
-
-This is fixed in recent versions. If you experience this, update to the latest version.
-
-## Roadmap
-
-Planned features for future releases:
-
-- **Custom Tunnel Settings** - Advanced Cloudflare tunnel configuration options
-- **Terminal Tabs** - Multiple terminal sessions in a single window
-- **Team Collaboration** - Individual sessions for team members with separate access controls
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+### Claude Code Channel not responding
+- Ensure Claude Code is installed and available in PATH
+- Check that `~/.root-operator/workspace/` exists (created on first run)
+- Right-click tray icon to verify Channel mode is active
 
 ## License
 
-[MIT](LICENSE) - Copyright (c) 2026 Tomas Krajcik
+[MIT](LICENSE) — Copyright (c) 2026 Tomas Krajcik
 
-## Acknowledgments
+## Author
 
-- [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) for secure tunneling
-- [xterm.js](https://xtermjs.org/) for terminal emulation
-- [node-pty](https://github.com/microsoft/node-pty) for PTY support
-- [Electron](https://www.electronjs.org/) for cross-platform desktop app
+**Tomas Krajcik**
+- Website: [rootdeveloper.dev](https://rootdeveloper.dev)
+
+---
+
+<p align="center">
+  <i>Your Mac, from your pocket.</i>
+</p>

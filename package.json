@@ -1,7 +1,7 @@
 {
   "name": "root-operator",
   "productName": "Root_Operator",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Remote terminal access via Cloudflare Tunnel",
   "main": "main.js",
   "scripts": {
@@ -102,15 +102,15 @@
           ]
         }
       ],
-      "identity": null,
-      "hardenedRuntime": false,
+      "identity": "Hjertefolger s.r.o. (4NF8ZKZ492)",
+      "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": false
     },
     "dmg": {
-      "sign": false
+      "sign": true
     },
     "icon": "public/icon-512-v3.png",
     "files": [
@@ -120,6 +120,8 @@
       "claude-stop-hook.cjs",
       "src/channel-manager.js",
       "src/chat-store.js",
+      "src/scheduler.js",
+      "src/workspace.js",
       ".env",
       "tray_*.png",
       "ui/**/*",
