@@ -35,6 +35,18 @@ Chat with Claude Code running on your Mac — from your phone or desktop.
 - **Mode switching** — Toggle between Terminal and Channel from client or tray menu
 - **MCP bridge** — Claude Code connects via stdio MCP server over Unix socket
 
+Under the hood, Root Operator spawns Claude Code with:
+
+```bash
+claude \
+  --dangerously-skip-permissions \
+  --mcp-config <root-operator-mcp.json> \
+  --append-system-prompt-file <system-prompt> \
+  --dangerously-load-development-channels server:root-operator
+```
+
+This gives Claude full autonomy, injects workspace identity into the system prompt, loads the MCP bridge for device communication, and connects via the Root Operator development channel.
+
 ### Terminal Mode *(desktop only for now)*
 
 Full remote shell access with military-grade encryption.
