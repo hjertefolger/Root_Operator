@@ -7,6 +7,10 @@
 
 **Powerful personal AI agent for macOS.** Talk to Claude Code from your phone — anywhere, anytime, encrypted.
 
+- 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
+- 🛡️ **RSA-PSS with challenge-response** (passwordless)
+- 🔐 **BIP39 fingerprinting**: 12 words on your phone, 12 on your Mac — if they match, no one is intercepting
+
 <!-- Add screenshots here -->
 
 ## Why Root Operator?
