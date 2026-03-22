@@ -2,7 +2,7 @@
   "name": "root-operator",
   "productName": "Root_Operator",
   "version": "2.0.0",
-  "description": "Remote terminal access via Cloudflare Tunnel",
+  "description": "Personal AI assistant for macOS powered by Claude Code channels",
   "main": "main.js",
   "scripts": {
     "dev:client": "vite --config vite.client.config.js",

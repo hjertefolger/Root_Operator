@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Root Operator** is an Electron-based desktop app that provides secure remote terminal access via Cloudflare Tunnel. It creates a bridge between a macOS desktop terminal and iOS/web clients with end-to-end encryption.
+**Root Operator** is a personal AI assistant for macOS powered by Claude Code channels. It combines chat, terminal access, identity-aware workspace bootstrapping, and secure remote access into a single desktop product.
 
 ## Build & Development Commands
 
