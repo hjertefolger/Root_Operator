@@ -1,17 +1,21 @@
-# Root Operator
+# Root_Operator
 
 [![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
 [![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
 
-**Powerful personal AI agent for macOS.** Talk to Claude Code from your phone — anywhere, anytime, encrypted.
+**Personal AI assistant for macOS - powered by latest Claude Code channels feature.**
+
+✨ Now with built in persistent cron scheduler and identity system (inspired by Openclaw)
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response** (passwordless)
 - 🔐 **BIP39 fingerprinting**: 12 words on your phone, 12 on your Mac — if they match, no one is intercepting
 
-<!-- Add screenshots here -->
+
+<img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
+
 
 ## Why Root Operator?
 
@@ -32,8 +36,12 @@ Chat with Claude Code running on your Mac — from your phone or desktop.
 - **Markdown chat interface** — Rich message rendering with full Markdown + GFM support
 - **Live activity indicators** — See what Claude is doing in real-time (reading files, running commands)
 - **Persistent history** — File-backed JSONL message store, survives app restarts
-- **Mode switching** — Toggle between Terminal and Channel from client or tray menu
-- **MCP bridge** — Claude Code connects via stdio MCP server over Unix socket
+- **MCP bridge via Claude Code channels** — Claude Code connects via stdio MCP server over Unix socket
+- **Zero-config tunneling** — Cloudflare Tunnel creates a public URL instantly, no port forwarding
+- **End-to-end encryption** — ECDH P-256 key exchange + AES-256-GCM for all terminal I/O
+- **Visual fingerprint verification** — 12-word BIP39 mnemonic confirms secure channel on both devices
+- **Device pairing** — 6-character code for new devices, challenge-response for returning ones
+- **PWA client** — Install on iOS home screen, works like a native app
 
 Under the hood, Root Operator spawns Claude Code with:
 
@@ -46,18 +54,6 @@ claude \
 ```
 
 This gives Claude full autonomy, injects workspace identity into the system prompt, loads the MCP bridge for device communication, and connects via the Root Operator development channel.
-
-### Terminal Mode *(desktop only for now)*
-
-Full remote shell access with military-grade encryption.
-
-- **Zero-config tunneling** — Cloudflare Tunnel creates a public URL instantly, no port forwarding
-- **End-to-end encryption** — ECDH P-256 key exchange + AES-256-GCM for all terminal I/O
-- **Visual fingerprint verification** — 12-word BIP39 mnemonic confirms secure channel on both devices
-- **Device pairing** — 6-character code for new devices, challenge-response for returning ones
-- **PWA client** — Install on iOS home screen, works like a native app with virtual keyboard
-- **Persistent sessions** — Terminal state survives reconnections with server-side output buffer
-- **ANSI sanitization** — Blocks dangerous escape sequences (clipboard hijacking, title spoofing)
 
 ### Identity & Workspace
 
@@ -81,7 +77,7 @@ Cron jobs powered by natural language, managed by Claude.
 
 - **macOS** 11+ (Big Sur or later) — Apple Silicon and Intel
 - **Node.js** 18+ (for building from source)
-- **Claude Code** (for Channel mode)
+- **latest Claude Code** (for Channel mode)
 
 ## Installation
 
