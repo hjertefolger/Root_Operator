@@ -21,6 +21,7 @@ const keytar = require('keytar');
 const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
+const { ensureWorkspace, writeSystemPromptFile } = require('./src/workspace');
 
 let store;
 const isDev = !app.isPackaged;
@@ -1400,6 +1401,13 @@ function spawnClaudeCode() {
         },
     }, null, 2));
 
+    // Ensure workspace exists and build system prompt append
+    const { workspaceDir, isFirstRun } = ensureWorkspace();
+    const systemPromptFile = writeSystemPromptFile();
+    if (isFirstRun) {
+        logDebug('[CLAUDE] First run — workspace seeded with identity templates');
+    }
+
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
         fs.writeFileSync(debugFilePath, '');
@@ -1414,6 +1422,7 @@ function spawnClaudeCode() {
             '--debug-file', debugFilePath,
             '--settings', settingsPath,
             '--mcp-config', mcpConfigPath,
+            '--append-system-prompt-file', systemPromptFile,
             '--dangerously-load-development-channels', 'server:root-operator',
         ], {
             name: 'xterm-256color',
