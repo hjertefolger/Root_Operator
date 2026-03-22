@@ -96,17 +96,6 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode, system
           style={{ gap: 8 }}
         >
           <img src={rabbitLogo} alt="Root Operator" style={{ height: 20 }} />
-          <span
-            aria-hidden="true"
-            style={{
-              width: 6,
-              height: 6,
-              flexShrink: 0,
-              borderRadius: '9999px',
-              backgroundColor: STATUS_COLORS[status.level] || STATUS_COLORS.orange,
-              boxShadow: `0 0 0 1px #000, 0 0 8px ${STATUS_COLORS[status.level] || STATUS_COLORS.orange}40`,
-            }}
-          />
         </div>
         <div className="flex items-center gap-1">
           {isReconnecting && (
@@ -118,8 +107,8 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode, system
               />
             </div>
           )}
-          {/* Mode toggle: chat <-> terminal */}
-          {onToggleMode && (
+          {/* Mode toggle: chat <-> terminal (dev only) */}
+          {import.meta.env.DEV && onToggleMode && (
             <Button
               variant="ghost"
               size="icon-sm"
@@ -142,6 +131,23 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode, system
               )}
             </Button>
           )}
+          {/* Status indicator */}
+          <div
+            className="w-8 h-8 flex items-center justify-center"
+            title={statusTooltip}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                width: 6,
+                height: 6,
+                flexShrink: 0,
+                borderRadius: '9999px',
+                backgroundColor: STATUS_COLORS[status.level] || STATUS_COLORS.orange,
+                boxShadow: `0 0 0 1px #000, 0 0 8px ${STATUS_COLORS[status.level] || STATUS_COLORS.orange}40`,
+              }}
+            />
+          </div>
           <Button
             variant="ghost"
             size="icon-sm"

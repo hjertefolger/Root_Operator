@@ -352,3 +352,26 @@ button {
   outline: 2px solid rgba(75, 90, 255, 0.85);
   outline-offset: 2px;
 }
+
+/* Markdown inside chat bubbles — first/last margin resets and list markers */
+.msg-md > *:first-child {
+  margin-top: 0 !important;
+}
+
+.msg-md > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+.msg-md li::marker {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.msg-md li > ul,
+.msg-md li > ol {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+.msg-md blockquote p:last-child {
+  margin-bottom: 0;
+}
