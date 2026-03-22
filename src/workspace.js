@@ -11,7 +11,9 @@ const os = require('os');
 
 const WORKSPACE_DIR = path.join(os.homedir(), '.root-operator', 'workspace');
 const STATE_FILE = path.join(WORKSPACE_DIR, '.state.json');
-const TEMPLATES_DIR = path.join(__dirname, '..', 'workspace-templates');
+// In packaged app, workspace-templates may be inside asar — use unpacked path
+const _baseDir = __dirname.replace('app.asar', 'app.asar.unpacked');
+const TEMPLATES_DIR = path.join(_baseDir, '..', 'workspace-templates');
 
 const IDENTITY_FILES = ['IDENTITY.md', 'SOUL.md', 'AGENTS.md', 'USER.md'];
 const BOOTSTRAP_FILE = 'BOOTSTRAP.md';

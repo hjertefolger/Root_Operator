@@ -135,6 +135,7 @@
     "asarUnpack": [
       "channel-bridge.cjs",
       "claude-stop-hook.cjs",
+      "workspace-templates/**/*",
       "node_modules/node-pty/**/*",
       "node_modules/keytar/**/*",
       "node_modules/cloudflared/**/*"
