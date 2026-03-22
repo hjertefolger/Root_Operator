@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
 [![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
 
-**Secure remote terminal + AI agent bridge for macOS.** Control your Mac from your phone — terminal or Claude.
+**Powerful personal AI agent for macOS.** Talk to Claude Code from your phone — anywhere, anytime, encrypted.
 
 <!-- Add screenshots here -->
 
@@ -21,7 +21,17 @@
 
 ## Features
 
-### Terminal Mode
+### Claude Code Channel
+
+Chat with Claude Code running on your Mac — from your phone or desktop.
+
+- **Markdown chat interface** — Rich message rendering with full Markdown + GFM support
+- **Live activity indicators** — See what Claude is doing in real-time (reading files, running commands)
+- **Persistent history** — File-backed JSONL message store, survives app restarts
+- **Mode switching** — Toggle between Terminal and Channel from client or tray menu
+- **MCP bridge** — Claude Code connects via stdio MCP server over Unix socket
+
+### Terminal Mode *(desktop only for now)*
 
 Full remote shell access with military-grade encryption.
 
@@ -32,16 +42,6 @@ Full remote shell access with military-grade encryption.
 - **PWA client** — Install on iOS home screen, works like a native app with virtual keyboard
 - **Persistent sessions** — Terminal state survives reconnections with server-side output buffer
 - **ANSI sanitization** — Blocks dangerous escape sequences (clipboard hijacking, title spoofing)
-
-### Claude Code Channel
-
-Chat with Claude Code running on your Mac — from your phone.
-
-- **Markdown chat interface** — Rich message rendering with full Markdown + GFM support
-- **Live activity indicators** — See what Claude is doing in real-time (reading files, running commands)
-- **Persistent history** — File-backed JSONL message store, survives app restarts
-- **Mode switching** — Toggle between Terminal and Channel from client or tray menu
-- **MCP bridge** — Claude Code connects via stdio MCP server over Unix socket
 
 ### Identity & Workspace
 
