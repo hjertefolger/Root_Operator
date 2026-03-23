@@ -3,6 +3,46 @@ import { useElectron } from './hooks/useElectron';
 import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
 
+const DEV_UPDATE_PREVIEW = import.meta.env.DEV
+  ? {
+      supported: true,
+      status: 'downloaded',
+      label: 'Update 2.0.5 ready',
+      detail: 'Preview mode in development. Restart action is not wired to a real downloaded update.',
+      currentVersion: '2.0.0',
+      availableVersion: '2.0.5',
+      downloadedVersion: '2.0.5',
+      progressPercent: 100,
+      checkedAt: '',
+      readyToInstall: true,
+      canInstallNow: true,
+      installBlockedReason: '',
+      error: '',
+      dismissedBanner: false,
+      preview: true,
+    }
+  : null;
+
+function withDevUpdatePreview(state) {
+  if (!import.meta.env.DEV || !DEV_UPDATE_PREVIEW) {
+    return state;
+  }
+
+  const currentUpdate = state?.update;
+
+  if (currentUpdate && !['disabled', 'idle'].includes(currentUpdate.status)) {
+    return state;
+  }
+
+  return {
+    ...state,
+    update: {
+      ...DEV_UPDATE_PREVIEW,
+      currentVersion: currentUpdate?.currentVersion || DEV_UPDATE_PREVIEW.currentVersion,
+    },
+  };
+}
+
 function App() {
   const { invoke, on } = useElectron();
   const [view, setView] = useState('main'); // 'main' or 'settings'
@@ -17,16 +57,29 @@ function App() {
     health: null,
   });
   const containerRef = useRef(null);
+  const resizeFrameRef = useRef(null);
+  const lastSentHeightRef = useRef(0);
 
   // Auto-resize window to fit content
   useEffect(() => {
     if (!containerRef.current) return;
 
     const resizeWindow = () => {
-      const height = containerRef.current.scrollHeight;
-      if (height > 0) {
-        invoke('RESIZE_WINDOW', height);
+      if (resizeFrameRef.current != null) {
+        cancelAnimationFrame(resizeFrameRef.current);
       }
+
+      resizeFrameRef.current = requestAnimationFrame(() => {
+        resizeFrameRef.current = null;
+
+        if (!containerRef.current) return;
+
+        const height = Math.ceil(containerRef.current.scrollHeight);
+        if (height > 0 && height !== lastSentHeightRef.current) {
+          lastSentHeightRef.current = height;
+          invoke('RESIZE_WINDOW', height);
+        }
+      });
     };
 
     const observer = new ResizeObserver(() => {
@@ -36,7 +89,12 @@ function App() {
     observer.observe(containerRef.current);
     resizeWindow(); // Initial resize
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (resizeFrameRef.current != null) {
+        cancelAnimationFrame(resizeFrameRef.current);
+      }
+    };
   }, [invoke]);
 
   // Apply dark mode
@@ -57,7 +115,7 @@ function App() {
         ]);
 
         if (tunnelStateFromMain) {
-          setTunnelState({
+          setTunnelState(withDevUpdatePreview({
             active: tunnelStateFromMain.active || false,
             connecting: tunnelStateFromMain.connecting || false,
             url: tunnelStateFromMain.url || '',
@@ -66,7 +124,7 @@ function App() {
             channelConnected: tunnelStateFromMain.channelConnected || false,
             update: tunnelStateFromMain.update || null,
             health: tunnelStateFromMain.health || null,
-          });
+          }));
           // Sync tray icon with actual state
           invoke('SET_TRAY_ICON', tunnelStateFromMain.active);
         }
@@ -95,7 +153,7 @@ function App() {
       }),
 
       on('SYNC_STATE', (state) => {
-        setTunnelState({
+        setTunnelState(withDevUpdatePreview({
           active: state.active || false,
           connecting: state.connecting || false,
           url: state.url || '',
@@ -104,7 +162,7 @@ function App() {
           channelConnected: state.channelConnected || false,
           update: state.update || null,
           health: state.health || null,
-        });
+        }));
         // Sync tray icon with authoritative state
         invoke('SET_TRAY_ICON', state.active || false);
       })

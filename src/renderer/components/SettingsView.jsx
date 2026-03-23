@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { X, Trash2, Loader, Check, RefreshCw, Zap } from 'lucide-react';
+import { X, Loader, RefreshCw } from 'lucide-react';
 import { useElectron } from '../hooks/useElectron';
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -111,6 +111,10 @@ function SettingsView({ onBack, tunnelState }) {
   };
 
   const handleSave = async () => {
+    if (saveState === 'idle' || saveState === 'saving' || saveState === 'saved') {
+      return;
+    }
+
     // Validate subdomain if it changed
     if (subdomain !== initialValues.current.subdomain) {
       const error = validateSubdomain(subdomain);
@@ -178,16 +182,11 @@ function SettingsView({ onBack, tunnelState }) {
         return (
           <>
             Saving
-            <Loader strokeWidth={2} className="h-3 w-3 animate-spin" />
+            <Loader strokeWidth={2} className="h-4 w-4 animate-spin" />
           </>
         );
       case 'saved':
-        return (
-          <>
-            Saved
-            <Check strokeWidth={2} className="h-3 w-3" />
-          </>
-        );
+        return 'Saved';
       default:
         return 'Save';
     }
@@ -199,9 +198,9 @@ function SettingsView({ onBack, tunnelState }) {
       case 'dirty':
         return `${base} bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 text-white`;
       case 'saving':
-        return `${base} bg-[#4B5AFF] text-white gap-1`;
+        return `${base} bg-[#4B5AFF] text-white gap-1 pointer-events-none`;
       case 'saved':
-        return `${base} bg-[#4B5AFF] text-white gap-1`;
+        return `${base} bg-[#4B5AFF] text-white pointer-events-none`;
       default:
         return `${base} bg-muted text-muted-foreground`;
     }
@@ -217,7 +216,7 @@ function SettingsView({ onBack, tunnelState }) {
         <div className="flex items-center gap-2">
           <Button
             onClick={handleSave}
-            disabled={saveState === 'idle' || saveState === 'saving' || saveState === 'saved'}
+            disabled={saveState === 'idle'}
             className={getSaveButtonClass()}
             size="sm"
           >
@@ -244,22 +243,27 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionTrigger>
             <AccordionContent className="pb-4">
               <div className="flex flex-col gap-2">
-                <label className="flex items-center cursor-text">
-                  <input
-                    type="text"
-                    value={subdomain}
-                    onChange={(e) => {
-                      const sanitized = sanitizeSubdomain(e.target.value);
-                      setSubdomain(sanitized);
-                      setSubdomainError('');
-                    }}
-                    placeholder="your-name"
-                    maxLength={MAX_SUBDOMAIN_LENGTH}
-                    className="font-mono bg-transparent border-none text-sm text-foreground focus:outline-none focus:bg-muted/30 rounded py-0.5 transition-colors"
-                    style={{ width: `${subdomain.length || 9}ch` }}
-                  />
-                  <span className="font-mono text-sm text-muted-foreground">.{WORKER_DOMAIN}</span>
-                </label>
+                {subdomain ? (
+                  <label className="flex items-center cursor-text">
+                    <input
+                      type="text"
+                      value={subdomain}
+                      onChange={(e) => {
+                        const sanitized = sanitizeSubdomain(e.target.value);
+                        setSubdomain(sanitized);
+                        setSubdomainError('');
+                      }}
+                      maxLength={MAX_SUBDOMAIN_LENGTH}
+                      className="font-mono bg-transparent border-none text-sm text-foreground focus:outline-none focus:bg-muted/30 rounded py-0.5 transition-colors"
+                      style={{ width: `${subdomain.length}ch` }}
+                    />
+                    <span className="font-mono text-sm text-muted-foreground">.{WORKER_DOMAIN}</span>
+                  </label>
+                ) : (
+                  <p className="font-mono text-sm text-muted-foreground">
+                    Hit Jump to generate link
+                  </p>
+                )}
                 {subdomainError && (
                   <span className="text-xs text-destructive">{subdomainError}</span>
                 )}
@@ -276,22 +280,22 @@ function SettingsView({ onBack, tunnelState }) {
               {pairedDevices.length === 0 ? (
                 <p className="text-xs text-muted-foreground/60">No devices paired yet</p>
               ) : (
-                <div className="flex flex-col gap-1">
+                <div className="flex flex-col">
                   {pairedDevices.map((device) => (
                     <div
                       key={device.kid}
-                      className="flex justify-between items-center py-1.5 px-2 bg-muted/30 rounded"
+                      className="flex items-center gap-3 border-b border-dashed border-border/60 py-2 last:border-b-0"
                     >
-                      <span className="font-mono text-xs text-muted-foreground">
+                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">
                         {device.name}
                       </span>
                       <Button
                         variant="ghost"
                         size="icon-sm"
                         onClick={() => handleRemoveDevice(device.kid)}
-                        className="rounded-full text-muted-foreground hover:text-destructive transition-colors duration-200 h-6 w-6"
+                        className="h-6 w-6 rounded-full text-muted-foreground hover:text-destructive transition-colors duration-200"
                       >
-                        <Trash2 strokeWidth={2} className="h-3 w-3" />
+                        <X strokeWidth={2} className="h-3.5 w-3.5" />
                       </Button>
                     </div>
                   ))}
@@ -326,22 +330,17 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionTrigger>
             <AccordionContent className="pb-4">
               <div className="flex flex-col gap-3">
-                <div className="rounded-2xl bg-muted/40 px-3 py-3">
-                  <div className="flex items-start gap-2">
-                    <div className="mt-0.5 rounded-full bg-[#4B5AFF]/12 p-1.5">
-                      <Zap strokeWidth={2} className="h-3.5 w-3.5 text-[#4B5AFF]" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-foreground">
-                        {update?.label || 'Update status unavailable'}
-                      </p>
-                      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        {update?.detail || 'Update information will appear here in the installed app.'}
-                      </p>
-                      <p className="mt-2 text-[11px] text-muted-foreground/80">
-                        Current version: {update?.currentVersion || tunnelState.version || 'Unknown'}
-                      </p>
-                    </div>
+                <div className="rounded-2xl border border-dashed border-border/70 px-3 py-3">
+                  <div className="min-w-0">
+                    <p className="font-mono text-[12px] font-medium leading-tight tracking-[0.01em] text-foreground">
+                      {update?.label || 'Update status unavailable'}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                      {update?.detail || 'Update information will appear here in the installed app.'}
+                    </p>
+                    <p className="mt-2 text-[11px] text-muted-foreground/80">
+                      Current version: {update?.currentVersion || tunnelState.version || 'Unknown'}
+                    </p>
                   </div>
                 </div>
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown, ChevronUp, Zap } from 'lucide-react';
+import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -250,6 +250,12 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             type="text"
             value={deviceName}
             onChange={handleNameChange}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                handleNameSubmit();
+              }
+            }}
             placeholder="My-iPhone"
             maxLength={MAX_NAME_LENGTH}
             autoFocus
@@ -441,30 +447,28 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
 
       {showMainUpdateStrip && (
         <div className="mt-2 w-full overflow-hidden border-t border-white/8 bg-[#4B5AFF] text-white shadow-[0_-12px_28px_rgba(75,90,255,0.18)]">
-          <div className="flex min-h-[52px] items-center gap-2 px-5 py-3 pr-4">
+          <div className="flex min-h-[38px] items-center gap-2 px-5 py-1 pr-4">
             <button
               type="button"
               onClick={() => setUpdateExpanded((prev) => !prev)}
-              className="flex min-w-0 flex-1 items-center gap-3 text-left"
+              className="flex min-w-0 flex-1 items-center justify-start gap-2 text-left"
             >
-              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-white/14">
-                <Zap strokeWidth={2} className="h-4 w-4" />
-              </div>
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium leading-tight">
+                <p className="truncate font-mono text-[12px] font-medium leading-tight tracking-[0.01em]">
                   {update.label}
                 </p>
                 {(update.status === 'downloading' || update.status === 'available') && update.progressPercent > 0 ? (
-                  <p className="mt-0.5 text-xs text-white/80">
+                  <p className="mt-0.5 font-mono text-[11px] text-white/80">
                     {update.progressPercent}% downloaded
                   </p>
                 ) : null}
               </div>
-              {updateExpanded ? (
-                <ChevronUp strokeWidth={2} className="h-4 w-4 flex-shrink-0 text-white/80" />
-              ) : (
-                <ChevronDown strokeWidth={2} className="h-4 w-4 flex-shrink-0 text-white/80" />
-              )}
+              <ChevronDown
+                strokeWidth={2}
+                className={`h-4 w-4 flex-shrink-0 text-white/80 transition-transform duration-200 ease-out ${
+                  updateExpanded ? 'rotate-180' : ''
+                }`}
+              />
             </button>
             <Button
               variant="ghost"
@@ -477,28 +481,40 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             </Button>
           </div>
 
-          {updateExpanded && (
-            <div className="border-t border-white/15 px-5 pb-3 pt-2 pr-4">
-              <p className="text-xs leading-relaxed text-white/88">
-                {update.detail}
-              </p>
-              {update.status === 'downloaded' && (
-                <div className="mt-3 flex items-center justify-between gap-2">
-                  <span className="text-[11px] text-white/75">
-                    {update.canInstallNow ? 'Ready when you are.' : 'Settings will keep this available after dismissal.'}
-                  </span>
-                  <Button
-                    size="sm"
-                    onClick={handleInstallUpdate}
-                    disabled={!update.canInstallNow || updateActionPending}
-                    className="h-7 rounded-full bg-white px-3 text-xs text-[#4B5AFF] hover:bg-white/90"
-                  >
-                    {updateActionPending ? 'Restarting' : 'Restart'}
-                  </Button>
-                </div>
-              )}
+          <div
+            className={`grid overflow-hidden transition-[grid-template-rows] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              updateExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+            }`}
+          >
+            <div className="overflow-hidden">
+              <div
+                className={`border-t transition-[padding,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  updateExpanded
+                    ? 'border-white/15 px-5 pb-3 pt-2 pr-4 opacity-100'
+                    : 'border-transparent px-5 pb-0 pt-0 pr-4 opacity-0'
+                }`}
+              >
+                <p className="text-xs leading-relaxed text-white/88">
+                  {update.detail}
+                </p>
+                {update.status === 'downloaded' && (
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-white/75">
+                      {update.canInstallNow ? 'Ready when you are.' : 'Settings will keep this available after dismissal.'}
+                    </span>
+                    <Button
+                      size="sm"
+                      onClick={handleInstallUpdate}
+                      disabled={!update.canInstallNow || updateActionPending}
+                      className="h-7 rounded-full bg-white px-3 text-xs text-[#4B5AFF] hover:bg-white/90"
+                    >
+                      {updateActionPending ? 'Restarting' : 'Restart'}
+                    </Button>
+                  </div>
+                )}
+              </div>
             </div>
-          )}
+          </div>
         </div>
       )}
     </div>

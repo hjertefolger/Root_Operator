@@ -280,7 +280,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
   }, [input, canSend, isSending, onSend]);
 
   const handleKeyDown = useCallback((e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       sendMessage();
     }

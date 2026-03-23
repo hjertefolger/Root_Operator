@@ -2061,13 +2061,12 @@ ipcMain.on('QUIT', () => {
 
 ipcMain.handle('RESIZE_WINDOW', (event, height) => {
     if (mainWindow) {
-        const currentBounds = mainWindow.getBounds();
-        mainWindow.setBounds({
-            x: currentBounds.x,
-            y: currentBounds.y,
-            width: currentBounds.width,
-            height: height
-        }, true);
+        const nextHeight = Math.max(1, Math.min(500, Math.ceil(height)));
+        const [currentWidth, currentHeight] = mainWindow.getContentSize();
+
+        if (currentHeight !== nextHeight) {
+            mainWindow.setContentSize(currentWidth, nextHeight, false);
+        }
     }
     return { success: true };
 });
