@@ -15,9 +15,14 @@
     "build:all": "npm run build:runtime-config && npm run build:client && npm run build:renderer && npm run build:bridge",
     "prebuild": "npm run security:audit && npm run build:all",
     "prebuild:unsigned": "npm run security:audit && npm run build:all",
+    "prerelease": "npm run security:audit && npm run build:all",
     "start": "electron .",
-    "build": "electron-builder --mac",
-    "build:unsigned": "electron-builder --mac -c.mac.identity=null",
+    "build": "electron-builder --config build/electron-builder.config.js --mac",
+    "build:staging": "node scripts/run-staging.js build",
+    "release": "electron-builder --config build/electron-builder.config.js --mac --publish always",
+    "build:unsigned": "electron-builder --config build/electron-builder.config.js --mac -c.mac.identity=null",
+    "build:unsigned:staging": "node scripts/run-staging.js build:unsigned",
+    "release:staging": "node scripts/run-staging.js release",
     "rebuild": "electron-rebuild -f -w node-pty keytar",
     "postinstall": "electron-rebuild -f -w node-pty keytar",
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -33,6 +38,10 @@
   ],
   "author": "Tomas Krajcik",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hjertefolger/Root_Operator.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@phosphor-icons/react": "^2.1.10",
@@ -45,6 +54,7 @@
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
     "electron-store": "^11.0.2",
+    "electron-updater": "^6.8.3",
     "fix-path": "^5.0.0",
     "geist": "^1.5.1",
     "input-otp": "^1.4.2",
@@ -125,6 +135,7 @@
       "src/chat-store.js",
       "src/scheduler.js",
       "src/workspace.js",
+      "src/updater.js",
       "tray_*.png",
       "ui/**/*",
       "public/dist/**/*",
@@ -147,6 +158,7 @@
       "node_modules/keytar/**/*",
       "node_modules/cloudflared/**/*"
     ],
+    "electronUpdaterCompatibility": ">=2.16",
     "afterSign": "scripts/notarize.js"
   }
 }

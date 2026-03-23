@@ -25,13 +25,21 @@
 
 const { notarize } = require('@electron/notarize');
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 exports.default = async function notarizing(context) {
     const { electronPlatformName, appOutDir } = context;
+    const configuredIdentity = context?.packager?.platformSpecificBuildOptions?.identity
+        ?? context?.packager?.config?.mac?.identity;
 
     // Only notarize on macOS
     if (electronPlatformName !== 'darwin') {
         console.log('Skipping notarization: not macOS');
+        return;
+    }
+
+    if (configuredIdentity === null) {
+        console.log('Skipping notarization: unsigned build');
         return;
     }
 

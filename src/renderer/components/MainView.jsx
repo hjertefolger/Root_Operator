@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X } from 'lucide-react';
+import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown, ChevronUp, Zap } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -34,9 +34,11 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const [pairingError, setPairingError] = useState('');
   const [pairingLoading, setPairingLoading] = useState(false);
   const [connectingWord, setConnectingWord] = useState(CONNECTING_WORDS[0]);
+  const [updateExpanded, setUpdateExpanded] = useState(false);
+  const [updateActionPending, setUpdateActionPending] = useState(false);
   const wasConnectingRef = useRef(false);
 
-  const { active, connecting, url, fingerprint, mode, health } = tunnelState;
+  const { active, connecting, url, fingerprint, mode, health, update } = tunnelState;
   const overallHealth = health?.overall || {
     level: connecting ? 'orange' : 'red',
     label: connecting ? 'Starting tunnel' : 'Tunnel offline',
@@ -61,6 +63,16 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
     wasConnectingRef.current = connecting;
   }, [connecting]);
 
+  const showMainUpdateStrip = !!update
+    && ['available', 'downloading', 'downloaded', 'error', 'installing'].includes(update.status)
+    && !update.dismissedBanner;
+
+  useEffect(() => {
+    if (!showMainUpdateStrip) {
+      setUpdateExpanded(false);
+    }
+  }, [showMainUpdateStrip, update?.availableVersion, update?.downloadedVersion, update?.status]);
+
   const handleToggle = () => {
     if (!active && !connecting) {
       onStart();
@@ -81,6 +93,21 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const handleToggleFingerprint = () => {
     if (!fingerprint) return;
     setFingerprintVisible(!fingerprintVisible);
+  };
+
+  const handleDismissUpdate = async () => {
+    if (!update) return;
+    await invoke('DISMISS_UPDATE_BANNER', update.downloadedVersion || update.availableVersion || '');
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!update || update.status !== 'downloaded') return;
+    setUpdateActionPending(true);
+    try {
+      await invoke('INSTALL_UPDATE');
+    } finally {
+      setUpdateActionPending(false);
+    }
   };
 
   const handleOpenPairing = () => {
@@ -297,117 +324,182 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
 
   // Normal Mode View
   return (
-    <div className="flex flex-col gap-1 pl-5 pr-4 py-2">
-      {/* Row 1: App Name + Settings */}
-      <div className="flex justify-between items-center">
-        <div className="flex items-center gap-2" title={statusTooltip} aria-label={statusTooltip}>
-          <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-            ROOT_OPERATOR
-          </span>
-          <span
-            aria-hidden="true"
-            className="inline-flex h-1.5 w-1.5 rounded-full"
-            style={{
-              backgroundColor: STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange,
-              boxShadow: `0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 8px ${(STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange)}40`,
-            }}
-          />
-        </div>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={onShowSettings}
-          className="rounded-full text-muted-foreground transition-colors duration-200"
-          title="Settings"
-        >
-          <Settings2 strokeWidth={2} />
-        </Button>
-      </div>
-
-      {/* Row 2: Plus/Lock/Copy Icons + Play/Pause Button */}
-      <div className="flex justify-between items-center pb-0.5">
-        <div className="flex gap-1 -ml-2">
-          {/* Add Device button - only when tunnel is ready */}
+    <div className="flex flex-col">
+      <div className={`flex flex-col gap-1 pl-5 pr-4 pt-2 ${showMainUpdateStrip ? 'pb-1.5' : 'pb-2'}`}>
+        {/* Row 1: App Name + Settings */}
+        <div className="flex justify-between items-center">
+          <div className="flex items-center gap-2" title={statusTooltip} aria-label={statusTooltip}>
+            <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+              ROOT_OPERATOR
+            </span>
+            <span
+              aria-hidden="true"
+              className="inline-flex h-1.5 w-1.5 rounded-full"
+              style={{
+                backgroundColor: STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange,
+                boxShadow: `0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 8px ${(STATUS_COLORS[overallHealth.level] || STATUS_COLORS.orange)}40`,
+              }}
+            />
+          </div>
           <Button
             variant="ghost"
             size="icon-sm"
-            onClick={handleOpenPairing}
-            disabled={!url}
-            className="rounded-full transition-none"
-            title="Pair Device"
+            onClick={onShowSettings}
+            className="rounded-full text-muted-foreground transition-colors duration-200"
+            title="Settings"
           >
-            <Plus strokeWidth={2} className={url ? 'text-[#4B5AFF]' : ''} />
-          </Button>
-
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={handleCopyLink}
-            disabled={!url}
-            className="rounded-full transition-none"
-            title="Copy Tunnel Link"
-          >
-            {copied ? (
-              <Check strokeWidth={2} className="text-[#4B5AFF]" />
-            ) : (
-              <Copy strokeWidth={2} className={url ? 'text-[#4B5AFF]' : ''} />
-            )}
-          </Button>
-
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={handleToggleFingerprint}
-            disabled={!fingerprint}
-            className="rounded-full transition-none"
-            title="Verify Session"
-          >
-            {fingerprint ? (
-              <ShieldCheck strokeWidth={2} className="text-[#4B5AFF]" />
-            ) : (
-              <Shield strokeWidth={2} />
-            )}
+            <Settings2 strokeWidth={2} />
           </Button>
         </div>
 
-        {connecting ? (
-          <Button
-            variant="default"
-            size="sm"
-            disabled
-            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
-          >
-            {connectingWord}
-            <Loader strokeWidth={2} className="animate-spin" />
-          </Button>
-        ) : active ? (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleToggle}
-            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90"
-            title="Stop Tunnel"
-          >
-            Pause
-            <CirclePause strokeWidth={2} />
-          </Button>
-        ) : (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleToggle}
-            className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
-            title="Start Tunnel"
-          >
-            Jump
-            <CirclePlay strokeWidth={2} />
-          </Button>
+        {/* Row 2: Plus/Lock/Copy Icons + Play/Pause Button */}
+        <div className="flex justify-between items-center pb-0.5">
+          <div className="flex gap-1 -ml-2">
+            {/* Add Device button - only when tunnel is ready */}
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={handleOpenPairing}
+              disabled={!url}
+              className="rounded-full transition-none"
+              title="Pair Device"
+            >
+              <Plus strokeWidth={2} className={url ? 'text-[#4B5AFF]' : ''} />
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={handleCopyLink}
+              disabled={!url}
+              className="rounded-full transition-none"
+              title="Copy Tunnel Link"
+            >
+              {copied ? (
+                <Check strokeWidth={2} className="text-[#4B5AFF]" />
+              ) : (
+                <Copy strokeWidth={2} className={url ? 'text-[#4B5AFF]' : ''} />
+              )}
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={handleToggleFingerprint}
+              disabled={!fingerprint}
+              className="rounded-full transition-none"
+              title="Verify Session"
+            >
+              {fingerprint ? (
+                <ShieldCheck strokeWidth={2} className="text-[#4B5AFF]" />
+              ) : (
+                <Shield strokeWidth={2} />
+              )}
+            </Button>
+          </div>
+
+          {connecting ? (
+            <Button
+              variant="default"
+              size="sm"
+              disabled
+              className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
+            >
+              {connectingWord}
+              <Loader strokeWidth={2} className="animate-spin" />
+            </Button>
+          ) : active ? (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleToggle}
+              className="rounded-full text-xs py-1.5 h-auto gap-1 bg-foreground text-background hover:bg-foreground/90"
+              title="Stop Tunnel"
+            >
+              Pause
+              <CirclePause strokeWidth={2} />
+            </Button>
+          ) : (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleToggle}
+              className="rounded-full text-xs py-1.5 h-auto gap-1 bg-[#4B5AFF] hover:bg-[#4B5AFF]/90 transition-colors duration-200"
+              title="Start Tunnel"
+            >
+              Jump
+              <CirclePlay strokeWidth={2} />
+            </Button>
+          )}
+        </div>
+
+        {/* Fingerprint section */}
+        {fingerprintVisible && fingerprint && (
+          <FingerprintSection fingerprint={fingerprint} />
         )}
       </div>
 
-      {/* Fingerprint section */}
-      {fingerprintVisible && fingerprint && (
-        <FingerprintSection fingerprint={fingerprint} />
+      {showMainUpdateStrip && (
+        <div className="mt-2 w-full overflow-hidden border-t border-white/8 bg-[#4B5AFF] text-white shadow-[0_-12px_28px_rgba(75,90,255,0.18)]">
+          <div className="flex min-h-[52px] items-center gap-2 px-5 py-3 pr-4">
+            <button
+              type="button"
+              onClick={() => setUpdateExpanded((prev) => !prev)}
+              className="flex min-w-0 flex-1 items-center gap-3 text-left"
+            >
+              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-white/14">
+                <Zap strokeWidth={2} className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium leading-tight">
+                  {update.label}
+                </p>
+                {(update.status === 'downloading' || update.status === 'available') && update.progressPercent > 0 ? (
+                  <p className="mt-0.5 text-xs text-white/80">
+                    {update.progressPercent}% downloaded
+                  </p>
+                ) : null}
+              </div>
+              {updateExpanded ? (
+                <ChevronUp strokeWidth={2} className="h-4 w-4 flex-shrink-0 text-white/80" />
+              ) : (
+                <ChevronDown strokeWidth={2} className="h-4 w-4 flex-shrink-0 text-white/80" />
+              )}
+            </button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={handleDismissUpdate}
+              className="h-8 w-8 rounded-full text-white/80 hover:bg-white/12 hover:text-white"
+              title="Dismiss update banner"
+            >
+              <X strokeWidth={2} className="h-4 w-4" />
+            </Button>
+          </div>
+
+          {updateExpanded && (
+            <div className="border-t border-white/15 px-5 pb-3 pt-2 pr-4">
+              <p className="text-xs leading-relaxed text-white/88">
+                {update.detail}
+              </p>
+              {update.status === 'downloaded' && (
+                <div className="mt-3 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-white/75">
+                    {update.canInstallNow ? 'Ready when you are.' : 'Settings will keep this available after dismissal.'}
+                  </span>
+                  <Button
+                    size="sm"
+                    onClick={handleInstallUpdate}
+                    disabled={!update.canInstallNow || updateActionPending}
+                    className="h-7 rounded-full bg-white px-3 text-xs text-[#4B5AFF] hover:bg-white/90"
+                  >
+                    {updateActionPending ? 'Restarting' : 'Restart'}
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

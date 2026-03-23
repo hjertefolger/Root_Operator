@@ -230,6 +230,11 @@ Copy `.env.example` to `.env` for custom domain support:
 | `WORKER_DOMAIN` | For custom domains | Your domain for custom subdomains |
 | `VITE_WORKER_DOMAIN` | For custom domains | Same as WORKER_DOMAIN (for UI) |
 | `INTERNAL_PORT` | No | Local server port (default: 22000) |
+| `UPDATE_REPO_OWNER` | No | GitHub owner for auto-update feed / publishing |
+| `UPDATE_REPO_NAME` | No | GitHub repo for auto-update feed / publishing |
+| `UPDATE_RELEASE_TYPE` | No | `release`, `prerelease`, or `draft` |
+| `UPDATE_VPREFIXED_TAG_NAME` | No | Whether update tags are prefixed with `v` |
+| `UPDATE_PRIVATE` | No | Use private GitHub update feed (`GH_TOKEN` required on client machines) |
 
 ### Identity Workspace
 
@@ -253,6 +258,7 @@ npm run build:all        # Build client + renderer
 npm run rebuild          # Rebuild native modules (node-pty, keytar)
 npm run build            # Production build (signed)
 npm run build:unsigned   # Production build (unsigned, local dev)
+npm run release          # Publish updater-ready release metadata + artifacts
 npm run security:check   # Run security audit
 ```
 

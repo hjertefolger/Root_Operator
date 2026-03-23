@@ -19,6 +19,7 @@ const keytar = require('keytar');
 const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
+const { AppUpdater, defaultUpdateState } = require('./src/updater');
 const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig } = require('./src/workspace');
 
 let store;
@@ -69,6 +70,7 @@ const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 // Worker API configuration (loaded from .env file)
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL || runtimeConfig.WORKER_BASE_URL || '';
 const WORKER_DOMAIN = process.env.WORKER_DOMAIN || runtimeConfig.WORKER_DOMAIN || '';
+const UPDATE_BANNER_DISMISSED_VERSION_KEY = 'updateBannerDismissedVersion';
 
 if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
     console.warn('[CONFIG] WORKER_BASE_URL or WORKER_DOMAIN is missing. Tunnel provisioning features will be unavailable.');
@@ -92,6 +94,7 @@ let isConnecting = false; // Track if tunnel is in the process of starting
 let operatingMode = 'channel'; // 'terminal' | 'channel'
 let channelManager = null;
 let scheduler = null;
+let updater = null;
 let claudeProcess = null; // Claude Code child process
 let chatStore = null; // initialized after app.whenReady()
 const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
@@ -1174,6 +1177,9 @@ function formatTrayTooltip(state) {
         `Tunnel: ${state.health.tunnel.label}`,
         `Chat: ${state.health.channel.label}`,
         state.health.channel.activity?.label ? `Activity: ${state.health.channel.activity.label}` : null,
+        state.update && !['disabled', 'idle'].includes(state.update.status)
+            ? `Update: ${state.update.label}`
+            : null,
     ].filter(Boolean).join('\n');
 }
 
@@ -1210,12 +1216,75 @@ function getTunnelState() {
         fingerprint: currentFingerprint,
         mode: operatingMode,
         channelConnected: !!(channelManager && channelManager.connected),
+        update: getUpdateState(),
         health: {
             overall: getOverallHealth(tunnelHealth, channelHealth),
             tunnel: tunnelHealth,
             channel: channelHealth,
         },
     };
+}
+
+function getUpdateInstallGate() {
+    const reasons = [];
+
+    if (isConnecting || currentTunnelUrl || tunnelProcess) {
+        reasons.push('the tunnel is active');
+    }
+
+    if (operatingMode === 'channel' && (channelReplyPending || latestChannelActivity)) {
+        reasons.push('Claude is active');
+    }
+
+    if (scheduler) {
+        const runningJobs = scheduler.listJobs().filter(job => job.running);
+        if (runningJobs.length > 0) {
+            reasons.push(runningJobs.length === 1
+                ? `scheduler job "${runningJobs[0].name}" is running`
+                : 'scheduler jobs are running');
+        }
+    }
+
+    return reasons.length > 0
+        ? { ok: false, reason: reasons.join(', ') }
+        : { ok: true, reason: '' };
+}
+
+function getUpdateState() {
+    const base = updater
+        ? updater.getState()
+        : defaultUpdateState({ packaged: app.isPackaged });
+    const activeVersion = base.downloadedVersion || base.availableVersion || '';
+    const dismissedVersion = store?.get(UPDATE_BANNER_DISMISSED_VERSION_KEY) || '';
+
+    if (base.status === 'downloaded') {
+        const gate = getUpdateInstallGate();
+        return {
+            ...base,
+            canInstallNow: gate.ok,
+            installBlockedReason: gate.ok ? '' : gate.reason,
+            detail: gate.ok
+                ? 'Restart Root Operator to install the update.'
+                : `Update is ready, but install is deferred: ${gate.reason}`,
+            dismissedBanner: !!activeVersion && dismissedVersion === activeVersion,
+        };
+    }
+
+    return {
+        ...base,
+        dismissedBanner: !!activeVersion && dismissedVersion === activeVersion,
+    };
+}
+
+function dismissUpdateBanner(version) {
+    const targetVersion = version || getUpdateState().downloadedVersion || getUpdateState().availableVersion;
+    if (!store || !targetVersion) {
+        return { success: false, error: 'No update banner is available to dismiss.' };
+    }
+
+    store.set(UPDATE_BANNER_DISMISSED_VERSION_KEY, targetVersion);
+    syncStateWithRenderer();
+    return { success: true, version: targetVersion };
 }
 
 // About window reference
@@ -1901,6 +1970,18 @@ app.whenReady().then(async () => {
     const { default: ES } = await import('electron-store');
     store = new ES();
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
+    updater = new AppUpdater({
+        packaged: app.isPackaged,
+        logger: {
+            info: logDebug,
+            warn: logDebug,
+            error: logDebug,
+        },
+        canInstallNow: getUpdateInstallGate,
+    });
+    updater.on('state', () => {
+        syncStateWithRenderer();
+    });
 
     await fixPath();
     chatStore = new ChatStore(app.getPath('userData'));
@@ -1923,6 +2004,7 @@ app.whenReady().then(async () => {
 
     createWindow();
     createTray();
+    updater.start();
 });
 
 // 2. IPC API (Frontend -> Backend)
@@ -1941,6 +2023,20 @@ ipcMain.handle('SET_STORE', (event, key, val) => store.set(key, val));
 
 // Authoritative tunnel state - renderer requests this on mount to avoid race conditions
 ipcMain.handle('GET_TUNNEL_STATE', () => getTunnelState());
+ipcMain.handle('GET_UPDATE_STATE', () => getUpdateState());
+ipcMain.handle('CHECK_FOR_UPDATES', async () => {
+    if (!updater) {
+        return { started: false, reason: 'Updater not initialized' };
+    }
+    return updater.checkForUpdates('manual');
+});
+ipcMain.handle('INSTALL_UPDATE', async () => {
+    if (!updater) {
+        return { success: false, error: 'Updater not initialized' };
+    }
+    return updater.installDownloadedUpdate();
+});
+ipcMain.handle('DISMISS_UPDATE_BANNER', (event, version) => dismissUpdateBanner(version));
 
 ipcMain.handle('SET_OPERATING_MODE', (event, mode) => {
     if (mode !== 'terminal' && mode !== 'channel') {
@@ -3123,5 +3219,8 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
     isAppQuitting = true;
+    if (updater) {
+        updater.stop();
+    }
     stopBridge();
 });

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { X, Trash2, Loader, Check } from 'lucide-react';
+import { X, Trash2, Loader, Check, RefreshCw, Zap } from 'lucide-react';
 import { useElectron } from '../hooks/useElectron';
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -26,6 +26,7 @@ function SettingsView({ onBack, tunnelState }) {
   const [debugLogging, setDebugLogging] = useState(false);
   const [subdomain, setSubdomain] = useState('');
   const [pairedDevices, setPairedDevices] = useState([]);
+  const [updateActionPending, setUpdateActionPending] = useState(false);
 
   // Initial values for dirty checking
   const initialValues = useRef({});
@@ -35,6 +36,7 @@ function SettingsView({ onBack, tunnelState }) {
 
   // Subdomain-specific status (for validation errors)
   const [subdomainError, setSubdomainError] = useState('');
+  const update = tunnelState.update;
 
   // Load settings and paired devices
   useEffect(() => {
@@ -149,6 +151,24 @@ function SettingsView({ onBack, tunnelState }) {
       console.error('Failed to save settings:', e);
       setSubdomainError(e.message || 'Failed to save');
       setSaveState('dirty');
+    }
+  };
+
+  const handleCheckForUpdates = async () => {
+    setUpdateActionPending(true);
+    try {
+      await invoke('CHECK_FOR_UPDATES');
+    } finally {
+      setUpdateActionPending(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    setUpdateActionPending(true);
+    try {
+      await invoke('INSTALL_UPDATE');
+    } finally {
+      setUpdateActionPending(false);
     }
   };
 
@@ -295,6 +315,68 @@ function SettingsView({ onBack, tunnelState }) {
                   checked={debugLogging}
                   onCheckedChange={setDebugLogging}
                 />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Section 4: App Updates */}
+          <AccordionItem value="app-updates" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              App Updates
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex flex-col gap-3">
+                <div className="rounded-2xl bg-muted/40 px-3 py-3">
+                  <div className="flex items-start gap-2">
+                    <div className="mt-0.5 rounded-full bg-[#4B5AFF]/12 p-1.5">
+                      <Zap strokeWidth={2} className="h-3.5 w-3.5 text-[#4B5AFF]" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-foreground">
+                        {update?.label || 'Update status unavailable'}
+                      </p>
+                      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                        {update?.detail || 'Update information will appear here in the installed app.'}
+                      </p>
+                      <p className="mt-2 text-[11px] text-muted-foreground/80">
+                        Current version: {update?.currentVersion || tunnelState.version || 'Unknown'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCheckForUpdates}
+                    disabled={!update?.supported || updateActionPending || update?.status === 'checking' || update?.status === 'downloading' || update?.status === 'installing'}
+                    className="rounded-full text-xs"
+                  >
+                    {update?.status === 'checking' ? (
+                      <>
+                        Checking
+                        <Loader strokeWidth={2} className="h-3 w-3 animate-spin" />
+                      </>
+                    ) : (
+                      <>
+                        Check now
+                        <RefreshCw strokeWidth={2} className="h-3 w-3" />
+                      </>
+                    )}
+                  </Button>
+
+                  {update?.status === 'downloaded' && (
+                    <Button
+                      size="sm"
+                      onClick={handleInstallUpdate}
+                      disabled={updateActionPending || !update.canInstallNow}
+                      className="rounded-full bg-[#4B5AFF] text-xs text-white hover:bg-[#4B5AFF]/90"
+                    >
+                      {updateActionPending ? 'Restarting' : 'Restart to update'}
+                    </Button>
+                  )}
+                </div>
               </div>
             </AccordionContent>
           </AccordionItem>

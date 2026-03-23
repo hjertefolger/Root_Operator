@@ -13,6 +13,7 @@ function App() {
     fingerprint: null,
     mode: 'channel',
     channelConnected: false,
+    update: null,
     health: null,
   });
   const containerRef = useRef(null);
@@ -63,6 +64,7 @@ function App() {
             fingerprint: tunnelStateFromMain.fingerprint || null,
             mode: tunnelStateFromMain.mode || 'channel',
             channelConnected: tunnelStateFromMain.channelConnected || false,
+            update: tunnelStateFromMain.update || null,
             health: tunnelStateFromMain.health || null,
           });
           // Sync tray icon with actual state
@@ -100,6 +102,7 @@ function App() {
           fingerprint: state.fingerprint || null,
           mode: state.mode || 'channel',
           channelConnected: state.channelConnected || false,
+          update: state.update || null,
           health: state.health || null,
         });
         // Sync tray icon with authoritative state
@@ -147,6 +150,7 @@ function App() {
       fingerprint: null,
       mode: tunnelState.mode,
       channelConnected: false,
+      update: tunnelState.update || null,
       health: null,
     });
     await invoke('SET_TRAY_ICON', false);

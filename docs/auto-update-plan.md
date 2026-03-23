@@ -124,12 +124,14 @@ Recommended behavior:
 
 ## Phase 2: Electron builder publish configuration
 
-Add explicit `publish` config under `build`, using GitHub:
+Use an environment-driven `electron-builder` config file for GitHub publishing:
 
 - provider: `github`
-- owner: `hjertefolger`
-- repo: `Root_Operator`
-- tag prefix: `v`
+- owner: `UPDATE_REPO_OWNER`
+- repo: `UPDATE_REPO_NAME`
+- release type: `UPDATE_RELEASE_TYPE`
+- tag prefix: `UPDATE_VPREFIXED_TAG_NAME`
+- private feed toggle: `UPDATE_PRIVATE`
 
 Also set:
 
@@ -140,6 +142,12 @@ Why:
 - ensures `app-update.yml` is embedded in the packaged app
 - makes the feed deterministic instead of inferred
 - aligns the app with the generated `latest-mac.yml`
+- allows staging and production feeds to come from the same codebase without hand-editing config
+
+Important:
+
+- `UPDATE_PRIVATE=true` is only suitable if client machines can provide `GH_TOKEN`
+- for low-friction tester installs, a separate public staging repo is usually easier than a private one
 
 ## Phase 3: Release workflow cleanup
 
