@@ -30,7 +30,10 @@ const VALID_INVOKE_CHANNELS = [
     'INSTALL_UPDATE',
     'DISMISS_UPDATE_BANNER',
     'SET_OPERATING_MODE',
-    'GET_OPERATING_MODE'
+    'GET_OPERATING_MODE',
+    'OPEN_LOCAL_CHAT_WINDOW',
+    'GET_LOCAL_CHAT_STATE',
+    'SEND_LOCAL_CHAT_MESSAGE'
 ];
 
 const VALID_SEND_CHANNELS = [
@@ -42,7 +45,8 @@ const VALID_RECEIVE_CHANNELS = [
     'AUTH_FAILED',
     'CF_LOG',
     'E2E_FINGERPRINT',
-    'SYNC_STATE'
+    'SYNC_STATE',
+    'LOCAL_CHAT_EVENT'
 ];
 
 // Expose protected methods that only allow specific channels

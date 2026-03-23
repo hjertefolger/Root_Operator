@@ -19,15 +19,8 @@ export function useElectron() {
 
   // Listen to IPC events
   const on = useCallback((channel, callback) => {
-    api.on(channel, callback);
-
-    // Return cleanup function
-    return () => {
-      // Note: preload.js needs to support removeListener for this to work
-      if (api.removeListener) {
-        api.removeListener(channel, callback);
-      }
-    };
+    const cleanup = api.on(channel, callback);
+    return typeof cleanup === 'function' ? cleanup : () => {};
   }, [api]);
 
   return { invoke, send, on };

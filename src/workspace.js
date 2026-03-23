@@ -198,34 +198,13 @@ function getRuntimeDir() {
 }
 
 /**
- * Ensure the workspace-backed chat history path exists conceptually and migrate
- * the legacy Electron userData file the first time we switch over.
+ * Ensure the workspace-backed chat history directory exists and return its path.
  */
-function ensureWorkspaceChatHistory(legacyPaths = []) {
+function ensureWorkspaceChatHistory() {
     fs.mkdirSync(MEMORY_DIR, { recursive: true });
-
-    let migratedFrom = null;
-
-    if (!fs.existsSync(CHAT_HISTORY_FILE)) {
-        for (const candidate of legacyPaths) {
-            if (!candidate || candidate === CHAT_HISTORY_FILE) {
-                continue;
-            }
-
-            if (!fs.existsSync(candidate)) {
-                continue;
-            }
-
-            fs.copyFileSync(candidate, CHAT_HISTORY_FILE);
-            migratedFrom = candidate;
-            console.log(`[Workspace] Migrated chat history from ${candidate} -> ${CHAT_HISTORY_FILE}`);
-            break;
-        }
-    }
 
     return {
         chatHistoryPath: CHAT_HISTORY_FILE,
-        migratedFrom,
     };
 }
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings2, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
+import { Settings2, MessageCircle, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -108,6 +108,10 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
     } finally {
       setUpdateActionPending(false);
     }
+  };
+
+  const handleOpenLocalChat = async () => {
+    await invoke('OPEN_LOCAL_CHAT_WINDOW');
   };
 
   const handleOpenPairing = () => {
@@ -332,7 +336,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   return (
     <div className="flex flex-col">
       <div className={`flex flex-col gap-1 pl-5 pr-4 pt-2 ${showMainUpdateStrip ? 'pb-1.5' : 'pb-2'}`}>
-        {/* Row 1: App Name + Settings */}
+        {/* Row 1: App Name + Chat + Settings */}
         <div className="flex justify-between items-center">
           <div className="flex items-center gap-2" title={statusTooltip} aria-label={statusTooltip}>
             <span className="font-mono text-xs font-normal tracking-wider text-foreground">
@@ -347,15 +351,26 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
               }}
             />
           </div>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onShowSettings}
-            className="rounded-full text-muted-foreground transition-colors duration-200"
-            title="Settings"
-          >
-            <Settings2 strokeWidth={2} />
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={handleOpenLocalChat}
+              className="rounded-full text-muted-foreground transition-colors duration-200"
+              title="Open Local Chat"
+            >
+              <MessageCircle strokeWidth={2} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={onShowSettings}
+              className="rounded-full text-muted-foreground transition-colors duration-200"
+              title="Settings"
+            >
+              <Settings2 strokeWidth={2} />
+            </Button>
+          </div>
         </div>
 
         {/* Row 2: Plus/Lock/Copy Icons + Play/Pause Button */}

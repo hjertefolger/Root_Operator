@@ -2,6 +2,12 @@ import { useState, useEffect, useRef } from 'react';
 import { useElectron } from './hooks/useElectron';
 import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
+import LocalChatView from './components/LocalChatView';
+
+const RENDERER_VIEW = typeof window !== 'undefined'
+  ? new URLSearchParams(window.location.search).get('view')
+  : null;
+const IS_LOCAL_CHAT_VIEW = RENDERER_VIEW === 'chat';
 
 function App() {
   const { invoke, on } = useElectron();
@@ -22,6 +28,7 @@ function App() {
 
   // Auto-resize window to fit content
   useEffect(() => {
+    if (IS_LOCAL_CHAT_VIEW) return undefined;
     if (!containerRef.current) return;
 
     const resizeWindow = () => {
@@ -176,16 +183,16 @@ function App() {
 
   return (
     <div ref={containerRef} className="flex flex-col">
-      {view === 'main' && (
+      {IS_LOCAL_CHAT_VIEW ? (
+        <LocalChatView tunnelState={tunnelState} />
+      ) : view === 'main' ? (
         <MainView
           tunnelState={tunnelState}
           onStart={handleStart}
           onStop={handleStop}
           onShowSettings={() => setView('settings')}
         />
-      )}
-
-      {view === 'settings' && (
+      ) : (
         <SettingsView
           onBack={() => setView('main')}
           tunnelState={tunnelState}

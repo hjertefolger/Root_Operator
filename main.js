@@ -78,6 +78,7 @@ if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
 
 // GLOBAL STATE
 let mainWindow;
+let localChatWindow;
 let tray;
 let server;
 let wss;
@@ -672,6 +673,56 @@ function createWindow() {
     });
 }
 
+function createLocalChatWindow() {
+    if (localChatWindow && !localChatWindow.isDestroyed()) {
+        localChatWindow.show();
+        localChatWindow.focus();
+        return localChatWindow;
+    }
+
+    localChatWindow = new BrowserWindow({
+        width: 430,
+        height: 760,
+        minWidth: 360,
+        minHeight: 520,
+        show: false,
+        backgroundColor: '#000000',
+        title: 'Root Operator Chat',
+        autoHideMenuBar: true,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js'),
+            sandbox: true
+        }
+    });
+
+    if (isDev) {
+        localChatWindow.loadURL(`http://localhost:${VITE_RENDERER_PORT}/renderer.html?view=chat`);
+    } else {
+        localChatWindow.loadFile('ui/dist/renderer.html', { search: '?view=chat' });
+    }
+
+    localChatWindow.once('ready-to-show', () => {
+        if (localChatWindow && !localChatWindow.isDestroyed()) {
+            localChatWindow.show();
+            localChatWindow.focus();
+        }
+    });
+
+    localChatWindow.on('closed', () => {
+        localChatWindow = null;
+    });
+
+    localChatWindow.webContents.on('did-finish-load', () => {
+        if (localChatWindow && !localChatWindow.isDestroyed()) {
+            localChatWindow.webContents.send('SYNC_STATE', getTunnelState());
+        }
+    });
+
+    return localChatWindow;
+}
+
 function createTray() {
     try {
         console.log('Creating tray...');
@@ -833,6 +884,83 @@ function scheduleChannelIdle(detail = 'Claude is ready for the next message.') {
     }, CHANNEL_ACTIVITY_IDLE_MS);
 }
 
+function sendLocalChatEvent(payload) {
+    if (localChatWindow && !localChatWindow.isDestroyed()) {
+        localChatWindow.webContents.send('LOCAL_CHAT_EVENT', payload);
+    }
+}
+
+function createChatTimelineItem(activity) {
+    const markerTs = activity.ts || new Date().toISOString();
+    const activityKey = `${activity.phase || 'idle'}:${activity.label || 'Idle'}:${activity.toolName || ''}`;
+    const isActive = activity.active !== false;
+
+    return {
+        id: `${markerTs}:${activityKey}`,
+        key: activityKey,
+        label: activity.label || 'Idle',
+        detail: activity.detail || '',
+        active: isActive,
+        done: !isActive,
+        ts: markerTs,
+        completedAt: !isActive ? markerTs : undefined,
+    };
+}
+
+function getLocalChatState() {
+    const messages = chatStore ? chatStore.loadMessages() : [];
+    const activities = latestChannelActivity ? [createChatTimelineItem(latestChannelActivity)] : [];
+
+    return {
+        messages,
+        waiting: channelReplyPending,
+        activities,
+    };
+}
+
+function submitChannelUserMessage(chatId, content, userId, options = {}) {
+    const { echoToLocalChat = false } = options;
+
+    if (operatingMode !== 'channel') {
+        setOperatingMode('channel');
+    }
+
+    if (!channelManager) {
+        return { success: false, error: 'Chat bridge unavailable' };
+    }
+
+    const ts = new Date().toISOString();
+    const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
+
+    channelReplyPending = true;
+    setChannelActivity(sentToBridge ? {
+        phase: 'bridging',
+        label: 'Forwarding to Claude',
+        detail: 'The chat bridge accepted your message.',
+    } : {
+        phase: 'queued',
+        label: 'Queued for Claude',
+        detail: 'Waiting for the Claude chat bridge to reconnect.',
+    }, { force: true });
+
+    chatStore.addMessage({ role: 'user', content, ts });
+
+    if (echoToLocalChat) {
+        sendLocalChatEvent({
+            type: 'channel_message',
+            role: 'user',
+            content,
+            ts,
+        });
+    }
+
+    return {
+        success: true,
+        queued: !sentToBridge,
+        ts,
+    };
+}
+
 function setChannelActivity(activity, options = {}) {
     const {
         force = false,
@@ -867,6 +995,11 @@ function setChannelActivity(activity, options = {}) {
             activity: normalized,
         });
     }
+
+    sendLocalChatEvent({
+        type: 'channel_activity',
+        activity: normalized,
+    });
 
     syncStateWithRenderer();
 }
@@ -1192,6 +1325,10 @@ function syncStateWithRenderer() {
 
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('SYNC_STATE', state);
+    }
+
+    if (localChatWindow && !localChatWindow.isDestroyed()) {
+        localChatWindow.webContents.send('SYNC_STATE', state);
     }
 
     for (const client of activeClients) {
@@ -1713,6 +1850,8 @@ function initChannelMode() {
                 sendEncryptedOutput(client, JSON.stringify(msg));
             }
         }
+
+        sendLocalChatEvent(msg);
         scheduleChannelIdle();
     });
 
@@ -1984,7 +2123,6 @@ app.whenReady().then(async () => {
     });
 
     await fixPath();
-    const legacyChatHistoryPath = path.join(app.getPath('userData'), 'channel-history.jsonl');
 
     try {
         const workspaceRuntime = prepareClaudeWorkspaceRuntime();
@@ -1996,17 +2134,7 @@ app.whenReady().then(async () => {
         logDebug(`[WORKSPACE] Startup preparation failed: ${error.message}`);
     }
 
-    let chatHistoryPath = legacyChatHistoryPath;
-    try {
-        const workspaceChatHistory = ensureWorkspaceChatHistory([legacyChatHistoryPath]);
-        chatHistoryPath = workspaceChatHistory.chatHistoryPath;
-        if (workspaceChatHistory.migratedFrom) {
-            logDebug(`[CHAT] Migrated history store to workspace: ${workspaceChatHistory.migratedFrom} -> ${workspaceChatHistory.chatHistoryPath}`);
-        }
-    } catch (error) {
-        logDebug(`[CHAT] Failed to prepare workspace history store, falling back to legacy path: ${error.message}`);
-    }
-
+    const { chatHistoryPath } = ensureWorkspaceChatHistory();
     chatStore = new ChatStore(path.dirname(chatHistoryPath), path.basename(chatHistoryPath));
     try {
         const historyCount = chatStore.loadMessages().length;
@@ -2042,6 +2170,19 @@ ipcMain.handle('CHECK_FOR_UPDATES', async () => {
         return { started: false, reason: 'Updater not initialized' };
     }
     return updater.checkForUpdates('manual');
+});
+ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
+    setOperatingMode('channel');
+    createLocalChatWindow();
+    return { success: true };
+});
+ipcMain.handle('GET_LOCAL_CHAT_STATE', () => getLocalChatState());
+ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', (event, text) => {
+    if (typeof text !== 'string' || !text.trim()) {
+        return { success: false, error: 'Message is empty' };
+    }
+
+    return submitChannelUserMessage('desktop-local', text.trim(), 'desktop-local');
 });
 ipcMain.handle('INSTALL_UPDATE', async () => {
     if (!updater) {
@@ -2759,23 +2900,15 @@ function handleConnection(ws, req) {
 
             if (operatingMode === 'channel') {
                 // Channel mode: forward to Claude Code via channel bridge
-                if (channelManager) {
-                    const deviceId = ws.kid || 'unknown';
-                    const sentToBridge = channelManager.sendToChannel(deviceId, inputData, deviceId);
-                    logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
-                    channelReplyPending = true;
-                    setChannelActivity(sentToBridge ? {
-                        phase: 'bridging',
-                        label: 'Forwarding to Claude',
-                        detail: 'The chat bridge accepted your message.',
-                    } : {
-                        phase: 'queued',
-                        label: 'Queued for Claude',
-                        detail: 'Waiting for the Claude chat bridge to reconnect.',
-                    }, { force: true });
+                const deviceId = ws.kid || 'unknown';
+                const result = submitChannelUserMessage(deviceId, inputData, deviceId, {
+                    echoToLocalChat: true,
+                });
 
-                    // Store user message in history (file-backed)
-                    chatStore.addMessage({ role: 'user', content: inputData, ts: new Date().toISOString() });
+                if (result.success) {
+                    logDebug(`[CHANNEL] Forwarded input to channel bridge (len: ${inputData.length})`);
+                } else {
+                    logDebug(`[CHANNEL] Failed to forward input to channel bridge: ${result.error}`);
                 }
             } else if (ptyProcess) {
                 // Terminal mode: write to PTY

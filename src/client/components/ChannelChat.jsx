@@ -373,9 +373,24 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
   );
 });
 
-function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, activities, setActivities, waiting, setWaiting }) {
+function ChannelChat({
+  socket,
+  encryptInput,
+  e2eReady,
+  messages,
+  setMessages,
+  activities,
+  setActivities,
+  waiting,
+  setWaiting,
+  onSubmitMessage,
+  canSendOverride,
+}) {
   const messagesEndRef = useRef(null);
   const prevLengthRef = useRef(messages.length);
+  const canSend = typeof canSendOverride === 'boolean'
+    ? canSendOverride
+    : Boolean(socket && e2eReady);
 
   // Scroll when messages change — instant if bulk load, smooth if single new message
   useEffect(() => {
@@ -385,7 +400,7 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, ac
   }, [messages, waiting, activities]);
   
   const sendMessage = useCallback(async (text) => {
-    if (!text || !socket || !e2eReady) return;
+    if (!text || !canSend) return;
 
     setActivities([]);
 
@@ -395,12 +410,23 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, ac
       ts: new Date().toISOString(),
     }]);
 
-    const encrypted = await encryptInput(text);
-    if (encrypted) {
-      socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
-    }
     setWaiting(true);
-  }, [socket, e2eReady, encryptInput, setActivities, setMessages, setWaiting]);
+
+    try {
+      if (onSubmitMessage) {
+        await onSubmitMessage(text);
+        return;
+      }
+
+      const encrypted = await encryptInput(text);
+      if (encrypted) {
+        socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
+      }
+    } catch (error) {
+      console.error('Failed to send chat message:', error);
+      setWaiting(false);
+    }
+  }, [canSend, socket, encryptInput, onSubmitMessage, setActivities, setMessages, setWaiting]);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000' }}>
@@ -411,7 +437,7 @@ function ChannelChat({ socket, encryptInput, e2eReady, messages, setMessages, ac
         messagesEndRef={messagesEndRef}
       />
       <ChatComposer
-        canSend={Boolean(socket && e2eReady)}
+        canSend={canSend}
         onSend={sendMessage}
       />
     </div>
