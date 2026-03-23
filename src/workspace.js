@@ -12,9 +12,11 @@ const os = require('os');
 const ROOT_OPERATOR_DIR = path.join(os.homedir(), '.root-operator');
 const WORKSPACE_DIR = path.join(ROOT_OPERATOR_DIR, 'workspace');
 const RUNTIME_DIR = path.join(ROOT_OPERATOR_DIR, 'runtime');
+const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 const STATE_FILE = path.join(WORKSPACE_DIR, '.state.json');
 const SYSTEM_PROMPT_FILE = path.join(RUNTIME_DIR, 'system-prompt-append.md');
 const PROJECT_MCP_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
+const CHAT_HISTORY_FILE = path.join(MEMORY_DIR, 'channel-history.jsonl');
 // In packaged app, workspace-templates may be inside asar — use unpacked path
 const _baseDir = __dirname.replace('app.asar', 'app.asar.unpacked');
 const TEMPLATES_DIR = path.join(_baseDir, '..', 'workspace-templates');
@@ -30,12 +32,11 @@ const MAX_TOTAL_CHARS = 150_000;
  * Returns { workspaceDir, runtimeDir, isFirstRun, repairedFiles, missingTemplateFiles }.
  */
 function ensureWorkspace() {
-    const memoryDir = path.join(WORKSPACE_DIR, 'memory');
     const repairedFiles = [];
     const missingTemplateFiles = [];
 
     // Create directories
-    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
     const state = _readState();
@@ -196,6 +197,38 @@ function getRuntimeDir() {
     return RUNTIME_DIR;
 }
 
+/**
+ * Ensure the workspace-backed chat history path exists conceptually and migrate
+ * the legacy Electron userData file the first time we switch over.
+ */
+function ensureWorkspaceChatHistory(legacyPaths = []) {
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
+
+    let migratedFrom = null;
+
+    if (!fs.existsSync(CHAT_HISTORY_FILE)) {
+        for (const candidate of legacyPaths) {
+            if (!candidate || candidate === CHAT_HISTORY_FILE) {
+                continue;
+            }
+
+            if (!fs.existsSync(candidate)) {
+                continue;
+            }
+
+            fs.copyFileSync(candidate, CHAT_HISTORY_FILE);
+            migratedFrom = candidate;
+            console.log(`[Workspace] Migrated chat history from ${candidate} -> ${CHAT_HISTORY_FILE}`);
+            break;
+        }
+    }
+
+    return {
+        chatHistoryPath: CHAT_HISTORY_FILE,
+        migratedFrom,
+    };
+}
+
 // --- Internal helpers ---
 
 function _readState() {
@@ -220,7 +253,10 @@ module.exports = {
     isBootstrapPending,
     getWorkspaceDir,
     getRuntimeDir,
+    ensureWorkspaceChatHistory,
     ROOT_OPERATOR_DIR,
     WORKSPACE_DIR,
     RUNTIME_DIR,
+    MEMORY_DIR,
+    CHAT_HISTORY_FILE,
 };

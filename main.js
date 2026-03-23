@@ -20,7 +20,7 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig } = require('./src/workspace');
+const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory } = require('./src/workspace');
 
 let store;
 const isDev = !app.isPackaged;
@@ -1984,13 +1984,7 @@ app.whenReady().then(async () => {
     });
 
     await fixPath();
-    chatStore = new ChatStore(app.getPath('userData'));
-    try {
-        const historyCount = chatStore.loadMessages().length;
-        logDebug(`[CHAT] History store ready: ${chatStore.filePath} (${historyCount} messages)`);
-    } catch (error) {
-        logDebug(`[CHAT] Failed to read history store: ${error.message}`);
-    }
+    const legacyChatHistoryPath = path.join(app.getPath('userData'), 'channel-history.jsonl');
 
     try {
         const workspaceRuntime = prepareClaudeWorkspaceRuntime();
@@ -2000,6 +1994,25 @@ app.whenReady().then(async () => {
     } catch (error) {
         console.error(`[WORKSPACE] Failed to prepare Claude workspace runtime: ${error.message}`);
         logDebug(`[WORKSPACE] Startup preparation failed: ${error.message}`);
+    }
+
+    let chatHistoryPath = legacyChatHistoryPath;
+    try {
+        const workspaceChatHistory = ensureWorkspaceChatHistory([legacyChatHistoryPath]);
+        chatHistoryPath = workspaceChatHistory.chatHistoryPath;
+        if (workspaceChatHistory.migratedFrom) {
+            logDebug(`[CHAT] Migrated history store to workspace: ${workspaceChatHistory.migratedFrom} -> ${workspaceChatHistory.chatHistoryPath}`);
+        }
+    } catch (error) {
+        logDebug(`[CHAT] Failed to prepare workspace history store, falling back to legacy path: ${error.message}`);
+    }
+
+    chatStore = new ChatStore(path.dirname(chatHistoryPath), path.basename(chatHistoryPath));
+    try {
+        const historyCount = chatStore.loadMessages().length;
+        logDebug(`[CHAT] History store ready: ${chatStore.filePath} (${historyCount} messages)`);
+    } catch (error) {
+        logDebug(`[CHAT] Failed to read history store: ${error.message}`);
     }
 
     createWindow();
