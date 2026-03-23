@@ -3,6 +3,8 @@ import { Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+const isMobileChatInput = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
 function ActivityDots() {
   const [active, setActive] = useState(0);
 
@@ -280,7 +282,23 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
   }, [input, canSend, isSending, onSend]);
 
   const handleKeyDown = useCallback((e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    if (e.key !== 'Enter' || e.nativeEvent?.isComposing) {
+      return;
+    }
+
+    if (isMobileChatInput) {
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+      return;
+    }
+
+    if (e.metaKey || e.ctrlKey) {
+      return;
+    }
+
+    if (!e.shiftKey && !e.altKey) {
       e.preventDefault();
       sendMessage();
     }
@@ -310,7 +328,8 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Message"
+          placeholder="Ask Root Operator"
+          enterKeyHint={isMobileChatInput ? 'enter' : 'send'}
           rows={1}
           style={{
             flex: 1,
