@@ -9,6 +9,13 @@
 
 ✨ Now with built in persistent cron scheduler and identity system (inspired by Openclaw)
 
+- 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
+- 🛡️ **RSA-PSS with challenge-response** (passwordless)
+- 🔐 **BIP39 fingerprinting**: 12 words on your phone, 12 on your Mac — if they match, no one is intercepting
+
+
+<img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
+
 > ⚠️ **Security notice**
 >
 > Root Operator gives the connected AI agent (Claude Code) powerful capabilities on your Mac — including running shell commands, reading and writing files, installing packages, and managing scheduled jobs. By default, it runs with `--dangerously-skip-permissions`, meaning the agent can act without per-action approval.
@@ -20,13 +27,6 @@
 > - Keep secrets and credentials out of the agent's reachable filesystem
 > - Use device pairing and E2E encryption — never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
-
-- 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
-- 🛡️ **RSA-PSS with challenge-response** (passwordless)
-- 🔐 **BIP39 fingerprinting**: 12 words on your phone, 12 on your Mac — if they match, no one is intercepting
-
-
-<img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 
 
 ## Why Root Operator?
