@@ -16,7 +16,7 @@
 > **Only run Root Operator if you understand the risks and trust the agent's configuration.** A bad prompt or misconfigured system prompt could lead to unintended or destructive changes. This is a personal tool designed for a single trusted operator — not a multi-user or shared system.
 >
 > Recommended baseline:
-> - Review your workspace files (`SOUL.md`, `AGENTS.md`) before first run
+> - Review your workspace files (`SOUL.md`, `AGENTS.md`) periodically
 > - Keep secrets and credentials out of the agent's reachable filesystem
 > - Use device pairing and E2E encryption — never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
