@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { PictureInPicture2 } from 'lucide-react';
 import rabbitLogo from '../../client/assets/rabbit.svg';
 import ChannelChat from '../../client/components/ChannelChat';
 import { useElectron } from '../hooks/useElectron';
@@ -33,6 +34,7 @@ function LocalChatView({ tunnelState }) {
   const [messages, setMessages] = useState([]);
   const [activities, setActivities] = useState([]);
   const [waiting, setWaiting] = useState(false);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -114,6 +116,7 @@ function LocalChatView({ tunnelState }) {
         setMessages((prev) => mergeMessages(prev, state.messages || []));
         setWaiting(Boolean(state.waiting));
         setActivities(state.activities || []);
+        setAlwaysOnTop(Boolean(state.alwaysOnTop));
       } catch (error) {
         console.error('Failed to load local chat state:', error);
       }
@@ -134,11 +137,27 @@ function LocalChatView({ tunnelState }) {
     }
   }, [invoke]);
 
+  const handleToggleAlwaysOnTop = useCallback(async () => {
+    try {
+      const result = await invoke('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP');
+      if (result?.success) {
+        setAlwaysOnTop(Boolean(result.alwaysOnTop));
+      }
+    } catch (error) {
+      console.error('Failed to toggle always-on-top:', error);
+    }
+  }, [invoke]);
+
   const channelStatus = tunnelState?.health?.channel || {
     level: 'orange',
     label: 'Channel status loading',
     detail: 'Waiting for Root Operator to report Claude channel status.',
   };
+  const canSend = Boolean(
+    tunnelState?.mode === 'channel'
+    && channelStatus?.bridgeConnected
+    && channelStatus?.phase === 'ready'
+  );
 
   const statusTooltip = [
     `Chat: ${channelStatus.label}`,
@@ -147,22 +166,20 @@ function LocalChatView({ tunnelState }) {
   ].filter(Boolean).join('\n');
 
   return (
-    <div className="flex h-dvh w-full flex-col bg-black text-white">
-      <header className="flex h-11 flex-shrink-0 items-center justify-between bg-black px-3">
-        <div className="inline-flex items-center gap-2">
+    <div className="desktop-chat-window flex h-dvh w-full flex-col bg-black text-white">
+      <header
+        className="flex min-h-11 flex-shrink-0 items-center justify-between bg-black py-2 pr-3 select-none"
+        style={{ WebkitAppRegion: 'drag', paddingLeft: 16 }}
+      >
+        <div className="inline-flex items-center">
           <img src={rabbitLogo} alt="Root Operator" style={{ height: 20 }} />
-          <span className="font-mono text-[11px] tracking-wider text-white/60">
-            LOCAL_CHAT
-          </span>
         </div>
         <div
-          className="inline-flex items-center gap-2"
+          className="inline-flex items-center gap-3"
+          style={{ WebkitAppRegion: 'no-drag' }}
           title={statusTooltip}
           aria-label={statusTooltip}
         >
-          <span className="font-mono text-[11px] text-white/45">
-            {channelStatus.label}
-          </span>
           <span
             aria-hidden="true"
             style={{
@@ -174,6 +191,31 @@ function LocalChatView({ tunnelState }) {
               boxShadow: `0 0 0 1px #000, 0 0 8px ${(STATUS_COLORS[channelStatus.level] || STATUS_COLORS.orange)}40`,
             }}
           />
+          <button
+            type="button"
+            onClick={handleToggleAlwaysOnTop}
+            onMouseDown={(event) => event.preventDefault()}
+            title={alwaysOnTop ? 'Disable always on top' : 'Pin always on top'}
+            aria-pressed={alwaysOnTop}
+            tabIndex={-1}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              padding: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: alwaysOnTop ? '#4B5AFF' : 'rgba(255,255,255,0.42)',
+              cursor: 'pointer',
+              transition: 'color 0.15s ease',
+              outline: 'none',
+              boxShadow: 'none',
+              WebkitTapHighlightColor: 'transparent',
+              WebkitAppRegion: 'no-drag',
+            }}
+          >
+            <PictureInPicture2 size={16} strokeWidth={2} />
+          </button>
         </div>
       </header>
 
@@ -185,7 +227,7 @@ function LocalChatView({ tunnelState }) {
         waiting={waiting}
         setWaiting={setWaiting}
         onSubmitMessage={handleSubmitMessage}
-        canSendOverride={true}
+        canSendOverride={canSend}
       />
     </div>
   );

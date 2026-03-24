@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect, useCallback, memo } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
 import { Check } from 'lucide-react';
+import { ArrowUp } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -204,9 +205,18 @@ const MessageMarkdown = memo(function MessageMarkdown({ content }) {
   );
 });
 
-const ChatMessages = memo(function ChatMessages({ messages, activities, waiting, messagesEndRef }) {
+const ChatMessages = memo(function ChatMessages({
+  messages,
+  activities,
+  waiting,
+  scrollContainerRef,
+  messagesEndRef,
+}) {
   return (
-    <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}>
+    <div
+      ref={scrollContainerRef}
+      style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}
+    >
       {messages.length === 0 && !waiting && activities.length === 0 && (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <pre style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 7, lineHeight: 1.12, color: 'rgba(75,90,255,0.42)', userSelect: 'none', whiteSpace: 'pre' }}>{`
@@ -309,8 +319,8 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
   return (
     <div style={{
       flexShrink: 0,
-      padding: '6px 16px',
-      paddingBottom: 'max(14px, env(safe-area-inset-bottom))',
+      padding: '8px 16px',
+      paddingBottom: 'max(24px, env(safe-area-inset-bottom))',
       maxWidth: 640,
       width: '100%',
       alignSelf: 'center',
@@ -328,7 +338,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Ask Root Operator"
+          placeholder="Ask me anything"
           enterKeyHint={isMobileChatInput ? 'enter' : 'send'}
           rows={1}
           style={{
@@ -339,11 +349,12 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
             resize: 'none',
             color: '#fff',
             fontSize: 15,
-            lineHeight: '22px',
-            padding: '5px 0',
+            lineHeight: '20px',
+            padding: '7px 0',
             minHeight: 34,
             maxHeight: 144,
             fontFamily: 'inherit',
+            display: 'block',
           }}
         />
         <button
@@ -363,10 +374,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
             transition: 'background 0.15s',
           }}
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="8" y1="14" x2="8" y2="3" />
-            <polyline points="3,7 8,2 13,7" />
-          </svg>
+          <ArrowUp size={14} strokeWidth={2} color="#fff" />
         </button>
       </div>
     </div>
@@ -386,17 +394,32 @@ function ChannelChat({
   onSubmitMessage,
   canSendOverride,
 }) {
+  const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
   const prevLengthRef = useRef(messages.length);
   const canSend = typeof canSendOverride === 'boolean'
     ? canSendOverride
     : Boolean(socket && e2eReady);
 
-  // Scroll when messages change — instant if bulk load, smooth if single new message
-  useEffect(() => {
+  // Scroll when messages change — jump to bottom on bulk load, smooth on single new message.
+  useLayoutEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return undefined;
+
     const isBulkLoad = Math.abs(messages.length - prevLengthRef.current) > 1;
     prevLengthRef.current = messages.length;
-    messagesEndRef.current?.scrollIntoView({ behavior: isBulkLoad ? 'instant' : 'smooth' });
+
+    const rafId = requestAnimationFrame(() => {
+      if (!scrollContainerRef.current) return;
+
+      if (isBulkLoad) {
+        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+      } else {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+    });
+
+    return () => cancelAnimationFrame(rafId);
   }, [messages, waiting, activities]);
   
   const sendMessage = useCallback(async (text) => {
@@ -434,6 +457,7 @@ function ChannelChat({
         messages={messages}
         activities={activities}
         waiting={waiting}
+        scrollContainerRef={scrollContainerRef}
         messagesEndRef={messagesEndRef}
       />
       <ChatComposer

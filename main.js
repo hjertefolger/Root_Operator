@@ -2,7 +2,7 @@
  * ROOT OPERATOR - MAIN PROCESS
  */
 const path = require('path');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const fixPath = async () => {
@@ -71,6 +71,7 @@ const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL || runtimeConfig.WORKER_BASE_URL || '';
 const WORKER_DOMAIN = process.env.WORKER_DOMAIN || runtimeConfig.WORKER_DOMAIN || '';
 const UPDATE_BANNER_DISMISSED_VERSION_KEY = 'updateBannerDismissedVersion';
+const DOUBLE_SHIFT_WINDOW_MS = 300;
 
 if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
     console.warn('[CONFIG] WORKER_BASE_URL or WORKER_DOMAIN is missing. Tunnel provisioning features will be unavailable.');
@@ -118,6 +119,98 @@ let claudeDebugLineBuffer = '';
 let claudeHookFilePath = '';
 let claudeHookPollTimer = null;
 let claudeHookReadOffset = 0;
+let shortcutHook = null;
+let shiftKeyCodes = [];
+let shiftShortcutStarted = false;
+let lastShiftKeyUpCode = null;
+let lastShiftKeyUpTime = 0;
+let hadOtherKeyBetweenShiftTaps = false;
+let shiftToggleCallback = null;
+
+function isActiveShiftCode(keycode) {
+    return shiftKeyCodes.includes(keycode);
+}
+
+function handleModifierShortcutKeyDown(event) {
+    if (!shiftShortcutStarted) {
+        return;
+    }
+
+    if (isActiveShiftCode(event.keycode)) {
+        return;
+    }
+
+    hadOtherKeyBetweenShiftTaps = true;
+}
+
+function handleModifierShortcutKeyUp(event) {
+    if (!shiftShortcutStarted || !isActiveShiftCode(event.keycode)) {
+        return;
+    }
+
+    const now = Date.now();
+
+    if (
+        !hadOtherKeyBetweenShiftTaps
+        && lastShiftKeyUpCode !== null
+        && isActiveShiftCode(lastShiftKeyUpCode)
+        && now - lastShiftKeyUpTime <= DOUBLE_SHIFT_WINDOW_MS
+    ) {
+        lastShiftKeyUpCode = null;
+        lastShiftKeyUpTime = 0;
+        hadOtherKeyBetweenShiftTaps = false;
+        if (typeof shiftToggleCallback === 'function') {
+            shiftToggleCallback();
+        }
+        return;
+    }
+
+    lastShiftKeyUpCode = event.keycode;
+    lastShiftKeyUpTime = now;
+    hadOtherKeyBetweenShiftTaps = false;
+}
+
+function initDoubleShiftShortcut(callback) {
+    shiftToggleCallback = callback;
+
+    try {
+        const { uIOhook, UiohookKey } = require('uiohook-napi');
+        shortcutHook = uIOhook;
+        shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight];
+        shortcutHook.on('keydown', handleModifierShortcutKeyDown);
+        shortcutHook.on('keyup', handleModifierShortcutKeyUp);
+        shortcutHook.start();
+        shiftShortcutStarted = true;
+        logDebug('[SHORTCUT] Double-Shift shortcut active');
+    } catch (error) {
+        shortcutHook = null;
+        shiftKeyCodes = [];
+        shiftShortcutStarted = false;
+        logDebug(`[SHORTCUT] Failed to initialize Double-Shift shortcut: ${error.message}`);
+    }
+}
+
+function stopDoubleShiftShortcut() {
+    if (!shortcutHook || !shiftShortcutStarted) {
+        return;
+    }
+
+    try {
+        shortcutHook.off('keydown', handleModifierShortcutKeyDown);
+        shortcutHook.off('keyup', handleModifierShortcutKeyUp);
+        shortcutHook.stop();
+    } catch (error) {
+        logDebug(`[SHORTCUT] Failed to stop Double-Shift shortcut: ${error.message}`);
+    }
+
+    shortcutHook = null;
+    shiftKeyCodes = [];
+    shiftShortcutStarted = false;
+    lastShiftKeyUpCode = null;
+    lastShiftKeyUpTime = 0;
+    hadOtherKeyBetweenShiftTaps = false;
+    shiftToggleCallback = null;
+}
 let claudeHookLineBuffer = '';
 let channelIdleTimer = null;
 let channelRuntime = {
@@ -673,6 +766,62 @@ function createWindow() {
     });
 }
 
+function getAppDockIconPath() {
+    const iconPath = path.join(__dirname, 'public', 'icon-512-v3.png');
+    return fs.existsSync(iconPath) ? iconPath : null;
+}
+
+function applyDockIcon() {
+    if (process.platform !== 'darwin' || !app.dock) {
+        return;
+    }
+
+    const iconPath = getAppDockIconPath();
+    if (iconPath) {
+        const dockIcon = nativeImage.createFromPath(iconPath);
+        if (!dockIcon.isEmpty()) {
+            app.dock.setIcon(dockIcon);
+        }
+    }
+}
+
+function syncDockVisibility() {
+    if (!app.dock) {
+        return;
+    }
+
+    const localChatVisible = Boolean(
+        localChatWindow
+        && !localChatWindow.isDestroyed()
+        && localChatWindow.isVisible()
+    );
+    const fallbackMainVisible = Boolean(
+        mainWindow
+        && !mainWindow.isDestroyed()
+        && mainWindow.isVisible()
+        && !tray
+    );
+
+    if (localChatVisible || fallbackMainVisible) {
+        app.setActivationPolicy('regular');
+        applyDockIcon();
+        app.dock.show();
+    } else {
+        app.dock.hide();
+        app.setActivationPolicy('accessory');
+    }
+}
+
+function toggleLocalChatWindow() {
+    if (localChatWindow && !localChatWindow.isDestroyed() && localChatWindow.isVisible()) {
+        localChatWindow.hide();
+        syncDockVisibility();
+        return localChatWindow;
+    }
+
+    return createLocalChatWindow();
+}
+
 function createLocalChatWindow() {
     if (localChatWindow && !localChatWindow.isDestroyed()) {
         localChatWindow.show();
@@ -686,6 +835,8 @@ function createLocalChatWindow() {
         minWidth: 360,
         minHeight: 520,
         show: false,
+        frame: false,
+        titleBarStyle: 'hidden',
         backgroundColor: '#000000',
         title: 'Root Operator Chat',
         autoHideMenuBar: true,
@@ -697,6 +848,10 @@ function createLocalChatWindow() {
         }
     });
 
+    if (process.platform === 'darwin') {
+        localChatWindow.setWindowButtonVisibility(false);
+    }
+
     if (isDev) {
         localChatWindow.loadURL(`http://localhost:${VITE_RENDERER_PORT}/renderer.html?view=chat`);
     } else {
@@ -705,13 +860,23 @@ function createLocalChatWindow() {
 
     localChatWindow.once('ready-to-show', () => {
         if (localChatWindow && !localChatWindow.isDestroyed()) {
+            syncDockVisibility();
             localChatWindow.show();
             localChatWindow.focus();
         }
     });
 
+    localChatWindow.on('show', () => {
+        syncDockVisibility();
+    });
+
+    localChatWindow.on('hide', () => {
+        syncDockVisibility();
+    });
+
     localChatWindow.on('closed', () => {
         localChatWindow = null;
+        syncDockVisibility();
     });
 
     localChatWindow.webContents.on('did-finish-load', () => {
@@ -721,6 +886,43 @@ function createLocalChatWindow() {
     });
 
     return localChatWindow;
+}
+
+function registerGlobalShortcuts() {
+    const startTunnelRegistered = globalShortcut.register('CommandOrControl+Shift+J', async () => {
+        if (isConnecting || server || tunnelProcess) {
+            stopBridge();
+            return;
+        }
+
+        try {
+            const cfSettings = await getStoredTunnelSettings();
+            await startBridge(cfSettings);
+        } catch (error) {
+            stopBridge();
+            logDebug(`[SHORTCUT] Failed to toggle tunnel from shortcut: ${error.message}`);
+        }
+    });
+
+    if (!startTunnelRegistered) {
+        logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+J');
+    }
+}
+
+async function getStoredTunnelSettings() {
+    const settings = store?.get('cfSettings', {}) || {};
+    let token = '';
+
+    try {
+        token = (await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_CF_TOKEN)) || '';
+    } catch (error) {
+        logDebug(`[SYSTEM] Failed to read secure tunnel token: ${error.message}`);
+    }
+
+    return {
+        token,
+        domain: settings?.domain || '',
+    };
 }
 
 function createTray() {
@@ -915,17 +1117,14 @@ function getLocalChatState() {
         messages,
         waiting: channelReplyPending,
         activities,
+        alwaysOnTop: Boolean(localChatWindow && !localChatWindow.isDestroyed() && localChatWindow.isAlwaysOnTop()),
     };
 }
 
 function submitChannelUserMessage(chatId, content, userId, options = {}) {
     const { echoToLocalChat = false } = options;
 
-    if (operatingMode !== 'channel') {
-        setOperatingMode('channel');
-    }
-
-    if (!channelManager) {
+    if (operatingMode !== 'channel' || !channelManager || !channelManager.connected) {
         return { success: false, error: 'Chat bridge unavailable' };
     }
 
@@ -1320,6 +1519,7 @@ function syncStateWithRenderer() {
     const state = getTunnelState();
 
     if (tray) {
+        setTrayIconState(state.active);
         tray.setToolTip(formatTrayTooltip(state));
     }
 
@@ -1339,6 +1539,16 @@ function syncStateWithRenderer() {
             }));
         }
     }
+}
+
+function setTrayIconState(isActive) {
+    if (!tray) {
+        return;
+    }
+
+    const iconName = isActive ? 'tray_icon_active.png' : 'tray_iconTemplate.png';
+    const iconPath = path.join(__dirname, iconName);
+    tray.setImage(iconPath);
 }
 
 function getTunnelState() {
@@ -2101,6 +2311,8 @@ function buildTrayMenu() {
 
 app.whenReady().then(async () => {
     console.log('App Ready');
+    applyDockIcon();
+    app.setActivationPolicy('accessory');
     if (app.dock) app.dock.hide();
 
     // Remove default application menu (tray-only app)
@@ -2145,7 +2357,31 @@ app.whenReady().then(async () => {
 
     createWindow();
     createTray();
+    registerGlobalShortcuts();
+    initDoubleShiftShortcut(() => {
+        toggleLocalChatWindow();
+    });
     updater.start();
+});
+
+app.on('activate', () => {
+    if (localChatWindow && !localChatWindow.isDestroyed()) {
+        localChatWindow.show();
+        localChatWindow.focus();
+        syncDockVisibility();
+        return;
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed() && !tray) {
+        mainWindow.show();
+        mainWindow.focus();
+        syncDockVisibility();
+    }
+});
+
+app.on('will-quit', () => {
+    globalShortcut.unregisterAll();
+    stopDoubleShiftShortcut();
 });
 
 // 2. IPC API (Frontend -> Backend)
@@ -2172,7 +2408,6 @@ ipcMain.handle('CHECK_FOR_UPDATES', async () => {
     return updater.checkForUpdates('manual');
 });
 ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
-    setOperatingMode('channel');
     createLocalChatWindow();
     return { success: true };
 });
@@ -2183,6 +2418,19 @@ ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', (event, text) => {
     }
 
     return submitChannelUserMessage('desktop-local', text.trim(), 'desktop-local');
+});
+ipcMain.handle('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP', () => {
+    if (!localChatWindow || localChatWindow.isDestroyed()) {
+        return { success: false, error: 'Local chat window is not open' };
+    }
+
+    const next = !localChatWindow.isAlwaysOnTop();
+    localChatWindow.setAlwaysOnTop(next, next ? 'floating' : 'normal');
+    if (next) {
+        localChatWindow.moveTop();
+        localChatWindow.focus();
+    }
+    return { success: true, alwaysOnTop: next };
 });
 ipcMain.handle('INSTALL_UPDATE', async () => {
     if (!updater) {
@@ -2226,12 +2474,7 @@ ipcMain.handle('RESIZE_WINDOW', (event, height) => {
 });
 
 ipcMain.handle('SET_TRAY_ICON', (event, isActive) => {
-    if (tray) {
-        // Active icon does NOT use Template suffix to preserve green color
-        const iconName = isActive ? 'tray_icon_active.png' : 'tray_iconTemplate.png';
-        const iconPath = path.join(__dirname, iconName);
-        tray.setImage(iconPath);
-    }
+    setTrayIconState(isActive);
     return { success: true };
 });
 
@@ -2409,6 +2652,7 @@ function isOriginAllowed(origin, cfSettings) {
 
 async function startBridge(cfSettings) {
     isConnecting = true;
+    syncStateWithRenderer();
 
     // Store settings for origin validation (include Worker domain)
     const storedCfSettings = { ...cfSettings, domain: cfSettings?.domain || WORKER_DOMAIN };
@@ -2644,6 +2888,7 @@ function stopBridge() {
     isConnecting = false;
     // Don't reset operatingMode — preserve user's choice across bridge restarts
     logDebug('[SYSTEM] Bridge stopped.');
+    syncStateWithRenderer();
 }
 
 // 4. CONNECTION HANDLER (The Auth Logic)

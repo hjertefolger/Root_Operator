@@ -153,3 +153,32 @@
     cursor: pointer;
   }
 }
+
+/* Markdown inside desktop chat bubbles — match the web chat spacing */
+.msg-md > *:first-child {
+  margin-top: 0 !important;
+}
+
+.msg-md > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+.msg-md li::marker {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.msg-md li > ul,
+.msg-md li > ol {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+.msg-md blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+.desktop-chat-window .msg-md :focus,
+.desktop-chat-window .msg-md :focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
