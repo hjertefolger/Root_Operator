@@ -2,7 +2,7 @@
  * ROOT OPERATOR - MAIN PROCESS
  */
 const path = require('path');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const fixPath = async () => {
@@ -16,6 +16,7 @@ const net = require('net');
 const crypto = require('crypto');
 const cloudflared = require('cloudflared');
 const keytar = require('keytar');
+const webpush = require('web-push');
 const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
@@ -104,6 +105,10 @@ const CHANNEL_STARTUP_TIMEOUT_MS = 15000;
 const CHANNEL_RESTART_DELAY_MS = 2500;
 const CHANNEL_ACTIVITY_IDLE_MS = 5000;
 const DEFAULT_ACTIVITY_ASSISTANT_NAME = 'Operator';
+const PUSH_SUBSCRIPTIONS_STORE_KEY = 'pushSubscriptions';
+const PUSH_VAPID_KEYS_STORE_KEY = 'pushVapidKeys';
+const PUSH_NOTIFICATION_TARGET_URL = '/';
+const PUSH_NOTIFICATION_SUBJECT = 'https://github.com/hjertefolger/Root_Operator';
 let channelStartupTimer = null;
 let channelRestartTimer = null;
 let channelConfirmTimers = [];
@@ -948,6 +953,251 @@ function getActivityAssistantName() {
 
     const trimmedName = rawName.trim();
     return trimmedName || DEFAULT_ACTIVITY_ASSISTANT_NAME;
+}
+
+function getNotificationPreviewBody() {
+    const assistantName = getActivityAssistantName();
+    return `${assistantName} sent a new message`;
+}
+
+function getAssistantNotificationPayload(message = {}) {
+    return {
+        title: 'Root Operator',
+        body: getNotificationPreviewBody(),
+        tag: 'root-operator-assistant-reply',
+        url: PUSH_NOTIFICATION_TARGET_URL,
+        assistantName: getActivityAssistantName(),
+        ts: message.ts || new Date().toISOString(),
+        icon: '/icon-192-v3.png',
+        badge: '/icon-192-v3.png',
+    };
+}
+
+function getStoredPushSubscriptions() {
+    if (!store) {
+        return [];
+    }
+
+    const subscriptions = store.get(PUSH_SUBSCRIPTIONS_STORE_KEY, []);
+    return Array.isArray(subscriptions) ? subscriptions : [];
+}
+
+function savePushSubscriptions(subscriptions) {
+    if (!store) {
+        return;
+    }
+
+    store.set(PUSH_SUBSCRIPTIONS_STORE_KEY, Array.isArray(subscriptions) ? subscriptions : []);
+}
+
+function getStoredPushVapidKeys() {
+    if (!store) {
+        return null;
+    }
+
+    const existing = store.get(PUSH_VAPID_KEYS_STORE_KEY, null);
+    if (
+        existing
+        && typeof existing.publicKey === 'string'
+        && existing.publicKey
+        && typeof existing.privateKey === 'string'
+        && existing.privateKey
+    ) {
+        return existing;
+    }
+
+    const generated = webpush.generateVAPIDKeys();
+    store.set(PUSH_VAPID_KEYS_STORE_KEY, generated);
+    logDebug('[NOTIFICATIONS] Generated VAPID keys');
+    return generated;
+}
+
+function configureWebPush() {
+    const vapidKeys = getStoredPushVapidKeys();
+    if (!vapidKeys) {
+        return null;
+    }
+
+    webpush.setVapidDetails(
+        PUSH_NOTIFICATION_SUBJECT,
+        vapidKeys.publicKey,
+        vapidKeys.privateKey,
+    );
+
+    return vapidKeys;
+}
+
+function normalizePushSubscription(subscription) {
+    if (!subscription || typeof subscription !== 'object') {
+        return null;
+    }
+
+    const endpoint = typeof subscription.endpoint === 'string' ? subscription.endpoint.trim() : '';
+    const keys = subscription.keys && typeof subscription.keys === 'object' ? subscription.keys : {};
+    const p256dh = typeof keys.p256dh === 'string' ? keys.p256dh.trim() : '';
+    const auth = typeof keys.auth === 'string' ? keys.auth.trim() : '';
+
+    if (!endpoint || !p256dh || !auth) {
+        return null;
+    }
+
+    return {
+        endpoint,
+        expirationTime: typeof subscription.expirationTime === 'number' ? subscription.expirationTime : null,
+        keys: { p256dh, auth },
+    };
+}
+
+function getPairedDeviceLabel(kid) {
+    if (!kid) {
+        return 'Unknown device';
+    }
+
+    const keys = store?.get('keys', []) || [];
+    const device = keys.find((item) => item.kid === kid);
+    return device?.name || kid.substring(0, 12);
+}
+
+function buildNotificationStatePayload(kid) {
+    const vapidKeys = configureWebPush();
+    const subscriptions = getStoredPushSubscriptions();
+
+    return {
+        type: 'notifications_state',
+        supported: Boolean(vapidKeys?.publicKey),
+        vapidPublicKey: vapidKeys?.publicKey || '',
+        subscribed: Boolean(kid && subscriptions.some((entry) => entry.kid === kid)),
+    };
+}
+
+function sendNotificationState(ws) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !ws.authenticated) {
+        return;
+    }
+
+    try {
+        ws.send(JSON.stringify(buildNotificationStatePayload(ws.kid || '')));
+    } catch (error) {
+        logDebug(`[NOTIFICATIONS] Failed to send notification state: ${error.message}`);
+    }
+}
+
+function upsertPushSubscription({ kid, subscription, platform = '', userAgent = '' }) {
+    const normalized = normalizePushSubscription(subscription);
+    if (!kid || !normalized) {
+        return false;
+    }
+
+    const now = new Date().toISOString();
+    const subscriptions = getStoredPushSubscriptions();
+    const existing = subscriptions.find((entry) => entry.kid === kid);
+    const next = subscriptions.filter((entry) => entry.kid !== kid && entry.subscription?.endpoint !== normalized.endpoint);
+
+    next.push({
+        kid,
+        name: getPairedDeviceLabel(kid),
+        subscription: normalized,
+        platform: typeof platform === 'string' ? platform.trim() : '',
+        userAgent: typeof userAgent === 'string' ? userAgent.trim() : '',
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+    });
+
+    savePushSubscriptions(next);
+    logDebug(`[NOTIFICATIONS] Registered push subscription for ${kid.substring(0, 8)}...`);
+    return true;
+}
+
+function removePushSubscriptionsForKid(kid) {
+    if (!kid) {
+        return;
+    }
+
+    const subscriptions = getStoredPushSubscriptions();
+    const next = subscriptions.filter((entry) => entry.kid !== kid);
+    if (next.length !== subscriptions.length) {
+        savePushSubscriptions(next);
+        logDebug(`[NOTIFICATIONS] Removed push subscriptions for ${kid.substring(0, 8)}...`);
+    }
+}
+
+function removePushSubscriptionByEndpoint(endpoint) {
+    if (!endpoint) {
+        return;
+    }
+
+    const subscriptions = getStoredPushSubscriptions();
+    const next = subscriptions.filter((entry) => entry.subscription?.endpoint !== endpoint);
+    if (next.length !== subscriptions.length) {
+        savePushSubscriptions(next);
+        logDebug('[NOTIFICATIONS] Removed stale push subscription');
+    }
+}
+
+function shouldSuppressDesktopNotification() {
+    const focusedWindow = BrowserWindow.getFocusedWindow();
+    return Boolean(
+        focusedWindow
+        && !focusedWindow.isDestroyed()
+        && (focusedWindow === localChatWindow || focusedWindow === mainWindow)
+    );
+}
+
+function showDesktopAssistantNotification(message) {
+    if (!Notification.isSupported() || shouldSuppressDesktopNotification()) {
+        return;
+    }
+
+    const payload = getAssistantNotificationPayload(message);
+    const notification = new Notification({
+        title: payload.title,
+        subtitle: payload.assistantName,
+        body: payload.body,
+        icon: path.join(__dirname, 'public', 'icon-192-v3.png'),
+        silent: false,
+    });
+
+    notification.on('click', () => {
+        app.focus({ steal: true });
+        createLocalChatWindow();
+    });
+
+    notification.show();
+}
+
+async function sendPushNotification(entry, payload) {
+    try {
+        await webpush.sendNotification(entry.subscription, JSON.stringify(payload), {
+            TTL: 60,
+            urgency: 'high',
+        });
+    } catch (error) {
+        if (error.statusCode === 404 || error.statusCode === 410) {
+            removePushSubscriptionByEndpoint(entry.subscription?.endpoint);
+        }
+        throw error;
+    }
+}
+
+async function notifyPushSubscribers(message) {
+    const subscriptions = getStoredPushSubscriptions();
+    if (subscriptions.length === 0) {
+        return;
+    }
+
+    const payload = getAssistantNotificationPayload(message);
+    const results = await Promise.allSettled(subscriptions.map((entry) => sendPushNotification(entry, payload)));
+    const failures = results.filter((result) => result.status === 'rejected');
+    if (failures.length > 0) {
+        logDebug(`[NOTIFICATIONS] Push delivery failures: ${failures.length}`);
+    }
+}
+
+function notifyAssistantReply(message) {
+    showDesktopAssistantNotification(message);
+    notifyPushSubscribers(message).catch((error) => {
+        logDebug(`[NOTIFICATIONS] Failed to deliver push notifications: ${error.message}`);
+    });
 }
 
 function createTray() {
@@ -2361,6 +2611,7 @@ function initChannelMode() {
         }
 
         sendLocalChatEvent(msg);
+        notifyAssistantReply(msg);
         scheduleChannelIdle();
     });
 
@@ -2644,6 +2895,7 @@ app.whenReady().then(async () => {
 
     const { default: ES } = await import('electron-store');
     store = new ES();
+    configureWebPush();
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
     updater = new AppUpdater({
         packaged: app.isPackaged,
@@ -3436,6 +3688,37 @@ function handleConnection(ws, req) {
             return;
         }
 
+        if (ws.authenticated && m.type === 'notifications_get_state') {
+            sendNotificationState(ws);
+            return;
+        }
+
+        if (ws.authenticated && m.type === 'notifications_subscribe') {
+            const registered = upsertPushSubscription({
+                kid: ws.kid,
+                subscription: m.subscription,
+                platform: m.platform,
+                userAgent: m.userAgent,
+            });
+
+            if (!registered) {
+                ws.send(JSON.stringify({
+                    type: 'notifications_error',
+                    message: 'Invalid push subscription payload.',
+                }));
+                return;
+            }
+
+            sendNotificationState(ws);
+            return;
+        }
+
+        if (ws.authenticated && m.type === 'notifications_unsubscribe') {
+            removePushSubscriptionsForKid(ws.kid);
+            sendNotificationState(ws);
+            return;
+        }
+
         // E2E: Receive client's ECDH public key
         if (ws.authenticated && m.type === 'e2e_client_key') {
             if (m.publicKey && typeof m.publicKey === 'string') {
@@ -3578,6 +3861,7 @@ function startPty(ws) {
         type: 'system_status',
         state: getTunnelState(),
     }));
+    sendNotificationState(ws);
 
     // In channel mode, don't spawn PTY — just track the client
     if (operatingMode === 'channel') {
@@ -3917,6 +4201,7 @@ ipcMain.handle('REMOVE_PAIRED_DEVICE', (event, kid) => {
     const keys = store.get('keys', []);
     const filtered = keys.filter(k => k.kid !== kid);
     store.set('keys', filtered);
+    removePushSubscriptionsForKid(kid);
     logDebug(`[PAIRING] Device removed: ${kid.substring(0, 8)}`);
     return { success: true };
 });

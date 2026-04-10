@@ -7,6 +7,7 @@ import Header from './components/Header';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useE2E } from './hooks/useE2E';
 import { useAuth } from './hooks/useAuth';
+import { useNotifications } from './hooks/useNotifications';
 import { mergeChannelActivity } from './lib/channelActivity';
 
 function getMessageKey(item) {
@@ -64,6 +65,7 @@ function App() {
     pairingError,
     wasAuthenticatedThisSession
   } = useAuth(socket);
+  const notifications = useNotifications(socket, isAuthenticated);
 
   // Toggle between channel and terminal mode
   const handleToggleMode = useCallback(() => {
@@ -208,6 +210,7 @@ function App() {
         onToggleMode={handleToggleMode}
         systemState={systemState}
         e2eReady={e2eReady}
+        notifications={notifications}
       />
       {clientMode === 'channel' ? (
         <ChannelChat

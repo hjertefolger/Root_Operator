@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Shield, ShieldCheck, RotateCw, X, Loader, MessageCircle, Terminal } from 'lucide-react';
+import { Shield, ShieldCheck, RotateCw, X, Loader, MessageCircle, Terminal, Bell, BellRing } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
 
@@ -74,13 +74,14 @@ function buildStatusTooltip(status, systemState, clientMode) {
   return lines.filter(Boolean).join('\n');
 }
 
-function Header({ fingerprint, connectionState, clientMode, onToggleMode, systemState, e2eReady }) {
+function Header({ fingerprint, connectionState, clientMode, onToggleMode, systemState, e2eReady, notifications }) {
   const isReconnecting = connectionState === 'reconnecting';
   const [showModal, setShowModal] = useState(false);
   const words = fingerprint ? fingerprint.split('-') : [];
   const isSecure = !!fingerprint;
   const status = getClientStatus(systemState, connectionState, e2eReady, clientMode);
   const statusTooltip = buildStatusTooltip(status, systemState, clientMode);
+  const notificationTitle = notifications?.title || 'Enable notifications';
 
   const handleReload = () => {
     window.location.reload();
@@ -108,6 +109,34 @@ function Header({ fingerprint, connectionState, clientMode, onToggleMode, system
               />
             </div>
           )}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => notifications?.enableNotifications?.()}
+            className="rounded-full"
+            title={notificationTitle}
+            aria-pressed={notifications?.enabled || false}
+          >
+            {notifications?.isLoading ? (
+              <Loader
+                size={16}
+                strokeWidth={2}
+                className="text-[#4B5AFF] animate-spin"
+              />
+            ) : notifications?.enabled ? (
+              <BellRing
+                size={16}
+                strokeWidth={2}
+                className="text-[#4B5AFF]"
+              />
+            ) : (
+              <Bell
+                size={16}
+                strokeWidth={2}
+                className={notifications?.supported ? 'text-white/60' : 'text-white/25'}
+              />
+            )}
+          </Button>
           {/* Mode toggle: chat <-> terminal (dev only) */}
           {import.meta.env.DEV && onToggleMode && (
             <Button
