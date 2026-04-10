@@ -47,7 +47,8 @@ const VALID_RECEIVE_CHANNELS = [
     'CF_LOG',
     'E2E_FINGERPRINT',
     'SYNC_STATE',
-    'LOCAL_CHAT_EVENT'
+    'LOCAL_CHAT_EVENT',
+    'LOCAL_CHAT_WINDOW_SHOWN'
 ];
 
 // Expose protected methods that only allow specific channels

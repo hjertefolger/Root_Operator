@@ -15,6 +15,8 @@ import {
 // - No hyphen at start/end, no consecutive hyphens
 const MAX_SUBDOMAIN_LENGTH = 10;
 const SUBDOMAIN_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const DEFAULT_ASSISTANT_NAME = 'Operator';
+const MAX_ASSISTANT_NAME_LENGTH = 24;
 
 // Worker domain from environment (must be set in .env file)
 const WORKER_DOMAIN = import.meta.env.VITE_WORKER_DOMAIN;
@@ -25,6 +27,7 @@ function SettingsView({ onBack, tunnelState }) {
   // Form state
   const [debugLogging, setDebugLogging] = useState(false);
   const [subdomain, setSubdomain] = useState('');
+  const [assistantName, setAssistantName] = useState(DEFAULT_ASSISTANT_NAME);
   const [pairedDevices, setPairedDevices] = useState([]);
   const [updateActionPending, setUpdateActionPending] = useState(false);
 
@@ -50,15 +53,18 @@ function SettingsView({ onBack, tunnelState }) {
 
         const loadedDebug = (settings && settings.debugLogging) || false;
         const loadedSubdomain = currentSubdomain || '';
+        const loadedAssistantName = (settings && settings.assistantName) || DEFAULT_ASSISTANT_NAME;
 
         setDebugLogging(loadedDebug);
         setSubdomain(loadedSubdomain);
+        setAssistantName(loadedAssistantName);
         setPairedDevices(devices || []);
 
         // Store initial values for dirty checking
         initialValues.current = {
           debugLogging: loadedDebug,
           subdomain: loadedSubdomain,
+          assistantName: loadedAssistantName,
         };
       } catch (e) {
         console.error('Failed to load settings:', e);
@@ -73,10 +79,11 @@ function SettingsView({ onBack, tunnelState }) {
 
     const isDirty =
       debugLogging !== initialValues.current.debugLogging ||
-      subdomain !== initialValues.current.subdomain;
+      subdomain !== initialValues.current.subdomain ||
+      assistantName !== initialValues.current.assistantName;
 
     setSaveState(isDirty ? 'dirty' : 'idle');
-  }, [debugLogging, subdomain, saveState]);
+  }, [debugLogging, subdomain, assistantName, saveState]);
 
   const handleRemoveDevice = async (kid) => {
     try {
@@ -128,8 +135,16 @@ function SettingsView({ onBack, tunnelState }) {
     setSaveState('saving');
 
     try {
+      const normalizedAssistantName = assistantName.trim().slice(0, MAX_ASSISTANT_NAME_LENGTH) || DEFAULT_ASSISTANT_NAME;
+      const currentSettings = (await invoke('GET_STORE', 'cfSettings')) || {};
+
       // Save settings
-      await invoke('SET_STORE', 'cfSettings', { debugLogging });
+      await invoke('SET_STORE', 'cfSettings', {
+        ...currentSettings,
+        debugLogging,
+        assistantName: normalizedAssistantName,
+      });
+      setAssistantName(normalizedAssistantName);
 
       // Update subdomain if changed (already sanitized via input handler)
       if (subdomain !== initialValues.current.subdomain) {
@@ -145,6 +160,7 @@ function SettingsView({ onBack, tunnelState }) {
       initialValues.current = {
         debugLogging,
         subdomain,
+        assistantName: normalizedAssistantName,
       };
 
       setSaveState('saved');
@@ -271,7 +287,32 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 2: Paired Devices */}
+          {/* Section 2: Operator Name */}
+          <AccordionItem value="operator-name" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Operator Name
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs text-muted-foreground">
+                  Assistant name shown in chat activity
+                </label>
+                <input
+                  type="text"
+                  value={assistantName}
+                  onChange={(event) => setAssistantName(event.target.value.slice(0, MAX_ASSISTANT_NAME_LENGTH))}
+                  maxLength={MAX_ASSISTANT_NAME_LENGTH}
+                  placeholder={DEFAULT_ASSISTANT_NAME}
+                  className="h-9 rounded-xl border border-border bg-transparent px-3 text-sm text-foreground outline-none transition-colors focus:border-[#4B5AFF]"
+                />
+                <p className="text-[11px] text-muted-foreground/80">
+                  Example: Delivered to {assistantName.trim() || DEFAULT_ASSISTANT_NAME}
+                </p>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Section 3: Paired Devices */}
           <AccordionItem value="paired-devices" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               Paired Devices
@@ -286,14 +327,14 @@ function SettingsView({ onBack, tunnelState }) {
                       key={device.kid}
                       className="flex items-center gap-3 border-b border-dashed border-border/60 py-2 last:border-b-0"
                     >
-                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground">
+                      <span className="min-w-0 flex-1 break-all font-mono text-sm leading-5 text-muted-foreground">
                         {device.name}
                       </span>
                       <Button
                         variant="ghost"
                         size="icon-sm"
                         onClick={() => handleRemoveDevice(device.kid)}
-                        className="h-6 w-6 rounded-full text-muted-foreground hover:text-destructive transition-colors duration-200"
+                        className="h-6 w-6 shrink-0 rounded-full text-muted-foreground hover:text-destructive transition-colors duration-200"
                       >
                         <X strokeWidth={2} className="h-3.5 w-3.5" />
                       </Button>
@@ -304,7 +345,7 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 3: Debug Logging */}
+          {/* Section 4: Debug Logging */}
           <AccordionItem value="debug-logging" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               Debug Logging
@@ -323,7 +364,7 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 4: App Updates */}
+          {/* Section 5: App Updates */}
           <AccordionItem value="app-updates" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               App Updates

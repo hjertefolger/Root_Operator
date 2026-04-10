@@ -15,6 +15,12 @@ process.stdin.on('end', () => {
 
   let payload = {
     hookEventName: '',
+    toolName: '',
+    toolInput: null,
+    toolResponse: null,
+    toolUseId: '',
+    cwd: '',
+    permissionMode: '',
     stopReason: '',
     error: '',
     errorDetails: null,
@@ -26,6 +32,12 @@ process.stdin.on('end', () => {
     const parsed = input ? JSON.parse(input) : {};
     payload = {
       hookEventName: parsed.hook_event_name || parsed.hookEventName || '',
+      toolName: parsed.tool_name || parsed.toolName || '',
+      toolInput: parsed.tool_input || parsed.toolInput || null,
+      toolResponse: parsed.tool_response || parsed.toolResponse || null,
+      toolUseId: parsed.tool_use_id || parsed.toolUseId || '',
+      cwd: parsed.cwd || '',
+      permissionMode: parsed.permission_mode || parsed.permissionMode || '',
       stopReason: parsed.stop_reason || parsed.stopReason || '',
       error: parsed.error || '',
       errorDetails: parsed.error_details || parsed.errorDetails || null,

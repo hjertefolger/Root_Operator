@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings2, MessageCircle, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
+import { Settings2, MessagesSquare, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -13,7 +13,7 @@ const CONNECTING_WORDS = ['Bridging', 'Phasing', 'Warping', 'Tunneling', 'Glidin
 const PAIRING_CODE_REGEXP = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]*$/;
 
 // Device name validation
-const MAX_NAME_LENGTH = 10;
+const MAX_NAME_LENGTH = 16;
 const NAME_PATTERN = /^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$/;
 const STATUS_COLORS = {
   green: '#34d399',
@@ -39,6 +39,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const wasConnectingRef = useRef(false);
 
   const { active, connecting, url, fingerprint, mode, health, update } = tunnelState;
+  const assistantName = health?.channel?.assistantName || 'Operator';
   const overallHealth = health?.overall || {
     level: connecting ? 'orange' : 'red',
     label: connecting ? 'Starting tunnel' : 'Tunnel offline',
@@ -50,7 +51,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
     `${mode === 'channel' ? 'Chat' : 'Terminal'}: ${overallHealth.label}`,
     overallHealth.detail,
     health?.tunnel?.label ? `Tunnel: ${health.tunnel.label}` : null,
-    health?.channel?.label ? `Claude: ${health.channel.label}` : null,
+    health?.channel?.label ? `${assistantName}: ${health.channel.label}` : null,
     health?.channel?.activity?.label ? `Activity: ${health.channel.activity.label}` : null,
   ].filter(Boolean).join('\n');
 
@@ -145,7 +146,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
 
   const validateName = (value) => {
     if (!value || value.length < 3) {
-      return 'Must be 3-10 characters';
+      return 'Must be 3-16 characters';
     }
     if (value.endsWith('-')) {
       return 'Cannot end with hyphen';
@@ -263,11 +264,11 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
             placeholder="My-iPhone"
             maxLength={MAX_NAME_LENGTH}
             autoFocus
-            className="font-mono text-sm text-center w-32 h-10 border-0 border-b-2 border-border rounded-none bg-transparent focus-visible:ring-0 focus-visible:border-[#4B5AFF]"
+            className="font-mono text-sm text-center w-40 h-10 border-0 border-b-2 border-border rounded-none bg-transparent focus-visible:ring-0 focus-visible:border-[#4B5AFF]"
           />
 
           <p className="text-xs text-muted-foreground mt-2">
-            {nameError ? '' : 'Enter a name for this device'}
+            {nameError ? '' : 'Enter a name for new device'}
           </p>
 
           {nameError && (
@@ -359,7 +360,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
               className="rounded-full text-muted-foreground transition-colors duration-200"
               title="Open Local Chat"
             >
-              <MessageCircle strokeWidth={2} />
+              <MessagesSquare strokeWidth={2} />
             </Button>
             <Button
               variant="ghost"

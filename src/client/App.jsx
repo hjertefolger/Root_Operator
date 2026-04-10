@@ -7,6 +7,30 @@ import Header from './components/Header';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useE2E } from './hooks/useE2E';
 import { useAuth } from './hooks/useAuth';
+import { mergeChannelActivity } from './lib/channelActivity';
+
+function getMessageKey(item) {
+  return `${item.role}:${item.ts || ''}:${item.content}`;
+}
+
+function mergeMessages(prev, incoming) {
+  if (!Array.isArray(incoming) || incoming.length === 0) {
+    return prev;
+  }
+
+  const next = [...prev];
+  const seen = new Set(prev.map(getMessageKey));
+
+  for (const item of incoming) {
+    const key = getMessageKey(item);
+    if (!seen.has(key)) {
+      seen.add(key);
+      next.push(item);
+    }
+  }
+
+  return next;
+}
 
 function App() {
   // Operating mode: 'terminal' or 'channel' (default matches server default)
@@ -94,63 +118,20 @@ function App() {
 
         if (parsed.type === 'channel_history') {
           setChannelMessages(parsed.messages || []);
-          setChannelWaiting(false);
         } else if (parsed.type === 'channel_message') {
           setChannelWaiting(false);
-          setChannelMessages(prev => [...prev, {
+          setChannelMessages(prev => mergeMessages(prev, [{
             role: parsed.role || 'assistant',
             content: parsed.content,
             ts: parsed.ts || new Date().toISOString(),
-          }]);
+          }]));
           setChannelActivities(prev => prev.map((item) => (
             item.active
               ? { ...item, active: false, done: true, completedAt: parsed.ts || new Date().toISOString() }
               : item
           )));
         } else if (parsed.type === 'channel_activity' && parsed.activity) {
-          const activity = parsed.activity;
-          const markerTs = activity.ts || new Date().toISOString();
-          const isActive = activity.active !== false;
-
-          if (activity.phase === 'idle') {
-            setChannelActivities(prev => prev
-              .map((item) => (
-                item.active
-                  ? { ...item, active: false, done: true, completedAt: markerTs }
-                  : item
-              ))
-              .slice(-4));
-            return;
-          }
-
-          const activityKey = `${activity.phase}:${activity.label}:${activity.toolName || ''}`;
-          setChannelActivities(prev => {
-            const next = prev
-              .map((item) => (
-                item.active
-                  ? { ...item, active: false, done: true, completedAt: markerTs }
-                  : item
-              ))
-              .filter((item, index, items) => {
-                if (index !== items.length - 1) {
-                  return true;
-                }
-                return item.key !== activityKey || item.active;
-              });
-
-            next.push({
-              id: `${markerTs}:${activityKey}`,
-              key: activityKey,
-              label: activity.label,
-              detail: activity.detail || '',
-              active: isActive,
-              done: !isActive,
-              ts: markerTs,
-              completedAt: !isActive ? markerTs : undefined,
-            });
-
-            return next.slice(-4);
-          });
+          setChannelActivities(prev => mergeChannelActivity(prev, parsed.activity));
         }
       }
     };
@@ -233,6 +214,8 @@ function App() {
           socket={socket}
           encryptInput={encryptInput}
           e2eReady={e2eReady}
+          assistantName={systemState?.health?.channel?.assistantName || 'Operator'}
+          draftStorageKey="root_operator_chat_draft"
           messages={channelMessages}
           setMessages={setChannelMessages}
           activities={channelActivities}

@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { PictureInPicture2 } from 'lucide-react';
 import rabbitLogo from '../../client/assets/rabbit.svg';
 import ChannelChat from '../../client/components/ChannelChat';
+import { mergeChannelActivity } from '../../client/lib/channelActivity';
 import { useElectron } from '../hooks/useElectron';
 
 const STATUS_COLORS = {
@@ -35,6 +36,7 @@ function LocalChatView({ tunnelState }) {
   const [activities, setActivities] = useState([]);
   const [waiting, setWaiting] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const [forceScrollToBottomKey, setForceScrollToBottomKey] = useState(0);
 
   useEffect(() => {
     let mounted = true;
@@ -60,50 +62,11 @@ function LocalChatView({ tunnelState }) {
       }
 
       if (payload.type === 'channel_activity' && payload.activity) {
-        const activity = payload.activity;
-        const markerTs = activity.ts || new Date().toISOString();
-        const isActive = activity.active !== false;
-
-        if (activity.phase === 'idle') {
-          setActivities((prev) => prev
-            .map((item) => (
-              item.active
-                ? { ...item, active: false, done: true, completedAt: markerTs }
-                : item
-            ))
-            .slice(-4));
-          return;
-        }
-
-        const activityKey = `${activity.phase}:${activity.label}:${activity.toolName || ''}`;
-        setActivities((prev) => {
-          const next = prev
-            .map((item) => (
-              item.active
-                ? { ...item, active: false, done: true, completedAt: markerTs }
-                : item
-            ))
-            .filter((item, index, items) => {
-              if (index !== items.length - 1) {
-                return true;
-              }
-              return item.key !== activityKey || item.active;
-            });
-
-          next.push({
-            id: `${markerTs}:${activityKey}`,
-            key: activityKey,
-            label: activity.label,
-            detail: activity.detail || '',
-            active: isActive,
-            done: !isActive,
-            ts: markerTs,
-            completedAt: !isActive ? markerTs : undefined,
-          });
-
-          return next.slice(-4);
-        });
+        setActivities((prev) => mergeChannelActivity(prev, payload.activity));
       }
+    });
+    const offShown = on('LOCAL_CHAT_WINDOW_SHOWN', () => {
+      setForceScrollToBottomKey((prev) => prev + 1);
     });
 
     async function loadInitialState() {
@@ -127,6 +90,7 @@ function LocalChatView({ tunnelState }) {
     return () => {
       mounted = false;
       off?.();
+      offShown?.();
     };
   }, [invoke, on]);
 
@@ -151,7 +115,7 @@ function LocalChatView({ tunnelState }) {
   const channelStatus = tunnelState?.health?.channel || {
     level: 'orange',
     label: 'Channel status loading',
-    detail: 'Waiting for Root Operator to report Claude channel status.',
+    detail: 'Waiting for Root Operator to report chat status.',
   };
   const canSend = Boolean(
     tunnelState?.mode === 'channel'
@@ -220,6 +184,8 @@ function LocalChatView({ tunnelState }) {
       </header>
 
       <ChannelChat
+        assistantName={channelStatus?.assistantName || 'Operator'}
+        forceScrollToBottomKey={forceScrollToBottomKey}
         messages={messages}
         setMessages={setMessages}
         activities={activities}

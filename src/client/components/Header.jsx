@@ -53,6 +53,7 @@ function getClientStatus(systemState, connectionState, e2eReady, clientMode) {
 }
 
 function buildStatusTooltip(status, systemState, clientMode) {
+  const assistantName = systemState?.health?.channel?.assistantName || 'Operator';
   const lines = [
     `${clientMode === 'channel' ? 'Chat' : 'Terminal'}: ${status.label}`,
     status.detail,
@@ -63,7 +64,7 @@ function buildStatusTooltip(status, systemState, clientMode) {
   }
 
   if (systemState?.health?.channel?.label) {
-    lines.push(`Claude: ${systemState.health.channel.label}`);
+    lines.push(`${assistantName}: ${systemState.health.channel.label}`);
   }
 
   if (systemState?.health?.channel?.activity?.label) {

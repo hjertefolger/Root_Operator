@@ -17,10 +17,10 @@
     "prebuild:unsigned": "npm run security:audit && npm run build:all",
     "prerelease": "npm run security:audit && npm run build:all",
     "start": "electron .",
-    "build": "electron-builder --config build/electron-builder.config.js --mac",
+    "build": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer electron-builder --config build/electron-builder.config.js --mac",
     "build:staging": "node scripts/run-staging.js build",
-    "release": "electron-builder --config build/electron-builder.config.js --mac --publish always",
-    "build:unsigned": "electron-builder --config build/electron-builder.config.js --mac -c.mac.identity=null",
+    "release": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer electron-builder --config build/electron-builder.config.js --mac --publish always",
+    "build:unsigned": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer electron-builder --config build/electron-builder.config.js --mac -c.mac.identity=null",
     "build:unsigned:staging": "node scripts/run-staging.js build:unsigned",
     "release:staging": "node scripts/run-staging.js release",
     "rebuild": "electron-rebuild -f -w node-pty keytar",
@@ -99,6 +99,7 @@
     "copyright": "Copyright © 2026 Tomas Krajcik",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "build/root-operator-macos.icon",
       "target": [
         {
           "target": "dmg",

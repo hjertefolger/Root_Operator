@@ -103,6 +103,7 @@ const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
 const CHANNEL_STARTUP_TIMEOUT_MS = 15000;
 const CHANNEL_RESTART_DELAY_MS = 2500;
 const CHANNEL_ACTIVITY_IDLE_MS = 5000;
+const DEFAULT_ACTIVITY_ASSISTANT_NAME = 'Operator';
 let channelStartupTimer = null;
 let channelRestartTimer = null;
 let channelConfirmTimers = [];
@@ -217,7 +218,7 @@ let channelRuntime = {
     phase: 'stopped',
     level: 'red',
     label: 'Chat offline',
-    detail: 'Claude Code is not running.',
+    detail: `${DEFAULT_ACTIVITY_ASSISTANT_NAME} is not running.`,
     attempt: 0,
     claudeRunning: false,
     bridgeConnected: false,
@@ -766,22 +767,33 @@ function createWindow() {
     });
 }
 
-function getAppDockIconPath() {
-    const iconPath = path.join(__dirname, 'public', 'icon-512-v3.png');
-    return fs.existsSync(iconPath) ? iconPath : null;
+function getDevDockIconPath() {
+    if (!isDev) {
+        return null;
+    }
+
+    const preferredIconPath = path.join(__dirname, 'public', 'icon-macos-dock.png');
+    if (fs.existsSync(preferredIconPath)) {
+        return preferredIconPath;
+    }
+
+    const fallbackIconPath = path.join(__dirname, 'public', 'icon-512-v3.png');
+    return fs.existsSync(fallbackIconPath) ? fallbackIconPath : null;
 }
 
-function applyDockIcon() {
-    if (process.platform !== 'darwin' || !app.dock) {
+function applyDevDockIcon() {
+    if (!isDev || process.platform !== 'darwin' || !app.dock) {
         return;
     }
 
-    const iconPath = getAppDockIconPath();
-    if (iconPath) {
-        const dockIcon = nativeImage.createFromPath(iconPath);
-        if (!dockIcon.isEmpty()) {
-            app.dock.setIcon(dockIcon);
-        }
+    const iconPath = getDevDockIconPath();
+    if (!iconPath) {
+        return;
+    }
+
+    const dockIcon = nativeImage.createFromPath(iconPath);
+    if (!dockIcon.isEmpty()) {
+        app.dock.setIcon(dockIcon);
     }
 }
 
@@ -804,7 +816,7 @@ function syncDockVisibility() {
 
     if (localChatVisible || fallbackMainVisible) {
         app.setActivationPolicy('regular');
-        applyDockIcon();
+        applyDevDockIcon();
         app.dock.show();
     } else {
         app.dock.hide();
@@ -868,6 +880,9 @@ function createLocalChatWindow() {
 
     localChatWindow.on('show', () => {
         syncDockVisibility();
+        localChatWindow.webContents.send('LOCAL_CHAT_WINDOW_SHOWN', {
+            ts: new Date().toISOString(),
+        });
     });
 
     localChatWindow.on('hide', () => {
@@ -923,6 +938,16 @@ async function getStoredTunnelSettings() {
         token,
         domain: settings?.domain || '',
     };
+}
+
+function getActivityAssistantName() {
+    const rawName = store?.get('cfSettings', {})?.assistantName;
+    if (typeof rawName !== 'string') {
+        return DEFAULT_ACTIVITY_ASSISTANT_NAME;
+    }
+
+    const trimmedName = rawName.trim();
+    return trimmedName || DEFAULT_ACTIVITY_ASSISTANT_NAME;
 }
 
 function createTray() {
@@ -1064,6 +1089,253 @@ function formatClaudeToolLabel(toolName) {
         .join(' ');
 }
 
+function getClaudeToolKey(toolName) {
+    if (!toolName) {
+        return '';
+    }
+
+    return toolName.split('__').pop() || toolName;
+}
+
+function getClaudeHookFilePath(event) {
+    const toolInput = event?.toolInput && typeof event.toolInput === 'object' ? event.toolInput : {};
+    const toolResponse = event?.toolResponse && typeof event.toolResponse === 'object' ? event.toolResponse : {};
+    const candidates = [
+        toolInput.file_path,
+        toolInput.filePath,
+        toolResponse.filePath,
+        toolResponse.file_path,
+        toolInput.path,
+        toolResponse.path,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            return candidate.trim();
+        }
+    }
+
+    return '';
+}
+
+function formatClaudeActivityFileLabel(filePath, cwd = '') {
+    if (!filePath) {
+        return '';
+    }
+
+    const normalizedFilePath = path.normalize(filePath);
+    const normalizedCwd = typeof cwd === 'string' && cwd.trim() ? path.normalize(cwd.trim()) : '';
+
+    if (normalizedCwd) {
+        const relativePath = path.relative(normalizedCwd, normalizedFilePath);
+        if (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
+            const parts = relativePath.split(path.sep).filter(Boolean);
+            if (parts.length >= 2) {
+                return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+            }
+            return parts[0] || path.basename(normalizedFilePath);
+        }
+    }
+
+    const baseName = path.basename(normalizedFilePath);
+    const parentName = path.basename(path.dirname(normalizedFilePath));
+    if (parentName && parentName !== '.' && parentName !== path.sep && parentName !== baseName) {
+        return `${parentName}/${baseName}`;
+    }
+
+    return baseName || normalizedFilePath;
+}
+
+function getClaudeBashCommand(event) {
+    const toolInput = event?.toolInput && typeof event.toolInput === 'object' ? event.toolInput : {};
+    const candidates = [
+        toolInput.command,
+        toolInput.cmd,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            return candidate.trim();
+        }
+    }
+
+    return '';
+}
+
+function tokenizeShellCommand(command) {
+    if (!command) {
+        return [];
+    }
+
+    const matches = command.match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`|[^\s]+/g) || [];
+    return matches.map((token) => token.replace(/^["'`]|["'`]$/g, ''));
+}
+
+function formatShellCommandPreview(command, maxLength = 72) {
+    const normalized = (command || '').replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+
+    return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function getPrimaryShellCommand(tokens) {
+    for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (!token) {
+            continue;
+        }
+
+        if (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token)) {
+            continue;
+        }
+
+        if (token === 'env' || token === '/usr/bin/env' || token === 'command') {
+            continue;
+        }
+
+        return {
+            primary: path.basename(token),
+            index,
+        };
+    }
+
+    return {
+        primary: '',
+        index: -1,
+    };
+}
+
+function describeClaudeBashCommand(command) {
+    const preview = formatShellCommandPreview(command);
+    const tokens = tokenizeShellCommand(command);
+    const { primary } = getPrimaryShellCommand(tokens);
+    const commandLabel = primary || 'shell command';
+    return {
+        active: `is running ${commandLabel}`,
+        done: `finished ${commandLabel}`,
+        failed: `hit an error running ${commandLabel}`,
+        detail: preview,
+    };
+}
+
+function buildClaudeToolActivity(event) {
+    const assistantName = getActivityAssistantName();
+    const toolName = event.toolName || '';
+    const toolKey = getClaudeToolKey(toolName);
+    const filePath = getClaudeHookFilePath(event);
+    const fileLabel = formatClaudeActivityFileLabel(filePath, event.cwd || '');
+    const isActive = event.hookEventName === 'PreToolUse';
+    const activityBase = {
+        phase: isActive ? 'tool' : 'tool_complete',
+        toolName,
+        toolUseId: event.toolUseId || '',
+        filePath,
+        fileLabel,
+        ts: event.ts || new Date().toISOString(),
+        active: isActive,
+    };
+    const copyByTool = {
+        Read: {
+            active: 'is reading',
+            done: 'finished reading',
+        },
+        Write: {
+            active: 'is writing',
+            done: 'finished writing',
+        },
+        Edit: {
+            active: 'is editing',
+            done: 'finished editing',
+        },
+        MultiEdit: {
+            active: 'is editing',
+            done: 'finished editing',
+        },
+        reply: {
+            active: 'is preparing a reply',
+            done: 'finished preparing a reply',
+        },
+    };
+
+    if (toolKey === 'Bash') {
+        const bashCommand = getClaudeBashCommand(event);
+        const bashCopy = describeClaudeBashCommand(bashCommand);
+        const action = isActive ? bashCopy.active : bashCopy.done;
+        return {
+            ...activityBase,
+            label: `${assistantName} ${action}`,
+            detail: bashCopy.detail || `${assistantName} ${action}.`,
+        };
+    }
+
+    if (copyByTool[toolKey]) {
+        const copy = copyByTool[toolKey];
+        const action = isActive ? copy.active : copy.done;
+        return {
+            ...activityBase,
+            label: fileLabel ? `${assistantName} ${action} ${fileLabel}` : `${assistantName} ${action}`,
+            detail: filePath || `${assistantName} ${action}.`,
+        };
+    }
+
+    const toolLabel = formatClaudeToolLabel(toolName);
+    return {
+        ...activityBase,
+        label: isActive
+            ? `${assistantName} is using ${toolLabel}`
+            : `${assistantName} finished using ${toolLabel}`,
+        detail: filePath || `${assistantName} ${isActive ? 'started' : 'finished'} using ${toolLabel}.`,
+    };
+}
+
+function buildClaudeToolFailureActivity(event) {
+    const assistantName = getActivityAssistantName();
+    const toolName = event.toolName || '';
+    const toolKey = getClaudeToolKey(toolName);
+    const filePath = getClaudeHookFilePath(event);
+    const fileLabel = formatClaudeActivityFileLabel(filePath, event.cwd || '');
+    const copyByTool = {
+        Read: 'stopped reading',
+        Write: 'stopped writing',
+        Edit: 'stopped editing',
+        MultiEdit: 'stopped editing',
+        reply: 'could not finish the reply',
+    };
+
+    if (toolKey === 'Bash') {
+        const bashCommand = getClaudeBashCommand(event);
+        const bashCopy = describeClaudeBashCommand(bashCommand);
+        return {
+            phase: 'tool_failed',
+            label: `${assistantName} ${bashCopy.failed}`,
+            detail: event.error || bashCopy.detail || `${assistantName} ${bashCopy.failed}.`,
+            toolName,
+            toolUseId: event.toolUseId || '',
+            filePath,
+            fileLabel,
+            ts: event.ts || new Date().toISOString(),
+            active: false,
+        };
+    }
+
+    const fallbackToolLabel = formatClaudeToolLabel(toolName);
+    const action = copyByTool[toolKey] || `hit an error using ${fallbackToolLabel}`;
+
+    return {
+        phase: 'tool_failed',
+        label: fileLabel ? `${assistantName} ${action} ${fileLabel}` : `${assistantName} ${action}`,
+        detail: event.error || filePath || `${assistantName} hit an error while using ${fallbackToolLabel}.`,
+        toolName,
+        toolUseId: event.toolUseId || '',
+        filePath,
+        fileLabel,
+        ts: event.ts || new Date().toISOString(),
+        active: false,
+    };
+}
+
 function resetChannelActivity() {
     clearChannelIdleTimer();
     channelReplyPending = false;
@@ -1073,7 +1345,7 @@ function resetChannelActivity() {
     syncStateWithRenderer();
 }
 
-function scheduleChannelIdle(detail = 'Claude is ready for the next message.') {
+function scheduleChannelIdle(detail = `${getActivityAssistantName()} is ready for the next message.`) {
     clearChannelIdleTimer();
     channelIdleTimer = setTimeout(() => {
         channelIdleTimer = null;
@@ -1094,7 +1366,7 @@ function sendLocalChatEvent(payload) {
 
 function createChatTimelineItem(activity) {
     const markerTs = activity.ts || new Date().toISOString();
-    const activityKey = `${activity.phase || 'idle'}:${activity.label || 'Idle'}:${activity.toolName || ''}`;
+    const activityKey = activity.toolUseId || `${activity.phase || 'idle'}:${activity.label || 'Idle'}:${activity.toolName || ''}:${activity.filePath || ''}`;
     const isActive = activity.active !== false;
 
     return {
@@ -1102,6 +1374,8 @@ function createChatTimelineItem(activity) {
         key: activityKey,
         label: activity.label || 'Idle',
         detail: activity.detail || '',
+        filePath: activity.filePath || '',
+        fileLabel: activity.fileLabel || '',
         active: isActive,
         done: !isActive,
         ts: markerTs,
@@ -1123,6 +1397,7 @@ function getLocalChatState() {
 
 function submitChannelUserMessage(chatId, content, userId, options = {}) {
     const { echoToLocalChat = false } = options;
+    const assistantName = getActivityAssistantName();
 
     if (operatingMode !== 'channel' || !channelManager || !channelManager.connected) {
         return { success: false, error: 'Chat bridge unavailable' };
@@ -1134,12 +1409,12 @@ function submitChannelUserMessage(chatId, content, userId, options = {}) {
     channelReplyPending = true;
     setChannelActivity(sentToBridge ? {
         phase: 'bridging',
-        label: 'Forwarding to Claude',
-        detail: 'The chat bridge accepted your message.',
+        label: `Forwarding to ${assistantName}`,
+        detail: `The chat bridge accepted your message for ${assistantName}.`,
     } : {
         phase: 'queued',
-        label: 'Queued for Claude',
-        detail: 'Waiting for the Claude chat bridge to reconnect.',
+        label: `Queued for ${assistantName}`,
+        detail: `Waiting for the ${assistantName} chat bridge to reconnect.`,
     }, { force: true });
 
     chatStore.addMessage({ role: 'user', content, ts });
@@ -1171,11 +1446,14 @@ function setChannelActivity(activity, options = {}) {
         label: activity.label || 'Idle',
         detail: activity.detail || '',
         toolName: activity.toolName || '',
+        toolUseId: activity.toolUseId || '',
+        filePath: activity.filePath || '',
+        fileLabel: activity.fileLabel || '',
         ts: activity.ts || new Date().toISOString(),
         active: typeof activity.active === 'boolean' ? activity.active : activity.phase !== 'idle',
     };
 
-    const activityKey = `${normalized.phase}:${normalized.label}:${normalized.toolName}`;
+    const activityKey = normalized.toolUseId || `${normalized.phase}:${normalized.label}:${normalized.toolName}:${normalized.filePath}`;
     const now = Date.now();
     if (!force && activityKey === lastChannelActivityKey && now - lastChannelActivityAt < 900) {
         return;
@@ -1229,41 +1507,14 @@ function handleClaudeDebugLine(line) {
     }
 
     if (line.includes('Stream started - received first chunk')) {
+        const assistantName = getActivityAssistantName();
         setChannelActivity({
             phase: 'thinking',
-            label: 'Claude is working',
-            detail: 'Claude started generating a response.',
+            label: `${assistantName} is working`,
+            detail: `${assistantName} started generating a response.`,
         });
         return;
     }
-
-    const toolMatch = line.match(/executePreToolHooks called for tool:\s+(.+)$/);
-    if (!toolMatch) {
-        return;
-    }
-
-    const rawToolName = toolMatch[1].trim();
-    if (!rawToolName) {
-        return;
-    }
-
-    if (rawToolName === 'mcp__root-operator__reply') {
-        setChannelActivity({
-            phase: 'replying',
-            label: 'Preparing reply',
-            detail: 'Claude is packaging the final response for chat.',
-            toolName: rawToolName,
-        });
-        return;
-    }
-
-    const toolLabel = formatClaudeToolLabel(rawToolName);
-    setChannelActivity({
-        phase: 'tool',
-        label: `Running ${toolLabel}`,
-        detail: `Claude started using ${toolLabel}.`,
-        toolName: rawToolName,
-    });
 }
 
 function pollClaudeDebugWatcher() {
@@ -1325,13 +1576,24 @@ function handleClaudeHookLine(line) {
         return;
     }
 
+    if (event.hookEventName === 'PreToolUse' || event.hookEventName === 'PostToolUse') {
+        setChannelActivity(buildClaudeToolActivity(event), { force: true });
+        return;
+    }
+
+    if (event.hookEventName === 'PostToolUseFailure') {
+        setChannelActivity(buildClaudeToolFailureActivity(event), { force: true });
+        return;
+    }
+
     if (event.hookEventName === 'Stop') {
+        const assistantName = getActivityAssistantName();
         clearChannelIdleTimer();
         channelReplyPending = false;
         setChannelActivity({
             phase: 'finished',
-            label: 'Claude finished',
-            detail: 'Claude finished this turn.',
+            label: `${assistantName} finished`,
+            detail: `${assistantName} finished this turn.`,
             ts: event.ts || new Date().toISOString(),
             active: false,
         }, { force: true });
@@ -1339,12 +1601,13 @@ function handleClaudeHookLine(line) {
     }
 
     if (event.hookEventName === 'StopFailure') {
+        const assistantName = getActivityAssistantName();
         clearChannelIdleTimer();
         channelReplyPending = false;
         setChannelActivity({
             phase: 'failed',
-            label: 'Claude stopped with error',
-            detail: `Claude ended the turn with ${event.error || 'an API error'}.`,
+            label: `${assistantName} stopped with error`,
+            detail: `${assistantName} ended the turn with ${event.error || 'an API error'}.`,
             ts: event.ts || new Date().toISOString(),
             active: false,
         }, { force: true });
@@ -1403,9 +1666,10 @@ function startClaudeHookWatcher(filePath) {
 }
 
 function setChannelRuntime(phase, detail, extra = {}) {
+    const assistantName = getActivityAssistantName();
     const phaseConfig = {
         stopped: { level: 'red', label: 'Chat offline' },
-        starting: { level: 'orange', label: 'Starting Claude' },
+        starting: { level: 'orange', label: `Starting ${assistantName}` },
         waiting_confirm: { level: 'orange', label: 'Waiting for confirmation' },
         waiting_bridge: { level: 'orange', label: 'Waiting for chat bridge' },
         retrying: { level: 'orange', label: 'Retrying chat startup' },
@@ -1429,6 +1693,7 @@ function setChannelRuntime(phase, detail, extra = {}) {
 function getChannelStatus() {
     return {
         ...channelRuntime,
+        assistantName: getActivityAssistantName(),
         claudeRunning: !!claudeProcess,
         bridgeConnected: !!(channelManager && channelManager.connected),
         socketExists: fs.existsSync(CHANNEL_IPC_PATH),
@@ -1580,7 +1845,7 @@ function getUpdateInstallGate() {
     }
 
     if (operatingMode === 'channel' && (channelReplyPending || latestChannelActivity)) {
-        reasons.push('Claude is active');
+        reasons.push(`${getActivityAssistantName()} is active`);
     }
 
     if (scheduler) {
@@ -1760,9 +2025,10 @@ function scheduleClaudeRestart(reason) {
     clearChannelRestartTimer();
     setChannelRuntime('retrying', reason, { lastError: reason });
     if (channelReplyPending) {
+        const assistantName = getActivityAssistantName();
         setChannelActivity({
             phase: 'retrying',
-            label: 'Restarting Claude',
+            label: `Restarting ${assistantName}`,
             detail: reason,
         }, { force: true });
     }
@@ -1796,6 +2062,7 @@ function prepareClaudeWorkspaceRuntime() {
     const debugFilePath = path.join(runtimeDir, 'claude-channel-debug.log');
     const hookLogPath = path.join(runtimeDir, 'claude-channel-hooks.jsonl');
     const systemPromptFile = writeSystemPromptFile();
+    const hookCommand = `/usr/bin/env ELECTRON_RUN_AS_NODE=1 ${shellEscapeArg(process.execPath)} ${shellEscapeArg(hookScriptPath)}`;
     const projectMcpPath = writeProjectMcpConfig({
         command: process.execPath,
         args: [bridgePath],
@@ -1812,7 +2079,7 @@ function prepareClaudeWorkspaceRuntime() {
                     hooks: [
                         {
                             type: 'command',
-                            command: `/usr/bin/env ELECTRON_RUN_AS_NODE=1 ${shellEscapeArg(process.execPath)} ${shellEscapeArg(hookScriptPath)}`,
+                            command: hookCommand,
                         },
                     ],
                 },
@@ -1822,7 +2089,37 @@ function prepareClaudeWorkspaceRuntime() {
                     hooks: [
                         {
                             type: 'command',
-                            command: `/usr/bin/env ELECTRON_RUN_AS_NODE=1 ${shellEscapeArg(process.execPath)} ${shellEscapeArg(hookScriptPath)}`,
+                            command: hookCommand,
+                        },
+                    ],
+                },
+            ],
+            PreToolUse: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: hookCommand,
+                        },
+                    ],
+                },
+            ],
+            PostToolUse: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: hookCommand,
+                        },
+                    ],
+                },
+            ],
+            PostToolUseFailure: [
+                {
+                    hooks: [
+                        {
+                            type: 'command',
+                            command: hookCommand,
                         },
                     ],
                 },
@@ -1864,13 +2161,15 @@ function spawnClaudeCode() {
         return;
     }
 
+    const assistantName = getActivityAssistantName();
+
     channelStartupAttempt += 1;
     clearChannelRestartTimer();
     clearChannelStartupTimer();
     clearChannelConfirmTimers();
     removeChannelSocket();
     resetChannelActivity();
-    setChannelRuntime('starting', 'Launching Claude Code for the chat channel.', {
+    setChannelRuntime('starting', `Launching ${assistantName} for the chat channel.`, {
         attempt: channelStartupAttempt,
         lastError: '',
     });
@@ -1910,7 +2209,7 @@ function spawnClaudeCode() {
             },
         });
 
-        setChannelRuntime('waiting_confirm', 'Waiting for Claude to confirm local development access.', {
+        setChannelRuntime('waiting_confirm', `Waiting for ${assistantName} to confirm local development access.`, {
             attempt: channelStartupAttempt,
         });
 
@@ -1922,7 +2221,7 @@ function spawnClaudeCode() {
             try {
                 claudeProcess.write(chars);
                 logDebug(`[CLAUDE] ${reason}`);
-                setChannelRuntime('waiting_bridge', 'Claude is running. Waiting for the chat bridge to come online.', {
+                setChannelRuntime('waiting_bridge', `${assistantName} is running. Waiting for the chat bridge to come online.`, {
                     attempt: channelStartupAttempt,
                 });
                 return true;
@@ -1959,7 +2258,7 @@ function spawnClaudeCode() {
                 return;
             }
 
-            const timeoutMessage = 'Claude never brought the chat bridge online.';
+            const timeoutMessage = `${assistantName} never brought the chat bridge online.`;
             setChannelRuntime('error', timeoutMessage, {
                 attempt: channelStartupAttempt,
                 lastError: timeoutMessage,
@@ -1984,8 +2283,8 @@ function spawnClaudeCode() {
 
             if (operatingMode === 'channel' && !isAppQuitting) {
                 const exitMessage = exitCode === 0
-                    ? 'Claude exited before the chat bridge was ready.'
-                    : `Claude exited with code ${exitCode}.`;
+                    ? `${assistantName} exited before the chat bridge was ready.`
+                    : `${assistantName} exited with code ${exitCode}.`;
                 setChannelRuntime('error', exitMessage, {
                     attempt: channelStartupAttempt,
                     lastError: exitMessage,
@@ -1993,29 +2292,29 @@ function spawnClaudeCode() {
                 if (channelReplyPending) {
                     setChannelActivity({
                         phase: 'error',
-                        label: 'Claude stopped',
+                        label: `${assistantName} stopped`,
                         detail: exitMessage,
                     }, { force: true });
                 } else {
                     resetChannelActivity();
                 }
-                scheduleClaudeRestart('Claude exited unexpectedly. Retrying.');
+                scheduleClaudeRestart(`${assistantName} exited unexpectedly. Retrying.`);
                 return;
             }
 
             resetChannelActivity();
-            setChannelRuntime('stopped', 'Claude chat is not running.');
+            setChannelRuntime('stopped', `${assistantName} is not running.`);
         });
     } catch (err) {
         logDebug(`[CLAUDE] Failed to spawn: ${err.message}`);
         stopClaudeDebugWatcher();
         stopClaudeHookWatcher();
         claudeProcess = null;
-        setChannelRuntime('error', `Failed to launch Claude: ${err.message}`, {
+        setChannelRuntime('error', `Failed to launch ${assistantName}: ${err.message}`, {
             attempt: channelStartupAttempt,
             lastError: err.message,
         });
-        scheduleClaudeRestart('Failed to launch Claude. Retrying.');
+        scheduleClaudeRestart(`Failed to launch ${assistantName}. Retrying.`);
     }
 }
 
@@ -2066,10 +2365,11 @@ function initChannelMode() {
     });
 
     channelManager.on('connected', () => {
+        const assistantName = getActivityAssistantName();
         logDebug('[CHANNEL] Bridge connected');
         clearChannelStartupTimer();
         clearChannelConfirmTimers();
-        setChannelRuntime('ready', 'Claude is connected and ready to send replies.', {
+        setChannelRuntime('ready', `${assistantName} is connected and ready to send replies.`, {
             attempt: channelStartupAttempt,
             lastError: '',
         });
@@ -2080,9 +2380,10 @@ function initChannelMode() {
             return;
         }
 
+        const assistantName = getActivityAssistantName();
         const detail = claudeProcess
-            ? 'The chat bridge dropped. Waiting for Claude to bring it back.'
-            : 'The chat bridge dropped because Claude is no longer running.';
+            ? `The chat bridge dropped. Waiting for ${assistantName} to bring it back.`
+            : `The chat bridge dropped because ${assistantName} is no longer running.`;
 
         setChannelRuntime('waiting_bridge', detail, {
             attempt: channelStartupAttempt,
@@ -2110,7 +2411,7 @@ function initChannelMode() {
             setChannelActivity({
                 phase: 'retrying',
                 label: 'Reconnecting bridge',
-                detail: 'Trying to reconnect the Claude chat bridge.',
+                detail: `Trying to reconnect the ${getActivityAssistantName()} chat bridge.`,
             }, { force: true });
         }
     });
@@ -2125,6 +2426,29 @@ function initChannelMode() {
 
     channelManager.on('claude_activity', (activity) => {
         if (operatingMode !== 'channel' || !activity) {
+            return;
+        }
+
+        if (activity.phase === 'forwarded') {
+            const assistantName = getActivityAssistantName();
+            setChannelActivity({
+                phase: 'forwarded',
+                label: `Delivered to ${assistantName}`,
+                detail: `The chat bridge handed your message to ${assistantName}.`,
+                ts: activity.ts,
+            }, { force: true });
+            return;
+        }
+
+        if (activity.phase === 'replying') {
+            const assistantName = getActivityAssistantName();
+            setChannelActivity({
+                phase: 'replying',
+                label: `${assistantName} is sending the reply`,
+                detail: `${assistantName} is sending the final answer back to chat.`,
+                ts: activity.ts,
+                toolName: activity.toolName,
+            }, { force: true });
             return;
         }
 
@@ -2311,7 +2635,7 @@ function buildTrayMenu() {
 
 app.whenReady().then(async () => {
     console.log('App Ready');
-    applyDockIcon();
+    applyDevDockIcon();
     app.setActivationPolicy('accessory');
     if (app.dock) app.dock.hide();
 
@@ -2396,7 +2720,13 @@ ipcMain.handle('START', async (event, cfSettings) => {
 });
 
 ipcMain.handle('GET_STORE', (event, key) => store.get(key));
-ipcMain.handle('SET_STORE', (event, key, val) => store.set(key, val));
+ipcMain.handle('SET_STORE', (event, key, val) => {
+    store.set(key, val);
+    if (key === 'cfSettings') {
+        syncStateWithRenderer();
+    }
+    return true;
+});
 
 // Authoritative tunnel state - renderer requests this on mount to avoid race conditions
 ipcMain.handle('GET_TUNNEL_STATE', () => getTunnelState());

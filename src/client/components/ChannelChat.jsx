@@ -1,10 +1,28 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
 import { Check } from 'lucide-react';
 import { ArrowUp } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 const isMobileChatInput = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+const AUTO_SCROLL_BOTTOM_THRESHOLD = 24;
+const loadStoredDraft = (storageKey) => {
+  if (!storageKey || typeof window === 'undefined') {
+    return '';
+  }
+
+  try {
+    return sessionStorage.getItem(storageKey) || '';
+  } catch (error) {
+    console.warn('[CHAT] Failed to restore draft:', error.message);
+    return '';
+  }
+};
+
+function isNearBottom(container) {
+  return (container.scrollHeight - container.scrollTop - container.clientHeight) <= AUTO_SCROLL_BOTTOM_THRESHOLD;
+}
 
 function ActivityDots() {
   const [active, setActive] = useState(0);
@@ -34,11 +52,11 @@ function ActivityDots() {
   );
 }
 
-function ActivityTimeline({ activities, waiting }) {
+function ActivityTimeline({ activities, waiting, assistantName }) {
   const items = activities.length > 0 ? activities : waiting ? [{
     id: 'waiting',
-    label: 'Waiting for Claude',
-    detail: 'Claude has not emitted an activity update yet.',
+    label: `Waiting for ${assistantName}`,
+    detail: `${assistantName} has not emitted an activity update yet.`,
     active: true,
     done: false,
   }] : [];
@@ -205,16 +223,38 @@ const MessageMarkdown = memo(function MessageMarkdown({ content }) {
   );
 });
 
+const ChatMessageItem = memo(function ChatMessageItem({ role, content }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: role === 'user' ? 'flex-end' : 'flex-start' }}>
+      <div style={{
+        maxWidth: '85%',
+        borderRadius: 18,
+        padding: '10px 14px',
+        background: role === 'user' ? '#4B5AFF' : 'rgba(255,255,255,0.08)',
+        color: role === 'user' ? '#fff' : 'rgba(255,255,255,0.9)',
+      }}>
+        {role === 'user' ? (
+          <p style={{ fontSize: 15, lineHeight: 1.45, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>{content}</p>
+        ) : (
+          <MessageMarkdown content={content} />
+        )}
+      </div>
+    </div>
+  );
+});
+
 const ChatMessages = memo(function ChatMessages({
   messages,
   activities,
   waiting,
+  assistantName,
   scrollContainerRef,
   messagesEndRef,
 }) {
   return (
     <div
       ref={scrollContainerRef}
+      className="channel-chat-scroll"
       style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}
     >
       {messages.length === 0 && !waiting && activities.length === 0 && (
@@ -236,26 +276,22 @@ const ChatMessages = memo(function ChatMessages({
         </div>
       )}
 
-      {messages.map((msg, i) => (
-        <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-          <div style={{
-            maxWidth: '85%',
-            borderRadius: 18,
-            padding: '10px 14px',
-            background: msg.role === 'user' ? '#4B5AFF' : 'rgba(255,255,255,0.08)',
-            color: msg.role === 'user' ? '#fff' : 'rgba(255,255,255,0.9)',
-          }}>
-            {msg.role === 'user' ? (
-              <p style={{ fontSize: 15, lineHeight: 1.45, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>{msg.content}</p>
-            ) : (
-              <MessageMarkdown content={msg.content} />
-            )}
-          </div>
-        </div>
-      ))}
+      {messages.map((msg, i) => {
+        const messageKey = msg.ts
+          ? `${msg.role}:${msg.ts}`
+          : `${msg.role}:${i}:${msg.content}`;
+
+        return (
+          <ChatMessageItem
+            key={messageKey}
+            role={msg.role}
+            content={msg.content}
+          />
+        );
+      })}
 
       {(waiting || activities.length > 0) && (
-        <ActivityTimeline activities={activities} waiting={waiting} />
+        <ActivityTimeline activities={activities} waiting={waiting} assistantName={assistantName} />
       )}
 
       <div ref={messagesEndRef} />
@@ -263,10 +299,34 @@ const ChatMessages = memo(function ChatMessages({
   );
 });
 
-const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
-  const [input, setInput] = useState('');
+const ChatComposer = memo(function ChatComposer({ canSend, onSend, draftStorageKey }) {
+  const [input, setInput] = useState(() => loadStoredDraft(draftStorageKey));
   const [isSending, setIsSending] = useState(false);
   const textareaRef = useRef(null);
+
+  useEffect(() => {
+    if (!draftStorageKey || typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      if (input) {
+        sessionStorage.setItem(draftStorageKey, input);
+      } else {
+        sessionStorage.removeItem(draftStorageKey);
+      }
+    } catch (error) {
+      console.warn('[CHAT] Failed to persist draft:', error.message);
+    }
+  }, [draftStorageKey, input]);
+
+  useEffect(() => {
+    if (!draftStorageKey) {
+      return;
+    }
+
+    setInput(loadStoredDraft(draftStorageKey));
+  }, [draftStorageKey]);
 
   useEffect(() => {
     const ta = textareaRef.current;
@@ -335,6 +395,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend }) {
       }}>
         <textarea
           ref={textareaRef}
+          className="channel-chat-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -385,6 +446,7 @@ function ChannelChat({
   socket,
   encryptInput,
   e2eReady,
+  assistantName = 'Operator',
   messages,
   setMessages,
   activities,
@@ -393,38 +455,150 @@ function ChannelChat({
   setWaiting,
   onSubmitMessage,
   canSendOverride,
+  draftStorageKey = '',
+  forceScrollToBottomKey = 0,
 }) {
   const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
-  const prevLengthRef = useRef(messages.length);
+  const prevLengthRef = useRef(0);
+  const prevWaitingRef = useRef(false);
+  const prevLatestActivityIdRef = useRef('');
+  const hasInitializedScrollRef = useRef(false);
+  const userDetachedFromBottomRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
+  const shouldAutoScrollRef = useRef(true);
+  const nextScrollBehaviorRef = useRef('auto');
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const canSend = typeof canSendOverride === 'boolean'
     ? canSendOverride
     : Boolean(socket && e2eReady);
 
-  // Scroll when messages change — jump to bottom on bulk load, smooth on single new message.
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return undefined;
+    }
+
+    const handleScroll = () => {
+      const nearBottom = isNearBottom(container);
+      const scrolledUp = container.scrollTop < lastScrollTopRef.current;
+
+      setShowScrollToBottom(!nearBottom);
+
+      if (nearBottom) {
+        shouldAutoScrollRef.current = true;
+        userDetachedFromBottomRef.current = false;
+      } else if (scrolledUp) {
+        shouldAutoScrollRef.current = false;
+        userDetachedFromBottomRef.current = true;
+      }
+
+      lastScrollTopRef.current = container.scrollTop;
+    };
+
+    handleScroll();
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    shouldAutoScrollRef.current = true;
+    userDetachedFromBottomRef.current = false;
+    nextScrollBehaviorRef.current = 'smooth';
+    setShowScrollToBottom(false);
+    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  }, []);
+
+  useLayoutEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return undefined;
+    }
+
+    userDetachedFromBottomRef.current = false;
+    shouldAutoScrollRef.current = true;
+    setShowScrollToBottom(false);
+
+    const rafId = requestAnimationFrame(() => {
+      const nextContainer = scrollContainerRef.current;
+      if (!nextContainer) {
+        return;
+      }
+
+      nextContainer.scrollTo({ top: nextContainer.scrollHeight, behavior: 'auto' });
+      lastScrollTopRef.current = nextContainer.scrollTop;
+    });
+
+    return () => cancelAnimationFrame(rafId);
+  }, [forceScrollToBottomKey]);
+
+  // Open restored conversations directly at the bottom. Only animate truly live updates.
   useLayoutEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return undefined;
 
-    const isBulkLoad = Math.abs(messages.length - prevLengthRef.current) > 1;
+    const latestActivityId = activities.length > 0 ? activities[activities.length - 1].id : '';
+    const messageDelta = messages.length - prevLengthRef.current;
+    const historyHydrated = prevLengthRef.current === 0 && messages.length > 0;
+    const activityHydrated = prevLatestActivityIdRef.current.length === 0 && latestActivityId.length > 0;
+    const activityStarted = latestActivityId.length > 0 && latestActivityId !== prevLatestActivityIdRef.current;
+    const shouldJump = !hasInitializedScrollRef.current || historyHydrated || activityHydrated || messageDelta > 1;
+    const stateChanged = messageDelta !== 0 || waiting !== prevWaitingRef.current || activityStarted;
+
     prevLengthRef.current = messages.length;
+    prevWaitingRef.current = waiting;
+    prevLatestActivityIdRef.current = latestActivityId;
+    hasInitializedScrollRef.current = true;
 
+    if (!stateChanged) {
+      return undefined;
+    }
+
+    if (userDetachedFromBottomRef.current) {
+      return undefined;
+    }
+
+    if (!shouldJump && !shouldAutoScrollRef.current) {
+      return undefined;
+    }
+
+    const scrollBehavior = shouldJump ? 'auto' : nextScrollBehaviorRef.current;
+    nextScrollBehaviorRef.current = 'auto';
+
+    let settleRafId = 0;
     const rafId = requestAnimationFrame(() => {
-      if (!scrollContainerRef.current) return;
+      const nextContainer = scrollContainerRef.current;
+      if (!nextContainer) return;
 
-      if (isBulkLoad) {
-        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
-      } else {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      nextContainer.scrollTo({ top: nextContainer.scrollHeight, behavior: scrollBehavior });
+      if (scrollBehavior !== 'auto') {
+        return;
       }
+
+      settleRafId = requestAnimationFrame(() => {
+        const settledContainer = scrollContainerRef.current;
+        if (!settledContainer) return;
+        settledContainer.scrollTo({ top: settledContainer.scrollHeight, behavior: 'auto' });
+      });
     });
 
-    return () => cancelAnimationFrame(rafId);
+    return () => {
+      cancelAnimationFrame(rafId);
+      cancelAnimationFrame(settleRafId);
+    };
   }, [messages, waiting, activities]);
   
   const sendMessage = useCallback(async (text) => {
     if (!text || !canSend) return;
 
+    shouldAutoScrollRef.current = true;
+    userDetachedFromBottomRef.current = false;
+    nextScrollBehaviorRef.current = 'smooth';
     setActivities([]);
 
     setMessages(prev => [...prev, {
@@ -452,17 +626,69 @@ function ChannelChat({
   }, [canSend, socket, encryptInput, onSubmitMessage, setActivities, setMessages, setWaiting]);
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000', position: 'relative' }}>
       <ChatMessages
         messages={messages}
         activities={activities}
         waiting={waiting}
+        assistantName={assistantName}
         scrollContainerRef={scrollContainerRef}
         messagesEndRef={messagesEndRef}
       />
+      <div
+        style={{
+          position: 'absolute',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          bottom: 'calc(max(24px, env(safe-area-inset-bottom)) + 76px)',
+          width: '100%',
+          maxWidth: 640,
+          paddingLeft: 16,
+          paddingRight: 24,
+          display: 'flex',
+          justifyContent: 'flex-end',
+          pointerEvents: 'none',
+          zIndex: 2,
+          boxSizing: 'border-box',
+        }}
+      >
+        <button
+          type="button"
+          onClick={scrollToBottom}
+          aria-label="Scroll to bottom"
+          title="Scroll to bottom"
+          style={{
+            width: 36,
+            height: 36,
+            borderRadius: '50%',
+            border: 'none',
+            background: 'rgba(16,16,16,0.92)',
+            color: '#fff',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.28)',
+            opacity: showScrollToBottom ? 1 : 0,
+            transform: showScrollToBottom ? 'translateY(0) scale(1)' : 'translateY(8px) scale(0.94)',
+            pointerEvents: showScrollToBottom ? 'auto' : 'none',
+            transition: 'opacity 0.2s ease, transform 0.2s ease',
+          }}
+        >
+          <ChevronDown
+            size={14}
+            strokeWidth={2}
+            style={{
+              opacity: showScrollToBottom ? 1 : 0,
+              transform: 'translateY(1px)',
+              transition: 'opacity 0.2s ease',
+            }}
+          />
+        </button>
+      </div>
       <ChatComposer
         canSend={canSend}
         onSend={sendMessage}
+        draftStorageKey={draftStorageKey}
       />
     </div>
   );
