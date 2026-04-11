@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings2, MessagesSquare, Shield, ShieldCheck, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
+import { Settings2, MessagesSquare, Lock, LockOpen, Copy, Check, CirclePlay, CirclePause, Loader, Plus, X, ChevronDown } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
@@ -413,9 +413,9 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
               title="Verify Session"
             >
               {fingerprint ? (
-                <ShieldCheck strokeWidth={2} className="text-[#4B5AFF]" />
+                <Lock strokeWidth={2} className="text-[#4B5AFF]" />
               ) : (
-                <Shield strokeWidth={2} />
+                <LockOpen strokeWidth={2} />
               )}
             </Button>
           </div>

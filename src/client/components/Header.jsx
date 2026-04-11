@@ -1,4 +1,4 @@
-import { Shield, ShieldCheck, RotateCw, Loader, MessageCircle, Terminal, Bell, BellDot } from 'lucide-react';
+import { Lock, LockOpen, RotateCw, Loader, MessageCircle, Terminal, Bell, BellDot } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
 
@@ -193,13 +193,13 @@ function Header({ connectionState, clientMode, onToggleMode, systemState, e2eRea
             title={e2eReady ? 'Authenticated E2E active' : 'Securing session'}
           >
             {isSecure ? (
-              <ShieldCheck
+              <Lock
                 size={18}
                 strokeWidth={2}
                 className="text-[#4B5AFF]"
               />
             ) : (
-              <Shield
+              <LockOpen
                 size={18}
                 strokeWidth={2}
                 className="text-white/40"

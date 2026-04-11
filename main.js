@@ -2,7 +2,7 @@
  * ROOT OPERATOR - MAIN PROCESS
  */
 const path = require('path');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const fixPath = async () => {
@@ -69,6 +69,7 @@ const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
 const DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY = 'desktopIdentityPrivateJwk';
 const DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY = 'desktopIdentityPublicJwk';
+const DESKTOP_IDENTITY_KEY_STORE_KEY = 'desktopIdentityKey';
 
 // Worker API configuration (loaded from .env file)
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL || runtimeConfig.WORKER_BASE_URL || '';
@@ -110,6 +111,8 @@ const PUSH_SUBSCRIPTIONS_STORE_KEY = 'pushSubscriptions';
 const PUSH_VAPID_KEYS_STORE_KEY = 'pushVapidKeys';
 const PUSH_NOTIFICATION_TARGET_URL = '/';
 const PUSH_NOTIFICATION_SUBJECT = 'https://github.com/hjertefolger/Root_Operator';
+let cachedPushVapidKeys = undefined;
+let cachedDesktopIdentityKeyPair = undefined;
 let channelStartupTimer = null;
 let channelRestartTimer = null;
 let channelConfirmTimers = [];
@@ -232,9 +235,10 @@ let channelRuntime = {
 };
 
 // Pairing system state
-let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt}
+let pendingPairings = new Map(); // code -> {ws, kid, jwk, createdAt, sourceKey}
 const PAIRING_CODE_EXPIRY_MS = 120000; // 2 minutes
 const MAX_PENDING_PAIRINGS = 5;
+const MAX_PENDING_PAIRINGS_PER_SOURCE = 2;
 const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // No ambiguous chars
 
 // ANSI ESCAPE SEQUENCE SANITIZER
@@ -310,6 +314,8 @@ const BIP39_WORDS = require('./public/bip39-words.json');
 // Global state for current session fingerprint (shown in tray)
 let currentFingerprint = null;
 let desktopIdentityKeyPair = null;
+const PAIRING_JWK_PRIVATE_FIELDS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth'];
+const loggedInvalidStoredPairingKids = new Set();
 
 const E2E_INFO = Buffer.from('root-operator-e2e-v2');
 
@@ -346,6 +352,85 @@ function isValidRsaPssJwk(jwk) {
     );
 }
 
+function isValidRsaPrivateJwk(jwk) {
+    return Boolean(
+        isValidRsaPssJwk(jwk)
+        && typeof jwk.d === 'string'
+        && jwk.d
+    );
+}
+
+function hasForbiddenPairingJwkFields(jwk) {
+    if (!jwk || typeof jwk !== 'object') {
+        return false;
+    }
+
+    return PAIRING_JWK_PRIVATE_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(jwk, field));
+}
+
+function toPublicPairingJwk(jwk) {
+    if (!isValidRsaPssJwk(jwk)) {
+        return null;
+    }
+
+    return {
+        kty: jwk.kty,
+        n: jwk.n,
+        e: jwk.e,
+    };
+}
+
+function assertNoPrivatePairingJwkMaterial(jwk) {
+    if (hasForbiddenPairingJwkFields(jwk)) {
+        throw new Error('refuse to store private JWK material');
+    }
+}
+
+function isEncryptedDesktopIdentityKeyRecord(value) {
+    return (
+        value
+        && isValidRsaPssJwk(value.publicJwk)
+        && typeof value.privateJwkEncrypted === 'string'
+        && value.privateJwkEncrypted
+        && !Object.prototype.hasOwnProperty.call(value, 'privateJwk')
+    );
+}
+
+function storeEncryptedDesktopIdentityKeyPair(keyPair) {
+    const storedKeyPair = {
+        publicJwk: keyPair.publicKeyJwk,
+        privateJwkEncrypted: safeStorage.encryptString(JSON.stringify(keyPair.privateKeyJwk)).toString('base64'),
+    };
+
+    store.set(DESKTOP_IDENTITY_KEY_STORE_KEY, storedKeyPair);
+
+    const verified = store.get(DESKTOP_IDENTITY_KEY_STORE_KEY, null);
+    if (
+        !isEncryptedDesktopIdentityKeyRecord(verified)
+        || canonicalizeJwk(verified.publicJwk) !== canonicalizeJwk(storedKeyPair.publicJwk)
+        || verified.privateJwkEncrypted !== storedKeyPair.privateJwkEncrypted
+    ) {
+        throw new Error('Failed to verify stored desktop identity key record');
+    }
+
+    return storedKeyPair;
+}
+
+function decryptStoredDesktopIdentityKeyPair(storedKeyPair) {
+    const privateKeyJwk = JSON.parse(
+        safeStorage.decryptString(Buffer.from(storedKeyPair.privateJwkEncrypted, 'base64'))
+    );
+
+    if (!isValidRsaPssJwk(storedKeyPair.publicJwk) || !isValidRsaPrivateJwk(privateKeyJwk)) {
+        throw new Error('Invalid desktop identity key material');
+    }
+
+    return {
+        publicKeyJwk: storedKeyPair.publicJwk,
+        privateKeyJwk,
+    };
+}
+
 function isValidEcdhPublicJwk(jwk) {
     return Boolean(
         jwk
@@ -373,22 +458,63 @@ function generateDesktopIdentityKeyPair() {
 }
 
 function getOrCreateDesktopIdentityKeyPair() {
+    if (cachedDesktopIdentityKeyPair !== undefined) {
+        return cachedDesktopIdentityKeyPair;
+    }
+
+    if (!safeStorage.isEncryptionAvailable()) {
+        logDebug('[SECURITY] safeStorage unavailable, desktop identity cannot be secured. E2E disabled.');
+        cachedDesktopIdentityKeyPair = null;
+        return null;
+    }
+
+    const encryptedRecord = store.get(DESKTOP_IDENTITY_KEY_STORE_KEY, null);
+    if (isEncryptedDesktopIdentityKeyRecord(encryptedRecord)) {
+        try {
+            cachedDesktopIdentityKeyPair = decryptStoredDesktopIdentityKeyPair(encryptedRecord);
+            return cachedDesktopIdentityKeyPair;
+        } catch (error) {
+            logDebug('[SECURITY] Failed to decrypt desktop identity private key — regenerating');
+            const regeneratedKeyPair = generateDesktopIdentityKeyPair();
+            storeEncryptedDesktopIdentityKeyPair(regeneratedKeyPair);
+            cachedDesktopIdentityKeyPair = regeneratedKeyPair;
+            return cachedDesktopIdentityKeyPair;
+        }
+    }
+
     const storedPublicJwk = store.get(DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY);
     const storedPrivateJwk = store.get(DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY);
 
-    if (isValidRsaPssJwk(storedPublicJwk) && isValidRsaPssJwk(storedPrivateJwk)) {
-        return {
+    if (isValidRsaPssJwk(storedPublicJwk) && isValidRsaPrivateJwk(storedPrivateJwk)) {
+        const migratedKeyPair = {
             publicKeyJwk: storedPublicJwk,
             privateKeyJwk: storedPrivateJwk,
         };
+
+        storeEncryptedDesktopIdentityKeyPair(migratedKeyPair);
+        store.delete(DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY);
+        store.delete(DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY);
+
+        const verifiedRecord = store.get(DESKTOP_IDENTITY_KEY_STORE_KEY, null);
+        const verifiedKeyPair = decryptStoredDesktopIdentityKeyPair(verifiedRecord);
+        if (
+            !isEncryptedDesktopIdentityKeyRecord(verifiedRecord)
+            || canonicalizeJwk(verifiedKeyPair.publicKeyJwk) !== canonicalizeJwk(migratedKeyPair.publicKeyJwk)
+            || canonicalizeJwk(verifiedKeyPair.privateKeyJwk) !== canonicalizeJwk(migratedKeyPair.privateKeyJwk)
+        ) {
+            throw new Error('Failed to verify migrated desktop identity key record');
+        }
+
+        logDebug('[SECURITY] Migrated desktop identity private key to safeStorage');
+        cachedDesktopIdentityKeyPair = migratedKeyPair;
+        return cachedDesktopIdentityKeyPair;
     }
 
     logDebug('[E2E] Generating desktop identity keypair');
     const keyPair = generateDesktopIdentityKeyPair();
-    store.set(DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY, keyPair.publicKeyJwk);
-    // TODO(#6): move to keychain
-    store.set(DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY, keyPair.privateKeyJwk);
-    return keyPair;
+    storeEncryptedDesktopIdentityKeyPair(keyPair);
+    cachedDesktopIdentityKeyPair = keyPair;
+    return cachedDesktopIdentityKeyPair;
 }
 
 function signRsaPssPayload(privateJwk, payload) {
@@ -416,6 +542,19 @@ function closeE2EUnauthenticated(ws, reason) {
 
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close(E2E_UNAUTHENTICATED_CLOSE_CODE, E2E_UNAUTHENTICATED_CLOSE_REASON);
+    }
+}
+
+function closeE2EUnavailable(ws, reason) {
+    logDebug(`[E2E] ${reason}`);
+
+    if (ws.e2eTimeout) {
+        clearTimeout(ws.e2eTimeout);
+        ws.e2eTimeout = null;
+    }
+
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(E2E_UNAVAILABLE_CLOSE_CODE, E2E_UNAVAILABLE_CLOSE_REASON);
     }
 }
 
@@ -537,7 +676,7 @@ const E2E_SETUP_TIMEOUT_MS = 10000;
 async function initE2EKeyExchange(ws) {
     if (!desktopIdentityKeyPair?.privateKeyJwk || !desktopIdentityKeyPair?.publicKeyJwk) {
         logDebug('[E2E] FATAL: desktop identity keypair unavailable; refusing authenticated E2E setup');
-        closeE2EUnauthenticated(ws, 'Desktop identity keypair unavailable');
+        closeE2EUnavailable(ws, 'Desktop identity keypair unavailable');
         return false;
     }
 
@@ -577,7 +716,7 @@ async function completeE2EKeyExchange(ws, clientEcdhPubJwk, clientSignature) {
             return false;
         }
 
-        const authorized = store.get('keys', []);
+        const authorized = getAuthorizedPairedKeys();
         const pairedDevice = authorized.find((key) => key.kid === ws.kid);
         const clientPayload = canonicalizeJwkBuffer(clientEcdhPubJwk);
 
@@ -1133,7 +1272,7 @@ function buildNotificationPreviewBody(content = '') {
 function getPushAssistantNotificationPayload(message = {}) {
     const assistantName = getActivityAssistantName();
     return {
-        title: 'Root_Operator',
+        title: assistantName || 'New message',
         body: buildNotificationPreviewBody(message.content),
         tag: 'root-operator-assistant-reply',
         url: PUSH_NOTIFICATION_TARGET_URL,
@@ -1169,26 +1308,106 @@ function savePushSubscriptions(subscriptions) {
     store.set(PUSH_SUBSCRIPTIONS_STORE_KEY, Array.isArray(subscriptions) ? subscriptions : []);
 }
 
+function isEncryptedPushVapidKeysRecord(value) {
+    return (
+        value
+        && typeof value.publicKey === 'string'
+        && value.publicKey
+        && typeof value.privateKeyEncrypted === 'string'
+        && value.privateKeyEncrypted
+        && typeof value.privateKey !== 'string'
+    );
+}
+
+function isPlaintextPushVapidKeysRecord(value) {
+    return (
+        value
+        && typeof value.publicKey === 'string'
+        && value.publicKey
+        && typeof value.privateKey === 'string'
+        && value.privateKey
+    );
+}
+
+function storeEncryptedPushVapidKeys(vapidKeys) {
+    const storedVapidKeys = {
+        publicKey: vapidKeys.publicKey,
+        privateKeyEncrypted: safeStorage.encryptString(vapidKeys.privateKey).toString('base64'),
+    };
+
+    store.set(PUSH_VAPID_KEYS_STORE_KEY, storedVapidKeys);
+
+    const verified = store.get(PUSH_VAPID_KEYS_STORE_KEY, null);
+    if (
+        !isEncryptedPushVapidKeysRecord(verified)
+        || verified.publicKey !== storedVapidKeys.publicKey
+        || verified.privateKeyEncrypted !== storedVapidKeys.privateKeyEncrypted
+    ) {
+        throw new Error('Failed to verify stored VAPID key record');
+    }
+
+    return storedVapidKeys;
+}
+
+function decryptStoredPushVapidKeys(storedVapidKeys) {
+    return {
+        publicKey: storedVapidKeys.publicKey,
+        privateKey: safeStorage.decryptString(Buffer.from(storedVapidKeys.privateKeyEncrypted, 'base64')),
+    };
+}
+
 function getStoredPushVapidKeys() {
+    if (cachedPushVapidKeys !== undefined) {
+        return cachedPushVapidKeys;
+    }
+
     if (!store) {
         return null;
     }
 
-    const existing = store.get(PUSH_VAPID_KEYS_STORE_KEY, null);
-    if (
-        existing
-        && typeof existing.publicKey === 'string'
-        && existing.publicKey
-        && typeof existing.privateKey === 'string'
-        && existing.privateKey
-    ) {
-        return existing;
+    if (!safeStorage.isEncryptionAvailable()) {
+        logDebug('[SECURITY] safeStorage unavailable, push notifications disabled');
+        cachedPushVapidKeys = null;
+        return null;
     }
 
-    const generated = webpush.generateVAPIDKeys();
-    store.set(PUSH_VAPID_KEYS_STORE_KEY, generated);
-    logDebug('[NOTIFICATIONS] Generated VAPID keys');
-    return generated;
+    try {
+        const existing = store.get(PUSH_VAPID_KEYS_STORE_KEY, null);
+        if (isEncryptedPushVapidKeysRecord(existing)) {
+            try {
+                cachedPushVapidKeys = decryptStoredPushVapidKeys(existing);
+                return cachedPushVapidKeys;
+            } catch (error) {
+                logDebug('[SECURITY] Failed to decrypt VAPID private key — regenerating');
+                const regenerated = webpush.generateVAPIDKeys();
+                storeEncryptedPushVapidKeys(regenerated);
+                logDebug('[NOTIFICATIONS] Generated VAPID keys');
+                cachedPushVapidKeys = regenerated;
+                return cachedPushVapidKeys;
+            }
+        }
+
+        if (isPlaintextPushVapidKeysRecord(existing)) {
+            const migrated = {
+                publicKey: existing.publicKey,
+                privateKey: existing.privateKey,
+            };
+            storeEncryptedPushVapidKeys(migrated);
+            logDebug('[SECURITY] Migrated VAPID private key to safeStorage');
+            cachedPushVapidKeys = migrated;
+            return cachedPushVapidKeys;
+        }
+
+        const generated = webpush.generateVAPIDKeys();
+        storeEncryptedPushVapidKeys(generated);
+        logDebug('[NOTIFICATIONS] Generated VAPID keys');
+        cachedPushVapidKeys = generated;
+        return cachedPushVapidKeys;
+    } catch (error) {
+        logDebug(`[NOTIFICATIONS] Failed to initialize VAPID keys: ${error.message}`);
+        cachedPushVapidKeys = null;
+        return null;
+    }
 }
 
 function configureWebPush() {
@@ -1235,6 +1454,35 @@ function getPairedDeviceLabel(kid) {
     const keys = store?.get('keys', []) || [];
     const device = keys.find((item) => item.kid === kid);
     return device?.name || kid.substring(0, 12);
+}
+
+function getStoredPairedKeys() {
+    if (!store) {
+        return [];
+    }
+
+    const keys = store.get('keys', []);
+    return Array.isArray(keys) ? keys : [];
+}
+
+function getAuthorizedPairedKeys() {
+    return getStoredPairedKeys().filter((keyRecord) => {
+        if (isValidKeyId(keyRecord?.kid) && isValidPairingJwk(keyRecord?.jwk)) {
+            return true;
+        }
+
+        const warningKey = typeof keyRecord?.kid === 'string' && keyRecord.kid
+            ? keyRecord.kid
+            : 'unknown-invalid-pairing-key';
+        const warningLabel = typeof keyRecord?.kid === 'string' && keyRecord.kid
+            ? keyRecord.kid.substring(0, 8)
+            : 'unknown';
+        if (!loggedInvalidStoredPairingKids.has(warningKey)) {
+            loggedInvalidStoredPairingKids.add(warningKey);
+            logDebug(`[SECURITY] Stored pairing JWK failed validation; refusing device until re-paired (${warningLabel})`);
+        }
+        return false;
+    });
 }
 
 function buildNotificationStatePayload(kid) {
@@ -3076,7 +3324,9 @@ app.whenReady().then(async () => {
     store = new ES();
     try {
         desktopIdentityKeyPair = getOrCreateDesktopIdentityKeyPair();
-        logDebug('[E2E] Desktop identity keypair ready');
+        if (desktopIdentityKeyPair) {
+            logDebug('[E2E] Desktop identity keypair ready');
+        }
     } catch (error) {
         desktopIdentityKeyPair = null;
         logDebug(`[E2E] FATAL: failed to initialize desktop identity keypair: ${error.message}`);
@@ -3142,8 +3392,14 @@ app.on('activate', () => {
 });
 
 app.on('will-quit', () => {
+    cachedPushVapidKeys = null;
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
+});
+
+app.on('will-quit', () => {
+    cachedDesktopIdentityKeyPair = undefined;
+    desktopIdentityKeyPair = null;
 });
 
 // 2. IPC API (Frontend -> Backend)
@@ -3361,12 +3617,20 @@ function rotateLogIfNeeded() {
     }
 }
 
-function logDebug(msg) {
+function logDebug(msg, metadata) {
     // Only write to file if debug logging is enabled
     if (isDebugLoggingEnabled() && logFile) {
         rotateLogIfNeeded();
         const time = new Date().toISOString();
-        const line = `[${time}] ${msg}\n`;
+        let metadataSuffix = '';
+        if (metadata !== undefined) {
+            try {
+                metadataSuffix = ` ${JSON.stringify(metadata)}`;
+            } catch {
+                metadataSuffix = ' {"logMetadata":"unserializable"}';
+            }
+        }
+        const line = `[${time}] ${msg}${metadataSuffix}\n`;
         try {
             fs.appendFileSync(logFile, line);
         } catch (e) {
@@ -3686,28 +3950,107 @@ function stopBridge() {
 // Security: Rate limiting and connection tracking
 const CHALLENGE_EXPIRY_MS = 30000; // Challenge expires after 30 seconds
 const MAX_CONNECTIONS_PER_MINUTE = 20;
+const MAX_CONNECTIONS_PER_SOURCE_PER_MINUTE = 10;
 const MAX_AUTH_ATTEMPTS_PER_CONNECTION = 3;
 const MAX_INPUT_SIZE = 131072; // Max bytes per input message (128KB)
 const SESSION_REVOKED_CLOSE_CODE = 4001;
 const E2E_UNAUTHENTICATED_CLOSE_CODE = 4002;
+const E2E_UNAVAILABLE_CLOSE_CODE = 4003;
 const E2E_UNAUTHENTICATED_CLOSE_REASON = 'e2e_unauthenticated';
+const E2E_UNAVAILABLE_CLOSE_REASON = 'e2e_unavailable';
 
-let connectionAttempts = [];
+let connectionAttempts = new Map();
 
 function isKidAuthorized(kid) {
     if (!kid) {
         return false;
     }
 
-    const authorized = store.get('keys', []);
+    const authorized = getAuthorizedPairedKeys();
     return authorized.some((key) => key.kid === kid);
 }
 
-function isRateLimited() {
+function normalizeSourceAddress(value) {
+    if (typeof value !== 'string') {
+        return '';
+    }
+
+    const normalized = value.trim();
+    if (!normalized) {
+        return '';
+    }
+
+    if (normalized.startsWith('::ffff:')) {
+        return normalized.substring(7);
+    }
+
+    return normalized;
+}
+
+function getClientSourceKey(req) {
+    const cfConnectingIpHeader = req?.headers?.['cf-connecting-ip'];
+    const xForwardedForHeader = req?.headers?.['x-forwarded-for'];
+    const cfConnectingIp = Array.isArray(cfConnectingIpHeader) ? cfConnectingIpHeader[0] : cfConnectingIpHeader;
+    if (typeof cfConnectingIp === 'string') {
+        const normalizedCfConnectingIp = normalizeSourceAddress(cfConnectingIp);
+        if (normalizedCfConnectingIp) {
+            return normalizedCfConnectingIp;
+        }
+    }
+
+    const xForwardedFor = Array.isArray(xForwardedForHeader) ? xForwardedForHeader.join(',') : xForwardedForHeader;
+    if (typeof xForwardedFor === 'string') {
+        const normalizedXForwardedFor = normalizeSourceAddress(xForwardedFor.split(',')[0]);
+        if (normalizedXForwardedFor) {
+            return normalizedXForwardedFor;
+        }
+    }
+
+    const normalizedRemoteAddress = normalizeSourceAddress(req?.socket?.remoteAddress);
+    return normalizedRemoteAddress || 'unknown';
+}
+
+function pruneConnectionAttempts(now = Date.now()) {
+    let totalAttempts = 0;
+    for (const [sourceKey, attempts] of connectionAttempts.entries()) {
+        const recentAttempts = attempts.filter(t => now - t < 60000);
+        if (recentAttempts.length === 0) {
+            connectionAttempts.delete(sourceKey);
+            continue;
+        }
+        connectionAttempts.set(sourceKey, recentAttempts);
+        totalAttempts += recentAttempts.length;
+    }
+    return totalAttempts;
+}
+
+function isRateLimited(sourceKey) {
     const now = Date.now();
-    // Remove attempts older than 1 minute
-    connectionAttempts = connectionAttempts.filter(t => now - t < 60000);
-    return connectionAttempts.length >= MAX_CONNECTIONS_PER_MINUTE;
+    const totalAttempts = pruneConnectionAttempts(now);
+    const sourceAttempts = connectionAttempts.get(sourceKey) || [];
+    if (sourceAttempts.length >= MAX_CONNECTIONS_PER_SOURCE_PER_MINUTE) {
+        return 'source_connections_per_minute';
+    }
+    if (totalAttempts >= MAX_CONNECTIONS_PER_MINUTE) {
+        return 'global_connections_per_minute';
+    }
+    return null;
+}
+
+function recordConnectionAttempt(sourceKey, timestamp = Date.now()) {
+    const sourceAttempts = connectionAttempts.get(sourceKey) || [];
+    sourceAttempts.push(timestamp);
+    connectionAttempts.set(sourceKey, sourceAttempts);
+}
+
+function countPendingPairingsForSource(sourceKey) {
+    let count = 0;
+    for (const pairing of pendingPairings.values()) {
+        if ((pairing.sourceKey || 'unknown') === sourceKey) {
+            count++;
+        }
+    }
+    return count;
 }
 
 // Generate 6-character pairing code
@@ -3725,7 +4068,7 @@ function isValidKeyId(keyId) {
 }
 
 function isValidPairingJwk(jwk) {
-    return isValidRsaPssJwk(jwk);
+    return isValidRsaPssJwk(jwk) && !hasForbiddenPairingJwkFields(jwk);
 }
 
 function computeKeyIdFromJwk(jwk) {
@@ -3827,13 +4170,22 @@ function cleanupExpiredPairings() {
 setInterval(cleanupExpiredPairings, 30000);
 
 function handleConnection(ws, req) {
+    const sourceKey = getClientSourceKey(req);
+    ws.sourceKey = sourceKey;
+
+    if (!desktopIdentityKeyPair?.privateKeyJwk || !desktopIdentityKeyPair?.publicKeyJwk) {
+        closeE2EUnavailable(ws, 'Desktop identity unavailable; rejecting bridge connection');
+        return;
+    }
+
     // Rate limiting check
-    if (isRateLimited()) {
-        logDebug('[SECURITY] Rate limit exceeded, rejecting connection');
+    const rateLimitReason = isRateLimited(sourceKey);
+    if (rateLimitReason) {
+        logDebug('[SECURITY] rate_limit rejected', { sourceKey, reason: rateLimitReason });
         ws.close(1008, 'Rate limit exceeded');
         return;
     }
-    connectionAttempts.push(Date.now());
+    recordConnectionAttempt(sourceKey);
 
     // Track auth attempts per connection
     ws.authAttempts = 0;
@@ -3883,6 +4235,12 @@ function handleConnection(ws, req) {
                 return;
             }
 
+            const publicPairingJwk = toPublicPairingJwk(m.jwk);
+            if (!publicPairingJwk) {
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid request' }));
+                return;
+            }
+
             // Normalize code (uppercase)
             const code = m.code.toUpperCase();
 
@@ -3899,7 +4257,7 @@ function handleConnection(ws, req) {
             }
 
             // Check if device is already registered
-            const authorized = store.get('keys', []);
+            const authorized = getAuthorizedPairedKeys();
             if (authorized.find(k => k.kid === m.keyId)) {
                 // Already registered - send challenge for proof of key possession
                 logDebug(`[PAIRING] Device registered, sending challenge: ${m.keyId.substring(0, 8)}`);
@@ -3915,7 +4273,19 @@ function handleConnection(ws, req) {
             cleanupExpiredPairings();
 
             // Check max pending pairings limit
+            if (countPendingPairingsForSource(ws.sourceKey || 'unknown') >= MAX_PENDING_PAIRINGS_PER_SOURCE) {
+                logDebug('[SECURITY] rate_limit rejected', {
+                    sourceKey: ws.sourceKey || 'unknown',
+                    reason: 'source_pending_pairings',
+                });
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Too many pending requests' }));
+                return;
+            }
             if (pendingPairings.size >= MAX_PENDING_PAIRINGS) {
+                logDebug('[SECURITY] rate_limit rejected', {
+                    sourceKey: ws.sourceKey || 'unknown',
+                    reason: 'global_pending_pairings',
+                });
                 ws.send(JSON.stringify({ type: 'pairing_error', message: 'Too many pending requests' }));
                 return;
             }
@@ -3930,8 +4300,9 @@ function handleConnection(ws, req) {
             pendingPairings.set(code, {
                 ws,
                 kid: m.keyId,
-                jwk: m.jwk,
-                createdAt: Date.now()
+                jwk: publicPairingJwk,
+                createdAt: Date.now(),
+                sourceKey: ws.sourceKey || 'unknown',
             });
 
             ws.send(JSON.stringify({ type: 'pairing_pending', code }));
@@ -3989,15 +4360,19 @@ function handleConnection(ws, req) {
                 logDebug(`[WS] Auth SUCCESS: ${m.keyId.substring(0, 8)}`);
 
                 if (isApprovedPairing) {
-                    const keys = store.get('keys', []);
-                    if (!keys.find(k => k.kid === approvedPairing.kid)) {
-                        keys.push({
-                            kid: approvedPairing.kid,
-                            jwk: approvedPairing.jwk,
-                            name: approvedPairing.name,
-                        });
-                        store.set('keys', keys);
+                    assertNoPrivatePairingJwkMaterial(approvedPairing.jwk);
+                    const pairingPublicJwk = toPublicPairingJwk(approvedPairing.jwk);
+                    if (!pairingPublicJwk) {
+                        throw new Error('Rejected invalid pairing key material');
                     }
+                    assertNoPrivatePairingJwkMaterial(pairingPublicJwk);
+                    const keys = getStoredPairedKeys().filter((key) => key.kid !== approvedPairing.kid);
+                    keys.push({
+                        kid: approvedPairing.kid,
+                        jwk: pairingPublicJwk,
+                        name: approvedPairing.name,
+                    });
+                    store.set('keys', keys);
                 }
 
                 let e2eInitialized = false;
@@ -4171,7 +4546,7 @@ function handleConnection(ws, req) {
 // SECURITY: Constant-time signature verification to prevent timing side-channel attacks
 // Always performs full verification flow regardless of whether key exists
 function verifySignature(kid, signature, challenge) {
-    const authorized = store.get('keys', []);
+    const authorized = getAuthorizedPairedKeys();
     const key = authorized.find(k => k.kid === kid);
 
     // Always perform cryptographic operations to prevent timing-based key ID enumeration
@@ -4499,6 +4874,10 @@ ipcMain.handle('VERIFY_PAIRING_CODE', async (event, code, deviceName) => {
     }
 
     pendingPairings.delete(normalizedCode);
+    const pairingPublicJwk = toPublicPairingJwk(pairing.jwk);
+    if (!pairingPublicJwk) {
+        return { success: false, error: 'Invalid pairing key material' };
+    }
     const challenge = crypto.randomBytes(32).toString('hex');
     ws.challenge = challenge;
     ws.challengeTime = Date.now();
@@ -4521,7 +4900,7 @@ ipcMain.handle('VERIFY_PAIRING_CODE', async (event, code, deviceName) => {
 
         ws.pendingPairingApproval = {
             kid: pairing.kid,
-            jwk: pairing.jwk,
+            jwk: pairingPublicJwk,
             name: deviceName,
             timeoutId,
             resolve: (result) => {
