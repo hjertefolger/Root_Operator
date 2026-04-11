@@ -98,6 +98,9 @@ function App() {
   // Initialize E2E encryption
   const {
     e2eReady,
+    sessionFingerprintHex,
+    sessionStartedAt,
+    pinnedDesktopKidHex,
     encryptInput,
     decryptOutput,
     handleServerKeyMessage
@@ -251,6 +254,9 @@ function App() {
         systemState={systemState}
         e2eReady={e2eReady}
         notifications={notifications}
+        pinnedDesktopKidHex={pinnedDesktopKidHex}
+        sessionFingerprintHex={sessionFingerprintHex}
+        sessionStartedAt={sessionStartedAt}
       />
       {clientMode === 'channel' ? (
         <ChannelChat

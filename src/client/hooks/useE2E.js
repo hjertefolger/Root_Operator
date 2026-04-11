@@ -63,40 +63,33 @@ function isValidEcdhPublicJwk(jwk) {
   );
 }
 
-async function loadBIP39Words() {
-  const response = await fetch('/bip39-words.json');
-  return await response.json();
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function generateFingerprint(sharedSecretBits, transcriptSalt) {
+// 64-bit session fingerprint in hex — matches the ~64 bits of entropy that
+// 12 bip39 words encoded, but in a form any platform can render without
+// needing a word list. Compared between devices for optional MITM check.
+async function generateFingerprintHex(sharedSecretBits, transcriptSalt) {
   const combined = new Uint8Array(sharedSecretBits.byteLength + transcriptSalt.byteLength);
   combined.set(new Uint8Array(sharedSecretBits), 0);
   combined.set(new Uint8Array(transcriptSalt), sharedSecretBits.byteLength);
   const hash = await window.crypto.subtle.digest('SHA-256', combined);
-  const hashBytes = new Uint8Array(hash);
-  const wordlist = await loadBIP39Words();
-  const words = [];
-  let bitBuffer = 0;
-  let bitsInBuffer = 0;
-  let byteIndex = 0;
+  return bytesToHex(new Uint8Array(hash).slice(0, 8));
+}
 
-  for (let i = 0; i < 12; i++) {
-    while (bitsInBuffer < 11 && byteIndex < hashBytes.length) {
-      bitBuffer = (bitBuffer << 8) | hashBytes[byteIndex++];
-      bitsInBuffer += 8;
-    }
-    bitsInBuffer -= 11;
-    const index = (bitBuffer >> bitsInBuffer) & 0x7FF;
-    words.push(wordlist[index]);
-  }
-
-  return words.join('-');
+async function computeJwkKidHex(jwk) {
+  if (!jwk) return null;
+  const canonical = canonicalizeJwk(jwk);
+  const hash = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return bytesToHex(new Uint8Array(hash));
 }
 
 export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload, onSecurityFailure, disconnect }) {
   const [e2eReady, setE2eReady] = useState(false);
-  const [fingerprint, setFingerprint] = useState(null);
-  const fingerprintRef = useRef(null);
+  const [sessionFingerprintHex, setSessionFingerprintHex] = useState(null);
+  const [sessionStartedAt, setSessionStartedAt] = useState(null);
+  const [pinnedDesktopKidHex, setPinnedDesktopKidHex] = useState(null);
   const sessionKeyRef = useRef(null);
   const e2eReadyRef = useRef(false);
   const handshakeStartedRef = useRef(false);
@@ -107,13 +100,27 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
   const resetE2EState = useCallback(() => {
     setE2eReady(false);
     e2eReadyRef.current = false;
-    setFingerprint(null);
-    fingerprintRef.current = null;
+    setSessionFingerprintHex(null);
+    setSessionStartedAt(null);
     sessionKeyRef.current = null;
     handshakeStartedRef.current = false;
     clientKeyPairRef.current = null;
     clientEcdhPubJwkRef.current = null;
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!serverIdentityJwk) {
+      setPinnedDesktopKidHex(null);
+      return () => { cancelled = true; };
+    }
+    computeJwkKidHex(serverIdentityJwk).then((kid) => {
+      if (!cancelled) setPinnedDesktopKidHex(kid);
+    }).catch(() => {
+      if (!cancelled) setPinnedDesktopKidHex(null);
+    });
+    return () => { cancelled = true; };
+  }, [serverIdentityJwk]);
 
   const failClosed = useCallback((message, options = {}) => {
     const { closeSocket = true } = options;
@@ -305,19 +312,19 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
         ['encrypt', 'decrypt']
       );
 
-      // Flip e2eReady BEFORE the fingerprint computation. The fingerprint is
-      // informational only — the lock icon is the real indicator — so it must
-      // never block decryption. Previously the BIP39 word-list fetch inside
-      // generateFingerprint sat on the critical path, opening a window where
-      // an already-decryptable session still silently dropped `channel_history`.
+      // Flip e2eReady BEFORE computing the session fingerprint. The hex
+      // fingerprint is for the security panel only — it must never block
+      // decryption. Previously the bip39 fetch sat on this critical path
+      // and silently dropped channel_history messages that arrived during
+      // the fetch window.
       e2eReadyRef.current = true;
       setE2eReady(true);
+      setSessionStartedAt(Date.now());
       console.log('[E2E] Encryption active. Desktop signature verified.');
 
-      generateFingerprint(sharedSecretBits, transcriptSalt)
+      generateFingerprintHex(sharedSecretBits, transcriptSalt)
         .then((fp) => {
-          fingerprintRef.current = fp;
-          setFingerprint(fp);
+          setSessionFingerprintHex(fp);
         })
         .catch((err) => {
           console.warn('[E2E] Fingerprint generation failed (informational only):', err);
@@ -381,7 +388,9 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
 
   return {
     e2eReady,
-    fingerprint,
+    sessionFingerprintHex,
+    sessionStartedAt,
+    pinnedDesktopKidHex,
     encryptInput,
     decryptOutput,
     handleServerKeyMessage

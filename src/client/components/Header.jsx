@@ -1,6 +1,8 @@
+import { useRef, useState } from 'react';
 import { Lock, LockOpen, RotateCw, Loader, MessageCircle, Terminal, Bell, BellDot } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import rabbitLogo from '../assets/rabbit.svg';
+import SecurityPanel from './SecurityPanel';
 
 const STATUS_COLORS = {
   green: '#34d399',
@@ -73,21 +75,38 @@ function buildStatusTooltip(status, systemState, clientMode) {
   return lines.filter(Boolean).join('\n');
 }
 
-function Header({ connectionState, clientMode, onToggleMode, systemState, e2eReady, notifications }) {
+function Header({
+  connectionState,
+  clientMode,
+  onToggleMode,
+  systemState,
+  e2eReady,
+  notifications,
+  pinnedDesktopKidHex,
+  sessionFingerprintHex,
+  sessionStartedAt,
+}) {
   const isReconnecting = connectionState === 'reconnecting';
   const isSecure = e2eReady;
   const status = getClientStatus(systemState, connectionState, e2eReady, clientMode);
   const statusTooltip = buildStatusTooltip(status, systemState, clientMode);
   const notificationTitle = notifications?.title || 'Enable notifications';
+  const lockButtonRef = useRef(null);
+  const [securityPanelOpen, setSecurityPanelOpen] = useState(false);
+  const lockTooltip = isSecure ? 'End-to-end encrypted — click for details' : 'Securing session — click for details';
 
   const handleReload = () => {
     window.location.reload();
   };
 
+  const handleToggleSecurityPanel = () => {
+    setSecurityPanelOpen((open) => !open);
+  };
+
   return (
     <>
       {/* Header bar matching tray app style */}
-      <header className="flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
+      <header className="relative flex-shrink-0 h-11 flex items-center justify-between bg-black" style={{ paddingLeft: 12, paddingRight: 12 }}>
         <div
           className="inline-flex items-center"
           title={statusTooltip}
@@ -188,9 +207,14 @@ function Header({ connectionState, clientMode, onToggleMode, systemState, e2eRea
               className="text-[#4B5AFF]"
             />
           </Button>
-          <div
-            className="w-8 h-8 flex items-center justify-center"
-            title={e2eReady ? 'Authenticated E2E active' : 'Securing session'}
+          <button
+            ref={lockButtonRef}
+            type="button"
+            onClick={handleToggleSecurityPanel}
+            aria-label={lockTooltip}
+            aria-expanded={securityPanelOpen}
+            title={lockTooltip}
+            className="w-8 h-8 flex items-center justify-center rounded-full transition-colors hover:bg-white/5"
           >
             {isSecure ? (
               <Lock
@@ -205,8 +229,18 @@ function Header({ connectionState, clientMode, onToggleMode, systemState, e2eRea
                 className="text-white/40"
               />
             )}
-          </div>
+          </button>
         </div>
+        {securityPanelOpen && (
+          <SecurityPanel
+            isReady={isSecure}
+            pinnedDesktopKidHex={pinnedDesktopKidHex}
+            sessionFingerprintHex={sessionFingerprintHex}
+            sessionStartedAt={sessionStartedAt}
+            onClose={() => setSecurityPanelOpen(false)}
+            anchorRef={lockButtonRef}
+          />
+        )}
       </header>
     </>
   );
