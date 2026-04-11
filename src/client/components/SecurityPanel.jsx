@@ -1,9 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Fingerprint } from 'lucide-react';
 
-function formatFingerprint(hex) {
+function renderFingerprint(hex) {
   if (!hex || hex.length < 16) return null;
-  return `${hex.slice(0, 4)} · ${hex.slice(4, 8)} · ${hex.slice(8, 12)} · ${hex.slice(12, 16)}`;
+  const groups = [hex.slice(0, 4), hex.slice(4, 8), hex.slice(8, 12), hex.slice(12, 16)];
+  return groups.map((g, i) => (
+    <span key={i}>
+      {i > 0 && <span className="text-muted-foreground"> · </span>}
+      <span className="text-foreground">{g}</span>
+    </span>
+  ));
 }
 
 function formatTime(ts) {
@@ -96,7 +102,7 @@ function SecurityPanel({
     };
   }, [onClose, anchorRef]);
 
-  const fingerprintFormatted = formatFingerprint(sessionFingerprintHex);
+  const fingerprintNodes = renderFingerprint(sessionFingerprintHex);
   const pinnedShort = pinnedDesktopKidHex ? pinnedDesktopKidHex.slice(0, 8) : null;
   const started = formatTime(sessionStartedAt);
   const placeholder = <span className="text-muted-foreground">—</span>;
@@ -128,8 +134,8 @@ function SecurityPanel({
         <Title trailing={<Fingerprint size={14} strokeWidth={2} className="text-[#4B5AFF]" />}>
           SESSION_FINGERPRINT
         </Title>
-        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-          {fingerprintFormatted || placeholder}
+        <span className="font-mono text-xs font-normal tracking-wider">
+          {fingerprintNodes || placeholder}
         </span>
         <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
           Compare with desktop to verify
