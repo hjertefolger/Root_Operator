@@ -28,7 +28,7 @@ function TwoDots({ color = '#4B5AFF' }) {
   const [active, setActive] = useState(0);
 
   useEffect(() => {
-    const t = setInterval(() => setActive((p) => (p + 1) % 2), 320);
+    const t = setInterval(() => setActive((p) => (p + 1) % 2), 720);
     return () => clearInterval(t);
   }, []);
 
@@ -39,7 +39,7 @@ function TwoDots({ color = '#4B5AFF' }) {
     backgroundColor: color,
     opacity: active === idx ? 1 : 0.18,
     transform: active === idx ? 'scale(1)' : 'scale(0.78)',
-    transition: 'opacity 0.28s ease, transform 0.28s ease',
+    transition: 'opacity 0.6s ease, transform 0.6s ease',
   });
 
   return (
