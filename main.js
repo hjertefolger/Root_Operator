@@ -67,6 +67,8 @@ const KEYTAR_SERVICE = 'RootOperator';
 const KEYTAR_CF_TOKEN = 'cloudflare-token';
 const KEYTAR_TUNNEL_TOKEN = 'tunnel-token';
 const KEYTAR_WORKER_PRIVATE_KEY = 'worker-private-key';
+const DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY = 'desktopIdentityPrivateJwk';
+const DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY = 'desktopIdentityPublicJwk';
 
 // Worker API configuration (loaded from .env file)
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL || runtimeConfig.WORKER_BASE_URL || '';
@@ -88,7 +90,6 @@ let ptyProcess;
 let outputBuffer = "";
 let tunnelProcess;
 let wakeLock;
-let pendingConns = new Map(); // kid -> ws
 let activeClients = new Set();
 let currentTunnelUrl = null; // Track tunnel URL for state sync
 let isConnecting = false; // Track if tunnel is in the process of starting
@@ -301,36 +302,165 @@ function sanitizeTerminalOutput(data) {
 }
 
 // E2E ENCRYPTION MODULE
-// Provides zero-knowledge encryption using ECDH key exchange + AES-256-GCM
+// Provides zero-knowledge encryption using authenticated ECDH + AES-256-GCM
 
 // BIP39 wordlist for human-readable fingerprints (2048 words, 11 bits each)
 const BIP39_WORDS = require('./public/bip39-words.json');
 
 // Global state for current session fingerprint (shown in tray)
 let currentFingerprint = null;
+let desktopIdentityKeyPair = null;
+
+const E2E_INFO = Buffer.from('root-operator-e2e-v2');
+
+function canonicalizeJwk(jwk) {
+    return JSON.stringify(jwk);
+}
+
+function canonicalizeJwkBuffer(jwk) {
+    return Buffer.from(canonicalizeJwk(jwk), 'utf8');
+}
+
+function buildE2ETranscript(clientEcdhPubJwk, serverEcdhPubJwk) {
+    return Buffer.concat([
+        canonicalizeJwkBuffer(clientEcdhPubJwk),
+        canonicalizeJwkBuffer(serverEcdhPubJwk),
+    ]);
+}
+
+function deriveE2ETranscriptSalt(clientEcdhPubJwk, serverEcdhPubJwk) {
+    return crypto.createHash('sha256').update(
+        buildE2ETranscript(clientEcdhPubJwk, serverEcdhPubJwk)
+    ).digest();
+}
+
+function isValidRsaPssJwk(jwk) {
+    return Boolean(
+        jwk
+        && typeof jwk === 'object'
+        && jwk.kty === 'RSA'
+        && typeof jwk.n === 'string'
+        && jwk.n
+        && typeof jwk.e === 'string'
+        && jwk.e
+    );
+}
+
+function isValidEcdhPublicJwk(jwk) {
+    return Boolean(
+        jwk
+        && typeof jwk === 'object'
+        && jwk.kty === 'EC'
+        && jwk.crv === 'P-256'
+        && typeof jwk.x === 'string'
+        && jwk.x
+        && typeof jwk.y === 'string'
+        && jwk.y
+        && typeof jwk.d !== 'string'
+    );
+}
+
+function generateDesktopIdentityKeyPair() {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        publicExponent: 0x10001,
+    });
+
+    return {
+        publicKeyJwk: publicKey.export({ format: 'jwk' }),
+        privateKeyJwk: privateKey.export({ format: 'jwk' }),
+    };
+}
+
+function getOrCreateDesktopIdentityKeyPair() {
+    const storedPublicJwk = store.get(DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY);
+    const storedPrivateJwk = store.get(DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY);
+
+    if (isValidRsaPssJwk(storedPublicJwk) && isValidRsaPssJwk(storedPrivateJwk)) {
+        return {
+            publicKeyJwk: storedPublicJwk,
+            privateKeyJwk: storedPrivateJwk,
+        };
+    }
+
+    logDebug('[E2E] Generating desktop identity keypair');
+    const keyPair = generateDesktopIdentityKeyPair();
+    store.set(DESKTOP_IDENTITY_PUBLIC_JWK_STORE_KEY, keyPair.publicKeyJwk);
+    // TODO(#6): move to keychain
+    store.set(DESKTOP_IDENTITY_PRIVATE_JWK_STORE_KEY, keyPair.privateKeyJwk);
+    return keyPair;
+}
+
+function signRsaPssPayload(privateJwk, payload) {
+    const privateKey = crypto.createPrivateKey({ key: privateJwk, format: 'jwk' });
+    const signature = crypto.sign(
+        'sha256',
+        payload,
+        {
+            key: privateKey,
+            padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+            saltLength: 32,
+        }
+    );
+
+    return signature.toString('base64');
+}
+
+function closeE2EUnauthenticated(ws, reason) {
+    logDebug(`[E2E] ${reason}`);
+
+    if (ws.e2eTimeout) {
+        clearTimeout(ws.e2eTimeout);
+        ws.e2eTimeout = null;
+    }
+
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(E2E_UNAUTHENTICATED_CLOSE_CODE, E2E_UNAUTHENTICATED_CLOSE_REASON);
+    }
+}
 
 // Generate ECDH key pair for key exchange
-function generateECDHKeyPair() {
-    const ecdh = crypto.createECDH('prime256v1');
-    ecdh.generateKeys();
+async function generateECDHKeyPair() {
+    const keyPair = await crypto.webcrypto.subtle.generateKey(
+        {
+            name: 'ECDH',
+            namedCurve: 'P-256',
+        },
+        true,
+        ['deriveBits']
+    );
+
+    const publicJwk = await crypto.webcrypto.subtle.exportKey('jwk', keyPair.publicKey);
+
     return {
-        publicKey: ecdh.getPublicKey('base64'),
-        privateKey: ecdh.getPrivateKey('base64'),
-        ecdh: ecdh
+        keyPair,
+        publicJwk,
     };
 }
 
 // Derive shared secret from ECDH
-function deriveSharedSecret(ecdh, otherPublicKeyBase64) {
-    const otherPublicKey = Buffer.from(otherPublicKeyBase64, 'base64');
-    return ecdh.computeSecret(otherPublicKey);
+async function deriveSharedSecret(privateKey, otherPublicKeyJwk) {
+    const otherPublicKey = await crypto.webcrypto.subtle.importKey(
+        'jwk',
+        otherPublicKeyJwk,
+        { name: 'ECDH', namedCurve: 'P-256' },
+        false,
+        []
+    );
+
+    const sharedSecret = await crypto.webcrypto.subtle.deriveBits(
+        { name: 'ECDH', public: otherPublicKey },
+        privateKey,
+        256
+    );
+
+    return Buffer.from(sharedSecret);
 }
 
 // Derive AES-256-GCM key using HKDF
 function deriveSessionKey(sharedSecret, salt) {
     // Use HKDF to derive a 256-bit key
-    const info = Buffer.from('root-operator-e2e-v1');
-    const key = crypto.hkdfSync('sha256', sharedSecret, salt, info, 32);
+    const key = crypto.hkdfSync('sha256', sharedSecret, salt, E2E_INFO, 32);
     return Buffer.from(key);
 }
 
@@ -404,14 +534,19 @@ function decryptMessage(encrypted, sessionKey) {
 const E2E_SETUP_TIMEOUT_MS = 10000;
 
 // Initialize E2E for a WebSocket connection
-function initE2EKeyExchange(ws) {
-    const keyPair = generateECDHKeyPair();
-    const salt = crypto.randomBytes(16);
+async function initE2EKeyExchange(ws) {
+    if (!desktopIdentityKeyPair?.privateKeyJwk || !desktopIdentityKeyPair?.publicKeyJwk) {
+        logDebug('[E2E] FATAL: desktop identity keypair unavailable; refusing authenticated E2E setup');
+        closeE2EUnauthenticated(ws, 'Desktop identity keypair unavailable');
+        return false;
+    }
+
+    const keyPair = await generateECDHKeyPair();
 
     // Store on ws object for later use
     ws.e2e = {
-        ecdh: keyPair.ecdh,
-        salt: salt,
+        keyPair: keyPair.keyPair,
+        publicJwk: keyPair.publicJwk,
         sessionKey: null,
         fingerprint: null,
         ready: false
@@ -425,27 +560,42 @@ function initE2EKeyExchange(ws) {
         }
     }, E2E_SETUP_TIMEOUT_MS);
 
-    // Send our public key and salt to client
-    ws.send(JSON.stringify({
-        type: 'e2e_init',
-        publicKey: keyPair.publicKey,
-        salt: salt.toString('base64')
-    }));
-
-    logDebug('[E2E] Key exchange initiated');
+    logDebug('[E2E] Authenticated key exchange ready; awaiting client key');
+    return true;
 }
 
 // Complete E2E setup when we receive client's public key
-function completeE2EKeyExchange(ws, clientPublicKey) {
-    if (!ws.e2e || !ws.e2e.ecdh) {
-        logDebug('[E2E] Error: No ECDH context for this connection');
+async function completeE2EKeyExchange(ws, clientEcdhPubJwk, clientSignature) {
+    if (!ws.e2e || !ws.e2e.keyPair?.privateKey || !ws.e2e.publicJwk) {
+        closeE2EUnauthenticated(ws, 'Missing ECDH context for this connection');
         return false;
     }
 
     try {
-        const sharedSecret = deriveSharedSecret(ws.e2e.ecdh, clientPublicKey);
-        ws.e2e.sessionKey = deriveSessionKey(sharedSecret, ws.e2e.salt);
-        ws.e2e.fingerprint = generateFingerprint(sharedSecret, ws.e2e.salt);
+        if (!isValidEcdhPublicJwk(clientEcdhPubJwk) || typeof clientSignature !== 'string' || !clientSignature) {
+            closeE2EUnauthenticated(ws, 'Rejected malformed client E2E payload');
+            return false;
+        }
+
+        const authorized = store.get('keys', []);
+        const pairedDevice = authorized.find((key) => key.kid === ws.kid);
+        const clientPayload = canonicalizeJwkBuffer(clientEcdhPubJwk);
+
+        if (!pairedDevice?.jwk) {
+            closeE2EUnauthenticated(ws, `No paired RSA key available for device ${ws.kid || 'unknown'}`);
+            return false;
+        }
+
+        if (!verifySignatureWithJwk(pairedDevice.jwk, clientSignature, clientPayload, 'base64')) {
+            closeE2EUnauthenticated(ws, `Rejected unauthenticated client E2E key for ${ws.kid.substring(0, 8)}...`);
+            return false;
+        }
+
+        // Bind both ephemeral keys into the signature transcript so a MITM cannot splice halves.
+        const transcriptSalt = deriveE2ETranscriptSalt(clientEcdhPubJwk, ws.e2e.publicJwk);
+        const sharedSecret = await deriveSharedSecret(ws.e2e.keyPair.privateKey, clientEcdhPubJwk);
+        ws.e2e.sessionKey = deriveSessionKey(sharedSecret, transcriptSalt);
+        ws.e2e.fingerprint = generateFingerprint(sharedSecret, transcriptSalt);
         ws.e2e.ready = true;
 
         // Clear E2E setup timeout
@@ -459,11 +609,16 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
 
         logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
 
-        // Notify client that E2E is ready FIRST — client needs this
-        // before it can decrypt any buffered output
+        const serverSignature = signRsaPssPayload(
+            desktopIdentityKeyPair.privateKeyJwk,
+            buildE2ETranscript(clientEcdhPubJwk, ws.e2e.publicJwk)
+        );
+
+        // Send the signed server ephemeral key before any encrypted payloads.
         ws.send(JSON.stringify({
-            type: 'e2e_ready',
-            fingerprint: ws.e2e.fingerprint
+            type: 'e2e_server_key',
+            serverEcdhPubJwk: ws.e2e.publicJwk,
+            serverSignature,
         }));
 
         // Send operating mode so client shows the right UI
@@ -472,8 +627,8 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
             mode: operatingMode,
         }));
 
-        // Flush buffered output AFTER e2e_ready — WebSocket guarantees
-        // in-order delivery, so client processes e2e_ready before these
+        // Flush buffered output after the signed server key. WebSocket preserves
+        // ordering, so the client verifies the transcript before decrypting these.
         if (ws.pendingOutput && ws.pendingOutput.length > 0) {
             logDebug(`[E2E] Flushing ${ws.pendingOutput.length} buffered messages`);
             for (const data of ws.pendingOutput) {
@@ -489,7 +644,7 @@ function completeE2EKeyExchange(ws, clientPublicKey) {
 
         return true;
     } catch (e) {
-        logDebug(`[E2E] Key exchange failed: ${e.message}`);
+        closeE2EUnauthenticated(ws, `Key exchange failed: ${e.message}`);
         return false;
     }
 }
@@ -955,21 +1110,45 @@ function getActivityAssistantName() {
     return trimmedName || DEFAULT_ACTIVITY_ASSISTANT_NAME;
 }
 
-function getNotificationPreviewBody() {
-    const assistantName = getActivityAssistantName();
-    return `${assistantName} sent a new message`;
+function buildNotificationPreviewBody(content = '') {
+    if (typeof content !== 'string') {
+        return `${getActivityAssistantName()} sent a new message`;
+    }
+
+    const cleaned = content
+        .replace(/\s+/g, ' ')
+        .replace(/[`*_>#-]+/g, ' ')
+        .trim();
+
+    if (!cleaned) {
+        return `${getActivityAssistantName()} sent a new message`;
+    }
+
+    const maxLength = 140;
+    return cleaned.length > maxLength
+        ? `${cleaned.slice(0, maxLength - 1).trimEnd()}…`
+        : cleaned;
 }
 
-function getAssistantNotificationPayload(message = {}) {
+function getPushAssistantNotificationPayload(message = {}) {
+    const assistantName = getActivityAssistantName();
     return {
-        title: 'Root Operator',
-        body: getNotificationPreviewBody(),
+        title: 'Root_Operator',
+        body: buildNotificationPreviewBody(message.content),
         tag: 'root-operator-assistant-reply',
         url: PUSH_NOTIFICATION_TARGET_URL,
-        assistantName: getActivityAssistantName(),
+        assistantName,
         ts: message.ts || new Date().toISOString(),
         icon: '/icon-192-v3.png',
         badge: '/icon-192-v3.png',
+    };
+}
+
+function getDesktopAssistantNotificationPayload(message = {}) {
+    return {
+        title: 'Root Operator',
+        subtitle: getActivityAssistantName(),
+        body: buildNotificationPreviewBody(message.content),
     };
 }
 
@@ -1148,10 +1327,10 @@ function showDesktopAssistantNotification(message) {
         return;
     }
 
-    const payload = getAssistantNotificationPayload(message);
+    const payload = getDesktopAssistantNotificationPayload(message);
     const notification = new Notification({
         title: payload.title,
-        subtitle: payload.assistantName,
+        subtitle: payload.subtitle,
         body: payload.body,
         icon: path.join(__dirname, 'public', 'icon-192-v3.png'),
         silent: false,
@@ -1185,7 +1364,7 @@ async function notifyPushSubscribers(message) {
         return;
     }
 
-    const payload = getAssistantNotificationPayload(message);
+    const payload = getPushAssistantNotificationPayload(message);
     const results = await Promise.allSettled(subscriptions.map((entry) => sendPushNotification(entry, payload)));
     const failures = results.filter((result) => result.status === 'rejected');
     if (failures.length > 0) {
@@ -2895,6 +3074,13 @@ app.whenReady().then(async () => {
 
     const { default: ES } = await import('electron-store');
     store = new ES();
+    try {
+        desktopIdentityKeyPair = getOrCreateDesktopIdentityKeyPair();
+        logDebug('[E2E] Desktop identity keypair ready');
+    } catch (error) {
+        desktopIdentityKeyPair = null;
+        logDebug(`[E2E] FATAL: failed to initialize desktop identity keypair: ${error.message}`);
+    }
     configureWebPush();
     logFile = path.join(app.getPath('userData'), 'pocket_bridge_debug.log');
     updater = new AppUpdater({
@@ -3191,6 +3377,19 @@ function logDebug(msg) {
 
 // 3. BRIDGE LOGIC
 
+function getHostnameFromUrl(url, label) {
+    if (!url || typeof url !== 'string') {
+        return null;
+    }
+
+    try {
+        return new URL(url).hostname.toLowerCase();
+    } catch (error) {
+        logDebug(`[SECURITY] Failed to parse ${label}: ${error.message}`);
+        return null;
+    }
+}
+
 // Allowed origins for WebSocket connections
 // In production with Cloudflare tunnel, origin will be the tunnel URL
 function isOriginAllowed(origin, cfSettings) {
@@ -3206,38 +3405,47 @@ function isOriginAllowed(origin, cfSettings) {
         return false;
     }
 
+    let originUrl;
+    try {
+        originUrl = new URL(origin);
+    } catch (error) {
+        logDebug(`[SECURITY] Rejecting malformed origin: ${origin}`);
+        return false;
+    }
+
+    const originHost = originUrl.hostname.toLowerCase();
+
     // Allow localhost for local development
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+    if (originHost === 'localhost' || originHost === '127.0.0.1') {
         return true;
     }
 
-    // Allow trycloudflare.com quick tunnels
-    if (origin.includes('.trycloudflare.com')) {
-        return true;
+    const allowedHosts = new Set();
+    const activeTunnelHost = getHostnameFromUrl(currentTunnelUrl, 'current tunnel URL');
+    if (activeTunnelHost) {
+        allowedHosts.add(activeTunnelHost);
     }
 
-    // Allow Worker-assigned domain (configured via WORKER_DOMAIN env var)
-    if (WORKER_DOMAIN && origin.includes(WORKER_DOMAIN)) {
-        return true;
-    }
-
-    // Allow configured custom domain
     if (cfSettings && cfSettings.domain) {
-        const domain = cfSettings.domain.replace(/^https?:\/\//, '');
-        if (origin.includes(domain)) {
-            return true;
+        const normalizedDomain = cfSettings.domain.startsWith('http')
+            ? cfSettings.domain
+            : `https://${cfSettings.domain}`;
+        const configuredHost = getHostnameFromUrl(normalizedDomain, 'configured domain');
+        // SECURITY: Trust a custom domain only while it is the live bridge hostname for this session.
+        if (configuredHost && configuredHost === activeTunnelHost) {
+            allowedHosts.add(configuredHost);
         }
     }
 
-    return false;
+    return allowedHosts.has(originHost);
 }
 
 async function startBridge(cfSettings) {
     isConnecting = true;
     syncStateWithRenderer();
 
-    // Store settings for origin validation (include Worker domain)
-    const storedCfSettings = { ...cfSettings, domain: cfSettings?.domain || WORKER_DOMAIN };
+    // Store only the configured settings; live origin trust comes from currentTunnelUrl.
+    const storedCfSettings = { ...(cfSettings || {}) };
 
     // A. Start HTTP/WebSocket Server
     server = http.createServer((req, res) => servePWA(req, res));
@@ -3294,7 +3502,8 @@ async function startBridge(cfSettings) {
         });
     });
 
-    server.listen(INTERNAL_PORT);
+    // SECURITY: keep the bridge off LAN interfaces; only the local tunnel should reach it.
+    server.listen(INTERNAL_PORT, '127.0.0.1');
 
     // Initialize channel mode if that's the default
     if (operatingMode === 'channel') {
@@ -3463,7 +3672,6 @@ function stopBridge() {
     ptyProcess = null;
     outputBuffer = "";
     activeClients.clear();
-    pendingConns.clear();
     pendingPairings.clear();
     currentTunnelUrl = null;
     currentFingerprint = null;
@@ -3480,8 +3688,20 @@ const CHALLENGE_EXPIRY_MS = 30000; // Challenge expires after 30 seconds
 const MAX_CONNECTIONS_PER_MINUTE = 20;
 const MAX_AUTH_ATTEMPTS_PER_CONNECTION = 3;
 const MAX_INPUT_SIZE = 131072; // Max bytes per input message (128KB)
+const SESSION_REVOKED_CLOSE_CODE = 4001;
+const E2E_UNAUTHENTICATED_CLOSE_CODE = 4002;
+const E2E_UNAUTHENTICATED_CLOSE_REASON = 'e2e_unauthenticated';
 
 let connectionAttempts = [];
+
+function isKidAuthorized(kid) {
+    if (!kid) {
+        return false;
+    }
+
+    const authorized = store.get('keys', []);
+    return authorized.some((key) => key.kid === kid);
+}
 
 function isRateLimited() {
     const now = Date.now();
@@ -3498,6 +3718,96 @@ function generatePairingCode() {
         code += PAIRING_CODE_CHARS[randomBytes[i] % PAIRING_CODE_CHARS.length];
     }
     return code;
+}
+
+function isValidKeyId(keyId) {
+    return typeof keyId === 'string' && /^[a-f0-9]{64}$/i.test(keyId);
+}
+
+function isValidPairingJwk(jwk) {
+    return isValidRsaPssJwk(jwk);
+}
+
+function computeKeyIdFromJwk(jwk) {
+    return crypto.createHash('sha256').update(canonicalizeJwk(jwk)).digest('hex');
+}
+
+function verifySignatureWithJwk(jwk, signature, payload, encoding = 'hex') {
+    if (!isValidRsaPssJwk(jwk) || typeof signature !== 'string' || !signature) {
+        return false;
+    }
+
+    try {
+        const pubKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+        return crypto.verify(
+            'sha256',
+            Buffer.isBuffer(payload) ? payload : Buffer.from(payload),
+            {
+                key: pubKey,
+                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+                saltLength: 32,
+            },
+            Buffer.from(signature, encoding)
+        );
+    } catch (error) {
+        logDebug(`[SECURITY] Pairing signature verification error: ${error.message}`);
+        return false;
+    }
+}
+
+function settlePendingPairingApproval(ws, result) {
+    if (!ws?.pendingPairingApproval) {
+        return;
+    }
+
+    const { timeoutId, resolve } = ws.pendingPairingApproval;
+    clearTimeout(timeoutId);
+    ws.pendingPairingApproval = null;
+    resolve(result);
+}
+
+function cleanupClientConnection(ws, options = {}) {
+    if (!ws || ws.connectionCleanedUp) {
+        return;
+    }
+
+    ws.connectionCleanedUp = true;
+    clearTimeout(ws.authTimeout);
+    if (ws.e2eTimeout) {
+        clearTimeout(ws.e2eTimeout);
+        ws.e2eTimeout = null;
+    }
+    activeClients.delete(ws);
+    for (const [code, data] of pendingPairings.entries()) {
+        if (data.ws === ws) {
+            pendingPairings.delete(code);
+        }
+    }
+    if (ws.pendingPairingApproval) {
+        settlePendingPairingApproval(ws, {
+            success: false,
+            error: options.pairingError || 'Device disconnected before pairing verification completed',
+        });
+    }
+    ws.pendingOutput = [];
+    ws.challenge = null;
+    ws.challengeTime = null;
+    ws.challengeKeyId = null;
+    ws.e2e = null;
+}
+
+function revokeClientConnection(ws, reason = 'Device removed') {
+    if (!ws || ws.connectionCleanedUp) {
+        return;
+    }
+
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'session_revoked', reason }));
+    }
+    cleanupClientConnection(ws, { pairingError: reason });
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(SESSION_REVOKED_CLOSE_CODE, 'revoked');
+    }
 }
 
 // Cleanup expired pairing codes
@@ -3543,7 +3853,7 @@ function handleConnection(ws, req) {
         console.error('[WS] Error:', err);
     });
 
-    ws.on('message', (msg) => {
+    ws.on('message', async (msg) => {
         let m;
         try {
             // SECURITY: Message size limit (defense in depth - maxPayload already enforces at WebSocket level)
@@ -3567,8 +3877,8 @@ function handleConnection(ws, req) {
         if (!ws.authenticated && m.type === 'pairing_request') {
             // Validate required fields
             if (!m.code || typeof m.code !== 'string' ||
-                !m.keyId || typeof m.keyId !== 'string' ||
-                !m.jwk || typeof m.jwk !== 'object' || m.jwk.kty !== 'RSA') {
+                !isValidKeyId(m.keyId) ||
+                !isValidPairingJwk(m.jwk)) {
                 ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid request' }));
                 return;
             }
@@ -3579,6 +3889,12 @@ function handleConnection(ws, req) {
             // Validate code format
             if (code.length !== 6 || !/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/.test(code)) {
                 ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid code format' }));
+                return;
+            }
+
+            if (computeKeyIdFromJwk(m.jwk) !== m.keyId) {
+                logDebug('[SECURITY] Rejected pairing request with mismatched key ID');
+                ws.send(JSON.stringify({ type: 'pairing_error', message: 'Invalid device identity' }));
                 return;
             }
 
@@ -3649,7 +3965,7 @@ function handleConnection(ws, req) {
             }
 
             // Validate required fields
-            if (!m.keyId || typeof m.keyId !== 'string' ||
+            if (!isValidKeyId(m.keyId) ||
                 !m.signature || typeof m.signature !== 'string') {
                 logDebug('[SECURITY] Invalid auth response format');
                 return;
@@ -3663,28 +3979,80 @@ function handleConnection(ws, req) {
             }
 
             logDebug(`[WS] Auth response from KID: ${m.keyId.substring(0, 8)}`);
-            if (verifySignature(m.keyId, m.signature, ws.challenge)) {
+            const approvedPairing = ws.pendingPairingApproval;
+            const isApprovedPairing = approvedPairing && approvedPairing.kid === m.keyId;
+            const isValidSignature = isApprovedPairing
+                ? verifySignatureWithJwk(approvedPairing.jwk, m.signature, ws.challenge)
+                : verifySignature(m.keyId, m.signature, ws.challenge);
+
+            if (isValidSignature) {
                 logDebug(`[WS] Auth SUCCESS: ${m.keyId.substring(0, 8)}`);
+
+                if (isApprovedPairing) {
+                    const keys = store.get('keys', []);
+                    if (!keys.find(k => k.kid === approvedPairing.kid)) {
+                        keys.push({
+                            kid: approvedPairing.kid,
+                            jwk: approvedPairing.jwk,
+                            name: approvedPairing.name,
+                        });
+                        store.set('keys', keys);
+                    }
+                }
+
+                let e2eInitialized = false;
+                try {
+                    e2eInitialized = await initE2EKeyExchange(ws);
+                } catch (error) {
+                    closeE2EUnauthenticated(ws, `Failed to initialize authenticated E2E state: ${error.message}`);
+                }
+                if (!e2eInitialized) {
+                    if (isApprovedPairing) {
+                        settlePendingPairingApproval(ws, {
+                            success: false,
+                            error: 'Desktop identity unavailable for authenticated E2E',
+                        });
+                    }
+                    ws.challenge = null;
+                    ws.challengeTime = null;
+                    ws.challengeKeyId = null;
+                    return;
+                }
+
                 ws.authenticated = true;
                 ws.kid = m.keyId;
                 clearTimeout(ws.authTimeout);
-                ws.send(JSON.stringify({ type: 'auth_success' }));
-                // Initiate E2E key exchange
-                initE2EKeyExchange(ws);
+                ws.send(JSON.stringify(
+                    isApprovedPairing
+                        ? {
+                            type: 'pairing_success',
+                            serverIdentityJwk: desktopIdentityKeyPair.publicKeyJwk,
+                        }
+                        : { type: 'auth_success' }
+                ));
                 startPty(ws);
+                if (isApprovedPairing) {
+                    settlePendingPairingApproval(ws, { success: true });
+                }
             } else {
                 logDebug(`[WS] Auth FAILED: ${m.keyId.substring(0, 8)}`);
                 ws.send(JSON.stringify({ type: 'auth_error', message: 'Authentication failed' }));
+                if (isApprovedPairing) {
+                    settlePendingPairingApproval(ws, {
+                        success: false,
+                        error: 'Device could not prove ownership of its pairing key',
+                    });
+                }
             }
+            ws.challenge = null;
+            ws.challengeTime = null;
+            ws.challengeKeyId = null;
             return;
         }
 
-        // Register Key (If user approves)
-        if (m.type === 'register_key') {
-            const keys = store.get('keys', []);
-            keys.push({ kid: m.kid, jwk: m.jwk });
-            store.set('keys', keys);
-            ws.send(JSON.stringify({ type: 'registered' }));
+        if (ws.authenticated && !isKidAuthorized(ws.kid)) {
+            logDebug(`[SECURITY] Rejected post-auth message for revoked device: ${ws.kid.substring(0, 8)}...`);
+            revokeClientConnection(ws, 'Device removed');
             return;
         }
 
@@ -3721,11 +4089,7 @@ function handleConnection(ws, req) {
 
         // E2E: Receive client's ECDH public key
         if (ws.authenticated && m.type === 'e2e_client_key') {
-            if (m.publicKey && typeof m.publicKey === 'string') {
-                completeE2EKeyExchange(ws, m.publicKey);
-            } else {
-                logDebug('[E2E] Invalid client key format');
-            }
+            await completeE2EKeyExchange(ws, m.clientEcdhPubJwk, m.clientSignature);
             return;
         }
 
@@ -3800,16 +4164,7 @@ function handleConnection(ws, req) {
     });
 
     ws.on('close', () => {
-        clearTimeout(ws.authTimeout);
-        activeClients.delete(ws);
-        // Cleanup pending conns if any
-        for (let [kid, pWs] of pendingConns.entries()) {
-            if (pWs === ws) pendingConns.delete(kid);
-        }
-        // Cleanup pending pairings if any
-        for (const [code, data] of pendingPairings.entries()) {
-            if (data.ws === ws) pendingPairings.delete(code);
-        }
+        cleanupClientConnection(ws);
     });
 }
 
@@ -3861,7 +4216,6 @@ function startPty(ws) {
         type: 'system_status',
         state: getTunnelState(),
     }));
-    sendNotificationState(ws);
 
     // In channel mode, don't spawn PTY — just track the client
     if (operatingMode === 'channel') {
@@ -4115,30 +4469,8 @@ function serveStaticPWA(req, res) {
     });
 }
 
-ipcMain.handle('REGISTER_KEY', (event, { kid, jwk }) => {
-    const keys = store.get('keys', []);
-    if (!keys.find(k => k.kid === kid)) {
-        keys.push({ kid, jwk });
-        store.set('keys', keys);
-    }
-
-    // If there's a pending connection, notify it to acceptance
-    const ws = pendingConns.get(kid);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.authenticated = true;
-        ws.kid = kid;
-        ws.send(JSON.stringify({ type: 'auth_success' }));
-        // Initiate E2E key exchange
-        initE2EKeyExchange(ws);
-        startPty(ws);
-    }
-    pendingConns.delete(kid);
-
-    return { success: true };
-});
-
 // Verify pairing code and approve device
-ipcMain.handle('VERIFY_PAIRING_CODE', (event, code, deviceName) => {
+ipcMain.handle('VERIFY_PAIRING_CODE', async (event, code, deviceName) => {
     const normalizedCode = code.toUpperCase().replace(/[^ABCDEFGHJKMNPQRSTUVWXYZ23456789]/g, '');
 
     if (normalizedCode.length !== 6) {
@@ -4156,28 +4488,54 @@ ipcMain.handle('VERIFY_PAIRING_CODE', (event, code, deviceName) => {
         return { success: false, error: 'Code expired' };
     }
 
-    // Save the key with device name
-    const keys = store.get('keys', []);
-    if (!keys.find(k => k.kid === pairing.kid)) {
-        keys.push({ kid: pairing.kid, jwk: pairing.jwk, name: deviceName });
-        store.set('keys', keys);
+    const ws = pairing.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        pendingPairings.delete(normalizedCode);
+        return { success: false, error: 'Device is no longer connected' };
     }
 
-    // Notify the client
-    const ws = pairing.ws;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.authenticated = true;
-        ws.kid = pairing.kid;
-        clearTimeout(ws.authTimeout);
-        ws.send(JSON.stringify({ type: 'pairing_success' }));
-        initE2EKeyExchange(ws);
-        startPty(ws);
+    if (ws.pendingPairingApproval) {
+        return { success: false, error: 'Device verification is already in progress' };
     }
 
     pendingPairings.delete(normalizedCode);
-    logDebug(`[PAIRING] Device paired successfully: ${pairing.kid.substring(0, 8)}...`);
+    const challenge = crypto.randomBytes(32).toString('hex');
+    ws.challenge = challenge;
+    ws.challengeTime = Date.now();
+    ws.challengeKeyId = pairing.kid;
 
-    return { success: true };
+    return await new Promise((resolve) => {
+        const timeoutId = setTimeout(() => {
+            if (ws.pendingPairingApproval) {
+                logDebug(`[PAIRING] Device verification timed out: ${pairing.kid.substring(0, 8)}...`);
+                ws.send(JSON.stringify({ type: 'auth_error', message: 'Pairing verification timed out' }));
+                settlePendingPairingApproval(ws, {
+                    success: false,
+                    error: 'Device verification timed out',
+                });
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.close(1008, 'Pairing verification timed out');
+                }
+            }
+        }, CHALLENGE_EXPIRY_MS);
+
+        ws.pendingPairingApproval = {
+            kid: pairing.kid,
+            jwk: pairing.jwk,
+            name: deviceName,
+            timeoutId,
+            resolve: (result) => {
+                if (result.success) {
+                    logDebug(`[PAIRING] Device paired successfully: ${pairing.kid.substring(0, 8)}...`);
+                } else {
+                    logDebug(`[PAIRING] Device verification failed: ${pairing.kid.substring(0, 8)}... ${result.error || ''}`.trim());
+                }
+                resolve(result);
+            },
+        };
+
+        ws.send(JSON.stringify({ type: 'auth_challenge', challenge }));
+    });
 });
 
 // Get list of paired devices
@@ -4202,6 +4560,12 @@ ipcMain.handle('REMOVE_PAIRED_DEVICE', (event, kid) => {
     const filtered = keys.filter(k => k.kid !== kid);
     store.set('keys', filtered);
     removePushSubscriptionsForKid(kid);
+    // SECURITY: Evict live sockets immediately so revocation takes effect mid-session.
+    for (const client of Array.from(activeClients)) {
+        if (client.kid === kid) {
+            revokeClientConnection(client, 'Device removed');
+        }
+    }
     logDebug(`[PAIRING] Device removed: ${kid.substring(0, 8)}`);
     return { success: true };
 });

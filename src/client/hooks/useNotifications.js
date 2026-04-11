@@ -37,6 +37,15 @@ async function registerServiceWorker() {
   return navigator.serviceWorker.register('/sw.js', { scope: '/' });
 }
 
+function getSubscriptionSignature(subscription) {
+  if (!subscription || typeof subscription.toJSON !== 'function') {
+    return '';
+  }
+
+  const serialized = subscription.toJSON();
+  return `${serialized.endpoint}:${serialized.keys?.p256dh || ''}:${serialized.keys?.auth || ''}`;
+}
+
 function getPlatformLabel() {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   const isIOS = /iPhone|iPad|iPod/i.test(ua);
@@ -62,16 +71,30 @@ export function useNotifications(socket, isAuthenticated) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const syncSignatureRef = useRef('');
+  const pendingStateRequestRef = useRef(null);
 
   const requestServerState = useCallback(() => {
     if (!socket || socket.readyState !== WebSocket.OPEN || !isAuthenticated) {
-      return;
+      return Promise.reject(new Error('Reconnect the chat first, then enable notifications.'));
     }
 
-    socket.send(JSON.stringify({ type: 'notifications_get_state' }));
+    return new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingStateRequestRef.current = null;
+        reject(new Error('Notification setup timed out. Please try again.'));
+      }, 4000);
+
+      pendingStateRequestRef.current = {
+        resolve,
+        reject,
+        timeoutId,
+      };
+
+      socket.send(JSON.stringify({ type: 'notifications_get_state' }));
+    });
   }, [socket, isAuthenticated]);
 
-  const syncSubscription = useCallback(async ({ allowSubscribe = false } = {}) => {
+  const syncSubscription = useCallback(async (nextVapidPublicKey) => {
     if (!supported || !socket || socket.readyState !== WebSocket.OPEN || !isAuthenticated) {
       return false;
     }
@@ -80,17 +103,9 @@ export function useNotifications(socket, isAuthenticated) {
     let subscription = await registration.pushManager.getSubscription();
 
     if (!subscription) {
-      if (!allowSubscribe) {
-        return false;
-      }
-
-      if (!vapidPublicKey) {
-        throw new Error('Notification setup is still loading. Please try again in a moment.');
-      }
-
       subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+        applicationServerKey: urlBase64ToUint8Array(nextVapidPublicKey),
       });
     }
 
@@ -109,7 +124,24 @@ export function useNotifications(socket, isAuthenticated) {
     }));
 
     return true;
-  }, [isAuthenticated, socket, subscribed, supported, vapidPublicKey]);
+  }, [isAuthenticated, socket, subscribed, supported]);
+
+  const refreshLocalState = useCallback(async () => {
+    const nextPermission = typeof Notification === 'undefined' ? 'default' : Notification.permission;
+    setPermission(nextPermission);
+
+    if (!supported || !window.isSecureContext || nextPermission !== 'granted') {
+      syncSignatureRef.current = '';
+      setSubscribed(false);
+      return { permission: nextPermission, subscription: null };
+    }
+
+    const registration = await registerServiceWorker();
+    const subscription = await registration.pushManager.getSubscription();
+    syncSignatureRef.current = getSubscriptionSignature(subscription);
+    setSubscribed(Boolean(subscription));
+    return { permission: nextPermission, subscription };
+  }, [supported]);
 
   const enableNotifications = useCallback(async () => {
     setError('');
@@ -120,6 +152,18 @@ export function useNotifications(socket, isAuthenticated) {
           ? 'Notifications are not available in this browser.'
           : 'Install the PWA to enable notifications on this device.'
       );
+      return false;
+    }
+
+    if (!window.isSecureContext) {
+      setError('Notifications require a secure HTTPS connection.');
+      return false;
+    }
+
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+    const isIOS = /iPhone|iPad|iPod/i.test(ua);
+    if (isIOS && !isStandaloneDisplayMode()) {
+      setError('Add Root Operator to the Home Screen to enable notifications on iPhone or iPad.');
       return false;
     }
 
@@ -147,12 +191,15 @@ export function useNotifications(socket, isAuthenticated) {
         );
       }
 
-      if (!vapidPublicKey) {
-        requestServerState();
-        throw new Error('Notification setup is still loading. Please tap again in a moment.');
+      const state = await requestServerState();
+      const nextVapidPublicKey = typeof state?.vapidPublicKey === 'string' ? state.vapidPublicKey : vapidPublicKey;
+      if (!nextVapidPublicKey) {
+        throw new Error('The desktop app did not provide push setup details.');
       }
 
-      await syncSubscription({ allowSubscribe: true });
+      setVapidPublicKey(nextVapidPublicKey);
+      setSubscribed(Boolean(state?.subscribed));
+      await syncSubscription(nextVapidPublicKey);
       setSubscribed(true);
       return true;
     } catch (notificationError) {
@@ -180,31 +227,75 @@ export function useNotifications(socket, isAuthenticated) {
       if (msg.type === 'notifications_state') {
         setVapidPublicKey(typeof msg.vapidPublicKey === 'string' ? msg.vapidPublicKey : '');
         setSubscribed(Boolean(msg.subscribed));
+        if (pendingStateRequestRef.current) {
+          clearTimeout(pendingStateRequestRef.current.timeoutId);
+          pendingStateRequestRef.current.resolve(msg);
+          pendingStateRequestRef.current = null;
+        }
         return;
       }
 
       if (msg.type === 'notifications_error') {
+        if (pendingStateRequestRef.current) {
+          clearTimeout(pendingStateRequestRef.current.timeoutId);
+          pendingStateRequestRef.current.reject(new Error(msg.message || 'Notifications are unavailable right now.'));
+          pendingStateRequestRef.current = null;
+        }
         setError(msg.message || 'Notifications are unavailable right now.');
       }
     };
 
     socket.addEventListener('message', handleMessage);
-    return () => socket.removeEventListener('message', handleMessage);
+    return () => {
+      socket.removeEventListener('message', handleMessage);
+      if (pendingStateRequestRef.current) {
+        clearTimeout(pendingStateRequestRef.current.timeoutId);
+        pendingStateRequestRef.current = null;
+      }
+    };
   }, [socket]);
 
   useEffect(() => {
-    requestServerState();
-  }, [requestServerState]);
+    let cancelled = false;
 
-  useEffect(() => {
-    if (!supported || permission !== 'granted') {
-      return;
-    }
+    const hydrateNotificationState = async () => {
+      try {
+        const { subscription } = await refreshLocalState();
+        if (
+          cancelled
+          || !subscription
+          || !socket
+          || socket.readyState !== WebSocket.OPEN
+          || !isAuthenticated
+        ) {
+          return;
+        }
 
-    syncSubscription().catch((syncError) => {
-      console.warn('[NOTIFICATIONS] Failed to sync existing subscription:', syncError.message);
-    });
-  }, [permission, supported, syncSubscription]);
+        const state = await requestServerState();
+        if (cancelled) {
+          return;
+        }
+
+        const nextVapidPublicKey = typeof state?.vapidPublicKey === 'string' ? state.vapidPublicKey : '';
+        setVapidPublicKey(nextVapidPublicKey);
+
+        if (!state?.subscribed) {
+          await syncSubscription(nextVapidPublicKey);
+          if (!cancelled) {
+            setSubscribed(true);
+          }
+        }
+      } catch (syncError) {
+        console.warn('[NOTIFICATIONS] Failed to refresh notification state:', syncError);
+      }
+    };
+
+    hydrateNotificationState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, refreshLocalState, requestServerState, socket, syncSubscription]);
 
   useEffect(() => {
     if (typeof document === 'undefined' || typeof Notification === 'undefined') {
@@ -212,12 +303,14 @@ export function useNotifications(socket, isAuthenticated) {
     }
 
     const handleVisibilityChange = () => {
-      setPermission(Notification.permission);
+      refreshLocalState().catch((refreshError) => {
+        console.warn('[NOTIFICATIONS] Failed to refresh local notification state:', refreshError);
+      });
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, []);
+  }, [refreshLocalState]);
 
   const enabled = subscribed && permission === 'granted';
   const title = error

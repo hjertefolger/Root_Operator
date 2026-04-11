@@ -44,17 +44,7 @@ function App() {
   const [channelActivities, setChannelActivities] = useState([]);
 
   // Initialize WebSocket connection
-  const { socket, isReady, connectionState } = useWebSocket();
-
-  // Initialize E2E encryption
-  const {
-    e2eReady,
-    fingerprint,
-    encryptInput,
-    decryptOutput,
-    handleE2EInit,
-    handleE2EReady
-  } = useE2E(socket);
+  const { socket, connectionState, disconnect } = useWebSocket();
 
   // Initialize authentication with pairing flow
   const {
@@ -63,9 +53,27 @@ function App() {
     pairingCode,
     pairingStatus,
     pairingError,
+    serverIdentityJwk,
+    signPayload,
+    handleSecurityFailure,
     wasAuthenticatedThisSession
   } = useAuth(socket);
   const notifications = useNotifications(socket, isAuthenticated);
+
+  // Initialize E2E encryption
+  const {
+    e2eReady,
+    encryptInput,
+    decryptOutput,
+    handleServerKeyMessage
+  } = useE2E({
+    socket,
+    isAuthenticated,
+    serverIdentityJwk,
+    signPayload,
+    onSecurityFailure: handleSecurityFailure,
+    disconnect
+  });
 
   // Toggle between channel and terminal mode
   const handleToggleMode = useCallback(() => {
@@ -91,14 +99,8 @@ function App() {
         return;
       }
 
-      // E2E key exchange
-      if (msg.type === 'e2e_init') {
-        await handleE2EInit(msg.publicKey, msg.salt);
-      }
-
-      // E2E ready
-      if (msg.type === 'e2e_ready') {
-        handleE2EReady(msg.fingerprint);
+      if (msg.type === 'e2e_server_key') {
+        await handleServerKeyMessage(msg);
       }
 
       // Operating mode from server
@@ -140,7 +142,7 @@ function App() {
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, handleE2EInit, handleE2EReady, decryptOutput]);
+  }, [socket, handleServerKeyMessage, decryptOutput]);
 
   // Safe area wrapper for overlay screens
   const SafeAreaWrapper = ({ children }) => (
@@ -204,7 +206,6 @@ function App() {
     <div className="h-dvh w-full flex flex-col bg-black pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
       <div className="flex-shrink-0 bg-black h-[env(safe-area-inset-top)]" />
       <Header
-        fingerprint={fingerprint}
         connectionState={connectionState}
         clientMode={clientMode}
         onToggleMode={handleToggleMode}

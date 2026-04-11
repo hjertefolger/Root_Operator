@@ -8,7 +8,9 @@ self.addEventListener('activate', (event) => {
 
 function normalizeNotificationPayload(data) {
   const payload = data && typeof data === 'object' ? data : {};
-  const title = typeof payload.title === 'string' && payload.title ? payload.title : 'Root Operator';
+  const title = typeof payload.title === 'string' && payload.title
+    ? payload.title
+    : (typeof payload.assistantName === 'string' && payload.assistantName ? payload.assistantName : 'New message');
   const body = typeof payload.body === 'string' && payload.body ? payload.body : 'Operator sent a new message';
   const url = typeof payload.url === 'string' && payload.url ? payload.url : '/';
 

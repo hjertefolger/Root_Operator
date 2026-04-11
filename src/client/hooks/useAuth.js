@@ -6,6 +6,31 @@ const RSA_PSS_PARAMS = {
   hash: "SHA-256"
 };
 
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function canonicalizeJwk(jwk) {
+  return JSON.stringify(jwk);
+}
+
+function isValidRsaPssJwk(jwk) {
+  return Boolean(
+    jwk
+    && typeof jwk === 'object'
+    && jwk.kty === 'RSA'
+    && typeof jwk.n === 'string'
+    && jwk.n
+    && typeof jwk.e === 'string'
+    && jwk.e
+  );
+}
+
 // Pairing code characters (no ambiguous chars)
 const PAIRING_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
@@ -78,6 +103,14 @@ async function clearIndexedDB() {
   });
 }
 
+function getCurrentHostname() {
+  if (typeof window === 'undefined' || !window.location?.hostname) {
+    return '';
+  }
+
+  return window.location.hostname.toLowerCase();
+}
+
 // Migrate from localStorage to IndexedDB (one-time migration)
 async function migrateFromLocalStorage() {
   const storedKeys = localStorage.getItem('pocket_bridge_keys');
@@ -110,15 +143,20 @@ export function useAuth(socket) {
   const [keysReady, setKeysReady] = useState(false);
   const [serverReady, setServerReady] = useState(false);
   const [isReturningDevice, setIsReturningDevice] = useState(false);
+  const [serverIdentityJwk, setServerIdentityJwk] = useState(null);
   const [wasAuthenticatedThisSession, setWasAuthenticatedThisSession] = useState(false);
   const keyPairRef = useRef(null); // Holds CryptoKey objects (non-extractable private key)
   const keyIdRef = useRef(null);
   const publicJwkRef = useRef(null); // Cached public JWK for sending to server
+  const serverIdentityJwkRef = useRef(null);
+  const fatalSecurityErrorRef = useRef(null);
   const pairingInitiatedRef = useRef(false);
 
   // Setup or load RSA-PSS keys from IndexedDB
   useEffect(() => {
     async function setupKeys() {
+      const currentHostname = getCurrentHostname();
+
       // First, check for and migrate any legacy localStorage keys
       const migrationResult = await migrateFromLocalStorage();
       if (migrationResult?.hadLegacyKeys) {
@@ -130,20 +168,50 @@ export function useAuth(socket) {
         const storedData = await getKeysFromIndexedDB();
 
         if (storedData && storedData.privateKey && storedData.publicKey && storedData.kid) {
-          // SECURITY: Keys stored in IndexedDB are CryptoKey objects
-          // The private key is non-extractable, so it cannot be stolen via XSS
-          keyPairRef.current = {
-            privateKey: storedData.privateKey,
-            publicKey: storedData.publicKey
-          };
-          keyIdRef.current = storedData.kid;
-          publicJwkRef.current = storedData.publicJwk;
+          const storedHostname = typeof storedData.hostname === 'string'
+            ? storedData.hostname.toLowerCase()
+            : '';
 
-          console.log('[AUTH] Loaded existing keypair from IndexedDB - returning device');
-          setIsReturningDevice(true);
-          setKeysReady(true);
-          setIsLoading(false);
-          return;
+          if (storedHostname && storedHostname !== currentHostname) {
+            // SECURITY: Never silently reuse a keypair across different hostnames.
+            console.warn(`[AUTH] Stored keypair is bound to ${storedHostname}; current hostname is ${currentHostname}. Clearing stored keypair.`);
+            await clearIndexedDB();
+          } else {
+            if (!storedHostname && currentHostname) {
+              try {
+                await saveKeysToIndexedDB({
+                  ...storedData,
+                  hostname: currentHostname
+                });
+                storedData.hostname = currentHostname;
+                console.log('[AUTH] Bound existing IndexedDB keypair to current hostname');
+              } catch (migrationError) {
+                console.warn('[AUTH] Failed to bind existing keypair to current hostname:', migrationError);
+              }
+            }
+
+            if (!isValidRsaPssJwk(storedData.serverIdentityJwk)) {
+              console.warn('[AUTH] Stored device record is missing the desktop identity key; clearing and re-pairing.');
+              await clearIndexedDB();
+            } else {
+              // SECURITY: Keys stored in IndexedDB are CryptoKey objects
+              // The private key is non-extractable, so it cannot be stolen via XSS
+              keyPairRef.current = {
+                privateKey: storedData.privateKey,
+                publicKey: storedData.publicKey
+              };
+              keyIdRef.current = storedData.kid;
+              publicJwkRef.current = storedData.publicJwk;
+              serverIdentityJwkRef.current = storedData.serverIdentityJwk;
+              setServerIdentityJwk(storedData.serverIdentityJwk);
+
+              console.log('[AUTH] Loaded existing keypair from IndexedDB - returning device');
+              setIsReturningDevice(true);
+              setKeysReady(true);
+              setIsLoading(false);
+              return;
+            }
+          }
         }
       } catch (e) {
         console.error('[AUTH] Failed to load keys from IndexedDB:', e);
@@ -170,9 +238,12 @@ export function useAuth(socket) {
       // Export public key only (public keys are always extractable for verification)
       const publicJwk = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
       publicJwkRef.current = publicJwk;
+      serverIdentityJwkRef.current = null;
+      setServerIdentityJwk(null);
+      fatalSecurityErrorRef.current = null;
 
       // Generate key ID from public key hash
-      const pubKeyString = JSON.stringify(publicJwk);
+      const pubKeyString = canonicalizeJwk(publicJwk);
       const hashBuffer = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(pubKeyString));
       const kid = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
       keyIdRef.current = kid;
@@ -185,7 +256,8 @@ export function useAuth(socket) {
           privateKey: keyPair.privateKey,
           publicKey: keyPair.publicKey,
           publicJwk: publicJwk,
-          kid: kid
+          kid: kid,
+          hostname: currentHostname
         });
         console.log('[AUTH] Generated and stored new secure keypair in IndexedDB');
       } catch (e) {
@@ -226,9 +298,36 @@ export function useAuth(socket) {
       .join('');
   }, []);
 
+  const signPayload = useCallback(async (payload) => {
+    if (!keyPairRef.current?.privateKey) {
+      throw new Error('Private key not available');
+    }
+
+    const signature = await window.crypto.subtle.sign(
+      { name: "RSA-PSS", saltLength: 32 },
+      keyPairRef.current.privateKey,
+      payload
+    );
+
+    return arrayBufferToBase64(signature);
+  }, []);
+
+  const handleSecurityFailure = useCallback((message) => {
+    if (fatalSecurityErrorRef.current) {
+      return;
+    }
+
+    console.error(`[AUTH] ${message}`);
+    fatalSecurityErrorRef.current = message;
+    setIsAuthenticated(false);
+    setWasAuthenticatedThisSession(false);
+    setPairingStatus('connecting');
+    setPairingError(message);
+  }, []);
+
   // Send pairing request
   const sendPairingRequest = useCallback(async () => {
-    if (!socket || !keyPairRef.current || pairingInitiatedRef.current) {
+    if (!socket || !keyPairRef.current || pairingInitiatedRef.current || fatalSecurityErrorRef.current) {
       return;
     }
 
@@ -275,9 +374,11 @@ export function useAuth(socket) {
     if (socket === null) {
       setServerReady(false);
       setIsAuthenticated(false);
-      setPairingStatus('connecting');
       pairingInitiatedRef.current = false;
-      setPairingError(null);
+      setPairingStatus('connecting');
+      if (!fatalSecurityErrorRef.current) {
+        setPairingError(null);
+      }
       // Note: Do NOT reset isReturningDevice - it's a permanent device characteristic
       // Note: Do NOT reset keysReady - keys persist across connections
     }
@@ -300,7 +401,9 @@ export function useAuth(socket) {
         console.log('[AUTH] Server connected');
         // Reset pairing state for this connection (fixes reconnection re-pairing bug)
         pairingInitiatedRef.current = false;
-        setPairingError(null);
+        if (!fatalSecurityErrorRef.current) {
+          setPairingError(null);
+        }
         setServerReady(true);
       }
 
@@ -312,7 +415,34 @@ export function useAuth(socket) {
 
       // Pairing successful
       if (msg.type === 'pairing_success') {
+        if (!isValidRsaPssJwk(msg.serverIdentityJwk)) {
+          handleSecurityFailure('Pairing failed: desktop identity key missing or invalid. Reload to re-pair.');
+          if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+            socket.close(4002, 'e2e_unauthenticated');
+          }
+          return;
+        }
+
         console.log('[AUTH] Pairing successful');
+        serverIdentityJwkRef.current = msg.serverIdentityJwk;
+        setServerIdentityJwk(msg.serverIdentityJwk);
+        fatalSecurityErrorRef.current = null;
+
+        (async () => {
+          try {
+            await saveKeysToIndexedDB({
+              privateKey: keyPairRef.current.privateKey,
+              publicKey: keyPairRef.current.publicKey,
+              publicJwk: publicJwkRef.current,
+              kid: keyIdRef.current,
+              hostname: getCurrentHostname(),
+              serverIdentityJwk: msg.serverIdentityJwk
+            });
+          } catch (e) {
+            console.error('[AUTH] Failed to persist desktop identity key:', e);
+          }
+        })();
+
         setPairingStatus('paired');
         setIsAuthenticated(true);
         setWasAuthenticatedThisSession(true);
@@ -339,7 +469,26 @@ export function useAuth(socket) {
 
       // Auth success (after challenge-response or new pairing)
       if (msg.type === 'auth_success') {
+        if (!isValidRsaPssJwk(serverIdentityJwkRef.current)) {
+          console.error('[AUTH] Authenticated device is missing a stored desktop identity key; clearing local pairing state.');
+          serverIdentityJwkRef.current = null;
+          setServerIdentityJwk(null);
+          keyPairRef.current = null;
+          keyIdRef.current = null;
+          publicJwkRef.current = null;
+          setIsReturningDevice(false);
+          clearIndexedDB().catch((e) => {
+            console.error('[AUTH] Failed to clear local pairing state:', e);
+          });
+          handleSecurityFailure('Stored desktop identity missing. Reload to re-pair this device.');
+          if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+            socket.close(4002, 'e2e_unauthenticated');
+          }
+          return;
+        }
+
         console.log('[AUTH] Authentication successful');
+        fatalSecurityErrorRef.current = null;
         setPairingStatus('paired');
         setIsAuthenticated(true);
         setWasAuthenticatedThisSession(true);
@@ -376,6 +525,9 @@ export function useAuth(socket) {
     pairingStatus,
     pairingError,
     isReturningDevice,
+    serverIdentityJwk,
+    signPayload,
+    handleSecurityFailure,
     wasAuthenticatedThisSession
   };
 }
