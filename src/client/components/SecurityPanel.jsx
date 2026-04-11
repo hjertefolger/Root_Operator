@@ -26,9 +26,9 @@ function Row({ label, value }) {
 
 function Title({ children }) {
   return (
-    <span className="font-mono text-xs font-normal tracking-wider text-[#4B5AFF]">
+    <div className="font-mono text-xs font-normal tracking-wider text-[#4B5AFF] leading-none">
       {children}
-    </span>
+    </div>
   );
 }
 
