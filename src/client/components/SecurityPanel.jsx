@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 function formatFingerprint(hex) {
   if (!hex || hex.length < 16) return null;
@@ -24,10 +24,39 @@ function Row({ label, value }) {
   );
 }
 
-function Title({ children }) {
+function TwoDots({ color = '#4B5AFF' }) {
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => setActive((p) => (p + 1) % 2), 320);
+    return () => clearInterval(t);
+  }, []);
+
+  const dotStyle = (idx) => ({
+    width: 4,
+    height: 4,
+    borderRadius: '50%',
+    backgroundColor: color,
+    opacity: active === idx ? 1 : 0.18,
+    transform: active === idx ? 'scale(1)' : 'scale(0.78)',
+    transition: 'opacity 0.28s ease, transform 0.28s ease',
+  });
+
   return (
-    <div className="font-mono text-xs font-normal tracking-wider text-[#4B5AFF] leading-none">
-      {children}
+    <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
+      <div style={dotStyle(0)} />
+      <div style={dotStyle(1)} />
+    </div>
+  );
+}
+
+function Title({ children, trailing }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <div className="font-mono text-xs font-normal tracking-wider text-[#4B5AFF] leading-none">
+        {children}
+      </div>
+      {trailing}
     </div>
   );
 }
@@ -82,7 +111,9 @@ function SecurityPanel({
         boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
       }}
     >
-      <Title>{isReady ? 'SECURED_SESSION' : 'PENDING_SESSION'}</Title>
+      <Title trailing={<TwoDots />}>
+        {isReady ? 'SECURED_SESSION' : 'PENDING_SESSION'}
+      </Title>
 
       <div className="mt-4 flex flex-col gap-2">
         <Row label="Cipher" value="AES-256-GCM" />
