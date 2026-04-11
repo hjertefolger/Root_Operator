@@ -271,7 +271,7 @@ const ChatMessages = memo(function ChatMessages({
                 userSelect: 'none',
                 whiteSpace: 'pre',
                 margin: 0,
-                textAlign: 'center',
+                textAlign: 'left',
               }}
             >{`██████╗  ██████╗  ██████╗ ████████╗
 ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝
@@ -289,7 +289,7 @@ const ChatMessages = memo(function ChatMessages({
                 userSelect: 'none',
                 whiteSpace: 'pre',
                 margin: 0,
-                textAlign: 'center',
+                textAlign: 'left',
               }}
             >{` ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
 ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
