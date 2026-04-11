@@ -205,12 +205,10 @@
   }
 }
 
-/* Global styles */
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+/* Global styles — intentionally no unlayered `* { margin:0; padding:0 }`
+   reset here. Tailwind v4 preflight (in @layer base) already zeroes these,
+   and an unlayered universal reset wins against @layer utilities, silently
+   breaking every p-*, m-*, and padding/margin utility in the client. */
 
 html,
 body,
