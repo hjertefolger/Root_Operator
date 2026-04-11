@@ -151,9 +151,22 @@ export function useAuth(socket) {
   const serverIdentityJwkRef = useRef(null);
   const fatalSecurityErrorRef = useRef(null);
   const pairingInitiatedRef = useRef(false);
+  const setupKeysStartedRef = useRef(false);
 
   // Setup or load RSA-PSS keys from IndexedDB
   useEffect(() => {
+    // Single-flight guard: React 18 StrictMode double-invokes effects in dev,
+    // and `setupKeys` generates a fresh RSA keypair when IndexedDB is empty.
+    // Without this guard, two concurrent runs race and can each generate a
+    // different keypair, overwriting `keyPairRef` / `keyIdRef` mid-pairing —
+    // the phone then signs `auth_challenge` with a keypair whose kid doesn't
+    // match what `pairing_request` used, and the server rejects with
+    // "Key mismatch". Refs persist across StrictMode's simulated remount.
+    if (setupKeysStartedRef.current) {
+      return;
+    }
+    setupKeysStartedRef.current = true;
+
     async function setupKeys() {
       const currentHostname = getCurrentHostname();
 
