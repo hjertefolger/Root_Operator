@@ -24,13 +24,11 @@ function Row({ label, value }) {
   );
 }
 
-function Divider() {
+function Title({ children }) {
   return (
-    <div
-      aria-hidden="true"
-      className="my-3"
-      style={{ borderTop: '1px dashed rgba(255,255,255,0.14)' }}
-    />
+    <span className="font-mono text-xs font-normal tracking-wider text-[#4B5AFF]">
+      {children}
+    </span>
   );
 }
 
@@ -78,43 +76,28 @@ function SecurityPanel({
       ref={panelRef}
       role="dialog"
       aria-label="Session security details"
-      className="absolute right-3 top-12 z-50 w-[280px] bg-black rounded-lg pl-5 pr-4 pt-3 pb-3"
+      className="absolute right-3 top-12 z-50 w-[280px] bg-black rounded-lg p-4"
       style={{
         border: '1px solid rgba(255,255,255,0.08)',
         boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
       }}
     >
-      <div className="flex items-center justify-between">
-        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
-          {isReady ? 'SESSION_SECURE' : 'SESSION_PENDING'}
-        </span>
-      </div>
+      <Title>{isReady ? 'SECURED_SESSION' : 'PENDING_SESSION'}</Title>
 
-      <Divider />
-
-      <div className="flex flex-col gap-1">
+      <div className="mt-4 flex flex-col gap-2">
         <Row label="Cipher" value="AES-256-GCM" />
         <Row label="Key exchange" value="ECDH P-256" />
         <Row label="Identity" value="RSA-PSS 2048" />
-      </div>
-
-      <Divider />
-
-      <div className="flex flex-col gap-1">
         <Row label="Pinned desktop" value={pinnedShort || placeholder} />
         <Row label="Session started" value={started || placeholder} />
       </div>
 
-      <Divider />
-
-      <div className="flex flex-col gap-1">
-        <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
-          Session fingerprint
-        </span>
+      <div className="mt-4 flex flex-col gap-2">
+        <Title>SESSION_FINGERPRINT</Title>
         <span className="font-mono text-xs font-normal tracking-wider text-foreground">
           {fingerprintFormatted || placeholder}
         </span>
-        <span className="font-mono text-[11px] tracking-wider text-muted-foreground mt-1">
+        <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
           Compare with desktop to verify
         </span>
       </div>
