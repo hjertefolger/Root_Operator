@@ -305,12 +305,23 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
         ['encrypt', 'decrypt']
       );
 
-      const fp = await generateFingerprint(sharedSecretBits, transcriptSalt);
-      fingerprintRef.current = fp;
-      setFingerprint(fp);
+      // Flip e2eReady BEFORE the fingerprint computation. The fingerprint is
+      // informational only — the lock icon is the real indicator — so it must
+      // never block decryption. Previously the BIP39 word-list fetch inside
+      // generateFingerprint sat on the critical path, opening a window where
+      // an already-decryptable session still silently dropped `channel_history`.
       e2eReadyRef.current = true;
       setE2eReady(true);
       console.log('[E2E] Encryption active. Desktop signature verified.');
+
+      generateFingerprint(sharedSecretBits, transcriptSalt)
+        .then((fp) => {
+          fingerprintRef.current = fp;
+          setFingerprint(fp);
+        })
+        .catch((err) => {
+          console.warn('[E2E] Fingerprint generation failed (informational only):', err);
+        });
     } catch (error) {
       failClosed(`Failed to verify authenticated E2E response: ${error.message}`);
     }

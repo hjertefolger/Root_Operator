@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from 'react';
-import { Loader2 } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { Loader } from 'lucide-react';
 import Terminal from './components/Terminal';
 import ChannelChat from './components/ChannelChat';
 import PairingScreen from './components/PairingScreen';
@@ -33,6 +33,40 @@ function mergeMessages(prev, incoming) {
   return next;
 }
 
+function getBootstrapLabel({
+  isLoading,
+  isAuthenticated,
+  e2eReady,
+  pairingStatus,
+  pairingError,
+  isReturningDevice,
+  connectionState,
+}) {
+  if (isLoading) {
+    return 'Preparing secure session...';
+  }
+
+  if (!isAuthenticated) {
+    if (pairingStatus === 'authenticating') {
+      return 'Authenticating device...';
+    }
+
+    if (isReturningDevice && !pairingError && pairingStatus !== 'waiting') {
+      return connectionState === 'reconnecting'
+        ? 'Reconnecting to desktop...'
+        : 'Connecting to desktop...';
+    }
+
+    return '';
+  }
+
+  if (!e2eReady) {
+    return 'Securing session...';
+  }
+
+  return '';
+}
+
 function App() {
   // Operating mode: 'terminal' or 'channel' (default matches server default)
   const [clientMode, setClientMode] = useState('channel');
@@ -53,6 +87,7 @@ function App() {
     pairingCode,
     pairingStatus,
     pairingError,
+    isReturningDevice,
     serverIdentityJwk,
     signPayload,
     handleSecurityFailure,
@@ -88,10 +123,19 @@ function App() {
   }, [socket, clientMode]);
 
   // Handle ALL WebSocket messages at App level — always mounted, never misses
+  const messageChainRef = useRef(Promise.resolve());
   useEffect(() => {
     if (!socket) return;
 
-    const handleMessage = async (event) => {
+    // Serialize async message processing through a promise chain.
+    // Browser WS 'message' events fire synchronously in arrival order, but
+    // async handlers run concurrently — so an `e2e_output` carrying
+    // `channel_history` could start processing before `handleServerKeyMessage`
+    // had finished setting `e2eReady`, and get silently dropped. Chaining
+    // guarantees each message's handler completes before the next begins.
+    messageChainRef.current = Promise.resolve();
+
+    const processMessage = async (event) => {
       let msg;
       try {
         msg = JSON.parse(event.data);
@@ -103,7 +147,6 @@ function App() {
         await handleServerKeyMessage(msg);
       }
 
-      // Operating mode from server
       if (msg.type === 'operating_mode') {
         setClientMode(msg.mode);
       }
@@ -112,7 +155,6 @@ function App() {
         setSystemState(msg.state || null);
       }
 
-      // Channel messages (encrypted) — always try to decrypt
       if (msg.type === 'e2e_output') {
         const plaintext = await decryptOutput({ iv: msg.iv, data: msg.data, tag: msg.tag });
         if (plaintext === null) return;
@@ -140,6 +182,14 @@ function App() {
       }
     };
 
+    const handleMessage = (event) => {
+      messageChainRef.current = messageChainRef.current
+        .then(() => processMessage(event))
+        .catch((err) => {
+          console.error('[MSG] Handler error:', err);
+        });
+    };
+
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, handleServerKeyMessage, decryptOutput]);
@@ -155,25 +205,25 @@ function App() {
     </div>
   );
 
-  // Show loading state while keys are being set up
-  if (isLoading) {
-    return (
-      <SafeAreaWrapper>
-        <p className="text-sm text-white/50">Initializing...</p>
-      </SafeAreaWrapper>
-    );
-  }
-
   // If already authenticated this session, skip overlays and show main view
   const showMainView = wasAuthenticatedThisSession;
+  const bootstrapLabel = getBootstrapLabel({
+    isLoading,
+    isAuthenticated,
+    e2eReady,
+    pairingStatus,
+    pairingError,
+    isReturningDevice,
+    connectionState,
+  });
 
   if (!showMainView) {
-    if (!isAuthenticated && pairingStatus === 'authenticating') {
+    if (bootstrapLabel) {
       return (
         <SafeAreaWrapper>
           <div className="flex flex-col items-center gap-3">
-            <Loader2 className="w-6 h-6 text-white animate-spin" />
-            <p className="text-sm text-white/50">Authenticating...</p>
+            <Loader className="w-6 h-6 text-white/70 animate-spin" strokeWidth={2} />
+            <p className="text-sm text-white/50">{bootstrapLabel}</p>
           </div>
         </SafeAreaWrapper>
       );
@@ -186,17 +236,6 @@ function App() {
           status={pairingStatus}
           error={pairingError}
         />
-      );
-    }
-
-    if (!e2eReady) {
-      return (
-        <SafeAreaWrapper>
-          <div className="flex flex-col items-center gap-3">
-            <Loader2 className="w-6 h-6 text-white animate-spin" />
-            <p className="text-sm text-white/50">Securing connection...</p>
-          </div>
-        </SafeAreaWrapper>
       );
     }
   }
