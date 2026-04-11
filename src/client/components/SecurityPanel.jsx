@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Fingerprint } from 'lucide-react';
 
 function formatFingerprint(hex) {
   if (!hex || hex.length < 16) return null;
@@ -124,7 +125,9 @@ function SecurityPanel({
       </div>
 
       <div className="mt-4 flex flex-col gap-2">
-        <Title>SESSION_FINGERPRINT</Title>
+        <Title trailing={<Fingerprint size={14} strokeWidth={2} className="text-[#4B5AFF]" />}>
+          SESSION_FINGERPRINT
+        </Title>
         <span className="font-mono text-xs font-normal tracking-wider text-foreground">
           {fingerprintFormatted || placeholder}
         </span>
