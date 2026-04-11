@@ -13,9 +13,13 @@ function formatTime(ts) {
 
 function Row({ label, value }) {
   return (
-    <div className="flex items-baseline justify-between gap-4">
-      <span className="text-[11px] uppercase tracking-wider text-white/42">{label}</span>
-      <span className="font-mono text-[11px] text-white/88 text-right">{value}</span>
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
+        {label}
+      </span>
+      <span className="font-mono text-xs font-normal tracking-wider text-foreground text-right">
+        {value}
+      </span>
     </div>
   );
 }
@@ -25,9 +29,7 @@ function Divider() {
     <div
       aria-hidden="true"
       className="my-3"
-      style={{
-        borderTop: '1px dashed rgba(255,255,255,0.14)',
-      }}
+      style={{ borderTop: '1px dashed rgba(255,255,255,0.14)' }}
     />
   );
 }
@@ -53,11 +55,9 @@ function SecurityPanel({
         onClose?.();
       }
     };
-
     const handleKey = (event) => {
       if (event.key === 'Escape') onClose?.();
     };
-
     document.addEventListener('mousedown', handleClickOutside);
     document.addEventListener('touchstart', handleClickOutside);
     document.addEventListener('keydown', handleKey);
@@ -71,25 +71,28 @@ function SecurityPanel({
   const fingerprintFormatted = formatFingerprint(sessionFingerprintHex);
   const pinnedShort = pinnedDesktopKidHex ? pinnedDesktopKidHex.slice(0, 8) : null;
   const started = formatTime(sessionStartedAt);
+  const placeholder = <span className="text-muted-foreground">—</span>;
 
   return (
     <div
       ref={panelRef}
       role="dialog"
       aria-label="Session security details"
-      className="absolute right-3 top-12 z-50 w-[280px] bg-black/95 backdrop-blur-sm rounded-lg p-4"
+      className="absolute right-3 top-12 z-50 w-[280px] bg-black rounded-lg pl-5 pr-4 pt-3 pb-3"
       style={{
-        border: '1px solid rgba(75, 90, 255, 0.32)',
-        boxShadow: '0 8px 32px rgba(0,0,0,0.6), 0 0 0 1px rgba(75,90,255,0.12)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
       }}
     >
-      <div className="text-[10px] font-mono uppercase tracking-[0.12em] text-[#4B5AFF]">
-        {isReady ? 'End-to-end encrypted' : 'Securing session'}
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+          {isReady ? 'SESSION_SECURE' : 'SESSION_PENDING'}
+        </span>
       </div>
 
       <Divider />
 
-      <div className="flex flex-col gap-1.5">
+      <div className="flex flex-col gap-1">
         <Row label="Cipher" value="AES-256-GCM" />
         <Row label="Key exchange" value="ECDH P-256" />
         <Row label="Identity" value="RSA-PSS 2048" />
@@ -97,33 +100,23 @@ function SecurityPanel({
 
       <Divider />
 
-      <div className="flex flex-col gap-1.5">
-        <Row
-          label="Pinned desktop"
-          value={pinnedShort || <span className="text-white/32">—</span>}
-        />
-        <Row
-          label="Session started"
-          value={started || <span className="text-white/32">—</span>}
-        />
+      <div className="flex flex-col gap-1">
+        <Row label="Pinned desktop" value={pinnedShort || placeholder} />
+        <Row label="Session started" value={started || placeholder} />
       </div>
 
       <Divider />
 
       <div className="flex flex-col gap-1">
-        <div className="text-[10px] font-mono uppercase tracking-wider text-white/42">
+        <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
           Session fingerprint
-        </div>
-        {fingerprintFormatted ? (
-          <div className="font-mono text-[11px] text-white/88 leading-relaxed">
-            {fingerprintFormatted}
-          </div>
-        ) : (
-          <div className="font-mono text-[11px] text-white/32">—</div>
-        )}
-        <div className="text-[9px] text-white/42 mt-1 leading-snug">
-          Compare with the desktop panel to verify no MITM.
-        </div>
+        </span>
+        <span className="font-mono text-xs font-normal tracking-wider text-foreground">
+          {fingerprintFormatted || placeholder}
+        </span>
+        <span className="font-mono text-[11px] tracking-wider text-muted-foreground mt-1">
+          Compare with desktop to verify
+        </span>
       </div>
     </div>
   );
