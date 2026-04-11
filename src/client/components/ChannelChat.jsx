@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 
 import { Check } from 'lucide-react';
 import { ArrowUp } from 'lucide-react';
 import { ChevronDown } from 'lucide-react';
+import { Loader } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -258,21 +259,51 @@ const ChatMessages = memo(function ChatMessages({
       style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, maxWidth: 640, width: '100%', alignSelf: 'center' }}
     >
       {messages.length === 0 && !waiting && activities.length === 0 && (
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <pre style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 7, lineHeight: 1.12, color: 'rgba(75,90,255,0.42)', userSelect: 'none', whiteSpace: 'pre' }}>{`
- ██████╗  ██████╗  ██████╗ ████████╗
- ██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝
- ██████╔╝██║   ██║██║   ██║   ██║
- ██╔══██╗██║   ██║██║   ██║   ██║
- ██║  ██║╚██████╔╝╚██████╔╝   ██║
- ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝
-
-██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+            <pre
+              aria-hidden="true"
+              style={{
+                fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                fontSize: 7,
+                lineHeight: 1.12,
+                color: 'rgba(75,90,255,0.42)',
+                userSelect: 'none',
+                whiteSpace: 'pre',
+                margin: 0,
+                textAlign: 'center',
+              }}
+            >{`██████╗  ██████╗  ██████╗ ████████╗
+██╔══██╗██╔═══██╗██╔═══██╗╚══██╔══╝
+██████╔╝██║   ██║██║   ██║   ██║
+██╔══██╗██║   ██║██║   ██║   ██║
+██║  ██║╚██████╔╝╚██████╔╝   ██║
+╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝`}</pre>
+            <pre
+              aria-hidden="true"
+              style={{
+                fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                fontSize: 7,
+                lineHeight: 1.12,
+                color: 'rgba(75,90,255,0.42)',
+                userSelect: 'none',
+                whiteSpace: 'pre',
+                margin: 0,
+                textAlign: 'center',
+              }}
+            >{` ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗
 ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗
 ██║   ██║██████╔╝█████╗  ██████╔╝███████║   ██║   ██║   ██║██████╔╝
 ██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗██╔══██║   ██║   ██║   ██║██╔══██╗
 ╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
- ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`.trimEnd()}</pre>
+ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`}</pre>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Loader size={14} strokeWidth={2} className="animate-spin" style={{ color: '#4B5AFF' }} />
+            <span style={{ fontSize: 12, color: '#4B5AFF', fontFamily: 'var(--font-mono, ui-monospace, monospace)', letterSpacing: '0.02em' }}>
+              Loading Conversation
+            </span>
+          </div>
         </div>
       )}
 
