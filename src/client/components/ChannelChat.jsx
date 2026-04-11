@@ -267,7 +267,7 @@ const ChatMessages = memo(function ChatMessages({
                 fontFamily: 'var(--font-mono, ui-monospace, monospace)',
                 fontSize: 7,
                 lineHeight: 1.12,
-                color: 'rgba(75,90,255,0.42)',
+                color: '#4B5AFF',
                 userSelect: 'none',
                 whiteSpace: 'pre',
                 margin: 0,
@@ -285,7 +285,7 @@ const ChatMessages = memo(function ChatMessages({
                 fontFamily: 'var(--font-mono, ui-monospace, monospace)',
                 fontSize: 7,
                 lineHeight: 1.12,
-                color: 'rgba(75,90,255,0.42)',
+                color: '#4B5AFF',
                 userSelect: 'none',
                 whiteSpace: 'pre',
                 margin: 0,
@@ -300,7 +300,7 @@ const ChatMessages = memo(function ChatMessages({
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Loader size={14} strokeWidth={2} className="animate-spin" style={{ color: '#4B5AFF' }} />
-            <span style={{ fontSize: 12, color: '#4B5AFF', fontFamily: 'var(--font-mono, ui-monospace, monospace)', letterSpacing: '0.02em' }}>
+            <span style={{ fontSize: 12, color: '#4B5AFF', fontFamily: 'var(--font-mono, ui-monospace, monospace)' }}>
               Loading Conversation
             </span>
           </div>
