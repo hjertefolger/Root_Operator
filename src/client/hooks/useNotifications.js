@@ -131,9 +131,20 @@ export function useNotifications(socket, isAuthenticated) {
     const nextPermission = typeof Notification === 'undefined' ? 'default' : Notification.permission;
     setPermission(nextPermission);
 
-    if (!supported || !window.isSecureContext || nextPermission !== 'granted') {
+    if (!supported || !window.isSecureContext) {
       syncSignatureRef.current = '';
       prevSubscribedRef.current = false;
+      setSubscribed(false);
+      return { permission: nextPermission, subscription: null };
+    }
+
+    // iOS can briefly return 'default' instead of 'granted' during foreground resume.
+    // If we were previously subscribed, don't kill the bell on a transient permission read.
+    if (nextPermission !== 'granted') {
+      if (prevSubscribedRef.current) {
+        return { permission: nextPermission, subscription: null };
+      }
+      syncSignatureRef.current = '';
       setSubscribed(false);
       return { permission: nextPermission, subscription: null };
     }
@@ -278,17 +289,20 @@ export function useNotifications(socket, isAuthenticated) {
 
     const hydrateNotificationState = async () => {
       try {
-        const { subscription } = await refreshLocalState();
+        const { permission: localPermission, subscription } = await refreshLocalState();
         if (
           cancelled
-          || !subscription
           || !socket
           || socket.readyState !== WebSocket.OPEN
           || !isAuthenticated
+          || localPermission !== 'granted'
         ) {
           return;
         }
 
+        // Always consult the server — it's the source of truth for subscription state.
+        // Don't bail on !subscription: iOS can return null transiently on fresh open,
+        // but the server still knows we're subscribed.
         const state = await requestServerState();
         if (cancelled) {
           return;
@@ -298,10 +312,22 @@ export function useNotifications(socket, isAuthenticated) {
         setVapidPublicKey(nextVapidPublicKey);
 
         if (!state?.subscribed) {
+          // Server doesn't have us — clear signature so syncSubscription doesn't
+          // skip the send due to a stale signature match
+          syncSignatureRef.current = '';
           await syncSubscription(nextVapidPublicKey);
           if (!cancelled) {
             prevSubscribedRef.current = true;
             setSubscribed(true);
+          }
+        } else if (!subscription && nextVapidPublicKey) {
+          // Server says subscribed but local subscription is gone — try to recover
+          // the local push pipe (bell is already on via the message handler)
+          try {
+            await syncSubscription(nextVapidPublicKey);
+          } catch {
+            // Local recovery failed — bell stays on (server truth), push delivery
+            // may be degraded until next successful sync
           }
         }
       } catch (syncError) {

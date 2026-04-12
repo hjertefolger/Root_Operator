@@ -1362,7 +1362,9 @@ function getStoredPushVapidKeys() {
                 logDebug('[SECURITY] Failed to decrypt VAPID private key — regenerating');
                 const regenerated = webpush.generateVAPIDKeys();
                 storeEncryptedPushVapidKeys(regenerated);
-                logDebug('[NOTIFICATIONS] Generated VAPID keys');
+                // Old subscriptions are bound to the old VAPID key — clear them
+                savePushSubscriptions([]);
+                logDebug('[NOTIFICATIONS] Generated VAPID keys — cleared stale subscriptions');
                 cachedPushVapidKeys = regenerated;
                 return cachedPushVapidKeys;
             }
@@ -1593,8 +1595,22 @@ async function notifyPushSubscribers(message) {
         return;
     }
 
+    // Skip push for devices that have an active WebSocket connection —
+    // they're already receiving the message in real time
+    const connectedKids = new Set(
+        [...activeClients]
+            .filter((c) => c.readyState === 1 && c.authenticated)
+            .map((c) => c.kid)
+            .filter(Boolean),
+    );
+
+    const targets = subscriptions.filter((entry) => !connectedKids.has(entry.kid));
+    if (targets.length === 0) {
+        return;
+    }
+
     const payload = getPushAssistantNotificationPayload(message);
-    const results = await Promise.allSettled(subscriptions.map((entry) => sendPushNotification(entry, payload)));
+    const results = await Promise.allSettled(targets.map((entry) => sendPushNotification(entry, payload)));
     const failures = results.filter((result) => result.status === 'rejected');
     if (failures.length > 0) {
         logDebug(`[NOTIFICATIONS] Push delivery failures: ${failures.length}`);

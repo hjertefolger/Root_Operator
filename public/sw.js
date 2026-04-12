@@ -6,8 +6,40 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-// Badge counter — persisted across push events
-let unreadCount = 0;
+// --- Persisted state via Cache API (survives iOS SW termination) ---
+
+const STATE_CACHE = 'ro-sw-state';
+
+async function getPersistedState(key, fallback) {
+  try {
+    const cache = await caches.open(STATE_CACHE);
+    const resp = await cache.match(key);
+    if (!resp) return fallback;
+    return await resp.json();
+  } catch {
+    return fallback;
+  }
+}
+
+async function setPersistedState(key, value) {
+  try {
+    const cache = await caches.open(STATE_CACHE);
+    await cache.put(key, new Response(JSON.stringify(value)));
+  } catch {
+    // Cache API unavailable — degrade gracefully
+  }
+}
+
+async function getUnreadCount() {
+  const { count } = await getPersistedState('unread-count', { count: 0 });
+  return typeof count === 'number' ? count : 0;
+}
+
+async function setUnreadCount(count) {
+  await setPersistedState('unread-count', { count });
+}
+
+// --- Notification payload ---
 
 function normalizeNotificationPayload(data) {
   const payload = data && typeof data === 'object' ? data : {};
@@ -32,16 +64,7 @@ function normalizeNotificationPayload(data) {
   };
 }
 
-async function hasFocusedClient() {
-  const windowClients = await self.clients.matchAll({
-    type: 'window',
-    includeUncontrolled: false,
-  });
-
-  // Use focused (not visibilityState) — iOS PWAs can report 'visible'
-  // even after swipe-up to home screen
-  return windowClients.some((client) => client.focused);
-}
+// --- Badge ---
 
 async function updateBadge(count) {
   if ('setAppBadge' in self.navigator) {
@@ -57,6 +80,14 @@ async function updateBadge(count) {
   }
 }
 
+// --- Push handler ---
+//
+// IMPORTANT: Every push event MUST call showNotification().
+// iOS/WebKit revokes the push subscription after 3 silent pushes
+// (userVisibleOnly violation). Foreground suppression is handled
+// server-side by skipping push delivery for devices with an active
+// WebSocket connection.
+
 self.addEventListener('push', (event) => {
   let payload = {};
 
@@ -69,45 +100,40 @@ self.addEventListener('push', (event) => {
   }
 
   event.waitUntil((async () => {
-    const clientVisible = await hasFocusedClient();
-
-    // If the user is already reading the chat, skip everything
-    if (clientVisible) {
-      return;
-    }
-
-    // Only count as unread when the app is not visible
-    unreadCount += 1;
-    await updateBadge(unreadCount);
+    const count = (await getUnreadCount()) + 1;
+    await setUnreadCount(count);
+    await updateBadge(count);
 
     const notification = normalizeNotificationPayload(payload);
     await self.registration.showNotification(notification.title, notification.options);
   })());
 });
 
+// --- Notification click ---
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  // Clear badge on notification tap
-  unreadCount = 0;
-  updateBadge(0);
-
-  const destination = new URL(event.notification.data?.url || '/', self.location.origin).toString();
-
   event.waitUntil((async () => {
+    // Clear badge and persisted count
+    await setUnreadCount(0);
+    await updateBadge(0);
+
+    const destination = new URL(event.notification.data?.url || '/', self.location.origin).toString();
+
     const clients = await self.clients.matchAll({
       type: 'window',
       includeUncontrolled: true,
     });
 
-    for (const client of clients) {
-      if (!('focus' in client)) {
-        continue;
-      }
+    // Prefer a client already at the destination URL
+    const matching = clients.find((c) => 'focus' in c && c.url === destination);
+    const target = matching || clients.find((c) => 'focus' in c);
 
-      await client.focus();
-      if ('navigate' in client) {
-        await client.navigate(destination);
+    if (target) {
+      await target.focus();
+      if (!matching && 'navigate' in target) {
+        await target.navigate(destination);
       }
       return;
     }
@@ -118,10 +144,15 @@ self.addEventListener('notificationclick', (event) => {
   })());
 });
 
-// Listen for badge clear messages from the client
+// --- Messages from client ---
+
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'clear_badge') {
-    unreadCount = 0;
-    updateBadge(0);
+  if (!event.data) return;
+
+  if (event.data.type === 'clear_badge') {
+    event.waitUntil((async () => {
+      await setUnreadCount(0);
+      await updateBadge(0);
+    })());
   }
 });
