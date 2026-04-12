@@ -1,41 +1,35 @@
-# Root_Operator
+# Root Operator
 
-[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
 [![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
 
-**Personal AI assistant for macOS - powered by latest Claude Code channels feature.**
-
-✨ Now with built in persistent cron scheduler and identity system (inspired by Openclaw)
-
-- 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
-- 🛡️ **RSA-PSS with challenge-response** (passwordless)
-- 🔐 **BIP39 fingerprinting**: 12 words on your phone, 12 on your Mac — if they match, no one is intercepting
-
+**Personal AI assistant for macOS powered by Claude Code channels.**
 
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 
-> ⚠️ **Security notice**
+> **Security notice**
 >
-> Root Operator gives the connected AI agent (Claude Code) powerful capabilities on your Mac — including running shell commands, reading and writing files, installing packages, and managing scheduled jobs. By default, it runs with `--dangerously-skip-permissions`, meaning the agent can act without per-action approval.
+> Root Operator gives the connected AI agent (Claude Code) powerful capabilities on your Mac -- including running shell commands, reading and writing files, installing packages, and managing scheduled jobs. By default, it runs with `--dangerously-skip-permissions`, meaning the agent can act without per-action approval.
 >
-> **Only run Root Operator if you understand the risks and trust the agent's configuration.** A bad prompt or misconfigured system prompt could lead to unintended or destructive changes. This is a personal tool designed for a single trusted operator — not a multi-user or shared system.
+> **Only run Root Operator if you understand the risks and trust the agent's configuration.** This is a personal tool designed for a single trusted operator -- not a multi-user or shared system.
 >
 > Recommended baseline:
 > - Review your workspace files (`SOUL.md`, `AGENTS.md`) periodically
 > - Keep secrets and credentials out of the agent's reachable filesystem
-> - Use device pairing and E2E encryption — never expose the tunnel without authentication
+> - Use device pairing and E2E encryption -- never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
 
+---
 
 ## Why Root Operator?
 
 | Problem | Root Operator |
 |---------|---------------|
-| SSH is complex to set up and expose | One-click Cloudflare Tunnel — zero open ports, zero config |
-| Terminal apps lack end-to-end encryption | AES-256-GCM with ECDH key exchange on every session |
-| No way to reach Claude Code from your phone | Claude Code Channel — chat with your desktop agent from anywhere |
+| SSH is complex to set up and expose | One-click Cloudflare Tunnel -- zero open ports, zero config |
+| Terminal apps lack end-to-end encryption | Authenticated ECDH + AES-256-GCM with mutual identity verification |
+| No way to reach Claude Code from your phone | Claude Code channels -- chat with your desktop agent from anywhere |
 | Scheduled tasks need cron + SSH + scripts | Built-in persistent scheduler with natural language cron jobs |
 | Remote tools feel disconnected from your machine | PWA that lives on your home screen like a native app |
 
@@ -43,53 +37,58 @@
 
 ### Claude Code Channel
 
-Chat with Claude Code running on your Mac — from your phone or desktop.
+Chat with Claude Code running on your Mac -- from any paired device.
 
-- **Markdown chat interface** — Rich message rendering with full Markdown + GFM support
-- **Live activity indicators** — See what Claude is doing in real-time (reading files, running commands)
-- **Persistent history** — File-backed JSONL message store, survives app restarts
-- **MCP bridge via Claude Code channels** — Claude Code connects via stdio MCP server over Unix socket
-- **Zero-config tunneling** — Cloudflare Tunnel creates a public URL instantly, no port forwarding
-- **End-to-end encryption** — ECDH P-256 key exchange + AES-256-GCM for all terminal I/O
-- **Visual fingerprint verification** — 12-word BIP39 mnemonic confirms secure channel on both devices
-- **Device pairing** — 6-character code for new devices, challenge-response for returning ones
-- **PWA client** — Install on iOS home screen, works like a native app
+- **Markdown chat** -- rich rendering with full GFM support
+- **File attachments** -- send images and files between devices, rendered as pills in the chat
+- **Push notifications** -- background notifications via Web Push (VAPID), respects foreground suppression
+- **Live activity indicators** -- see what Claude is doing in real-time (reading files, running commands)
+- **Persistent history** -- file-backed JSONL message store, survives app restarts
+- **Multi-device** -- pair your phone, tablet, or any browser; messages sync across all connected clients
 
-Under the hood, Root Operator spawns Claude Code with:
+### Security
 
-```bash
-claude \
-  --dangerously-skip-permissions \
-  --mcp-config <root-operator-mcp.json> \
-  --append-system-prompt-file <system-prompt> \
-  --dangerously-load-development-channels server:root-operator
-```
+End-to-end encrypted with mutual authentication. No trust-on-first-use -- every session is cryptographically verified.
 
-This gives Claude full autonomy, injects workspace identity into the system prompt, loads the MCP bridge for device communication, and connects via the Root Operator development channel.
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| **Transport** | Cloudflare Tunnel (TLS 1.3) | Encrypted tunnel, zero open ports |
+| **E2E encryption** | AES-256-GCM + ECDH P-256 | All traffic encrypted client-to-server |
+| **Key derivation** | HKDF-SHA256 | Session key derived from ECDH shared secret |
+| **Authentication** | RSA-PSS 2048-bit | Mutual identity proof via challenge-response |
+| **MITM protection** | Transcript-bound signatures | Both sides sign ECDH keys with paired RSA identity; spliced halves are rejected |
+| **Fingerprint** | Hex fingerprint (4-block) | Visual verification of secure channel on both devices |
+| **Credential storage** | macOS Keychain (keytar) + Electron safeStorage | Private keys and tokens never stored in plaintext |
+| **Network isolation** | Loopback-only binding | Bridge server bound to 127.0.0.1, unreachable from LAN |
+| **Rate limiting** | Per-source (CF-Connecting-IP) | Connection and pairing limits scoped to individual clients |
+| **Session revocation** | Immediate socket eviction | Removing a device terminates all its active connections instantly |
+| **Input sanitization** | ANSI filter | Blocks dangerous escape sequences (OSC 52, DCS, APC) |
 
-### Identity & Workspace
-
-Give Claude a persistent persona across sessions.
-
-- **Workspace files** — `IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md` define who Claude is and who you are
-- **System prompt injection** — Workspace files automatically appended to Claude's system prompt at startup
-- **First-run onboarding** — `BOOTSTRAP.md` guides initial setup, then self-deletes
-- **Fully customizable** — Edit workspace files at `~/.root-operator/workspace/`
+The Security Panel is accessible from both the web client (lock icon) and the desktop tray, showing cipher suite, device identity, session fingerprint, and connection status.
 
 ### Persistent Scheduler
 
 Cron jobs powered by natural language, managed by Claude.
 
-- **MCP tools** — `ro_schedule`, `ro_list_schedules`, `ro_delete_schedule`, `ro_toggle_schedule`, `ro_run_now`
-- **Production-grade** — Exponential backoff, auto-disable after 10 failures, stuck-run detection
-- **Persistent** — Jobs survive app restarts, stored in electron-store
-- **Limits** — Up to 50 jobs, 50KB max prompt per job, 5s refire gap
+- **MCP tools** -- `ro_schedule`, `ro_list_schedules`, `ro_delete_schedule`, `ro_toggle_schedule`, `ro_run_now`
+- **Production-grade** -- exponential backoff, auto-disable after 10 failures, stuck-run detection
+- **Persistent** -- jobs survive app restarts, stored in electron-store
+- **Limits** -- up to 50 jobs, 50KB max prompt per job, 5s refire gap
+
+### Identity & Workspace
+
+Give Claude a persistent persona across sessions.
+
+- **Workspace files** -- `IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md` define who Claude is and who you are
+- **System prompt injection** -- workspace files automatically appended to Claude's system prompt at startup
+- **First-run onboarding** -- `BOOTSTRAP.md` guides initial setup, then self-deletes
+- **Fully customizable** -- edit workspace files at `~/.root-operator/workspace/`
 
 ## Requirements
 
-- **macOS** 11+ (Big Sur or later) — Apple Silicon and Intel
+- **macOS** 11+ (Big Sur or later) -- Apple Silicon and Intel
 - **Node.js** 18+ (for building from source)
-- **latest Claude Code** (for Channel mode)
+- **Claude Code** (latest, with channels support)
 
 ## Installation
 
@@ -97,7 +96,7 @@ Cron jobs powered by natural language, managed by Claude.
 
 Download the latest `.dmg` from the [Releases](https://github.com/hjertefolger/Root_Operator/releases) page.
 
-The app is signed and notarized — macOS will allow it to run without extra steps.
+The app is signed and notarized -- macOS will allow it to run without extra steps.
 
 ### From Source
 
@@ -110,49 +109,47 @@ npm run dev:app    # Start with hot reload
 
 ## Quick Start
 
-1. **Launch** Root Operator — it lives in your menu bar
-2. **Click "Jump"** to start the Cloudflare Tunnel
-3. **Scan the QR code** or copy the tunnel URL
-4. **Open on your phone** — Safari, Chrome, or add to home screen as PWA
-5. **Pair** — enter the 6-character code shown on your phone into the desktop app
-6. **Verify** — confirm the 12-word fingerprint matches on both devices
-7. **Go** — encrypted terminal access from anywhere
-
-To use **Claude Code Channel**, right-click the tray icon and switch to Channel mode. Messages from your phone will route to Claude Code.
+1. **Launch** Root Operator -- it lives in your menu bar
+2. **Start the tunnel** -- click the power button to create a Cloudflare Tunnel
+3. **Scan the QR code** or copy the tunnel URL on your phone
+4. **Pair** -- enter the 6-character code shown on your phone into the desktop app
+5. **Verify** -- confirm the hex fingerprint matches on both devices
+6. **Go** -- encrypted chat with Claude from anywhere
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        iOS / Web Client                         │
-│                     PWA + xterm.js + React                      │
-│              Terminal Mode  ←→  Channel Mode                    │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ E2E Encrypted (AES-256-GCM)
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                      Cloudflare Tunnel                          │
-│                   TLS 1.3 · Zero Open Ports                     │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                    Root Operator (Electron)                      │
-│                                                                  │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
-│  │  PTY Shell  │  │  HTTP Server │  │  Channel Manager       │  │
-│  │  (node-pty) │  │  (port 22000)│  │  (Unix socket bridge)  │  │
-│  └──────┬──────┘  └──────┬───────┘  └──────────┬─────────────┘  │
-│         │                │                      │                │
-│         │                │               ┌──────▼─────────────┐  │
-│         │                │               │  Claude Code CLI   │  │
-│         │                │               │  (MCP stdio)       │  │
-│         │                │               └──────┬─────────────┘  │
-│         │                │                      │                │
-│  ┌──────▼──────┐  ┌──────▼───────┐  ┌──────────▼─────────────┐  │
-│  │  Terminal   │  │   WebSocket  │  │  Scheduler · Identity  │  │
-│  │  I/O        │  │   E2E Layer  │  │  Chat Store            │  │
-│  └─────────────┘  └──────────────┘  └────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------+
+|                      iOS / Web Client (PWA)                      |
+|                  React + Tailwind + shadcn/ui                    |
+|         Channel Chat  -  File Attachments  -  Notifications      |
++-------------------------------+---------------------------------+
+                                | E2E Encrypted (AES-256-GCM)
+                                | Authenticated ECDH + RSA-PSS
+                                |
++-------------------------------+---------------------------------+
+|                       Cloudflare Tunnel                          |
+|                    TLS 1.3 - Zero Open Ports                     |
++-------------------------------+---------------------------------+
+                                |
++-------------------------------+---------------------------------+
+|                  Root Operator (Electron, macOS)                  |
+|                                                                  |
+|  +---------------+  +----------------+  +---------------------+  |
+|  |  HTTP Server  |  |  WebSocket     |  |  Channel Manager    |  |
+|  |  (127.0.0.1)  |  |  E2E Layer     |  |  (Unix socket MCP)  |  |
+|  +-------+-------+  +-------+--------+  +----------+----------+  |
+|          |                  |                       |             |
+|          |                  |              +--------+----------+  |
+|          |                  |              |  Claude Code CLI  |  |
+|          |                  |              |  (channels mode)  |  |
+|          |                  |              +--------+----------+  |
+|          |                  |                       |             |
+|  +-------+-------+  +------+--------+  +-----------+----------+  |
+|  |  Static       |  |  Device Auth  |  |  Scheduler - Chat    |  |
+|  |  Assets       |  |  + Pairing    |  |  Store - Identity    |  |
+|  +---------------+  +---------------+  +----------------------+  |
++-----------------------------------------------------------------+
 ```
 
 ### Connection Flow
@@ -162,50 +159,30 @@ sequenceDiagram
     participant C as Client
     participant S as Server
 
-    C->>S: 1. WebSocket Connect (via Cloudflare Tunnel)
-    S->>C: 2. ECDH Public Key + Salt
-    C->>S: 3. ECDH Public Key + Key ID
-
-    Note over C,S: Both derive AES-256-GCM session key via HKDF<br/>+ compute 12-word BIP39 fingerprint
+    C->>S: 1. WebSocket connect (via Cloudflare Tunnel)
 
     alt New Device
-        S-->>C: 4a. Request pairing
+        S-->>C: 2a. Request pairing
         Note over C: Display 6-char code
         Note over S: User enters code to approve
+        C->>S: 3a. RSA public key + signed challenge
     else Known Device
-        S->>C: 4b. Challenge (random bytes)
-        C->>S: 5. RSA-PSS Signature
+        S->>C: 2b. Challenge (random bytes)
+        C->>S: 3b. RSA-PSS signature (proof of key possession)
     end
 
-    S->>C: 6. AUTH_SUCCESS (encrypted)
+    S->>C: 4. AUTH_SUCCESS
 
-    loop Terminal Session
-        C->>S: 7. Input (E2E encrypted)
-        S->>C: 8. Output (E2E encrypted)
+    Note over C,S: Authenticated ECDH key exchange
+    C->>S: 5. ECDH public key + RSA-PSS signature
+    S->>C: 6. ECDH public key + RSA-PSS transcript signature
+    Note over C,S: Both derive AES-256-GCM session key via HKDF<br/>+ compute hex fingerprint for visual verification
+
+    loop Encrypted Session
+        C->>S: Input / files (E2E encrypted)
+        S->>C: Output / notifications (E2E encrypted)
     end
 ```
-
-## Security
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| **Transport** | Cloudflare Tunnel (TLS 1.3) | Encrypted tunnel, no open ports |
-| **E2E Encryption** | AES-256-GCM + ECDH P-256 | Terminal I/O encrypted client-to-server |
-| **Key Derivation** | HKDF-SHA256 | Derives session key from ECDH shared secret |
-| **Authentication** | RSA-PSS 2048-bit | Proves device identity via challenge-response |
-| **Fingerprint** | 12-word BIP39 mnemonic | Visual verification of secure channel |
-| **Credential Storage** | macOS Keychain (keytar) | Cloudflare tokens stored in system keychain |
-| **Input Sanitization** | ANSI filter | Blocks dangerous escape sequences (OSC 52, DCS, APC) |
-
-### Security Highlights
-
-- **Zero open ports** — Cloudflare Tunnel eliminates port forwarding entirely
-- **Challenge-response on every reconnect** — cryptographic proof of key possession, not just key ID
-- **Rate limiting** — 5 auth attempts per connection, 30-second challenge expiry
-- **Origin validation** — WebSocket connections verified against tunnel URL
-- **Session isolation** — terminal content in sessionStorage, cleared on tab close
-- **IPC whitelist** — renderer process has no direct Node.js access (context isolation)
-- **Hardened runtime** — macOS hardened runtime enabled for signed build
 
 ## MCP Tools
 
@@ -224,13 +201,13 @@ Root Operator exposes tools to Claude Code via the MCP bridge:
 
 ### Custom Operator URL
 
-Set a custom URL (e.g., `yourname.rootoperator.dev`) for easy sharing:
+Set a custom URL (e.g., `yourname.rootoperator.dev`) for easy access:
 
 1. Open Settings from the tray menu
 2. Enter your desired subdomain
 3. Your tunnel will be accessible at `yourname.rootoperator.dev`
 
-Requires deploying the optional Cloudflare Worker — see `worker/` directory and `.env.example`.
+Requires the optional Cloudflare Worker -- see `worker/` directory and `.env.example`.
 
 ### Environment Variables
 
@@ -254,11 +231,11 @@ Customize Claude's persona by editing files in `~/.root-operator/workspace/`:
 
 | File | Purpose |
 |------|---------|
-| `IDENTITY.md` | Who Claude is in the system |
-| `SOUL.md` | Persona, tone, values, decision-making style |
-| `AGENTS.md` | Agent definitions, roles, capabilities |
-| `USER.md` | Your profile — name, location, preferences |
-| `MEMORY.md` | Persistent memory (user-maintained) |
+| `IDENTITY.md` | Who Claude is -- name, creature, vibe, emoji |
+| `SOUL.md` | Persona, tone, values, boundaries |
+| `AGENTS.md` | Agent behavior, safety rules, collaboration patterns |
+| `USER.md` | Your profile -- name, timezone, preferences |
+| `MEMORY.md` | Persistent long-term memory index |
 
 Files are automatically injected into Claude's system prompt at startup. Max 150KB total, 20KB per file.
 
@@ -268,7 +245,7 @@ Files are automatically injected into Claude's system prompt at startup. Max 150
 npm run dev:app          # Start with hot reload (recommended)
 npm run build:all        # Build client + renderer
 npm run rebuild          # Rebuild native modules (node-pty, keytar)
-npm run build            # Production build (signed)
+npm run build            # Production build (signed + notarized)
 npm run build:unsigned   # Production build (unsigned, local dev)
 npm run release          # Publish updater-ready release metadata + artifacts
 npm run security:check   # Run security audit
@@ -277,25 +254,23 @@ npm run security:check   # Run security audit
 ### Project Structure
 
 ```
-├── main.js                  # Electron main process (server, tunnel, PTY, E2E)
-├── preload.js               # IPC bridge with security whitelist
-├── channel-bridge.cjs       # MCP server — bridges Electron ↔ Claude Code
-├── claude-stop-hook.cjs     # Claude session cleanup hook
-├── src/
-│   ├── channel-manager.js   # IPC client for channel bridge (Unix socket)
-│   ├── chat-store.js        # JSONL message persistence (200-msg rotation)
-│   ├── scheduler.js         # Persistent cron scheduler (node-cron)
-│   ├── workspace.js         # Identity workspace manager
-│   ├── renderer/            # Tray app (React + Tailwind + shadcn/ui)
-│   │   ├── App.jsx
-│   │   └── components/      # MainView, SettingsView, PowerButton, etc.
-│   └── client/              # PWA client (React + Tailwind + shadcn/ui)
-│       ├── App.jsx
-│       ├── components/      # Terminal, ChannelChat, PairingScreen, Header
-│       └── hooks/           # useWebSocket, useAuth, useE2E, useTerminal
-├── workspace-templates/     # Default identity files (seeded on first run)
-├── worker/                  # Cloudflare Worker for custom subdomains (optional)
-└── public/                  # Static assets, fonts, PWA manifest
+main.js                  # Electron main process (server, tunnel, E2E, auth)
+preload.js               # IPC bridge with security whitelist
+channel-bridge.cjs       # MCP server -- bridges Electron <-> Claude Code
+claude-stop-hook.cjs     # Claude session cleanup hook
+src/
+  channel-manager.js     # IPC client for channel bridge (Unix socket)
+  chat-store.js          # JSONL message persistence (200-msg rotation)
+  scheduler.js           # Persistent cron scheduler (node-cron)
+  workspace.js           # Identity workspace manager
+  renderer/              # Desktop tray app (React + Tailwind + shadcn/ui)
+    components/          # MainView, SettingsView, SecurityPanel, PowerButton
+  client/                # PWA client (React + Tailwind + shadcn/ui)
+    components/          # ChannelChat, SecurityPanel, PairingScreen, Header
+    hooks/               # useWebSocket, useAuth, useE2E, useNotifications, useFileAttachment
+public/                  # Static assets, fonts, PWA manifest, service worker
+workspace-templates/     # Default identity files (seeded on first run)
+worker/                  # Cloudflare Worker for custom subdomains (optional)
 ```
 
 ### Native Dependencies
@@ -324,6 +299,11 @@ npm run rebuild
 - Ensure Claude Code is installed and available in PATH
 - Check that `~/.root-operator/workspace/` exists (created on first run)
 - Right-click tray icon to verify Channel mode is active
+
+### Push notifications not arriving
+- Ensure notifications are enabled in the web client (bell icon)
+- Background the app -- notifications are suppressed when the app is in the foreground
+- On iOS PWA, swipe the app fully out of the app switcher and reopen to force service worker refresh
 
 ## License
 
