@@ -52,7 +52,7 @@ function normalizeNotificationPayload(data) {
   const body = typeof payload.body === 'string' && payload.body
     ? payload.body
     : (typeof n.body === 'string' && n.body ? n.body : 'Operator sent a new message');
-  const url = typeof payload.url === 'string' && payload.url ? payload.url : (n.navigate || '/');
+  const url = typeof payload.url === 'string' && payload.url ? payload.url : (payload.navigate || n.navigate || '/');
 
   return {
     title,

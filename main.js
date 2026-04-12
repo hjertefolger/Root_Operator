@@ -1265,12 +1265,13 @@ function getPushAssistantNotificationPayload(message = {}) {
         icon: '/icon-192-v3.png',
         badge: '/icon-192-v3.png',
         // Declarative Web Push (iOS 18.4+) — browser shows this notification
-        // directly if the service worker fails or times out
+        // directly if the service worker fails or times out.
+        // Per WebKit spec: 'navigate' is top-level, not inside 'notification'.
         web_push: 8030,
+        navigate: PUSH_NOTIFICATION_TARGET_URL,
         notification: {
             title,
             body,
-            navigate: PUSH_NOTIFICATION_TARGET_URL,
             icon: '/icon-192-v3.png',
             badge: '/icon-192-v3.png',
             tag: 'root-operator-assistant-reply',
@@ -4320,7 +4321,10 @@ function handleConnection(ws, req) {
 
     ws.lastActivity = Date.now();
     ws.lastHeartbeat = Date.now();
-    ws.clientVisible = true;
+    // Start as not-visible — the client will send client_visible:true once it
+    // confirms foreground state. Prevents a 35-second race window on reconnect
+    // where the server assumes the client is visible and suppresses push.
+    ws.clientVisible = false;
 
     ws.on('message', async (msg) => {
         ws.lastActivity = Date.now();

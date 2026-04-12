@@ -321,13 +321,28 @@ export function useNotifications(socket, isAuthenticated) {
             setSubscribed(true);
           }
         } else if (!subscription && nextVapidPublicKey) {
-          // Server says subscribed but local subscription is gone — try to recover
-          // the local push pipe (bell is already on via the message handler)
+          // Server says subscribed but local subscription is gone — try to recover.
+          // This can happen when iOS revokes the subscription (3-strike silent push
+          // rule) or after extended background/storage eviction.
           try {
             await syncSubscription(nextVapidPublicKey);
           } catch {
-            // Local recovery failed — bell stays on (server truth), push delivery
-            // may be degraded until next successful sync
+            // Recovery failed — subscription is likely permanently revoked by iOS.
+            // Surface this to the user so they know to re-enable, rather than
+            // showing a bell that looks "on" while delivering zero notifications.
+            if (!cancelled) {
+              prevSubscribedRef.current = false;
+              setSubscribed(false);
+              syncSignatureRef.current = '';
+              // Also tell the server to clear the stale subscription
+              if (socket && socket.readyState === WebSocket.OPEN) {
+                try {
+                  socket.send(JSON.stringify({ type: 'notifications_unsubscribe' }));
+                } catch {
+                  // Socket may be closing
+                }
+              }
+            }
           }
         }
       } catch (syncError) {
