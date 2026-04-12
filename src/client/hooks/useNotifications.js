@@ -72,6 +72,7 @@ export function useNotifications(socket, isAuthenticated) {
   const [error, setError] = useState('');
   const syncSignatureRef = useRef('');
   const pendingStateRequestRef = useRef(null);
+  const prevSubscribedRef = useRef(false);
 
   const requestServerState = useCallback(() => {
     if (!socket || socket.readyState !== WebSocket.OPEN || !isAuthenticated) {
@@ -111,7 +112,7 @@ export function useNotifications(socket, isAuthenticated) {
 
     const serialized = subscription.toJSON();
     const signature = `${serialized.endpoint}:${serialized.keys?.p256dh || ''}:${serialized.keys?.auth || ''}`;
-    if (signature === syncSignatureRef.current && subscribed) {
+    if (signature === syncSignatureRef.current) {
       return true;
     }
 
@@ -124,7 +125,7 @@ export function useNotifications(socket, isAuthenticated) {
     }));
 
     return true;
-  }, [isAuthenticated, socket, subscribed, supported]);
+  }, [isAuthenticated, socket, supported]);
 
   const refreshLocalState = useCallback(async () => {
     const nextPermission = typeof Notification === 'undefined' ? 'default' : Notification.permission;
@@ -132,13 +133,28 @@ export function useNotifications(socket, isAuthenticated) {
 
     if (!supported || !window.isSecureContext || nextPermission !== 'granted') {
       syncSignatureRef.current = '';
+      prevSubscribedRef.current = false;
       setSubscribed(false);
       return { permission: nextPermission, subscription: null };
     }
 
     const registration = await registerServiceWorker();
-    const subscription = await registration.pushManager.getSubscription();
+    let subscription = await registration.pushManager.getSubscription();
+
+    // iOS WebKit returns null transiently after extended background — retry once
+    if (!subscription) {
+      await new Promise((r) => setTimeout(r, 400));
+      subscription = await registration.pushManager.getSubscription();
+    }
+
+    // If still null but we were previously subscribed, don't flip the bell off —
+    // the server-side subscription is still valid, rely on server state to recover
+    if (!subscription && prevSubscribedRef.current) {
+      return { permission: nextPermission, subscription: null };
+    }
+
     syncSignatureRef.current = getSubscriptionSignature(subscription);
+    prevSubscribedRef.current = Boolean(subscription);
     setSubscribed(Boolean(subscription));
     return { permission: nextPermission, subscription };
   }, [supported]);
@@ -200,6 +216,7 @@ export function useNotifications(socket, isAuthenticated) {
       setVapidPublicKey(nextVapidPublicKey);
       setSubscribed(Boolean(state?.subscribed));
       await syncSubscription(nextVapidPublicKey);
+      prevSubscribedRef.current = true;
       setSubscribed(true);
       return true;
     } catch (notificationError) {
@@ -226,6 +243,7 @@ export function useNotifications(socket, isAuthenticated) {
 
       if (msg.type === 'notifications_state') {
         setVapidPublicKey(typeof msg.vapidPublicKey === 'string' ? msg.vapidPublicKey : '');
+        prevSubscribedRef.current = Boolean(msg.subscribed);
         setSubscribed(Boolean(msg.subscribed));
         if (pendingStateRequestRef.current) {
           clearTimeout(pendingStateRequestRef.current.timeoutId);
@@ -282,6 +300,7 @@ export function useNotifications(socket, isAuthenticated) {
         if (!state?.subscribed) {
           await syncSubscription(nextVapidPublicKey);
           if (!cancelled) {
+            prevSubscribedRef.current = true;
             setSubscribed(true);
           }
         }
@@ -315,10 +334,11 @@ export function useNotifications(socket, isAuthenticated) {
     };
 
     const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        clearBadge();
+      if (document.hidden) {
+        return;
       }
 
+      clearBadge();
       refreshLocalState().catch((refreshError) => {
         console.warn('[NOTIFICATIONS] Failed to refresh local notification state:', refreshError);
       });
