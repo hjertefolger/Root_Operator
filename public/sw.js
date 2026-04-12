@@ -32,13 +32,15 @@ function normalizeNotificationPayload(data) {
   };
 }
 
-async function hasVisibleClient() {
+async function hasFocusedClient() {
   const windowClients = await self.clients.matchAll({
     type: 'window',
     includeUncontrolled: false,
   });
 
-  return windowClients.some((client) => client.visibilityState === 'visible');
+  // Use focused (not visibilityState) — iOS PWAs can report 'visible'
+  // even after swipe-up to home screen
+  return windowClients.some((client) => client.focused);
 }
 
 async function updateBadge(count) {
@@ -67,7 +69,7 @@ self.addEventListener('push', (event) => {
   }
 
   event.waitUntil((async () => {
-    const clientVisible = await hasVisibleClient();
+    const clientVisible = await hasFocusedClient();
 
     // If the user is already reading the chat, skip everything
     if (clientVisible) {
