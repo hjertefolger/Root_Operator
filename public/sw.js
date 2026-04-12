@@ -43,11 +43,16 @@ async function setUnreadCount(count) {
 
 function normalizeNotificationPayload(data) {
   const payload = data && typeof data === 'object' ? data : {};
+  // Support both flat fields and Declarative Web Push nested format
+  const n = payload.notification && typeof payload.notification === 'object' ? payload.notification : {};
   const title = typeof payload.title === 'string' && payload.title
     ? payload.title
-    : (typeof payload.assistantName === 'string' && payload.assistantName ? payload.assistantName : 'New message');
-  const body = typeof payload.body === 'string' && payload.body ? payload.body : 'Operator sent a new message';
-  const url = typeof payload.url === 'string' && payload.url ? payload.url : '/';
+    : (typeof n.title === 'string' && n.title ? n.title
+      : (typeof payload.assistantName === 'string' && payload.assistantName ? payload.assistantName : 'New message'));
+  const body = typeof payload.body === 'string' && payload.body
+    ? payload.body
+    : (typeof n.body === 'string' && n.body ? n.body : 'Operator sent a new message');
+  const url = typeof payload.url === 'string' && payload.url ? payload.url : (n.navigate || '/');
 
   return {
     title,

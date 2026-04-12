@@ -360,6 +360,17 @@ export function useNotifications(socket, isAuthenticated) {
     };
 
     const handleVisibilityChange = () => {
+      // Tell the server our visibility state so it can route push notifications
+      // correctly. iOS suspends WebSockets when backgrounded without closing them,
+      // so the server needs an explicit signal to know we can't receive WS messages.
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ type: 'client_visible', visible: !document.hidden }));
+        } catch {
+          // Socket may be closing
+        }
+      }
+
       if (document.hidden) {
         return;
       }
@@ -373,9 +384,18 @@ export function useNotifications(socket, isAuthenticated) {
     // Clear badge on initial load (app just opened)
     clearBadge();
 
+    // Send initial visibility state to server
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(JSON.stringify({ type: 'client_visible', visible: !document.hidden }));
+      } catch {
+        // Socket may be closing
+      }
+    }
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [refreshLocalState]);
+  }, [refreshLocalState, socket]);
 
   const enabled = subscribed && permission === 'granted';
   const title = error

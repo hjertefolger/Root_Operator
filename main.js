@@ -1252,15 +1252,29 @@ function buildNotificationPreviewBody(content = '') {
 
 function getPushAssistantNotificationPayload(message = {}) {
     const assistantName = getActivityAssistantName();
+    const title = assistantName || 'New message';
+    const body = buildNotificationPreviewBody(message.content);
     return {
-        title: assistantName || 'New message',
-        body: buildNotificationPreviewBody(message.content),
+        // Standard fields for our service worker
+        title,
+        body,
         tag: 'root-operator-assistant-reply',
         url: PUSH_NOTIFICATION_TARGET_URL,
         assistantName,
         ts: message.ts || new Date().toISOString(),
         icon: '/icon-192-v3.png',
         badge: '/icon-192-v3.png',
+        // Declarative Web Push (iOS 18.4+) — browser shows this notification
+        // directly if the service worker fails or times out
+        web_push: 8030,
+        notification: {
+            title,
+            body,
+            navigate: PUSH_NOTIFICATION_TARGET_URL,
+            icon: '/icon-192-v3.png',
+            badge: '/icon-192-v3.png',
+            tag: 'root-operator-assistant-reply',
+        },
     };
 }
 
@@ -1578,7 +1592,7 @@ function showDesktopAssistantNotification(message) {
 async function sendPushNotification(entry, payload) {
     try {
         await webpush.sendNotification(entry.subscription, JSON.stringify(payload), {
-            TTL: 60,
+            TTL: 86400,
             urgency: 'high',
         });
     } catch (error) {
@@ -1595,16 +1609,30 @@ async function notifyPushSubscribers(message) {
         return;
     }
 
-    // Skip push for devices that have an active WebSocket connection —
-    // they're already receiving the message in real time
-    const connectedKids = new Set(
+    // Skip push only for devices with a genuinely active WebSocket connection.
+    // iOS suspends WebSockets when the PWA is backgrounded without closing them,
+    // so readyState alone is not reliable. A connection is considered active only if:
+    // (a) the socket is open AND authenticated, AND
+    // (b) the client reported itself as visible (not backgrounded), AND
+    // (c) we received a heartbeat ping within the last 35 seconds (one heartbeat cycle).
+    //     Uses lastHeartbeat (not lastActivity) because client_visible messages are
+    //     fire-and-forget — if iOS drops one, lastActivity would be artificially fresh.
+    const STALE_THRESHOLD_MS = 35000;
+    const now = Date.now();
+    const activeKids = new Set(
         [...activeClients]
-            .filter((c) => c.readyState === 1 && c.authenticated)
+            .filter((c) => (
+                c.readyState === 1
+                && c.authenticated
+                && c.clientVisible === true
+                && (now - (c.lastHeartbeat || 0)) < STALE_THRESHOLD_MS
+            ))
             .map((c) => c.kid)
             .filter(Boolean),
     );
 
-    const targets = subscriptions.filter((entry) => !connectedKids.has(entry.kid));
+    const targets = subscriptions.filter((entry) => !activeKids.has(entry.kid));
+    logDebug(`[NOTIFICATIONS] Push routing: ${subscriptions.length} subscriptions, ${activeKids.size} active clients, ${targets.length} push targets`);
     if (targets.length === 0) {
         return;
     }
@@ -4290,7 +4318,13 @@ function handleConnection(ws, req) {
         console.error('[WS] Error:', err);
     });
 
+    ws.lastActivity = Date.now();
+    ws.lastHeartbeat = Date.now();
+    ws.clientVisible = true;
+
     ws.on('message', async (msg) => {
+        ws.lastActivity = Date.now();
+
         let m;
         try {
             // SECURITY: Message size limit (defense in depth - maxPayload already enforces at WebSocket level)
@@ -4306,7 +4340,17 @@ function handleConnection(ws, req) {
 
         // Heartbeat - respond to ping immediately
         if (m.type === 'ping') {
+            ws.lastHeartbeat = Date.now();
             ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
+            return;
+        }
+
+        // Client visibility state — used for push notification routing.
+        // Does NOT update lastHeartbeat: if this message is lost during iOS
+        // suspension, the staleness check should still expire based on the
+        // last confirmed heartbeat, not this fire-and-forget signal.
+        if (m.type === 'client_visible') {
+            ws.clientVisible = Boolean(m.visible);
             return;
         }
 
