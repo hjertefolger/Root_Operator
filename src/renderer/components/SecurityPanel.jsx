@@ -75,7 +75,7 @@ function SecurityPanel({ fingerprint, sessionStartedAt }) {
   const placeholder = <span className="text-muted-foreground">—</span>;
 
   return (
-    <div className="flex flex-col gap-0 p-4">
+    <div className="flex flex-col gap-0 pt-4 pb-2">
       <Title trailing={<TwoDots />}>
         {isReady ? 'SECURED_SESSION' : 'PENDING_SESSION'}
       </Title>
@@ -87,15 +87,18 @@ function SecurityPanel({ fingerprint, sessionStartedAt }) {
         <Row label="Session started" value={started || placeholder} />
       </div>
 
-      <div className="mt-4 flex flex-col gap-2">
+      <div className="mt-4">
         <Title trailing={<Fingerprint size={14} strokeWidth={2} className="text-[#4B5AFF]" />}>
           SESSION_FINGERPRINT
         </Title>
+      </div>
+
+      <div className="mt-4 flex flex-col gap-2">
         <span className="font-mono text-xs font-normal tracking-wider">
           {fingerprintNodes || placeholder}
         </span>
         <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
-          Compare with paired device to verify
+          Verify with paired devices
         </span>
       </div>
     </div>

@@ -138,7 +138,7 @@ function SecurityPanel({
           {fingerprintNodes || placeholder}
         </span>
         <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
-          Compare with desktop to verify
+          Verify with desktop app
         </span>
       </div>
     </div>
