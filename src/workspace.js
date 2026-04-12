@@ -63,7 +63,7 @@ function ensureWorkspace() {
     }
 
     if (isFirstRun) {
-        _writeState({ ...state, seededAt: new Date().toISOString() });
+        _writeState({ ...state, seededAt: new Date().toISOString(), onboardedAt: new Date().toISOString() });
         console.log('[Workspace] First run — workspace seeded');
     }
 

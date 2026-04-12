@@ -308,11 +308,9 @@ function sanitizeTerminalOutput(data) {
 // E2E ENCRYPTION MODULE
 // Provides zero-knowledge encryption using authenticated ECDH + AES-256-GCM
 
-// BIP39 wordlist for human-readable fingerprints (2048 words, 11 bits each)
-const BIP39_WORDS = require('./public/bip39-words.json');
-
 // Global state for current session fingerprint (shown in tray)
 let currentFingerprint = null;
+let currentSessionStartedAt = null;
 let desktopIdentityKeyPair = null;
 const PAIRING_JWK_PRIVATE_FIELDS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth'];
 const loggedInvalidStoredPairingKids = new Set();
@@ -603,30 +601,12 @@ function deriveSessionKey(sharedSecret, salt) {
     return Buffer.from(key);
 }
 
-// Generate human-readable fingerprint from key material (12 words = 132 bits)
+// Generate hex fingerprint from key material (8 bytes = 16 hex chars)
+// Matches the client-side generateFingerprintHex() in useE2E.js
 function generateFingerprint(sharedSecret, salt) {
     const combined = Buffer.concat([sharedSecret, salt]);
     const hash = crypto.createHash('sha256').update(combined).digest();
-
-    // Use 11 bits per word to select from 2048-word BIP39 list
-    // 12 words × 11 bits = 132 bits of entropy
-    const words = [];
-    let bitBuffer = 0;
-    let bitsInBuffer = 0;
-    let byteIndex = 0;
-
-    for (let i = 0; i < 12; i++) {
-        // Accumulate bits until we have at least 11
-        while (bitsInBuffer < 11 && byteIndex < hash.length) {
-            bitBuffer = (bitBuffer << 8) | hash[byteIndex++];
-            bitsInBuffer += 8;
-        }
-        // Extract 11 bits for word index
-        bitsInBuffer -= 11;
-        const index = (bitBuffer >> bitsInBuffer) & 0x7FF; // 0x7FF = 2047
-        words.push(BIP39_WORDS[index]);
-    }
-    return words.join('-');
+    return hash.subarray(0, 8).toString('hex');
 }
 
 // Encrypt message with AES-256-GCM
@@ -743,8 +723,9 @@ async function completeE2EKeyExchange(ws, clientEcdhPubJwk, clientSignature) {
             ws.e2eTimeout = null;
         }
 
-        // Update global fingerprint for tray display (shown in right-click menu)
+        // Update global fingerprint for tray display
         currentFingerprint = ws.e2e.fingerprint;
+        currentSessionStartedAt = new Date().toISOString();
 
         logDebug(`[E2E] Key exchange complete. Fingerprint: ${ws.e2e.fingerprint}`);
 
@@ -776,9 +757,9 @@ async function completeE2EKeyExchange(ws, clientEcdhPubJwk, clientSignature) {
             ws.pendingOutput = [];
         }
 
-        // Notify renderer to show fingerprint
+        // Notify renderer to show fingerprint + session timestamp
         if (mainWindow) {
-            mainWindow.webContents.send('E2E_FINGERPRINT', ws.e2e.fingerprint);
+            mainWindow.webContents.send('E2E_FINGERPRINT', ws.e2e.fingerprint, new Date().toISOString());
         }
 
         return true;
@@ -2503,6 +2484,7 @@ function getTunnelState() {
         connecting: isConnecting,
         url: currentTunnelUrl || '',
         fingerprint: currentFingerprint,
+        sessionStartedAt: currentSessionStartedAt,
         mode: operatingMode,
         channelConnected: !!(channelManager && channelManager.connected),
         update: getUpdateState(),
@@ -3349,12 +3331,12 @@ app.whenReady().then(async () => {
     await fixPath();
 
     try {
-        const workspaceRuntime = prepareClaudeWorkspaceRuntime();
-        if (workspaceRuntime.missingTemplateFiles.length > 0) {
-            console.warn(`[WORKSPACE] Missing bundled templates: ${workspaceRuntime.missingTemplateFiles.join(', ')}`);
+        const { missingTemplateFiles } = ensureWorkspace();
+        if (missingTemplateFiles.length > 0) {
+            console.warn(`[WORKSPACE] Missing bundled templates: ${missingTemplateFiles.join(', ')}`);
         }
     } catch (error) {
-        console.error(`[WORKSPACE] Failed to prepare Claude workspace runtime: ${error.message}`);
+        console.error(`[WORKSPACE] Failed to prepare workspace: ${error.message}`);
         logDebug(`[WORKSPACE] Startup preparation failed: ${error.message}`);
     }
 
@@ -3939,6 +3921,7 @@ function stopBridge() {
     pendingPairings.clear();
     currentTunnelUrl = null;
     currentFingerprint = null;
+    currentSessionStartedAt = null;
     isConnecting = false;
     // Don't reset operatingMode — preserve user's choice across bridge restarts
     logDebug('[SYSTEM] Bridge stopped.');

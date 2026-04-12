@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { useElectron } from '../hooks/useElectron';
-import FingerprintSection from './FingerprintSection';
+import SecurityPanel from './SecurityPanel';
 
 // Random connecting state words
 const CONNECTING_WORDS = ['Bridging', 'Phasing', 'Warping', 'Tunneling', 'Gliding', 'Flying', 'Encoding'];
@@ -38,7 +38,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
   const [updateActionPending, setUpdateActionPending] = useState(false);
   const wasConnectingRef = useRef(false);
 
-  const { active, connecting, url, fingerprint, mode, health, update } = tunnelState;
+  const { active, connecting, url, fingerprint, sessionStartedAt, mode, health, update } = tunnelState;
   const assistantName = health?.channel?.assistantName || 'Operator';
   const overallHealth = health?.overall || {
     level: connecting ? 'orange' : 'red',
@@ -457,7 +457,7 @@ function MainView({ tunnelState, onStart, onStop, onShowSettings }) {
 
         {/* Fingerprint section */}
         {fingerprintVisible && fingerprint && (
-          <FingerprintSection fingerprint={fingerprint} />
+          <SecurityPanel fingerprint={fingerprint} sessionStartedAt={sessionStartedAt} />
         )}
       </div>
 

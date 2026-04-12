@@ -142,7 +142,6 @@
       "tray_*.png",
       "ui/**/*",
       "public/dist/**/*",
-      "public/bip39-words.json",
       "public/fonts/**/*",
       "public/icon-*.png",
       "workspace-templates/**/*",

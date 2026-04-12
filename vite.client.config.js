@@ -15,7 +15,7 @@ export default defineConfig(({ mode }) => {
     // Use relative paths for serving from tunnel
     base: './',
 
-    // Static assets from public folder (fonts, bip39, manifest)
+    // Static assets from public folder (fonts, manifest)
     publicDir: 'public',
 
     build: {

@@ -17,6 +17,7 @@ function App() {
     connecting: false,
     url: '',
     fingerprint: null,
+    sessionStartedAt: null,
     mode: 'channel',
     channelConnected: false,
     update: null,
@@ -87,6 +88,7 @@ function App() {
             connecting: tunnelStateFromMain.connecting || false,
             url: tunnelStateFromMain.url || '',
             fingerprint: tunnelStateFromMain.fingerprint || null,
+            sessionStartedAt: tunnelStateFromMain.sessionStartedAt || null,
             mode: tunnelStateFromMain.mode || 'channel',
             channelConnected: tunnelStateFromMain.channelConnected || false,
             update: tunnelStateFromMain.update || null,
@@ -115,8 +117,8 @@ function App() {
         invoke('SET_TRAY_ICON', true);
       }),
 
-      on('E2E_FINGERPRINT', (fingerprint) => {
-        setTunnelState(prev => ({ ...prev, fingerprint }));
+      on('E2E_FINGERPRINT', (fingerprint, sessionStartedAt) => {
+        setTunnelState(prev => ({ ...prev, fingerprint, sessionStartedAt }));
       }),
 
       on('SYNC_STATE', (state) => {
@@ -125,6 +127,7 @@ function App() {
           connecting: state.connecting || false,
           url: state.url || '',
           fingerprint: state.fingerprint || null,
+          sessionStartedAt: state.sessionStartedAt || null,
           mode: state.mode || 'channel',
           channelConnected: state.channelConnected || false,
           update: state.update || null,
@@ -173,6 +176,7 @@ function App() {
       connecting: false,
       url: '',
       fingerprint: null,
+      sessionStartedAt: null,
       mode: tunnelState.mode,
       channelConnected: false,
       update: tunnelState.update || null,
