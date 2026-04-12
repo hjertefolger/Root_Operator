@@ -6,6 +6,9 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+// Badge counter — persisted across push events
+let unreadCount = 0;
+
 function normalizeNotificationPayload(data) {
   const payload = data && typeof data === 'object' ? data : {};
   const title = typeof payload.title === 'string' && payload.title
@@ -29,6 +32,29 @@ function normalizeNotificationPayload(data) {
   };
 }
 
+async function hasVisibleClient() {
+  const windowClients = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: false,
+  });
+
+  return windowClients.some((client) => client.visibilityState === 'visible');
+}
+
+async function updateBadge(count) {
+  if ('setAppBadge' in self.navigator) {
+    try {
+      if (count > 0) {
+        await self.navigator.setAppBadge(count);
+      } else {
+        await self.navigator.clearAppBadge();
+      }
+    } catch {
+      // Badge API not available in this context
+    }
+  }
+}
+
 self.addEventListener('push', (event) => {
   let payload = {};
 
@@ -40,12 +66,29 @@ self.addEventListener('push', (event) => {
     }
   }
 
-  const notification = normalizeNotificationPayload(payload);
-  event.waitUntil(self.registration.showNotification(notification.title, notification.options));
+  event.waitUntil((async () => {
+    const clientVisible = await hasVisibleClient();
+
+    // Always increment badge (cleared when client focuses)
+    unreadCount += 1;
+    await updateBadge(unreadCount);
+
+    // Suppress notification banner when the PWA is open and visible
+    if (clientVisible) {
+      return;
+    }
+
+    const notification = normalizeNotificationPayload(payload);
+    await self.registration.showNotification(notification.title, notification.options);
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+
+  // Clear badge on notification tap
+  unreadCount = 0;
+  updateBadge(0);
 
   const destination = new URL(event.notification.data?.url || '/', self.location.origin).toString();
 
@@ -71,4 +114,12 @@ self.addEventListener('notificationclick', (event) => {
       await self.clients.openWindow(destination);
     }
   })());
+});
+
+// Listen for badge clear messages from the client
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'clear_badge') {
+    unreadCount = 0;
+    updateBadge(0);
+  }
 });

@@ -302,11 +302,30 @@ export function useNotifications(socket, isAuthenticated) {
       return undefined;
     }
 
+    const clearBadge = () => {
+      // Clear badge via Badging API (direct)
+      if ('clearAppBadge' in navigator) {
+        navigator.clearAppBadge().catch(() => {});
+      }
+
+      // Tell service worker to reset its counter
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: 'clear_badge' });
+      }
+    };
+
     const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        clearBadge();
+      }
+
       refreshLocalState().catch((refreshError) => {
         console.warn('[NOTIFICATIONS] Failed to refresh local notification state:', refreshError);
       });
     };
+
+    // Clear badge on initial load (app just opened)
+    clearBadge();
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
