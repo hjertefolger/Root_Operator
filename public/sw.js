@@ -69,14 +69,14 @@ self.addEventListener('push', (event) => {
   event.waitUntil((async () => {
     const clientVisible = await hasVisibleClient();
 
-    // Always increment badge (cleared when client focuses)
-    unreadCount += 1;
-    await updateBadge(unreadCount);
-
-    // Suppress notification banner when the PWA is open and visible
+    // If the user is already reading the chat, skip everything
     if (clientVisible) {
       return;
     }
+
+    // Only count as unread when the app is not visible
+    unreadCount += 1;
+    await updateBadge(unreadCount);
 
     const notification = normalizeNotificationPayload(payload);
     await self.registration.showNotification(notification.title, notification.options);
