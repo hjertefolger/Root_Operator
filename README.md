@@ -7,6 +7,12 @@
 
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
+✨ Now with built-in persistent cron scheduler and identity system
+
+- 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
+- 🛡️ **RSA-PSS with challenge-response** (passwordless)
+- 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
+
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 
 > **Security notice**
