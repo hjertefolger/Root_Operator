@@ -13,6 +13,7 @@ const ROOT_OPERATOR_DIR = path.join(os.homedir(), '.root-operator');
 const WORKSPACE_DIR = path.join(ROOT_OPERATOR_DIR, 'workspace');
 const RUNTIME_DIR = path.join(ROOT_OPERATOR_DIR, 'runtime');
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
+const ATTACHMENTS_DIR = path.join(WORKSPACE_DIR, 'attachments');
 const STATE_FILE = path.join(WORKSPACE_DIR, '.state.json');
 const SYSTEM_PROMPT_FILE = path.join(RUNTIME_DIR, 'system-prompt-append.md');
 const PROJECT_MCP_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
@@ -208,6 +209,14 @@ function ensureWorkspaceChatHistory() {
     };
 }
 
+/**
+ * Ensure the attachments directory exists and return its path.
+ */
+function ensureAttachmentsDir() {
+    fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+    return ATTACHMENTS_DIR;
+}
+
 // --- Internal helpers ---
 
 function _readState() {
@@ -233,9 +242,11 @@ module.exports = {
     getWorkspaceDir,
     getRuntimeDir,
     ensureWorkspaceChatHistory,
+    ensureAttachmentsDir,
     ROOT_OPERATOR_DIR,
     WORKSPACE_DIR,
     RUNTIME_DIR,
     MEMORY_DIR,
+    ATTACHMENTS_DIR,
     CHAT_HISTORY_FILE,
 };

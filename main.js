@@ -21,7 +21,7 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory } = require('./src/workspace');
+const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR } = require('./src/workspace');
 
 let store;
 const isDev = !app.isPackaged;
@@ -2054,7 +2054,7 @@ function getLocalChatState() {
 }
 
 function submitChannelUserMessage(chatId, content, userId, options = {}) {
-    const { echoToLocalChat = false } = options;
+    const { echoToLocalChat = false, senderWs = null } = options;
     const assistantName = getActivityAssistantName();
 
     if (operatingMode !== 'channel' || !channelManager || !channelManager.connected) {
@@ -2084,6 +2084,14 @@ function submitChannelUserMessage(chatId, content, userId, options = {}) {
             content,
             ts,
         });
+    }
+
+    // Broadcast to all WebSocket clients except the sender so other clients mirror the message
+    const msg = JSON.stringify({ type: 'channel_message', role: 'user', content, ts });
+    for (const client of activeClients) {
+        if (client !== senderWs && client.readyState === WebSocket.OPEN) {
+            sendEncryptedOutput(client, msg);
+        }
     }
 
     return {
@@ -2717,6 +2725,7 @@ function prepareClaudeWorkspaceRuntime() {
         repairedFiles,
         missingTemplateFiles,
     } = ensureWorkspace();
+    ensureAttachmentsDir();
     const settingsPath = path.join(runtimeDir, 'root-operator-claude-settings.json');
     const debugFilePath = path.join(runtimeDir, 'claude-channel-debug.log');
     const hookLogPath = path.join(runtimeDir, 'claude-channel-hooks.jsonl');
@@ -3425,6 +3434,67 @@ ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', (event, text) => {
 
     return submitChannelUserMessage('desktop-local', text.trim(), 'desktop-local');
 });
+ipcMain.handle('SEND_LOCAL_CHAT_FILE', (event, { data, filename, mimeType, caption }) => {
+    if (!data || !filename) {
+        return { success: false, error: 'Missing file data or filename' };
+    }
+
+    const fileBuffer = Buffer.from(data);
+
+    if (fileBuffer.length === 0) {
+        return { success: false, error: 'File is empty' };
+    }
+
+    if (fileBuffer.length > MAX_FILE_SIZE) {
+        return { success: false, error: `File too large (max ${MAX_FILE_SIZE / 1024 / 1024} MB)` };
+    }
+
+    // Sanitize filename
+    const sanitized = path.basename(filename).replace(/[^a-zA-Z0-9._\- ]/g, '_');
+    if (!sanitized || sanitized === '.' || sanitized === '..') {
+        return { success: false, error: 'Invalid filename' };
+    }
+
+    if (BLOCKED_FILE_EXTENSIONS.test(sanitized)) {
+        return { success: false, error: 'File type not allowed' };
+    }
+
+    ensureAttachmentsDir();
+    let finalName = sanitized;
+    let destPath = path.join(ATTACHMENTS_DIR, finalName);
+
+    // Path traversal check
+    const resolved = path.resolve(destPath);
+    if (!resolved.startsWith(ATTACHMENTS_DIR + path.sep) && resolved !== ATTACHMENTS_DIR) {
+        return { success: false, error: 'Invalid file path' };
+    }
+
+    // Collision handling
+    if (fs.existsSync(destPath)) {
+        const ext = path.extname(sanitized);
+        const base = path.basename(sanitized, ext);
+        let counter = 2;
+        while (fs.existsSync(destPath)) {
+            finalName = `${base}-${counter}${ext}`;
+            destPath = path.join(ATTACHMENTS_DIR, finalName);
+            counter++;
+        }
+    }
+
+    try {
+        fs.writeFileSync(destPath, fileBuffer);
+        logDebug(`[ATTACH] Desktop local file saved: ${finalName} (${fileBuffer.length} bytes)`);
+    } catch (e) {
+        return { success: false, error: `Failed to save: ${e.message}` };
+    }
+
+    const parts = [];
+    if (caption) {
+        parts.push(caption);
+    }
+    parts.push(`[File attached: ${filename}]\nSaved to: ${destPath}`);
+    return submitChannelUserMessage('desktop-local', parts.join('\n\n'), 'desktop-local');
+});
 ipcMain.handle('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP', () => {
     if (!localChatWindow || localChatWindow.isDestroyed()) {
         return { success: false, error: 'Local chat window is not open' };
@@ -3698,11 +3768,11 @@ async function startBridge(cfSettings) {
 
     // WebSocket server with origin verification and payload limits
     // SECURITY: maxPayload prevents DoS attacks via large messages
-    // 64KB supports larger clipboard pastes while remaining safe for terminal I/O
+    // 1MB supports file attachment chunks (512KB plaintext → ~700KB base64 + JSON envelope)
     // Using noServer: true to manually handle upgrades (needed for Vite HMR proxy in dev)
     wss = new WebSocket.Server({
         noServer: true,
-        maxPayload: 64 * 1024 // 64KB max message size (enforced at server level)
+        maxPayload: 1024 * 1024 // 1MB max message size (covers file chunks + overhead)
     });
 
     wss.on('connection', (ws, req) => handleConnection(ws, req));
@@ -3936,6 +4006,12 @@ const MAX_CONNECTIONS_PER_MINUTE = 20;
 const MAX_CONNECTIONS_PER_SOURCE_PER_MINUTE = 10;
 const MAX_AUTH_ATTEMPTS_PER_CONNECTION = 3;
 const MAX_INPUT_SIZE = 131072; // Max bytes per input message (128KB)
+const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB max file upload
+const MAX_FILE_CHUNK_SIZE = 512 * 1024; // must match client CHUNK_SIZE
+const MAX_ACTIVE_TRANSFERS_PER_DEVICE = 3;
+const FILE_TRANSFER_TIMEOUT_MS = 120_000; // 2 minutes to complete a transfer
+const BLOCKED_FILE_EXTENSIONS = /\.(exe|bat|cmd|sh|ps1|app|dmg|pkg|msi|vbs|wsf)$/i;
+const fileTransfers = new Map(); // transferId -> { chunks, totalChunks, filename, mimeType, fileSize, deviceId, timer }
 const SESSION_REVOKED_CLOSE_CODE = 4001;
 const E2E_UNAUTHENTICATED_CLOSE_CODE = 4002;
 const E2E_UNAVAILABLE_CLOSE_CODE = 4003;
@@ -4120,6 +4196,16 @@ function cleanupClientConnection(ws, options = {}) {
     ws.challengeTime = null;
     ws.challengeKeyId = null;
     ws.e2e = null;
+
+    // Clean up any in-progress file transfers for this device
+    const deviceId = ws.kid || 'unknown';
+    for (const [tid, transfer] of fileTransfers.entries()) {
+        if (transfer.deviceId === deviceId) {
+            clearTimeout(transfer.timer);
+            fileTransfers.delete(tid);
+            logDebug(`[ATTACH] Cleaned up stale transfer ${tid} for disconnected device ${deviceId}`);
+        }
+    }
 }
 
 function revokeClientConnection(ws, reason = 'Device removed') {
@@ -4192,8 +4278,8 @@ function handleConnection(ws, req) {
         let m;
         try {
             // SECURITY: Message size limit (defense in depth - maxPayload already enforces at WebSocket level)
-            // 32KB matches the maxPayload setting
-            if (msg.length > 32768) {
+            // File chunks can be up to ~1MB (512KB plaintext + base64 + JSON), regular messages stay at 256KB
+            if (msg.length > 1024 * 1024) {
                 logDebug('[SECURITY] Message too large, ignoring');
                 return;
             }
@@ -4483,6 +4569,7 @@ function handleConnection(ws, req) {
                 const deviceId = ws.kid || 'unknown';
                 const result = submitChannelUserMessage(deviceId, inputData, deviceId, {
                     echoToLocalChat: true,
+                    senderWs: ws,
                 });
 
                 if (result.success) {
@@ -4500,6 +4587,170 @@ function handleConnection(ws, req) {
 
         // NOTE: Unencrypted 'input' handler removed for security
         // All terminal input MUST go through e2e_input after E2E is established
+
+        // E2E Encrypted File Chunk - file attachment upload
+        if (ws.authenticated && m.type === 'e2e_file_chunk') {
+            if (!ws.e2e || !ws.e2e.ready) {
+                logDebug('[E2E] Received file chunk but E2E not ready');
+                return;
+            }
+
+            const { transferId, chunkIndex, totalChunks, filename, mimeType, fileSize } = m;
+
+            // Validate metadata
+            if (!transferId || typeof chunkIndex !== 'number' || typeof totalChunks !== 'number' || !filename) {
+                logDebug('[SECURITY] Malformed file chunk metadata');
+                return;
+            }
+
+            if (!Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks)
+                || totalChunks < 1 || totalChunks > Math.ceil(MAX_FILE_SIZE / MAX_FILE_CHUNK_SIZE)
+                || chunkIndex < 0 || chunkIndex >= totalChunks) {
+                logDebug(`[SECURITY] File chunk index/count out of range: chunk=${chunkIndex} total=${totalChunks}`);
+                return;
+            }
+
+            // Validate claimed file size
+            if (typeof fileSize === 'number' && fileSize > MAX_FILE_SIZE) {
+                logDebug(`[SECURITY] Claimed file size ${fileSize} exceeds limit`);
+                return;
+            }
+
+            // Limit active transfers per device
+            const deviceId = ws.kid || 'unknown';
+            const activeForDevice = Array.from(fileTransfers.values()).filter(t => t.deviceId === deviceId).length;
+            if (!fileTransfers.has(transferId) && activeForDevice >= MAX_ACTIVE_TRANSFERS_PER_DEVICE) {
+                logDebug(`[SECURITY] Too many active transfers for device ${deviceId}`);
+                return;
+            }
+
+            // Pre-decryption size gate
+            if (m.data && m.data.length > MAX_FILE_SIZE * 2) {
+                logDebug('[SECURITY] File chunk payload too large');
+                return;
+            }
+
+            // Decrypt chunk to Buffer (not string)
+            let chunkBuffer;
+            try {
+                const iv = Buffer.from(m.iv, 'base64');
+                const data = Buffer.from(m.data, 'base64');
+                const authTag = Buffer.from(m.tag, 'base64');
+
+                const decipher = crypto.createDecipheriv('aes-256-gcm', ws.e2e.sessionKey, iv);
+                decipher.setAuthTag(authTag);
+                chunkBuffer = Buffer.concat([decipher.update(data), decipher.final()]);
+            } catch (e) {
+                logDebug(`[SECURITY] File chunk decryption failed: ${e.message}`);
+                return;
+            }
+
+            // Initialize or get transfer
+            if (!fileTransfers.has(transferId)) {
+                const timer = setTimeout(() => {
+                    logDebug(`[ATTACH] Transfer ${transferId} timed out, cleaning up`);
+                    fileTransfers.delete(transferId);
+                }, FILE_TRANSFER_TIMEOUT_MS);
+
+                fileTransfers.set(transferId, {
+                    chunks: new Map(),
+                    totalChunks,
+                    filename,
+                    mimeType: mimeType || 'application/octet-stream',
+                    fileSize: fileSize || 0,
+                    caption: m.caption || '',
+                    deviceId,
+                    timer,
+                });
+            }
+
+            const transfer = fileTransfers.get(transferId);
+            transfer.chunks.set(chunkIndex, chunkBuffer);
+
+            logDebug(`[ATTACH] Chunk ${chunkIndex + 1}/${totalChunks} for ${filename} (${chunkBuffer.length} bytes)`);
+
+            // All chunks received — reassemble and save
+            if (transfer.chunks.size === transfer.totalChunks) {
+                clearTimeout(transfer.timer);
+                fileTransfers.delete(transferId);
+
+                const ordered = [];
+                for (let i = 0; i < transfer.totalChunks; i++) {
+                    const chunk = transfer.chunks.get(i);
+                    if (!chunk) {
+                        logDebug(`[ATTACH] Missing chunk ${i} for transfer ${transferId}`);
+                        return;
+                    }
+                    ordered.push(chunk);
+                }
+
+                const assembled = Buffer.concat(ordered);
+
+                // Final size check
+                if (assembled.length > MAX_FILE_SIZE) {
+                    logDebug(`[SECURITY] Reassembled file exceeds max size: ${assembled.length}`);
+                    return;
+                }
+
+                // Sanitize filename — keep original name but strip path components and dangerous chars
+                const sanitized = path.basename(transfer.filename).replace(/[^a-zA-Z0-9._\- ]/g, '_');
+                if (!sanitized || sanitized === '.' || sanitized === '..') {
+                    logDebug(`[SECURITY] Invalid filename after sanitization: ${transfer.filename}`);
+                    return;
+                }
+
+                // Block executable extensions
+                if (BLOCKED_FILE_EXTENSIONS.test(sanitized)) {
+                    logDebug(`[SECURITY] Blocked file extension: ${sanitized}`);
+                    return;
+                }
+
+                // Resolve final path — use original name, add suffix on collision
+                ensureAttachmentsDir();
+                let finalName = sanitized;
+                let destPath = path.join(ATTACHMENTS_DIR, finalName);
+
+                // Path traversal check
+                const resolved = path.resolve(destPath);
+                if (!resolved.startsWith(ATTACHMENTS_DIR + path.sep) && resolved !== ATTACHMENTS_DIR) {
+                    logDebug('[SECURITY] Path traversal attempt blocked');
+                    return;
+                }
+
+                // Collision handling — append -2, -3, etc.
+                if (fs.existsSync(destPath)) {
+                    const ext = path.extname(sanitized);
+                    const base = path.basename(sanitized, ext);
+                    let counter = 2;
+                    while (fs.existsSync(destPath)) {
+                        finalName = `${base}-${counter}${ext}`;
+                        destPath = path.join(ATTACHMENTS_DIR, finalName);
+                        counter++;
+                    }
+                }
+
+                try {
+                    fs.writeFileSync(destPath, assembled);
+                    logDebug(`[ATTACH] Saved: ${finalName} (${assembled.length} bytes, ${transfer.mimeType})`);
+                } catch (e) {
+                    logDebug(`[ATTACH] Failed to write file: ${e.message}`);
+                    return;
+                }
+
+                // Send path reference to Claude via channel (single message with optional caption)
+                const absPath = destPath;
+                const parts = [];
+                if (transfer.caption) {
+                    parts.push(transfer.caption);
+                }
+                parts.push(`[File attached: ${transfer.filename}]\nSaved to: ${absPath}`);
+                submitChannelUserMessage(transfer.deviceId, parts.join('\n\n'), transfer.deviceId, {
+                    echoToLocalChat: true,
+                    senderWs: ws,
+                });
+            }
+            return;
+        }
 
         // Mode switch from client
         if (ws.authenticated && m.type === 'set_mode') {

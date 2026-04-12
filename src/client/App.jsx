@@ -8,6 +8,7 @@ import { useWebSocket } from './hooks/useWebSocket';
 import { useE2E } from './hooks/useE2E';
 import { useAuth } from './hooks/useAuth';
 import { useNotifications } from './hooks/useNotifications';
+import { useFileAttachment } from './hooks/useFileAttachment';
 import { mergeChannelActivity } from './lib/channelActivity';
 
 function getMessageKey(item) {
@@ -102,6 +103,7 @@ function App() {
     sessionStartedAt,
     pinnedDesktopKidHex,
     encryptInput,
+    encryptBuffer,
     decryptOutput,
     handleServerKeyMessage
   } = useE2E({
@@ -112,6 +114,20 @@ function App() {
     onSecurityFailure: handleSecurityFailure,
     disconnect
   });
+
+  // File attachment support
+  const { sendFile, uploadProgress, abortUpload } = useFileAttachment({
+    encryptBuffer,
+    socket,
+    e2eReady,
+  });
+
+  const handleSendFile = useCallback(async (file, caption) => {
+    const result = await sendFile(file, caption);
+    if (!result.success) {
+      console.error('[FILE] Upload failed:', result.error);
+    }
+  }, [sendFile]);
 
   // Toggle between channel and terminal mode
   const handleToggleMode = useCallback(() => {
@@ -271,6 +287,9 @@ function App() {
           setActivities={setChannelActivities}
           waiting={channelWaiting}
           setWaiting={setChannelWaiting}
+          onSendFile={handleSendFile}
+          uploadProgress={uploadProgress}
+          onAbortUpload={abortUpload}
         />
       ) : (
         <Terminal

@@ -359,6 +359,30 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
     };
   }, []);
 
+  const encryptBuffer = useCallback(async (arrayBuffer) => {
+    if (!e2eReadyRef.current || !sessionKeyRef.current) {
+      return null;
+    }
+
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+
+    const ciphertext = await window.crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv },
+      sessionKeyRef.current,
+      arrayBuffer
+    );
+
+    const ciphertextArray = new Uint8Array(ciphertext);
+    const data = ciphertextArray.slice(0, -16);
+    const tag = ciphertextArray.slice(-16);
+
+    return {
+      iv: arrayBufferToBase64(iv),
+      data: arrayBufferToBase64(data),
+      tag: arrayBufferToBase64(tag)
+    };
+  }, []);
+
   const decryptOutput = useCallback(async (encrypted) => {
     if (!e2eReadyRef.current || !sessionKeyRef.current) {
       return null;
@@ -392,6 +416,7 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
     sessionStartedAt,
     pinnedDesktopKidHex,
     encryptInput,
+    encryptBuffer,
     decryptOutput,
     handleServerKeyMessage
   };

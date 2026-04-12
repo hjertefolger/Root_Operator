@@ -101,6 +101,19 @@ function LocalChatView({ tunnelState }) {
     }
   }, [invoke]);
 
+  const handleSendFile = useCallback(async (file, caption) => {
+    const buffer = await file.arrayBuffer();
+    const result = await invoke('SEND_LOCAL_CHAT_FILE', {
+      data: Array.from(new Uint8Array(buffer)),
+      filename: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      caption: caption || '',
+    });
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to send file');
+    }
+  }, [invoke]);
+
   const handleToggleAlwaysOnTop = useCallback(async () => {
     try {
       const result = await invoke('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP');
@@ -193,6 +206,7 @@ function LocalChatView({ tunnelState }) {
         waiting={waiting}
         setWaiting={setWaiting}
         onSubmitMessage={handleSubmitMessage}
+        onSendFile={handleSendFile}
         canSendOverride={canSend}
       />
     </div>
