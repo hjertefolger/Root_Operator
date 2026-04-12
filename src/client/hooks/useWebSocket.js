@@ -66,18 +66,43 @@ export function useWebSocket() {
     }
   }, []);
 
+  // Send a single heartbeat ping. Carries the current visibility state so
+  // the server can update clientVisible and lastHeartbeat atomically.
+  const sendPing = useCallback((ws) => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({
+        type: 'ping',
+        timestamp: Date.now(),
+        visible: isPageVisible(),
+      }));
+    } catch {
+      // Socket may be closing
+    }
+  }, []);
+
   const startHeartbeat = useCallback((ws) => {
     clearHeartbeat();
+
+    // Fire an immediate ping so lastHeartbeat is fresh right now — don't
+    // wait up to 25 s for the first interval tick. This is critical when
+    // resuming from background: the visibility change sends client_visible
+    // immediately, but without a fresh heartbeat the server sees the pair
+    // (visible=true, lastHeartbeat=stale) and sends push anyway.
+    sendPing(ws);
+
     heartbeatIntervalRef.current = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN && isPageVisible()) {
-        ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+        sendPing(ws);
         heartbeatTimeoutRef.current = setTimeout(() => {
           console.log('[WS] Heartbeat timeout');
           ws.close(4000, 'Heartbeat timeout');
         }, HEARTBEAT_CONFIG.timeout);
       }
     }, HEARTBEAT_CONFIG.interval);
-  }, [clearHeartbeat]);
+  }, [clearHeartbeat, sendPing]);
 
   const handlePong = useCallback(() => {
     if (heartbeatTimeoutRef.current) {

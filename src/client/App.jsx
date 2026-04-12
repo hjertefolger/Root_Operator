@@ -184,6 +184,13 @@ function App() {
         if (parsed.type === 'channel_history') {
           setChannelMessages(parsed.messages || []);
         } else if (parsed.type === 'channel_message') {
+          // Clear badge when receiving a message while visible
+          if (!document.hidden && 'clearAppBadge' in navigator) {
+            navigator.clearAppBadge().catch(() => {});
+          }
+          if (!document.hidden && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({ type: 'clear_badge' });
+          }
           setChannelWaiting(false);
           setChannelMessages(prev => mergeMessages(prev, [{
             role: parsed.role || 'assistant',

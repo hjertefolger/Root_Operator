@@ -1632,17 +1632,40 @@ async function notifyPushSubscribers(message) {
             .filter(Boolean),
     );
 
+    // Log each client's state for debugging push routing — show which
+    // condition(s) caused it to be excluded from activeKids
+    for (const c of activeClients) {
+        const hbAge = c.lastHeartbeat ? now - c.lastHeartbeat : 'never';
+        const kid8 = (c.kid || '?').substring(0, 8);
+        const isOpen = c.readyState === 1;
+        const isAuth = !!c.authenticated;
+        const isVis = c.clientVisible === true;
+        const hbFresh = (now - (c.lastHeartbeat || 0)) < STALE_THRESHOLD_MS;
+        const suppressed = isOpen && isAuth && isVis && hbFresh;
+        const reason = suppressed
+            ? 'SUPPRESSED (active)'
+            : `PUSH (open=${isOpen} auth=${isAuth} vis=${isVis} hbFresh=${hbFresh})`;
+        logDebug(`[NOTIFICATIONS] Client ${kid8}: ${reason} hbAge=${hbAge}ms`);
+    }
+
     const targets = subscriptions.filter((entry) => !activeKids.has(entry.kid));
-    logDebug(`[NOTIFICATIONS] Push routing: ${subscriptions.length} subscriptions, ${activeKids.size} active clients, ${targets.length} push targets`);
+    logDebug(`[NOTIFICATIONS] Push routing: ${subscriptions.length} subs, ${activeKids.size} active, ${targets.length} targets`);
     if (targets.length === 0) {
+        logDebug('[NOTIFICATIONS] All devices have active WS — push suppressed');
         return;
+    }
+
+    for (const t of targets) {
+        logDebug(`[NOTIFICATIONS] Sending push to ${(t.kid || '?').substring(0, 8)} (${t.platform || 'unknown'})`);
     }
 
     const payload = getPushAssistantNotificationPayload(message);
     const results = await Promise.allSettled(targets.map((entry) => sendPushNotification(entry, payload)));
     const failures = results.filter((result) => result.status === 'rejected');
     if (failures.length > 0) {
-        logDebug(`[NOTIFICATIONS] Push delivery failures: ${failures.length}`);
+        for (const f of failures) {
+            logDebug(`[NOTIFICATIONS] Push delivery failure: ${f.reason?.message || f.reason}`);
+        }
     }
 }
 
@@ -4342,19 +4365,33 @@ function handleConnection(ws, req) {
             return;
         }
 
-        // Heartbeat - respond to ping immediately
+        // Heartbeat - respond to ping immediately.
+        // Pings carry the client's visibility state so that lastHeartbeat and
+        // clientVisible are always updated atomically. This eliminates the race
+        // where the page returns to foreground (clientVisible=true) but
+        // lastHeartbeat is stale because the first interval-ping hasn't fired.
         if (m.type === 'ping') {
             ws.lastHeartbeat = Date.now();
+            if (typeof m.visible === 'boolean') {
+                ws.clientVisible = m.visible;
+            }
             ws.send(JSON.stringify({ type: 'pong', timestamp: m.timestamp }));
             return;
         }
 
-        // Client visibility state — used for push notification routing.
-        // Does NOT update lastHeartbeat: if this message is lost during iOS
-        // suspension, the staleness check should still expire based on the
-        // last confirmed heartbeat, not this fire-and-forget signal.
+        // Client visibility state — belt-and-suspenders signal alongside
+        // heartbeat pings. When the client reports it is now visible, we also
+        // bump lastHeartbeat so the pair (clientVisible, lastHeartbeat) is
+        // immediately consistent. Without this, a push arriving between the
+        // visibility change and the next heartbeat ping would see
+        // clientVisible=true but a stale heartbeat and fire incorrectly.
         if (m.type === 'client_visible') {
-            ws.clientVisible = Boolean(m.visible);
+            const nowVisible = Boolean(m.visible);
+            ws.clientVisible = nowVisible;
+            if (nowVisible) {
+                ws.lastHeartbeat = Date.now();
+            }
+            logDebug(`[NOTIFICATIONS] client_visible kid=${(ws.kid || '?').substring(0, 8)} visible=${nowVisible} hb=${ws.lastHeartbeat}`);
             return;
         }
 
@@ -4529,6 +4566,8 @@ function handleConnection(ws, req) {
 
                 ws.authenticated = true;
                 ws.kid = m.keyId;
+                ws.lastHeartbeat = Date.now();
+                ws.clientVisible = true;
                 clearTimeout(ws.authTimeout);
                 ws.send(JSON.stringify(
                     isApprovedPairing

@@ -399,8 +399,8 @@ export function useNotifications(socket, isAuthenticated) {
     // Clear badge on initial load (app just opened)
     clearBadge();
 
-    // Send initial visibility state to server
-    if (socket && socket.readyState === WebSocket.OPEN) {
+    // Send initial visibility state to server once authenticated
+    if (isAuthenticated && socket && socket.readyState === WebSocket.OPEN) {
       try {
         socket.send(JSON.stringify({ type: 'client_visible', visible: !document.hidden }));
       } catch {
@@ -410,7 +410,7 @@ export function useNotifications(socket, isAuthenticated) {
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [refreshLocalState, socket]);
+  }, [isAuthenticated, refreshLocalState, socket]);
 
   const enabled = subscribed && permission === 'granted';
   const title = error
