@@ -232,12 +232,21 @@ function parseFileAttachments(content) {
   const textLines = [];
   const files = [];
   for (const line of lines) {
-    const match = line.match(/^📎\s+(.+?)(?:\|(\d+))?$/);
-    if (match) {
-      files.push({ name: match[1], size: match[2] ? parseInt(match[2], 10) : null });
-    } else {
-      textLines.push(line);
+    // Local send format: 📎 FILENAME|SIZE
+    const emojiMatch = line.match(/^📎\s+(.+?)(?:\|(\d+))?$/);
+    if (emojiMatch) {
+      files.push({ name: emojiMatch[1], size: emojiMatch[2] ? parseInt(emojiMatch[2], 10) : null });
+      continue;
     }
+    // Server/cross-client format: [File attached: FILENAME]
+    const bracketMatch = line.match(/^\[File attached:\s+(.+?)\]$/);
+    if (bracketMatch) {
+      files.push({ name: bracketMatch[1], size: null });
+      continue;
+    }
+    // Strip "Saved to:" lines that follow [File attached:]
+    if (/^Saved to:\s+/.test(line)) continue;
+    textLines.push(line);
   }
   return { text: textLines.join('\n').trim(), files };
 }

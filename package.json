@@ -1,7 +1,7 @@
 {
   "name": "root-operator",
   "productName": "Root_Operator",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Personal AI assistant for macOS powered by Claude Code channels",
   "main": "main.js",
   "scripts": {
@@ -77,6 +77,9 @@
     "xterm-addon-fit": "^0.8.0",
     "xterm-addon-web-links": "^0.9.0",
     "zustand": "^5.0.9"
+  },
+  "overrides": {
+    "axios": ">=1.15.0"
   },
   "devDependencies": {
     "@electron/notarize": "^2.5.0",
