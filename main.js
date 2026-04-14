@@ -2926,36 +2926,6 @@ async function spawnClaudeCode() {
         systemPromptFile,
     } = prepareClaudeWorkspaceRuntime();
 
-    // Dynamic Memory: if enabled, search for relevant past context and append
-    // it to the system prompt file before Claude Code spawns. Bounded by a
-    // 1500ms timeout so a slow embed never blocks spawn materially.
-    if (dynamicMemory && dynamicMemory.isEnabled()) {
-        try {
-            const inject = (async () => {
-                try {
-                    const recentContent = (chatStore ? chatStore.loadMessages() : [])
-                        .slice(-10)
-                        .filter((m) => m && m.role === 'user' && typeof m.content === 'string')
-                        .map((m) => m.content)
-                        .join(' ');
-                    if (recentContent.trim().length <= 20) return;
-                    // chatId=undefined => global query across all stored fragments
-                    // (chatId scoped storage, but v1 queries globally per plan).
-                    const memoryBlock = await dynamicMemory.buildContextForSpawn(recentContent, undefined);
-                    if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
-                        fs.appendFileSync(systemPromptFile, '\n\n' + memoryBlock, 'utf-8');
-                        logDebug(`[MEMORY] Injected ${memoryBlock.length} chars into system prompt`);
-                    }
-                } catch (err) {
-                    logDebug(`[MEMORY] Context injection failed: ${err.message}`);
-                }
-            })();
-            const timeout = new Promise((resolve) => setTimeout(resolve, 1500));
-            await Promise.race([inject, timeout]);
-        } catch (err) {
-            logDebug(`[MEMORY] Injection race failed: ${err.message}`);
-        }
-    }
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
