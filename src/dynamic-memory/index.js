@@ -24,6 +24,13 @@ const { buildMemoryBlock } = require('./prompt');
 
 const STORE_KEY = 'dynamicMemory.enabled';
 
+const PERF_ENABLED = process.env.NODE_ENV === 'development' || process.env.DYNAMIC_MEMORY_PERF === '1';
+function perfLog(msg) {
+    if (PERF_ENABLED) {
+        try { console.error(`[MEMORY-PERF] ${msg}`); } catch (_) { /* ignore */ }
+    }
+}
+
 class DynamicMemory {
     /**
      * @param {string} workspaceDir  Root Operator workspace dir (~/.root-operator/workspace).
@@ -151,10 +158,12 @@ class DynamicMemory {
         if (this._embedderInitPromise) return this._embedderInitPromise;
         const baseDir = this._modelBaseDir();
         this._log(`[MEMORY] Initializing embedder (baseDir=${baseDir})`);
+        const _perfT0 = Date.now();
         this._embedderInitPromise = (async () => {
             await embeddings.initEmbedder(baseDir);
             this._embedderReady = true;
             this._log('[MEMORY] Embedder ready');
+            perfLog(`embedder cold_load=${Date.now() - _perfT0}ms`);
         })();
         try {
             await this._embedderInitPromise;
@@ -182,6 +191,11 @@ class DynamicMemory {
         const chunks = extractChunks(content, effectiveRole);
         if (!chunks.length) return;
 
+        const _perfT0 = Date.now();
+        let _perfEmbedTotal = 0;
+        let _perfEmbedCount = 0;
+        let _perfInsertTotal = 0;
+
         // Ensure embedder is ready (lazy load on first call).
         try {
             await this._ensureEmbedder();
@@ -206,6 +220,7 @@ class DynamicMemory {
             // Skip content that is almost certainly noise even after chunking.
             if (shouldExclude(chunk) && getContentValue(chunk) === 0) continue;
 
+            const _perfEmbedStart = Date.now();
             let embedding;
             try {
                 embedding = await embeddings.embedPassage(chunk);
@@ -213,8 +228,11 @@ class DynamicMemory {
                 this._log(`[MEMORY] embedPassage failed: ${err.message}`);
                 continue;
             }
+            _perfEmbedTotal += Date.now() - _perfEmbedStart;
+            _perfEmbedCount += 1;
             if (!this.isEnabled()) return;
 
+            const _perfInsertStart = Date.now();
             try {
                 insertMemory(this.db, {
                     content: chunk,
@@ -229,7 +247,9 @@ class DynamicMemory {
                     this._log(`[MEMORY] insertMemory failed: ${err.message}`);
                 }
             }
+            _perfInsertTotal += Date.now() - _perfInsertStart;
         }
+        perfLog(`indexMessage role=${effectiveRole} chunks=${chunks.length} embed_total=${_perfEmbedTotal}ms embed_count=${_perfEmbedCount} insert_total=${_perfInsertTotal}ms total=${Date.now() - _perfT0}ms`);
     }
 
     /**
@@ -240,6 +260,8 @@ class DynamicMemory {
         if (!this.isEnabled()) return null;
         if (typeof query !== 'string' || query.trim().length < 3) return null;
 
+        const _perfT0 = Date.now();
+
         try {
             await this._ensureEmbedder();
         } catch (err) {
@@ -249,15 +271,22 @@ class DynamicMemory {
         if (!this.isEnabled()) return null;
 
         let results = [];
+        const _perfSearchStart = Date.now();
         try {
             results = await hybridSearch(this.db, query, { chatId, limit });
         } catch (err) {
             this._log(`[MEMORY] hybridSearch failed: ${err.message}`);
             return null;
         }
-        if (!results.length) return null;
+        const _perfSearchMs = Date.now() - _perfSearchStart;
+        if (!results.length) {
+            perfLog(`buildContextForSpawn total=${Date.now() - _perfT0}ms search=${_perfSearchMs}ms results=0 query_len=${query.length} block_len=0`);
+            return null;
+        }
 
-        return buildMemoryBlock(results);
+        const block = buildMemoryBlock(results);
+        perfLog(`buildContextForSpawn total=${Date.now() - _perfT0}ms search=${_perfSearchMs}ms results=${results.length} query_len=${query.length} block_len=${block ? block.length : 0}`);
+        return block;
     }
 
     close() {
