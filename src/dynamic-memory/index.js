@@ -153,6 +153,19 @@ class DynamicMemory {
         return packagedParent || devParent;
     }
 
+    /**
+     * Fire-and-forget embedder warmup. Safe to call any time after init().
+     * Resolves immediately if disabled; swallows errors so a failed warmup
+     * never crashes the caller. Subsequent enrichment calls benefit from
+     * the already-hot model.
+     */
+    warmup() {
+        if (!this.isEnabled()) return Promise.resolve();
+        return this._ensureEmbedder().catch((err) => {
+            this._log(`[MEMORY] warmup failed: ${err && err.message ? err.message : err}`);
+        });
+    }
+
     async _ensureEmbedder() {
         if (this._embedderReady) return;
         if (this._embedderInitPromise) return this._embedderInitPromise;

@@ -2144,7 +2144,7 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
         try {
             const memoryBlock = await Promise.race([
                 dynamicMemory.buildContextForSpawn(content, chatId, 5),
-                new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+                new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
             ]);
             if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
                 outboundContent = `<memory-context>\n${memoryBlock}\n</memory-context>\n\n${content}`;
@@ -3475,6 +3475,11 @@ app.whenReady().then(async () => {
         dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
         dynamicMemory.setLogger(logDebug);
         await dynamicMemory.init(store);
+        // Non-blocking embedder warmup: on Intel Macs the cold load can eat
+        // the entire enrichment timeout budget, so first-turn enrichment
+        // would silently miss. Running it in the background during app init
+        // makes the first real user turn hit a hot embedder.
+        dynamicMemory.warmup();
     } catch (error) {
         logDebug(`[MEMORY] Failed to initialize: ${error.message}`);
         dynamicMemory = null;
