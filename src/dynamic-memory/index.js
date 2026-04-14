@@ -101,23 +101,6 @@ class DynamicMemory {
             this._log(`[MEMORY] lstat check failed: ${err.message}`);
         }
 
-        // Backup rotation BEFORE opening the DB (safer: snapshots last-good state).
-        // Gated on a read-only validation probe so we don't overwrite the last
-        // good backup with a snapshot of a corrupt live DB. Keeps last 3.
-        try {
-            if (fs.existsSync(dbPath)) {
-                const probe = validateDbFile(dbPath);
-                if (probe.valid) {
-                    const backupPath = backupDb(dbPath, backupsDir, 3);
-                    if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
-                } else {
-                    this._log(`[MEMORY] Skipping backup — current DB failed validation: ${probe.errors.join('; ')}`);
-                }
-            }
-        } catch (err) {
-            this._log(`[MEMORY] Backup rotation failed (non-fatal): ${err.message}`);
-        }
-
         // Integrity + recovery gate. Covers two failure modes:
         //   a) initDb() throws (file truncated / unreadable header / disk err)
         //   b) initDb() succeeds but validateDb flags structural issues
@@ -169,6 +152,21 @@ class DynamicMemory {
         } else {
             const warn = validation.warnings.length ? ` (warnings: ${validation.warnings.join('; ')})` : '';
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
+        }
+
+        // Backup rotation AFTER the DB is confirmed healthy. We checkpoint the
+        // WAL first via wal_checkpoint(TRUNCATE) so the main .db file contains
+        // all committed pages — raw file copy is then a consistent snapshot.
+        // Without this, backups would be missing data still living in the WAL
+        // sidecar, and restoring from such a backup would silently drop writes.
+        if (this.db) {
+            try {
+                this.db.pragma('wal_checkpoint(TRUNCATE)');
+                const backupPath = backupDb(dbPath, backupsDir, 3);
+                if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+            } catch (err) {
+                this._log(`[MEMORY] Backup rotation failed (non-fatal): ${err.message}`);
+            }
         }
     }
 

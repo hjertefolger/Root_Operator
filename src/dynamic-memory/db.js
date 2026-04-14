@@ -456,6 +456,13 @@ function attemptRecovery(dbPath, backupsDir) {
             probe = null;
 
             if (v.valid) {
+                // Clean stale WAL/SHM sidecars from the live-but-corrupt state
+                // BEFORE overwriting the main file. Otherwise the next open in
+                // WAL mode replays the old journal against the restored main,
+                // silently undoing the restore or reintroducing corruption.
+                for (const suffix of ['-wal', '-shm']) {
+                    try { fs.unlinkSync(dbPath + suffix); } catch { /* ok if missing */ }
+                }
                 fs.copyFileSync(backupPath, dbPath);
                 result.recovered = true;
                 result.from = backupPath;
