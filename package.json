@@ -82,7 +82,8 @@
     "zustand": "^5.0.9"
   },
   "overrides": {
-    "axios": ">=1.15.0"
+    "axios": ">=1.15.0",
+    "isbinaryfile": "^5.0.7"
   },
   "devDependencies": {
     "@electron/notarize": "^2.5.0",
