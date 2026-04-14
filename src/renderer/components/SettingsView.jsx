@@ -30,6 +30,8 @@ function SettingsView({ onBack, tunnelState }) {
   const [assistantName, setAssistantName] = useState(DEFAULT_ASSISTANT_NAME);
   const [pairedDevices, setPairedDevices] = useState([]);
   const [updateActionPending, setUpdateActionPending] = useState(false);
+  const [dynamicMemoryEnabled, setDynamicMemoryEnabled] = useState(false);
+  const [dynamicMemoryBusy, setDynamicMemoryBusy] = useState(false);
 
   // Initial values for dirty checking
   const initialValues = useRef({});
@@ -45,10 +47,11 @@ function SettingsView({ onBack, tunnelState }) {
   useEffect(() => {
     async function loadSettings() {
       try {
-        const [settings, currentSubdomain, devices] = await Promise.all([
+        const [settings, currentSubdomain, devices, memoryEnabled] = await Promise.all([
           invoke('GET_STORE', 'cfSettings'),
           invoke('GET_SUBDOMAIN'),
-          invoke('GET_PAIRED_DEVICES')
+          invoke('GET_PAIRED_DEVICES'),
+          invoke('GET_DYNAMIC_MEMORY_ENABLED').catch(() => false)
         ]);
 
         const loadedDebug = (settings && settings.debugLogging) || false;
@@ -59,6 +62,7 @@ function SettingsView({ onBack, tunnelState }) {
         setSubdomain(loadedSubdomain);
         setAssistantName(loadedAssistantName);
         setPairedDevices(devices || []);
+        setDynamicMemoryEnabled(Boolean(memoryEnabled));
 
         // Store initial values for dirty checking
         initialValues.current = {
@@ -91,6 +95,26 @@ function SettingsView({ onBack, tunnelState }) {
       setPairedDevices(prev => prev.filter(d => d.kid !== kid));
     } catch (e) {
       console.error('Failed to remove device:', e);
+    }
+  };
+
+  const handleDynamicMemoryToggle = async (nextValue) => {
+    const next = Boolean(nextValue);
+    const previous = dynamicMemoryEnabled;
+    setDynamicMemoryEnabled(next); // optimistic
+    setDynamicMemoryBusy(true);
+    try {
+      const result = await invoke('SET_DYNAMIC_MEMORY_ENABLED', next);
+      if (!result || result.success === false) {
+        setDynamicMemoryEnabled(previous);
+      } else if (typeof result.enabled === 'boolean') {
+        setDynamicMemoryEnabled(result.enabled);
+      }
+    } catch (e) {
+      console.error('Failed to toggle dynamic memory:', e);
+      setDynamicMemoryEnabled(previous);
+    } finally {
+      setDynamicMemoryBusy(false);
     }
   };
 
@@ -364,7 +388,28 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 5: App Updates */}
+          {/* Section 5: Dynamic Memory */}
+          <AccordionItem value="dynamic-memory" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Dynamic Memory
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex justify-between items-start gap-3">
+                <span className="text-xs text-muted-foreground leading-relaxed">
+                  Indexes conversation history for context retrieval across sessions.
+                  Uses local AI embeddings (~300MB, runs fully on-device).
+                </span>
+                <Switch
+                  id="dynamic-memory"
+                  checked={dynamicMemoryEnabled}
+                  disabled={dynamicMemoryBusy}
+                  onCheckedChange={handleDynamicMemoryToggle}
+                />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Section 6: App Updates */}
           <AccordionItem value="app-updates" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               App Updates

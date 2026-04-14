@@ -22,8 +22,10 @@ const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
 const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR } = require('./src/workspace');
+const { DynamicMemory } = require('./src/dynamic-memory');
 
 let store;
+let dynamicMemory = null;
 const isDev = !app.isPackaged;
 
 if (isDev) {
@@ -2132,6 +2134,12 @@ function submitChannelUserMessage(chatId, content, userId, options = {}) {
     const ts = new Date().toISOString();
     const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
 
+    if (dynamicMemory && dynamicMemory.isEnabled()) {
+        dynamicMemory.indexMessage('user', content, chatId).catch((err) => {
+            logDebug(`[MEMORY] Index (user) error: ${err.message}`);
+        });
+    }
+
     channelReplyPending = true;
     setChannelActivity(sentToBridge ? {
         phase: 'bridging',
@@ -2891,7 +2899,7 @@ function prepareClaudeWorkspaceRuntime() {
     };
 }
 
-function spawnClaudeCode() {
+async function spawnClaudeCode() {
     if (claudeProcess) {
         logDebug('[CLAUDE] Already running, skipping spawn');
         return;
@@ -2917,6 +2925,35 @@ function spawnClaudeCode() {
         hookLogPath,
         systemPromptFile,
     } = prepareClaudeWorkspaceRuntime();
+
+    // Dynamic Memory: if enabled, search for relevant past context and append
+    // it to the system prompt file before Claude Code spawns. Bounded by a
+    // 1500ms timeout so a slow embed never blocks spawn materially.
+    if (dynamicMemory && dynamicMemory.isEnabled()) {
+        try {
+            const inject = (async () => {
+                try {
+                    const recentContent = (chatStore ? chatStore.loadMessages() : [])
+                        .slice(-10)
+                        .filter((m) => m && m.role === 'user' && typeof m.content === 'string')
+                        .map((m) => m.content)
+                        .join(' ');
+                    if (recentContent.trim().length <= 20) return;
+                    const memoryBlock = await dynamicMemory.buildContextForSpawn(recentContent, null);
+                    if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
+                        fs.appendFileSync(systemPromptFile, '\n\n' + memoryBlock, 'utf-8');
+                        logDebug(`[MEMORY] Injected ${memoryBlock.length} chars into system prompt`);
+                    }
+                } catch (err) {
+                    logDebug(`[MEMORY] Context injection failed: ${err.message}`);
+                }
+            })();
+            const timeout = new Promise((resolve) => setTimeout(resolve, 1500));
+            await Promise.race([inject, timeout]);
+        } catch (err) {
+            logDebug(`[MEMORY] Injection race failed: ${err.message}`);
+        }
+    }
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
@@ -3088,6 +3125,13 @@ function initChannelMode() {
 
         // Store in history (file-backed)
         chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+
+        if (dynamicMemory && dynamicMemory.isEnabled()) {
+            const replyChatId = reply.chat_id || reply.chatId || null;
+            dynamicMemory.indexMessage('assistant', msg.content, replyChatId).catch((err) => {
+                logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
+            });
+        }
 
         // Send to all connected clients
         for (const client of activeClients) {
@@ -3426,6 +3470,15 @@ app.whenReady().then(async () => {
         logDebug(`[CHAT] Failed to read history store: ${error.message}`);
     }
 
+    try {
+        dynamicMemory = new DynamicMemory(app.getPath('userData'), process.resourcesPath);
+        dynamicMemory.setLogger(logDebug);
+        await dynamicMemory.init(store);
+    } catch (error) {
+        logDebug(`[MEMORY] Failed to initialize: ${error.message}`);
+        dynamicMemory = null;
+    }
+
     createWindow();
     createTray();
     registerGlobalShortcuts();
@@ -3583,6 +3636,16 @@ ipcMain.handle('INSTALL_UPDATE', async () => {
     return updater.installDownloadedUpdate();
 });
 ipcMain.handle('DISMISS_UPDATE_BANNER', (event, version) => dismissUpdateBanner(version));
+
+ipcMain.handle('GET_DYNAMIC_MEMORY_ENABLED', () => {
+    return dynamicMemory ? dynamicMemory.isEnabled() : false;
+});
+
+ipcMain.handle('SET_DYNAMIC_MEMORY_ENABLED', (event, enabled) => {
+    if (!dynamicMemory) return { success: false, error: 'Dynamic memory not initialized' };
+    dynamicMemory.setEnabled(Boolean(enabled));
+    return { success: true, enabled: dynamicMemory.isEnabled() };
+});
 
 ipcMain.handle('SET_OPERATING_MODE', (event, mode) => {
     if (mode !== 'terminal' && mode !== 'channel') {
@@ -5308,4 +5371,7 @@ app.on('before-quit', () => {
         updater.stop();
     }
     stopBridge();
+    if (dynamicMemory) {
+        try { dynamicMemory.close(); } catch (err) { /* ignore */ }
+    }
 });
