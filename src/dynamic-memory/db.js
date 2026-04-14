@@ -300,6 +300,177 @@ function searchByLike(db, query, chatId, limit) {
 }
 
 // ============================================================================
+// Integrity validation + recovery
+// ============================================================================
+
+const REQUIRED_TABLES = ['memories', 'memories_fts'];
+const EXPECTED_EMBEDDING_DIM = 768;
+
+function getBackupFiles(backupsDir) {
+    if (!fs.existsSync(backupsDir)) return [];
+    try {
+        return fs
+            .readdirSync(backupsDir)
+            .filter((f) => /^memory-\d{8}-\d{6}\.db\.bak$/.test(f))
+            .map((f) => {
+                const full = path.join(backupsDir, f);
+                return { path: full, mtime: fs.statSync(full).mtimeMs };
+            })
+            .sort((a, b) => b.mtime - a.mtime)
+            .map((e) => e.path);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Validate an open DB handle. Non-destructive.
+ *
+ * Returns: {
+ *   valid: bool,
+ *   errors: string[],    // blocking issues → DB is unsafe to use
+ *   warnings: string[],  // soft issues → DB is usable but worth knowing
+ *   tables: string[],
+ *   integrityCheck: bool,
+ *   fts5Available: bool,
+ *   embeddingDimension: number|null  // null when no rows indexed yet
+ * }
+ */
+function validateDb(db) {
+    const result = {
+        valid: true,
+        errors: [],
+        warnings: [],
+        tables: [],
+        integrityCheck: false,
+        fts5Available: false,
+        embeddingDimension: null,
+    };
+
+    try {
+        const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all();
+        result.tables = rows.map((r) => r.name);
+        for (const t of REQUIRED_TABLES) {
+            if (!result.tables.includes(t)) {
+                result.errors.push(`missing table: ${t}`);
+                result.valid = false;
+            }
+        }
+    } catch (err) {
+        result.errors.push(`table query failed: ${err.message}`);
+        result.valid = false;
+    }
+
+    try {
+        const status = db.pragma('integrity_check', { simple: true });
+        result.integrityCheck = status === 'ok';
+        if (!result.integrityCheck) {
+            result.errors.push(`integrity_check: ${status}`);
+            result.valid = false;
+        }
+    } catch (err) {
+        result.errors.push(`integrity_check threw: ${err.message}`);
+        result.valid = false;
+    }
+
+    try {
+        db.prepare(`SELECT 1 FROM memories_fts LIMIT 1`).get();
+        result.fts5Available = true;
+    } catch {
+        result.fts5Available = false;
+        result.warnings.push('memories_fts not queryable — keyword search will use LIKE fallback');
+    }
+
+    try {
+        const row = db.prepare(`SELECT embedding FROM memories LIMIT 1`).get();
+        if (row && row.embedding) {
+            result.embeddingDimension = row.embedding.length / 4; // Float32 = 4 bytes
+            if (result.embeddingDimension !== EXPECTED_EMBEDDING_DIM) {
+                result.warnings.push(`embedding_dim=${result.embeddingDimension}, expected ${EXPECTED_EMBEDDING_DIM}`);
+            }
+        }
+    } catch {
+        // No rows yet → nothing to validate. Fresh DB is fine.
+    }
+
+    return result;
+}
+
+/**
+ * Open a DB file read-only, run validateDb, close. Returns the validation
+ * result without mutating the file. Useful for "should I back this up?"
+ * checks before the main handle is opened.
+ */
+function validateDbFile(dbPath) {
+    const invalidShell = (err) => ({
+        valid: false,
+        errors: [err],
+        warnings: [],
+        tables: [],
+        integrityCheck: false,
+        fts5Available: false,
+        embeddingDimension: null,
+    });
+    if (!Database) return invalidShell('better-sqlite3 unavailable');
+    let probe = null;
+    try {
+        probe = new Database(dbPath, { readonly: true, fileMustExist: true });
+        const result = validateDb(probe);
+        probe.close();
+        return result;
+    } catch (err) {
+        if (probe) { try { probe.close(); } catch { /* ignore */ } }
+        return invalidShell(`open failed: ${err.message}`);
+    }
+}
+
+/**
+ * Try to restore the DB at dbPath from the newest valid backup in backupsDir.
+ * Walks newest-first, opens each backup read-only, runs validateDb, and copies
+ * the first valid one over dbPath.
+ *
+ * CALLERS MUST close any open handle on dbPath before calling this.
+ *
+ * Returns: { recovered, from: backupPath|null, validationsTried, errors: string[] }
+ */
+function attemptRecovery(dbPath, backupsDir) {
+    const result = { recovered: false, from: null, validationsTried: 0, errors: [] };
+    if (!Database) {
+        result.errors.push('better-sqlite3 unavailable');
+        return result;
+    }
+
+    const backups = getBackupFiles(backupsDir);
+    if (!backups.length) {
+        result.errors.push('no backups available');
+        return result;
+    }
+
+    for (const backupPath of backups) {
+        result.validationsTried += 1;
+        let probe = null;
+        try {
+            probe = new Database(backupPath, { readonly: true, fileMustExist: true });
+            const v = validateDb(probe);
+            probe.close();
+            probe = null;
+
+            if (v.valid) {
+                fs.copyFileSync(backupPath, dbPath);
+                result.recovered = true;
+                result.from = backupPath;
+                return result;
+            }
+            result.errors.push(`${path.basename(backupPath)}: ${v.errors.join('; ')}`);
+        } catch (err) {
+            result.errors.push(`${path.basename(backupPath)}: ${err.message}`);
+            if (probe) { try { probe.close(); } catch { /* ignore */ } }
+        }
+    }
+    return result;
+}
+
+// ============================================================================
 // Backup rotation
 // ============================================================================
 
@@ -366,4 +537,8 @@ module.exports = {
     searchByVector,
     searchByKeyword,
     cosineSimilarity,
+    validateDb,
+    validateDbFile,
+    attemptRecovery,
+    getBackupFiles,
 };

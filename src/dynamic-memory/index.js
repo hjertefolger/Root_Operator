@@ -16,7 +16,7 @@
 const path = require('path');
 const fs = require('fs');
 
-const { initDb, closeDb, contentExists, insertMemory, backupDb } = require('./db');
+const { initDb, closeDb, contentExists, insertMemory, backupDb, validateDb, validateDbFile, attemptRecovery } = require('./db');
 const embeddings = require('./embeddings');
 const { extractChunks, shouldExclude, getContentValue } = require('./chunker');
 const { hybridSearch } = require('./search');
@@ -102,22 +102,73 @@ class DynamicMemory {
         }
 
         // Backup rotation BEFORE opening the DB (safer: snapshots last-good state).
-        // Keeps last 3 backups in <workspace>/brain/backups/.
+        // Gated on a read-only validation probe so we don't overwrite the last
+        // good backup with a snapshot of a corrupt live DB. Keeps last 3.
         try {
             if (fs.existsSync(dbPath)) {
-                const backupPath = backupDb(dbPath, backupsDir, 3);
-                if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+                const probe = validateDbFile(dbPath);
+                if (probe.valid) {
+                    const backupPath = backupDb(dbPath, backupsDir, 3);
+                    if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+                } else {
+                    this._log(`[MEMORY] Skipping backup — current DB failed validation: ${probe.errors.join('; ')}`);
+                }
             }
         } catch (err) {
             this._log(`[MEMORY] Backup rotation failed (non-fatal): ${err.message}`);
         }
 
+        // Integrity + recovery gate. Covers two failure modes:
+        //   a) initDb() throws (file truncated / unreadable header / disk err)
+        //   b) initDb() succeeds but validateDb flags structural issues
+        // In either case, walk backups newest->oldest and restore from the
+        // first valid one. If none recover, leave db=null so isEnabled returns
+        // false and the feature disables itself gracefully.
+        let openErr = null;
         try {
             this.db = initDb(dbPath);
-            this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})`);
         } catch (err) {
             this.db = null;
+            openErr = err;
             this._log(`[MEMORY] Failed to open DB: ${err.message}`);
+        }
+
+        const validation = this.db ? validateDb(this.db) : null;
+        const needsRecovery = !this.db || !validation.valid;
+
+        if (needsRecovery) {
+            if (validation && !validation.valid) {
+                this._log(`[MEMORY] Integrity check FAILED: ${validation.errors.join('; ')}`);
+                closeDb(this.db);
+                this.db = null;
+            }
+
+            const recovery = attemptRecovery(dbPath, backupsDir);
+            if (recovery.recovered) {
+                this._log(`[MEMORY] Recovered from backup ${path.basename(recovery.from)} after ${recovery.validationsTried} probe(s)`);
+                try {
+                    this.db = initDb(dbPath);
+                    const post = validateDb(this.db);
+                    if (!post.valid) {
+                        this._log(`[MEMORY] Recovered DB still invalid: ${post.errors.join('; ')}`);
+                        closeDb(this.db);
+                        this.db = null;
+                    } else {
+                        const warn = post.warnings.length ? ` (warnings: ${post.warnings.join('; ')})` : '';
+                        this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
+                    }
+                } catch (err2) {
+                    this.db = null;
+                    this._log(`[MEMORY] Failed to reopen after recovery: ${err2.message}`);
+                }
+            } else if (openErr) {
+                this._log(`[MEMORY] Recovery failed after open error. Tried ${recovery.validationsTried} backup(s). Errors: ${recovery.errors.join('; ')}`);
+            } else {
+                this._log(`[MEMORY] Recovery failed. Tried ${recovery.validationsTried} backup(s). Errors: ${recovery.errors.join('; ')}`);
+            }
+        } else {
+            const warn = validation.warnings.length ? ` (warnings: ${validation.warnings.join('; ')})` : '';
+            this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
         }
     }
 
@@ -300,6 +351,26 @@ class DynamicMemory {
         const block = buildMemoryBlock(results);
         perfLog(`buildContextForSpawn total=${Date.now() - _perfT0}ms search=${_perfSearchMs}ms results=${results.length} query_len=${query.length} block_len=${block ? block.length : 0}`);
         return block;
+    }
+
+    /**
+     * Non-destructive validation of the live DB handle. Returns the full
+     * result object from validateDb, or a stub with errors=['db not open']
+     * when the DB is unavailable. Safe to call any time after init().
+     */
+    healthCheck() {
+        if (!this.db) {
+            return {
+                valid: false,
+                errors: ['db not open'],
+                warnings: [],
+                tables: [],
+                integrityCheck: false,
+                fts5Available: false,
+                embeddingDimension: null,
+            };
+        }
+        return validateDb(this.db);
     }
 
     close() {
