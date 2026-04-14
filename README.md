@@ -10,8 +10,9 @@
 ✨ Persistent cron scheduler, identity system, and dynamic recall memory — all in-harness
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
-- 🛡️ **RSA-PSS with challenge-response** (passwordless)
+- 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
+- 🧠 **Dynamic recall memory** — local SQLite + ONNX embedder, ~21ms semantic enrichment per turn
 
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 
