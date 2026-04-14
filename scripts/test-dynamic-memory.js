@@ -13,7 +13,7 @@ const fs = require('fs');
 const os = require('os');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dyn-mem-test-'));
-const fakeUserData = tmpDir;
+const fakeWorkspace = tmpDir; // stands in for ~/.root-operator/workspace
 const repoRoot = path.join(__dirname, '..');
 // DynamicMemory looks in "<resources>/nomic-embed-text-v1.5" when packaged,
 // or "<repo>/models/..." in dev. Using repoRoot as resourcesPath and letting
@@ -30,11 +30,12 @@ const fakeResources = repoRoot;
             set(key, val) { this._state[key] = val; },
         };
 
-        const dm = new DynamicMemory(fakeUserData, fakeResources);
+        const dm = new DynamicMemory(fakeWorkspace, fakeResources);
         dm.setLogger((m) => console.log('LOG', m));
         await dm.init(fakeStore);
 
         console.log('enabled?', dm.isEnabled());
+        console.log('dbPath:', dm.dbPath);
 
         const msgs = [
             ['user', 'I am building a desktop app called Root Operator. We decided to use better-sqlite3 instead of sql.js because it is synchronous and integrates with electron-rebuild.'],
@@ -48,7 +49,7 @@ const fakeResources = repoRoot;
             await dm.indexMessage(role, content, 'test-chat-1');
         }
 
-        const dbPath = path.join(fakeUserData, 'dynamic-memory', 'memory.db');
+        const dbPath = path.join(fakeWorkspace, 'brain', 'memory.db');
         console.log('DB exists:', fs.existsSync(dbPath), 'size:', fs.statSync(dbPath).size);
 
         // Quick introspection: count rows

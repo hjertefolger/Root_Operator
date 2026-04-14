@@ -25,10 +25,16 @@ const { buildMemoryBlock } = require('./prompt');
 const STORE_KEY = 'dynamicMemory.enabled';
 
 class DynamicMemory {
-    constructor(userDataPath, resourcesPath) {
-        this.userDataPath = userDataPath;
+    /**
+     * @param {string} workspaceDir  Root Operator workspace dir (~/.root-operator/workspace).
+     *                               DB is stored at <workspaceDir>/brain/memory.db.
+     * @param {string} resourcesPath Electron resourcesPath (for packaged model lookup).
+     */
+    constructor(workspaceDir, resourcesPath) {
+        this.workspaceDir = workspaceDir;
         this.resourcesPath = resourcesPath;
         this.db = null;
+        this.dbPath = null;
         this.store = null;
         this._enabled = false;
         this._embedderReady = false;
@@ -54,7 +60,16 @@ class DynamicMemory {
             this._enabled = false;
         }
 
-        const dbPath = path.join(this.userDataPath, 'dynamic-memory', 'memory.db');
+        const brainDir = path.join(this.workspaceDir, 'brain');
+        const dbPath = path.join(brainDir, 'memory.db');
+        this.dbPath = dbPath;
+
+        try {
+            fs.mkdirSync(brainDir, { recursive: true });
+        } catch (err) {
+            this._log(`[MEMORY] Failed to create brain dir: ${err.message}`);
+        }
+
         try {
             this.db = initDb(dbPath);
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})`);

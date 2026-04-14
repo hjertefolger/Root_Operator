@@ -21,7 +21,7 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR } = require('./src/workspace');
+const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR, WORKSPACE_DIR } = require('./src/workspace');
 const { DynamicMemory } = require('./src/dynamic-memory');
 
 let store;
@@ -3473,7 +3473,7 @@ app.whenReady().then(async () => {
     }
 
     try {
-        dynamicMemory = new DynamicMemory(app.getPath('userData'), process.resourcesPath);
+        dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
         dynamicMemory.setLogger(logDebug);
         await dynamicMemory.init(store);
     } catch (error) {
