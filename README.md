@@ -7,7 +7,7 @@
 
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
-✨ Persistent cron scheduler, identity system, and offline semantic memory — all in-harness
+✨ Persistent cron scheduler, identity system, and Dynamic Memory — all in-harness
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response** (passwordless)
@@ -128,7 +128,7 @@ npm run dev:app    # Start with hot reload
 
 1. **Launch** Root Operator -- it lives in your menu bar
 2. **Start the tunnel** -- click the power button to create a Cloudflare Tunnel
-3. **Scan the QR code** or copy the tunnel URL on your phone
+3. **Open the tunnel URL** on your phone (copy from the desktop app)
 4. **Pair** -- enter the 6-character code shown on your phone into the desktop app
 5. **Verify** -- confirm the hex fingerprint matches on both devices
 6. **Go** -- encrypted chat with Claude from anywhere
