@@ -1,13 +1,13 @@
 # Root Operator
 
-[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
 [![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
 
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
-✨ Now with built-in persistent cron scheduler and identity system
+✨ Persistent cron scheduler, identity system, and offline semantic memory — all in-harness
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response** (passwordless)
@@ -90,6 +90,17 @@ Give Claude a persistent persona across sessions.
 - **First-run onboarding** -- `BOOTSTRAP.md` guides initial setup, then self-deletes
 - **Fully customizable** -- edit workspace files at `~/.root-operator/workspace/`
 
+### Dynamic Memory
+
+Offline semantic memory layer that gives Claude continuity across sessions, restarts, and even chip architectures. Every turn is embedded, stored, and retrieved on the next inbound — no cloud round-trip.
+
+- **Local-first** -- everything runs on-device: SQLite (FTS5 + `vec0`) for storage, `nomic-embed-text-v1.5` (768d) bundled in the app for embeddings
+- **Hybrid retrieval** -- BM25 keyword + vector cosine combined with reciprocal rank fusion; relevance gate filters before injection
+- **Fast** -- ~21ms enrichment per turn after a one-time ~100–800ms embedder warmup at boot
+- **Resilient** -- pre-open integrity validation, auto-recovery from rolling backups, WAL checkpoint before snapshot, in-place FTS rebuild for partial corruption
+- **Opt-in** -- disabled by default; toggle in Settings → Dynamic Memory. Database lives at `~/.root-operator/workspace/brain/memory.db`
+- **Backed up** -- snapshot-on-boot rotation in `brain/backups/`, gated to never archive a freshly-healed empty schema
+
 ## Requirements
 
 - **macOS** 11+ (Big Sur or later) -- Apple Silicon and Intel
@@ -155,6 +166,10 @@ npm run dev:app    # Start with hot reload
 |  |  Static       |  |  Device Auth  |  |  Scheduler - Chat    |  |
 |  |  Assets       |  |  + Pairing    |  |  Store - Identity    |  |
 |  +---------------+  +---------------+  +----------------------+  |
+|                                                                  |
+|  +------------------------------------------------------------+  |
+|  |  Dynamic Memory  -  SQLite (FTS5+vec0) + ONNX Embedder     |  |
+|  +------------------------------------------------------------+  |
 +-----------------------------------------------------------------+
 ```
 
@@ -241,7 +256,7 @@ Customize Claude's persona by editing files in `~/.root-operator/workspace/`:
 | `SOUL.md` | Persona, tone, values, boundaries |
 | `AGENTS.md` | Agent behavior, safety rules, collaboration patterns |
 | `USER.md` | Your profile -- name, timezone, preferences |
-| `MEMORY.md` | Persistent long-term memory index |
+| `MEMORY.md` | Index of long-term memories — curated by Claude, surfaced at session start |
 
 Files are automatically injected into Claude's system prompt at startup. Max 150KB total, 20KB per file.
 
@@ -286,8 +301,11 @@ worker/                  # Cloudflare Worker for custom subdomains (optional)
 | `node-pty` | Shell/PTY spawning |
 | `keytar` | macOS Keychain access |
 | `cloudflared` | Cloudflare Tunnel binary |
+| `better-sqlite3` | Synchronous SQLite for Dynamic Memory store (FTS5 + `vec0`) |
+| `onnxruntime-node` | Local embedder runtime (`nomic-embed-text-v1.5`, 768d) |
+| `uiohook-napi` | Global keyboard shortcut listener |
 
-All three are unpacked from asar for native module compatibility.
+All native modules are unpacked from asar for native module compatibility and rebuilt per architecture during the production build.
 
 ## Troubleshooting
 
