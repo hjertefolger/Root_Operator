@@ -21,9 +21,11 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR } = require('./src/workspace');
+const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR, WORKSPACE_DIR } = require('./src/workspace');
+const { DynamicMemory } = require('./src/dynamic-memory');
 
 let store;
+let dynamicMemory = null;
 const isDev = !app.isPackaged;
 
 if (isDev) {
@@ -2121,7 +2123,7 @@ function getLocalChatState() {
     };
 }
 
-function submitChannelUserMessage(chatId, content, userId, options = {}) {
+async function submitChannelUserMessage(chatId, content, userId, options = {}) {
     const { echoToLocalChat = false, senderWs = null } = options;
     const assistantName = getActivityAssistantName();
 
@@ -2130,7 +2132,42 @@ function submitChannelUserMessage(chatId, content, userId, options = {}) {
     }
 
     const ts = new Date().toISOString();
-    const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
+
+    // Dynamic Memory: enrich outbound content with a per-turn memory hint
+    // before forwarding to the channel bridge. Indexing below still stores
+    // the ORIGINAL content so the DB doesn't get polluted with hint wrappers.
+    // Bounded by a 500ms Promise.race so a stuck embedder never delays
+    // message delivery to Claude.
+    let outboundContent = content;
+    if (dynamicMemory && dynamicMemory.isEnabled()) {
+        const perfStart = Date.now();
+        try {
+            const memoryBlock = await Promise.race([
+                dynamicMemory.buildContextForSpawn(content, chatId, 5),
+                new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
+            ]);
+            if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
+                outboundContent = `<memory-context>\n${memoryBlock}\n</memory-context>\n\n${content}`;
+            }
+            if (process.env.NODE_ENV === 'development' || process.env.DYNAMIC_MEMORY_PERF === '1') {
+                const wall = Date.now() - perfStart;
+                const hit = outboundContent !== content;
+                console.error(`[MEMORY-PERF] enrichment wall=${wall}ms hit=${hit} original_len=${content.length} enriched_len=${outboundContent.length}`);
+                logDebug(`[MEMORY-PERF] enrichment wall=${wall}ms hit=${hit} original_len=${content.length} enriched_len=${outboundContent.length}`);
+            }
+        } catch (err) {
+            logDebug(`[MEMORY] Enrichment failed: ${err.message}`);
+            outboundContent = content;
+        }
+    }
+
+    const sentToBridge = channelManager.sendToChannel(chatId, outboundContent, userId || chatId);
+
+    if (dynamicMemory && dynamicMemory.isEnabled()) {
+        dynamicMemory.indexMessage('user', content, chatId).catch((err) => {
+            logDebug(`[MEMORY] Index (user) error: ${err.message}`);
+        });
+    }
 
     channelReplyPending = true;
     setChannelActivity(sentToBridge ? {
@@ -2891,7 +2928,7 @@ function prepareClaudeWorkspaceRuntime() {
     };
 }
 
-function spawnClaudeCode() {
+async function spawnClaudeCode() {
     if (claudeProcess) {
         logDebug('[CLAUDE] Already running, skipping spawn');
         return;
@@ -2917,6 +2954,7 @@ function spawnClaudeCode() {
         hookLogPath,
         systemPromptFile,
     } = prepareClaudeWorkspaceRuntime();
+
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
     try {
@@ -3088,6 +3126,13 @@ function initChannelMode() {
 
         // Store in history (file-backed)
         chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+
+        if (dynamicMemory && dynamicMemory.isEnabled()) {
+            const replyChatId = reply.chat_id || reply.chatId || null;
+            dynamicMemory.indexMessage('assistant', msg.content, replyChatId).catch((err) => {
+                logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
+            });
+        }
 
         // Send to all connected clients
         for (const client of activeClients) {
@@ -3426,6 +3471,20 @@ app.whenReady().then(async () => {
         logDebug(`[CHAT] Failed to read history store: ${error.message}`);
     }
 
+    try {
+        dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
+        dynamicMemory.setLogger(logDebug);
+        await dynamicMemory.init(store);
+        // Non-blocking embedder warmup: on Intel Macs the cold load can eat
+        // the entire enrichment timeout budget, so first-turn enrichment
+        // would silently miss. Running it in the background during app init
+        // makes the first real user turn hit a hot embedder.
+        dynamicMemory.warmup();
+    } catch (error) {
+        logDebug(`[MEMORY] Failed to initialize: ${error.message}`);
+        dynamicMemory = null;
+    }
+
     createWindow();
     createTray();
     registerGlobalShortcuts();
@@ -3495,14 +3554,14 @@ ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
     return { success: true };
 });
 ipcMain.handle('GET_LOCAL_CHAT_STATE', () => getLocalChatState());
-ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', (event, text) => {
+ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', async (event, text) => {
     if (typeof text !== 'string' || !text.trim()) {
         return { success: false, error: 'Message is empty' };
     }
 
-    return submitChannelUserMessage('desktop-local', text.trim(), 'desktop-local');
+    return await submitChannelUserMessage('desktop-local', text.trim(), 'desktop-local');
 });
-ipcMain.handle('SEND_LOCAL_CHAT_FILE', (event, { data, filename, mimeType, caption }) => {
+ipcMain.handle('SEND_LOCAL_CHAT_FILE', async (event, { data, filename, mimeType, caption }) => {
     if (!data || !filename) {
         return { success: false, error: 'Missing file data or filename' };
     }
@@ -3561,7 +3620,7 @@ ipcMain.handle('SEND_LOCAL_CHAT_FILE', (event, { data, filename, mimeType, capti
         parts.push(caption);
     }
     parts.push(`[File attached: ${filename}]\nSaved to: ${destPath}`);
-    return submitChannelUserMessage('desktop-local', parts.join('\n\n'), 'desktop-local');
+    return await submitChannelUserMessage('desktop-local', parts.join('\n\n'), 'desktop-local');
 });
 ipcMain.handle('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP', () => {
     if (!localChatWindow || localChatWindow.isDestroyed()) {
@@ -3583,6 +3642,16 @@ ipcMain.handle('INSTALL_UPDATE', async () => {
     return updater.installDownloadedUpdate();
 });
 ipcMain.handle('DISMISS_UPDATE_BANNER', (event, version) => dismissUpdateBanner(version));
+
+ipcMain.handle('GET_DYNAMIC_MEMORY_ENABLED', () => {
+    return dynamicMemory ? dynamicMemory.isEnabled() : false;
+});
+
+ipcMain.handle('SET_DYNAMIC_MEMORY_ENABLED', (event, enabled) => {
+    if (!dynamicMemory) return { success: false, error: 'Dynamic memory not initialized' };
+    dynamicMemory.setEnabled(Boolean(enabled));
+    return { success: true, enabled: dynamicMemory.isEnabled() };
+});
 
 ipcMain.handle('SET_OPERATING_MODE', (event, mode) => {
     if (mode !== 'terminal' && mode !== 'channel') {
@@ -4670,7 +4739,7 @@ function handleConnection(ws, req) {
             if (operatingMode === 'channel') {
                 // Channel mode: forward to Claude Code via channel bridge
                 const deviceId = ws.kid || 'unknown';
-                const result = submitChannelUserMessage(deviceId, inputData, deviceId, {
+                const result = await submitChannelUserMessage(deviceId, inputData, deviceId, {
                     echoToLocalChat: true,
                     senderWs: ws,
                 });
@@ -4847,10 +4916,16 @@ function handleConnection(ws, req) {
                     parts.push(transfer.caption);
                 }
                 parts.push(`[File attached: ${transfer.filename}]\nSaved to: ${absPath}`);
-                submitChannelUserMessage(transfer.deviceId, parts.join('\n\n'), transfer.deviceId, {
+                const fileResult = await submitChannelUserMessage(transfer.deviceId, parts.join('\n\n'), transfer.deviceId, {
                     echoToLocalChat: true,
                     senderWs: ws,
+                }).catch((err) => {
+                    logDebug(`[CHANNEL] File attachment forward failed: ${err.message}`);
+                    return { success: false, error: err.message };
                 });
+                if (!fileResult.success) {
+                    logDebug(`[CHANNEL] File attachment forward not successful: ${fileResult.error}`);
+                }
             }
             return;
         }
@@ -5308,4 +5383,7 @@ app.on('before-quit', () => {
         updater.stop();
     }
     stopBridge();
+    if (dynamicMemory) {
+        try { dynamicMemory.close(); } catch (err) { /* ignore */ }
+    }
 });

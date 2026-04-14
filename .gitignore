@@ -33,3 +33,6 @@ worker/wrangler.toml
 *_source.jpg
 channel-bridge.bundle.cjs
 runtime-config.json
+
+# Dynamic memory model (downloaded by scripts/download-model.js)
+models/

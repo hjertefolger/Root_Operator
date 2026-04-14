@@ -23,8 +23,9 @@
     "build:unsigned": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer electron-builder --config build/electron-builder.config.js --mac -c.mac.identity=null",
     "build:unsigned:staging": "node scripts/run-staging.js build:unsigned",
     "release:staging": "node scripts/run-staging.js release",
-    "rebuild": "electron-rebuild -f -w node-pty keytar",
-    "postinstall": "electron-rebuild -f -w node-pty keytar",
+    "rebuild": "electron-rebuild -f -w node-pty keytar better-sqlite3",
+    "postinstall": "electron-rebuild -f -w node-pty keytar better-sqlite3",
+    "_note:rebuild": "onnxruntime-node intentionally NOT in rebuild list — ships prebuilt N-API v3 binaries for darwin/arm64 + darwin/x64, no source build needed. electron-builder rebuilds native modules per-arch automatically during multi-arch DMG build.",
     "test": "echo \"Error: no test specified\" && exit 1",
     "security:audit": "npm audit --audit-level=critical",
     "security:audit:fix": "npm audit fix",
@@ -49,6 +50,8 @@
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-slot": "^1.2.4",
     "@radix-ui/react-switch": "^1.2.6",
+    "@xenova/transformers": "^2.17.2",
+    "better-sqlite3": "^12.9.0",
     "class-variance-authority": "^0.7.1",
     "cloudflared": "^0.7.1",
     "clsx": "^2.1.1",
@@ -162,7 +165,18 @@
       "node_modules/node-pty/**/*",
       "node_modules/keytar/**/*",
       "node_modules/cloudflared/**/*",
-      "node_modules/uiohook-napi/**/*"
+      "node_modules/uiohook-napi/**/*",
+      "node_modules/better-sqlite3/**/*",
+      "node_modules/onnxruntime-node/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "models/nomic-embed-text-v1.5",
+        "to": "nomic-embed-text-v1.5",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "electronUpdaterCompatibility": ">=2.16",
     "afterSign": "scripts/notarize.js"
