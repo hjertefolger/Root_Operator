@@ -1,9 +1,11 @@
 /**
- * Dynamic Memory - Hybrid search (vector + keyword + RRF + recency decay).
+ * Dynamic Memory - Hybrid search (vector + keyword + RRF + recency decay + MMR).
  *
  * Ported from Cortex (src/search.ts). Changes:
  *   - chatId replaces projectId (channel-scoped, no filesystem projects)
  *   - CommonJS
+ *   - Min-cosine floor on vector matches before fusion
+ *   - MMR diversity selection at the end (content-based Jaccard)
  */
 
 const { searchByVector, searchByKeyword } = require('./db');
@@ -19,6 +21,14 @@ const RECENCY_HALF_LIFE_DAYS = 7;
 // RRF (Reciprocal Rank Fusion) constant
 const RRF_K = 60;
 
+// Minimum cosine similarity for a vector match to enter the fusion pool.
+// Stops weakly-relevant hits from surviving via rank-based RRF alone.
+const MIN_VECTOR_SIMILARITY = 0.25;
+
+// MMR diversity: 1.0 = pure relevance, 0.0 = pure diversity.
+// 0.7 gives relevance priority while breaking up near-duplicate fragments.
+const MMR_LAMBDA = 0.7;
+
 /**
  * Hybrid search.
  *
@@ -33,15 +43,21 @@ async function hybridSearch(db, query, opts = {}) {
 
     const queryEmbedding = await embedQuery(query);
 
-    const [vectorResults, keywordResults] = await Promise.all([
+    const [vectorResultsRaw, keywordResults] = await Promise.all([
         Promise.resolve(searchByVector(db, queryEmbedding, chatId, limit * 2)),
         Promise.resolve(searchByKeyword(db, query, chatId, limit * 2)),
     ]);
 
+    // Drop weakly-relevant vector hits before fusion.
+    const vectorResults = vectorResultsRaw.filter(
+        (r) => typeof r.score === 'number' && r.score >= MIN_VECTOR_SIMILARITY,
+    );
+
     const combined = combineWithRRF(vectorResults, keywordResults);
     const withRecency = applyRecencyDecay(combined);
+    const sorted = withRecency.sort((a, b) => b.score - a.score);
 
-    return withRecency.sort((a, b) => b.score - a.score).slice(0, limit);
+    return selectWithMMR(sorted, MMR_LAMBDA, limit);
 }
 
 /**
@@ -117,12 +133,83 @@ function applyRecencyDecay(results) {
     });
 }
 
+/**
+ * Maximal Marginal Relevance selection with content-based (Jaccard) similarity.
+ *
+ * Greedily picks the top-ranked item, then for each subsequent slot picks the
+ * candidate that maximizes `lambda * relevance - (1 - lambda) * maxSimToSelected`.
+ * Relevance is the normalized RRF-after-decay score so the two sides are
+ * comparable; similarity uses word-set Jaccard, cheap and good enough for short
+ * conversation fragments (no extra embedding round-trips).
+ */
+function selectWithMMR(candidates, lambda, limit) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+    if (candidates.length <= 1) return candidates.slice(0, limit);
+    if (!(limit > 0)) return [];
+
+    const scores = candidates.map((c) => c.score);
+    const maxScore = Math.max(...scores);
+    const minScore = Math.min(...scores);
+    const range = maxScore - minScore || 1;
+    const normed = candidates.map((c) => ({
+        ...c,
+        _normScore: (c.score - minScore) / range,
+    }));
+
+    const selected = [normed[0]];
+    const pool = normed.slice(1);
+
+    while (selected.length < limit && pool.length) {
+        let bestIdx = -1;
+        let bestMmr = -Infinity;
+        for (let i = 0; i < pool.length; i++) {
+            const cand = pool[i];
+            let maxSim = 0;
+            for (const s of selected) {
+                const sim = jaccardSimilarity(cand.content, s.content);
+                if (sim > maxSim) maxSim = sim;
+            }
+            const mmr = lambda * cand._normScore - (1 - lambda) * maxSim;
+            if (mmr > bestMmr) {
+                bestMmr = mmr;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx === -1) break;
+        selected.push(pool[bestIdx]);
+        pool.splice(bestIdx, 1);
+    }
+
+    return selected.map(({ _normScore, ...rest }) => rest);
+}
+
+function jaccardSimilarity(a, b) {
+    const tokensA = tokenize(a);
+    const tokensB = tokenize(b);
+    if (!tokensA.size || !tokensB.size) return 0;
+    let intersect = 0;
+    for (const w of tokensA) {
+        if (tokensB.has(w)) intersect++;
+    }
+    const union = tokensA.size + tokensB.size - intersect;
+    return union ? intersect / union : 0;
+}
+
+function tokenize(text) {
+    const words = String(text).toLowerCase().match(/\b[a-z0-9]+\b/g);
+    return new Set(words || []);
+}
+
 module.exports = {
     hybridSearch,
     combineWithRRF,
     applyRecencyDecay,
+    selectWithMMR,
+    jaccardSimilarity,
     VECTOR_WEIGHT,
     KEYWORD_WEIGHT,
     RECENCY_HALF_LIFE_DAYS,
     RRF_K,
+    MIN_VECTOR_SIMILARITY,
+    MMR_LAMBDA,
 };
