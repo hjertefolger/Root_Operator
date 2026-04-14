@@ -70,6 +70,24 @@ const fakeResources = repoRoot;
         console.log(block || '(none)');
         console.log('======================');
 
+        // --- Per-turn enrichment simulation ---
+        // Verifies the exact shape the new main.js bridge-prefix path produces.
+        const userTurn = 'How do we handle the spawn timeout for claude memory injection?';
+        const hint = await dm.buildContextForSpawn(userTurn, 'test-chat-1', 3);
+        if (!hint) {
+            console.error('FAIL: enrichment produced null for a query that should match indexed content');
+            process.exit(1);
+        }
+        const enriched = `<memory-context>\n${hint}\n</memory-context>\n\n${userTurn}`;
+        console.log('==== enriched user turn ====');
+        console.log(enriched);
+        console.log('============================');
+        if (!enriched.includes('<memory-context>') || !enriched.endsWith(userTurn)) {
+            console.error('FAIL: enriched content malformed');
+            process.exit(1);
+        }
+        console.log('OK: enrichment shape verified');
+
         dm.close();
 
         // Toggle off and verify indexing skips.
