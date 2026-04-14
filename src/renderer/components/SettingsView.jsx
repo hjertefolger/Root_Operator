@@ -369,35 +369,15 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 4: Debug Logging */}
-          <AccordionItem value="debug-logging" className="border-none">
-            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
-              Debug Logging
-            </AccordionTrigger>
-            <AccordionContent className="pb-4">
-              <div className="flex justify-between items-center">
-                <span className="text-xs text-muted-foreground">
-                  Enable debug logs for troubleshooting
-                </span>
-                <Switch
-                  id="debug-logging"
-                  checked={debugLogging}
-                  onCheckedChange={setDebugLogging}
-                />
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-
-          {/* Section 5: Dynamic Memory */}
+          {/* Section 4: Dynamic Memory */}
           <AccordionItem value="dynamic-memory" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               Dynamic Memory
             </AccordionTrigger>
             <AccordionContent className="pb-4">
-              <div className="flex justify-between items-start gap-3">
-                <span className="text-xs text-muted-foreground leading-relaxed">
-                  Indexes conversation history for context retrieval across sessions.
-                  Uses local AI embeddings (~300MB, runs fully on-device).
+              <div className="flex justify-between items-center">
+                <span className="text-xs text-muted-foreground">
+                  Local AI embeddings of dynamic conversation history
                 </span>
                 <Switch
                   id="dynamic-memory"
@@ -409,7 +389,7 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 6: App Updates */}
+          {/* Section 5: App Updates */}
           <AccordionItem value="app-updates" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               App Updates
@@ -462,6 +442,25 @@ function SettingsView({ onBack, tunnelState }) {
                     </Button>
                   )}
                 </div>
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Section 6: Debug Logging */}
+          <AccordionItem value="debug-logging" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Debug Logging
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex justify-between items-center">
+                <span className="text-xs text-muted-foreground">
+                  Enable debug logs for troubleshooting
+                </span>
+                <Switch
+                  id="debug-logging"
+                  checked={debugLogging}
+                  onCheckedChange={setDebugLogging}
+                />
               </div>
             </AccordionContent>
           </AccordionItem>
