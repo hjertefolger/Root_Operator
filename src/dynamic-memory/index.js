@@ -213,6 +213,21 @@ class DynamicMemory {
             //     to avoid rolling back newer rows to an older backup.
             if (preExistedButInvalid && hasRows) {
                 this._log(`[MEMORY] DB auto-healed in place (missing objects restored; ${postValidation.embeddingDimension ? `data preserved, dim=${postValidation.embeddingDimension}` : 'row data preserved'})`);
+
+                // If memories_fts was among the objects recreated, it was
+                // built empty — CREATE VIRTUAL TABLE IF NOT EXISTS does NOT
+                // backfill an external-content FTS from existing memories
+                // rows, and `SELECT COUNT(*) FROM memories_fts` on an
+                // external-content FTS reads through to the content table
+                // (so it equals memories' count even when the index is empty;
+                // we cannot use it to detect the drift). Always rebuild on
+                // this path — it's idempotent and the path is rare.
+                try {
+                    this.db.prepare("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')").run();
+                    this._log(`[MEMORY] Rebuilt memories_fts after in-place repair`);
+                } catch (err) {
+                    this._log(`[MEMORY] FTS rebuild failed (non-fatal; keyword search will use LIKE fallback): ${err.message}`);
+                }
             }
             const warn = postValidation.warnings.length ? ` (warnings: ${postValidation.warnings.join('; ')})` : '';
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
