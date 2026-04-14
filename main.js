@@ -2939,7 +2939,9 @@ async function spawnClaudeCode() {
                         .map((m) => m.content)
                         .join(' ');
                     if (recentContent.trim().length <= 20) return;
-                    const memoryBlock = await dynamicMemory.buildContextForSpawn(recentContent, null);
+                    // chatId=undefined => global query across all stored fragments
+                    // (chatId scoped storage, but v1 queries globally per plan).
+                    const memoryBlock = await dynamicMemory.buildContextForSpawn(recentContent, undefined);
                     if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
                         fs.appendFileSync(systemPromptFile, '\n\n' + memoryBlock, 'utf-8');
                         logDebug(`[MEMORY] Injected ${memoryBlock.length} chars into system prompt`);
