@@ -72,6 +72,28 @@ class DynamicMemory {
             this._log(`[MEMORY] Failed to create brain dirs: ${err.message}`);
         }
 
+        // Reject symlinks for brain/ and memory.db — these are app-managed state;
+        // symlinks here likely mean user misconfiguration or sync-tool weirdness.
+        // Failing loud is safer than silently writing into an unexpected location.
+        try {
+            const brainStat = fs.lstatSync(brainDir);
+            if (brainStat.isSymbolicLink()) {
+                this._log(`[MEMORY] brain/ is a symlink — refusing to open DB. Path: ${brainDir}`);
+                this.db = null;
+                return;
+            }
+            if (fs.existsSync(dbPath)) {
+                const dbStat = fs.lstatSync(dbPath);
+                if (dbStat.isSymbolicLink()) {
+                    this._log(`[MEMORY] memory.db is a symlink — refusing to open. Path: ${dbPath}`);
+                    this.db = null;
+                    return;
+                }
+            }
+        } catch (err) {
+            this._log(`[MEMORY] lstat check failed: ${err.message}`);
+        }
+
         // Backup rotation BEFORE opening the DB (safer: snapshots last-good state).
         // Keeps last 3 backups in <workspace>/brain/backups/.
         try {

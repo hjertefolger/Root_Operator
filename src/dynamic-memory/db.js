@@ -311,6 +311,11 @@ function searchByLike(db, query, chatId, limit) {
  * This uses a plain file copy — safe to call when no writer holds the DB
  * exclusively (WAL mode tolerates readers). For our usage we call it at app
  * start BEFORE initDb opens the file, so there is no contention.
+ *
+ * SCOPE: covers the "restart after bad write / power loss" corruption class.
+ * Does NOT cover bulk rewrites mid-session. v1 has no bulk-rewrite operations
+ * (writes are single-chunk, append-only). If future work adds re-indexing or
+ * mass migration, call backupDb() at the start of that operation too.
  */
 function backupDb(dbPath, backupsDir, maxBackups = 3) {
     if (!fs.existsSync(dbPath)) return null;
