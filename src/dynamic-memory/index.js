@@ -130,12 +130,26 @@ class DynamicMemory {
         const postValidation = this.db ? validateDb(this.db) : null;
         const postOpenValid = postValidation ? postValidation.valid : false;
 
+        // Distinguish in-place repair from auto-heal-into-empty:
+        //   - in-place repair preserves existing rows (e.g. missing memories_fts
+        //     was re-created but `memories` still has data) — trust the live DB.
+        //   - auto-heal into empty schema (zero-byte file → fresh schema, no
+        //     rows) — the user's memory is gone unless we restore from backup.
+        let hasRows = false;
+        if (this.db && postOpenValid) {
+            try {
+                hasRows = Number(this.db.prepare('SELECT COUNT(*) AS c FROM memories').get().c) > 0;
+            } catch { hasRows = false; }
+        }
+
         // Phase 4: recovery decision. Trigger recovery for ANY of:
         //   - open failed outright (hard error)
         //   - open succeeded but structural validation rejected the DB
-        //   - the pre-open file was absent/invalid (initDb auto-healed into
-        //     an empty schema; user's data is only in the backups)
-        const shouldAttemptRecovery = !this.db || !postOpenValid || preExistedButInvalid;
+        //   - pre-open file was invalid AND auto-heal left us with no rows
+        //     (i.e. the original data is gone, only a backup can restore it)
+        const shouldAttemptRecovery = !this.db
+            || !postOpenValid
+            || (preExistedButInvalid && !hasRows);
 
         if (shouldAttemptRecovery) {
             if (postValidation && !postValidation.valid) {
@@ -163,14 +177,24 @@ class DynamicMemory {
                     this.db = null;
                     this._log(`[MEMORY] Failed to reopen after recovery: ${err2.message}`);
                 }
-            } else if (preExistedButInvalid && !openErr) {
-                // Auto-heal fallback: no valid backups, but initDb DID produce
-                // a working empty DB. Prior memories are lost but the feature
-                // can still run from here. Reopen with the fresh schema.
+            } else if (preExistedButInvalid && !openErr && postOpenValid) {
+                // Auto-heal fallback: pre-open invalid, but initDb DID produce
+                // a structurally-valid empty DB. Prior memories are lost
+                // (none to recover) but the feature can still run. Do NOT
+                // enter this branch when postOpenValid is false — that means
+                // the damage runs deeper than missing objects (e.g. integrity
+                // failure), and reopening would just get the same broken DB.
                 this._log(`[MEMORY] No valid backup available. Starting with fresh schema (prior memories lost). Tried ${recovery.validationsTried} backup(s).`);
                 try {
                     this.db = initDb(dbPath);
-                    this._log(`[MEMORY] DB ready at ${dbPath} (fresh schema, enabled=${this._enabled})`);
+                    const postFresh = validateDb(this.db);
+                    if (!postFresh.valid) {
+                        this._log(`[MEMORY] Fresh-schema reopen did not validate: ${postFresh.errors.join('; ')}`);
+                        closeDb(this.db);
+                        this.db = null;
+                    } else {
+                        this._log(`[MEMORY] DB ready at ${dbPath} (fresh schema, enabled=${this._enabled})`);
+                    }
                 } catch (err3) {
                     this.db = null;
                     this._log(`[MEMORY] Failed to reopen with fresh schema: ${err3.message}`);
@@ -181,6 +205,15 @@ class DynamicMemory {
                 this._log(`[MEMORY] Recovery failed. Tried ${recovery.validationsTried} backup(s). Errors: ${recovery.errors.join('; ')}`);
             }
         } else {
+            // No recovery needed. Two sub-cases:
+            //   - clean open (preOpenValid + postOpenValid): normal case
+            //   - in-place auto-heal that preserved data (preExistedButInvalid
+            //     + postOpenValid + hasRows): initDb restored missing objects
+            //     without touching row data. Trust the live DB, skip recovery
+            //     to avoid rolling back newer rows to an older backup.
+            if (preExistedButInvalid && hasRows) {
+                this._log(`[MEMORY] DB auto-healed in place (missing objects restored; ${postValidation.embeddingDimension ? `data preserved, dim=${postValidation.embeddingDimension}` : 'row data preserved'})`);
+            }
             const warn = postValidation.warnings.length ? ` (warnings: ${postValidation.warnings.join('; ')})` : '';
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
         }
