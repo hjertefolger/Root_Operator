@@ -16,7 +16,7 @@
 const path = require('path');
 const fs = require('fs');
 
-const { initDb, closeDb, contentExists, insertMemory } = require('./db');
+const { initDb, closeDb, contentExists, insertMemory, backupDb } = require('./db');
 const embeddings = require('./embeddings');
 const { extractChunks, shouldExclude, getContentValue } = require('./chunker');
 const { hybridSearch } = require('./search');
@@ -61,13 +61,26 @@ class DynamicMemory {
         }
 
         const brainDir = path.join(this.workspaceDir, 'brain');
+        const backupsDir = path.join(brainDir, 'backups');
         const dbPath = path.join(brainDir, 'memory.db');
         this.dbPath = dbPath;
 
         try {
             fs.mkdirSync(brainDir, { recursive: true });
+            fs.mkdirSync(backupsDir, { recursive: true });
         } catch (err) {
-            this._log(`[MEMORY] Failed to create brain dir: ${err.message}`);
+            this._log(`[MEMORY] Failed to create brain dirs: ${err.message}`);
+        }
+
+        // Backup rotation BEFORE opening the DB (safer: snapshots last-good state).
+        // Keeps last 3 backups in <workspace>/brain/backups/.
+        try {
+            if (fs.existsSync(dbPath)) {
+                const backupPath = backupDb(dbPath, backupsDir, 3);
+                if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+            }
+        } catch (err) {
+            this._log(`[MEMORY] Backup rotation failed (non-fatal): ${err.message}`);
         }
 
         try {

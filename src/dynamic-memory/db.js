@@ -300,6 +300,48 @@ function searchByLike(db, query, chatId, limit) {
 }
 
 // ============================================================================
+// Backup rotation
+// ============================================================================
+
+/**
+ * Copy the DB file to <backupsDir>/memory-YYYYMMDD-HHMMSS.db.bak, then prune
+ * to keep only the last `maxBackups` files. Returns the new backup path, or
+ * null if the source DB did not exist.
+ *
+ * This uses a plain file copy — safe to call when no writer holds the DB
+ * exclusively (WAL mode tolerates readers). For our usage we call it at app
+ * start BEFORE initDb opens the file, so there is no contention.
+ */
+function backupDb(dbPath, backupsDir, maxBackups = 3) {
+    if (!fs.existsSync(dbPath)) return null;
+    fs.mkdirSync(backupsDir, { recursive: true });
+
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp =
+        `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+        `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const backupPath = path.join(backupsDir, `memory-${stamp}.db.bak`);
+
+    fs.copyFileSync(dbPath, backupPath);
+
+    // Prune oldest, keep only maxBackups.
+    try {
+        const files = fs
+            .readdirSync(backupsDir)
+            .filter((f) => /^memory-\d{8}-\d{6}\.db\.bak$/.test(f))
+            .map((f) => ({ f, mtime: fs.statSync(path.join(backupsDir, f)).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime); // newest first
+
+        for (const { f } of files.slice(maxBackups)) {
+            try { fs.unlinkSync(path.join(backupsDir, f)); } catch { /* ignore */ }
+        }
+    } catch { /* ignore rotation errors — backup itself succeeded */ }
+
+    return backupPath;
+}
+
+// ============================================================================
 // Close
 // ============================================================================
 
@@ -312,6 +354,7 @@ function closeDb(db) {
 module.exports = {
     initDb,
     closeDb,
+    backupDb,
     hashContent,
     contentExists,
     insertMemory,

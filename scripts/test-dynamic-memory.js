@@ -51,6 +51,8 @@ const fakeResources = repoRoot;
 
         const dbPath = path.join(fakeWorkspace, 'brain', 'memory.db');
         console.log('DB exists:', fs.existsSync(dbPath), 'size:', fs.statSync(dbPath).size);
+        const backupsDir = path.join(fakeWorkspace, 'brain', 'backups');
+        console.log('Backups dir exists:', fs.existsSync(backupsDir));
 
         // Quick introspection: count rows
         const Database = require('better-sqlite3');
@@ -73,6 +75,23 @@ const fakeResources = repoRoot;
         // Toggle off and verify indexing skips.
         dm.setEnabled(false);
         console.log('disabled, isEnabled?', dm.isEnabled());
+
+        // Re-init 4 times to verify backup rotation caps at 3.
+        for (let i = 0; i < 4; i++) {
+            const dmN = new DynamicMemory(fakeWorkspace, fakeResources);
+            dmN.setLogger((m) => console.log(`LOG${i + 2}`, m));
+            await dmN.init(fakeStore);
+            dmN.close();
+            // Ensure distinct second-resolution timestamps so filenames differ.
+            await new Promise((r) => setTimeout(r, 1100));
+        }
+
+        const backups = fs.readdirSync(backupsDir).filter((f) => f.endsWith('.db.bak'));
+        console.log('backup count after 4 re-inits:', backups.length, '(expected 3)');
+        backups.forEach((b) => console.log('  backup:', b));
+        if (backups.length !== 3) {
+            throw new Error(`Expected 3 backups after rotation, got ${backups.length}`);
+        }
 
         console.log('SMOKE TEST OK');
         process.exit(0);
