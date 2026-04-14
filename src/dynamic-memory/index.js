@@ -101,6 +101,14 @@ class DynamicMemory {
             this._log(`[MEMORY] lstat check failed: ${err.message}`);
         }
 
+        // Pre-open advisory check. Used ONLY to gate the post-open backup
+        // rotation. Reasoning: if the on-disk file is missing, zero-byte, or
+        // foreign (e.g. disk cleanup zeroed it), initDb() will run
+        // `CREATE TABLE IF NOT EXISTS` and produce a technically-valid but
+        // empty DB. Without this gate we'd snapshot that empty state and
+        // gradually rotate out the last genuinely good backups.
+        const preOpenValid = fs.existsSync(dbPath) && validateDbFile(dbPath).valid;
+
         // Integrity + recovery gate. Covers two failure modes:
         //   a) initDb() throws (file truncated / unreadable header / disk err)
         //   b) initDb() succeeds but validateDb flags structural issues
@@ -154,19 +162,30 @@ class DynamicMemory {
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
         }
 
-        // Backup rotation AFTER the DB is confirmed healthy. We checkpoint the
-        // WAL first via wal_checkpoint(TRUNCATE) so the main .db file contains
-        // all committed pages — raw file copy is then a consistent snapshot.
-        // Without this, backups would be missing data still living in the WAL
-        // sidecar, and restoring from such a backup would silently drop writes.
-        if (this.db) {
+        // Backup rotation — only when the DB existed and was structurally
+        // valid BEFORE we opened it. Protects the backup ring from two
+        // failure modes: (a) snapshotting a freshly-auto-healed empty DB,
+        // and (b) double-snapshotting a just-recovered-from-backup state.
+        //
+        // Before copying we checkpoint the WAL (TRUNCATE) so the main .db
+        // file contains all committed pages. If another process is holding
+        // a read lock the checkpoint can partially fail (busy > 0), leaving
+        // pages in the WAL — in that case we skip the backup rather than
+        // ship a stale one.
+        if (this.db && preOpenValid) {
             try {
-                this.db.pragma('wal_checkpoint(TRUNCATE)');
-                const backupPath = backupDb(dbPath, backupsDir, 3);
-                if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+                const cp = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+                if (cp && cp.busy > 0) {
+                    this._log(`[MEMORY] Skipping backup — checkpoint busy (busy=${cp.busy}, log=${cp.log}, checkpointed=${cp.checkpointed})`);
+                } else {
+                    const backupPath = backupDb(dbPath, backupsDir, 3);
+                    if (backupPath) this._log(`[MEMORY] Backup created: ${path.basename(backupPath)}`);
+                }
             } catch (err) {
                 this._log(`[MEMORY] Backup rotation failed (non-fatal): ${err.message}`);
             }
+        } else if (this.db) {
+            this._log(`[MEMORY] Skipping backup — pre-open state was missing or invalid`);
         }
     }
 
