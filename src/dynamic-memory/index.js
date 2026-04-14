@@ -101,20 +101,22 @@ class DynamicMemory {
             this._log(`[MEMORY] lstat check failed: ${err.message}`);
         }
 
-        // Pre-open advisory check. Used ONLY to gate the post-open backup
-        // rotation. Reasoning: if the on-disk file is missing, zero-byte, or
-        // foreign (e.g. disk cleanup zeroed it), initDb() will run
-        // `CREATE TABLE IF NOT EXISTS` and produce a technically-valid but
-        // empty DB. Without this gate we'd snapshot that empty state and
-        // gradually rotate out the last genuinely good backups.
-        const preOpenValid = fs.existsSync(dbPath) && validateDbFile(dbPath).valid;
+        // Phase 1: pre-open probe. Tells us whether the on-disk file is a
+        // real, structurally-valid SQLite DB BEFORE initDb() runs
+        // `CREATE TABLE IF NOT EXISTS` on it. Critical for the zero-byte /
+        // foreign-file cases: otherwise initDb auto-heals the file into an
+        // empty schema, validateDb passes, and the user's memory is silently
+        // lost when a valid backup would have restored it.
+        const existedPreOpen = fs.existsSync(dbPath);
+        const preOpenValidation = existedPreOpen ? validateDbFile(dbPath) : null;
+        const preOpenValid = preOpenValidation ? preOpenValidation.valid : false;
+        const preExistedButInvalid = existedPreOpen && !preOpenValid;
 
-        // Integrity + recovery gate. Covers two failure modes:
-        //   a) initDb() throws (file truncated / unreadable header / disk err)
-        //   b) initDb() succeeds but validateDb flags structural issues
-        // In either case, walk backups newest->oldest and restore from the
-        // first valid one. If none recover, leave db=null so isEnabled returns
-        // false and the feature disables itself gracefully.
+        if (preExistedButInvalid) {
+            this._log(`[MEMORY] Pre-open validation failed: ${preOpenValidation.errors.join('; ')}`);
+        }
+
+        // Phase 2: open. May throw on hard failures (disk errors, bad header).
         let openErr = null;
         try {
             this.db = initDb(dbPath);
@@ -124,15 +126,24 @@ class DynamicMemory {
             this._log(`[MEMORY] Failed to open DB: ${err.message}`);
         }
 
-        const validation = this.db ? validateDb(this.db) : null;
-        const needsRecovery = !this.db || !validation.valid;
+        // Phase 3: post-open validation.
+        const postValidation = this.db ? validateDb(this.db) : null;
+        const postOpenValid = postValidation ? postValidation.valid : false;
 
-        if (needsRecovery) {
-            if (validation && !validation.valid) {
-                this._log(`[MEMORY] Integrity check FAILED: ${validation.errors.join('; ')}`);
-                closeDb(this.db);
-                this.db = null;
+        // Phase 4: recovery decision. Trigger recovery for ANY of:
+        //   - open failed outright (hard error)
+        //   - open succeeded but structural validation rejected the DB
+        //   - the pre-open file was absent/invalid (initDb auto-healed into
+        //     an empty schema; user's data is only in the backups)
+        const shouldAttemptRecovery = !this.db || !postOpenValid || preExistedButInvalid;
+
+        if (shouldAttemptRecovery) {
+            if (postValidation && !postValidation.valid) {
+                this._log(`[MEMORY] Integrity check FAILED: ${postValidation.errors.join('; ')}`);
             }
+            // Release the (maybe auto-healed) handle so recovery can overwrite
+            // the main file.
+            if (this.db) { closeDb(this.db); this.db = null; }
 
             const recovery = attemptRecovery(dbPath, backupsDir);
             if (recovery.recovered) {
@@ -152,13 +163,25 @@ class DynamicMemory {
                     this.db = null;
                     this._log(`[MEMORY] Failed to reopen after recovery: ${err2.message}`);
                 }
+            } else if (preExistedButInvalid && !openErr) {
+                // Auto-heal fallback: no valid backups, but initDb DID produce
+                // a working empty DB. Prior memories are lost but the feature
+                // can still run from here. Reopen with the fresh schema.
+                this._log(`[MEMORY] No valid backup available. Starting with fresh schema (prior memories lost). Tried ${recovery.validationsTried} backup(s).`);
+                try {
+                    this.db = initDb(dbPath);
+                    this._log(`[MEMORY] DB ready at ${dbPath} (fresh schema, enabled=${this._enabled})`);
+                } catch (err3) {
+                    this.db = null;
+                    this._log(`[MEMORY] Failed to reopen with fresh schema: ${err3.message}`);
+                }
             } else if (openErr) {
                 this._log(`[MEMORY] Recovery failed after open error. Tried ${recovery.validationsTried} backup(s). Errors: ${recovery.errors.join('; ')}`);
             } else {
                 this._log(`[MEMORY] Recovery failed. Tried ${recovery.validationsTried} backup(s). Errors: ${recovery.errors.join('; ')}`);
             }
         } else {
-            const warn = validation.warnings.length ? ` (warnings: ${validation.warnings.join('; ')})` : '';
+            const warn = postValidation.warnings.length ? ` (warnings: ${postValidation.warnings.join('; ')})` : '';
             this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
         }
 
