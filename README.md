@@ -7,7 +7,7 @@
 
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
-✨ Persistent cron scheduler, identity system, and Dynamic Memory — all in-harness
+✨ Persistent cron scheduler, identity system, and dynamic recall memory — all in-harness
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response** (passwordless)
