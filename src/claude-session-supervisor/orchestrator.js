@@ -218,27 +218,21 @@ class ClaudeSessionSupervisor extends EventEmitter {
             sendingAt: now,
         });
 
-        // Bridge-unavailable guard. ChannelManager.sendToChannel() internally
-        // buffers the payload when the socket is down (see channel-manager.js
-        // _queuePayload), and a later reconnect would flush that buffered
-        // payload — potentially to a Claude session that didn't start it.
-        // If we are not connected right now, refuse to hand the payload to
-        // ChannelManager at all: mark the dispatch FAILED and move on. This
-        // avoids the "buffered then silently re-sent" path entirely.
-        //
-        // PR1 known limitation: still a narrow race between this check and
-        // sendToChannel() where the socket could drop mid-call. In that case
-        // ChannelManager returns false and buffers the payload; we still
-        // mark FAILED below, but the buffered send might later reach Claude.
-        // Fully removing that risk requires PR2's unbuffered transport.
-        if (this.channelManager.connected === false) {
-            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'bridge_unavailable');
-            return;
-        }
+        // Use the unbuffered variant so we never implicitly hand the payload
+        // to ChannelManager's pendingMessages buffer. If the socket is down
+        // (or drops mid-call), we get false and the payload is NOT queued.
+        // This closes the buffered-then-flushed-to-a-different-session race
+        // fully for PR1, without waiting for PR2's transport refactor.
+        // Fallback to legacy sendToChannel for ChannelManager instances that
+        // predate the unbuffered method (shouldn't happen in-tree, but keeps
+        // external injections — e.g., tests mocking the interface — working).
+        const send = typeof this.channelManager.sendToChannelUnbuffered === 'function'
+            ? this.channelManager.sendToChannelUnbuffered.bind(this.channelManager)
+            : this.channelManager.sendToChannel.bind(this.channelManager);
 
         let sent;
         try {
-            sent = this.channelManager.sendToChannel(
+            sent = send(
                 row.chat_id || this.defaultChatId,
                 row.payload,
                 row.chat_id || this.defaultChatId

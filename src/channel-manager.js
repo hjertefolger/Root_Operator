@@ -150,6 +150,42 @@ class ChannelManager extends EventEmitter {
         return true;
     }
 
+    /**
+     * Unbuffered variant used by ClaudeSessionSupervisor. Same semantics as
+     * sendToChannel() except it NEVER queues on disconnect — it just returns
+     * false so the caller can make its own reliability decision. This closes
+     * the PR1 race where the supervisor marks a dispatch failed but the
+     * default sendToChannel() had already pushed the payload into
+     * pendingMessages, causing a later flush to deliver the "failed"
+     * dispatch to Claude after the fact.
+     *
+     * Legacy sendToChannel() callers keep their buffering behavior so
+     * scheduled tool responses etc. still survive brief reconnects.
+     *
+     * PR2 will remove the buffer entirely and make the supervisor the only
+     * queue authority; until then this method is the clean opt-out.
+     */
+    sendToChannelUnbuffered(chatId, content, userId) {
+        const payload = JSON.stringify({
+            type: 'client_message',
+            chat_id: chatId,
+            content,
+            user_id: userId || chatId,
+            ts: new Date().toISOString(),
+        }) + '\n';
+
+        if (!this.socket || !this.connected) {
+            return false;
+        }
+
+        try {
+            this.socket.write(payload);
+        } catch {
+            return false;
+        }
+        return true;
+    }
+
     sendSchedulerResponse(callId, result, isError = false) {
         const payload = JSON.stringify({
             type: 'scheduler_response',

@@ -310,20 +310,24 @@ test('multiple awaitOutcome callers on same dispatch all settle', async () => {
     store.close();
 });
 
-test('disconnected ChannelManager: supervisor does NOT hand payload to buffer', async () => {
-    // Real ChannelManager stand-in with the same surface area as the live
-    // one (connected flag + buffered-when-disconnected sendToChannel).
-    // Verifies the supervisor refuses to send when connected=false, so the
-    // ChannelManager internal buffer never receives the payload.
+test('disconnected ChannelManager: supervisor uses unbuffered send, nothing enters buffer', async () => {
+    // Real-shaped ChannelManager stand-in with the current interface:
+    // connected flag + buffered sendToChannel (legacy) + unbuffered variant
+    // (PR1 addition). Verifies the supervisor routes through the unbuffered
+    // variant so no payload ever reaches the internal buffer.
     const { supervisor, store } = fixture();
     const bufferedPayloads = [];
+    const unbufferedAttempts = [];
     supervisor.channelManager = {
         connected: false,
         sendToChannel(chatId, content, userId) {
-            // This is what the real ChannelManager does when disconnected:
-            // queue internally and return false.
+            // legacy buffered path — if this is ever called, the test fails
             bufferedPayloads.push({ chatId, content, userId });
             return false;
+        },
+        sendToChannelUnbuffered(chatId, content, userId) {
+            unbufferedAttempts.push({ chatId, content, userId });
+            return false; // disconnected → no buffer, just false
         },
     };
     await supervisor.start();
@@ -331,9 +335,10 @@ test('disconnected ChannelManager: supervisor does NOT hand payload to buffer', 
     const outcome = await supervisor.awaitOutcome(dispatchId);
     assert.equal(outcome.state, DISPATCH_STATES.FAILED);
     assert.equal(outcome.error, 'bridge_unavailable');
-    // Critical: buffer should be empty — payload never reached ChannelManager
+    // Supervisor must use unbuffered, never the buffered legacy method.
     assert.equal(bufferedPayloads.length, 0,
-        `payload leaked into buffer: ${JSON.stringify(bufferedPayloads)}`);
+        `supervisor called buffered sendToChannel: ${JSON.stringify(bufferedPayloads)}`);
+    assert.equal(unbufferedAttempts.length, 1);
     const row = store.getDispatch(dispatchId);
     assert.equal(row.state, DISPATCH_STATES.FAILED);
     await supervisor.shutdown();
