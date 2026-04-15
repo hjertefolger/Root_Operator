@@ -310,6 +310,81 @@ test('multiple awaitOutcome callers on same dispatch all settle', async () => {
     store.close();
 });
 
+test('disconnected ChannelManager: supervisor does NOT hand payload to buffer', async () => {
+    // Real ChannelManager stand-in with the same surface area as the live
+    // one (connected flag + buffered-when-disconnected sendToChannel).
+    // Verifies the supervisor refuses to send when connected=false, so the
+    // ChannelManager internal buffer never receives the payload.
+    const { supervisor, store } = fixture();
+    const bufferedPayloads = [];
+    supervisor.channelManager = {
+        connected: false,
+        sendToChannel(chatId, content, userId) {
+            // This is what the real ChannelManager does when disconnected:
+            // queue internally and return false.
+            bufferedPayloads.push({ chatId, content, userId });
+            return false;
+        },
+    };
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'sensitive' });
+    const outcome = await supervisor.awaitOutcome(dispatchId);
+    assert.equal(outcome.state, DISPATCH_STATES.FAILED);
+    assert.equal(outcome.error, 'bridge_unavailable');
+    // Critical: buffer should be empty — payload never reached ChannelManager
+    assert.equal(bufferedPayloads.length, 0,
+        `payload leaked into buffer: ${JSON.stringify(bufferedPayloads)}`);
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('queue does not stall when pre-activation dispatch fails', async () => {
+    // Regression for the Codex round-5 finding: when a dispatch fails
+    // before becoming active (bridge_unavailable), _completeDispatch must
+    // still call _activateNext() so later queued dispatches can proceed
+    // once the bridge recovers.
+    const { supervisor, store, hookLog } = fixture();
+    let connected = false;
+    const cm = {
+        get connected() { return connected; },
+        sendToChannel(chatId, content, userId) {
+            if (!connected) return false;
+            return true; // would normally also call supervisor-side handlers
+        },
+    };
+    supervisor.channelManager = cm;
+    await supervisor.start();
+
+    const first = supervisor.enqueue({ source: 'scheduler', payload: 'one' });
+    const second = supervisor.enqueue({ source: 'scheduler', payload: 'two' });
+
+    const outcome1 = supervisor.awaitOutcome(first.dispatchId);
+    const outcome2 = supervisor.awaitOutcome(second.dispatchId);
+
+    // Both should fail with bridge_unavailable (connected === false)
+    const r1 = await outcome1;
+    assert.equal(r1.state, DISPATCH_STATES.FAILED);
+    assert.equal(r1.error, 'bridge_unavailable');
+
+    const r2 = await outcome2;
+    assert.equal(r2.state, DISPATCH_STATES.FAILED,
+        `queue stalled after pre-activation failure (second state=${r2.state})`);
+    assert.equal(r2.error, 'bridge_unavailable');
+
+    // Now "reconnect" and fire a fresh dispatch — it should activate normally.
+    connected = true;
+    const third = supervisor.enqueue({ source: 'scheduler', payload: 'three' });
+    await waitForCondition(() => store.getDispatch(third.dispatchId).state === DISPATCH_STATES.ACTIVE);
+    fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
+    const r3 = await supervisor.awaitOutcome(third.dispatchId);
+    assert.equal(r3.state, DISPATCH_STATES.COMPLETED);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
 test('abandon removes queued id from in-memory queue (defensive)', async () => {
     // Even with the timer fix, an external caller could in principle call
     // _abandonDispatch() on a queued (not-yet-active) id. Verify that does

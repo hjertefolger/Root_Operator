@@ -218,9 +218,24 @@ class ClaudeSessionSupervisor extends EventEmitter {
             sendingAt: now,
         });
 
-        // Send via channelManager. PR1 uses the existing transport.
-        // PR2 will remove ChannelManager's internal pending buffer so this is
-        // the only path. PR3 converts bridge tools to request/response.
+        // Bridge-unavailable guard. ChannelManager.sendToChannel() internally
+        // buffers the payload when the socket is down (see channel-manager.js
+        // _queuePayload), and a later reconnect would flush that buffered
+        // payload — potentially to a Claude session that didn't start it.
+        // If we are not connected right now, refuse to hand the payload to
+        // ChannelManager at all: mark the dispatch FAILED and move on. This
+        // avoids the "buffered then silently re-sent" path entirely.
+        //
+        // PR1 known limitation: still a narrow race between this check and
+        // sendToChannel() where the socket could drop mid-call. In that case
+        // ChannelManager returns false and buffers the payload; we still
+        // mark FAILED below, but the buffered send might later reach Claude.
+        // Fully removing that risk requires PR2's unbuffered transport.
+        if (this.channelManager.connected === false) {
+            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'bridge_unavailable');
+            return;
+        }
+
         let sent;
         try {
             sent = this.channelManager.sendToChannel(
@@ -233,12 +248,6 @@ class ClaudeSessionSupervisor extends EventEmitter {
             return;
         }
 
-        // channelManager returns false when the bridge socket is down and
-        // buffers the payload for later flush. Treat that as a clean
-        // failure rather than marking the dispatch active — otherwise the
-        // dispatch sits waiting for a Stop hook that will never come from
-        // this send (and ChannelManager may later flush the buffered payload
-        // to a different session entirely, which is worse).
         if (sent === false) {
             this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'bridge_unavailable');
             return;
@@ -379,8 +388,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._clearActiveSafetyTimer();
             this.activeDispatch = null;
             this._transition('dispatch_terminal', { occurredAt: now });
-            this._activateNext();
         }
+
+        // Always try to activate the next queued dispatch — whether this one
+        // was pre-activation (e.g. bridge_unavailable) or fully active. Without
+        // this, a pre-activation failure would leave the rest of the queue
+        // stalled until the next external enqueue arrived.
+        // _activateNext() no-ops if activeDispatch is still set, so it is
+        // safe to call unconditionally.
+        this._activateNext();
     }
 
     _settleResolvers(dispatchId, terminalState, error) {
