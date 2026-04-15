@@ -90,19 +90,39 @@ function createSchema(db) {
 }
 
 /**
- * Idempotent migration: add `external_ref` column if absent.
+ * Idempotent migration: add `external_ref` column if absent, then ensure the
+ * index exists regardless of whether we added the column this run.
  * Supervisor PR1 schema prep for PR3's effect-ledger writes. PR1 itself
  * does not populate this column — but later PRs stamp it with the
  * committing effect_id so the reconcile-on-recovery pass can match
  * supervisor effects to dynamic-memory rows by direct lookup.
  *
+ * Safe against concurrent opens: wraps the check-and-ALTER in an IMMEDIATE
+ * transaction so two processes serialise. Also tolerates the "duplicate
+ * column" error defensively in case SQLite surfaces it through a race.
+ *
  * Design doc: ~/.root-operator/workspace/design/claude-session-supervisor-v4.md §N-v4.2
  */
 function ensureExternalRefColumn(db) {
-    const info = db.prepare("PRAGMA table_info('memories')").all();
-    const has = info.some(col => col.name === 'external_ref');
-    if (has) return;
-    db.prepare("ALTER TABLE memories ADD COLUMN external_ref TEXT").run();
+    const addColumnIfMissing = db.transaction(() => {
+        const info = db.prepare("PRAGMA table_info('memories')").all();
+        const has = info.some(col => col.name === 'external_ref');
+        if (!has) {
+            try {
+                db.prepare("ALTER TABLE memories ADD COLUMN external_ref TEXT").run();
+            } catch (err) {
+                // Benign race: another process added the column between the
+                // PRAGMA and the ALTER. Re-check and accept if resolved.
+                if (!/duplicate column/i.test(err.message || '')) throw err;
+                const recheck = db.prepare("PRAGMA table_info('memories')").all();
+                if (!recheck.some(col => col.name === 'external_ref')) throw err;
+            }
+        }
+    });
+    addColumnIfMissing.immediate();
+    // Always run the index creation — idempotent, and self-heals a DB that
+    // got the column via a crash-interrupted earlier migration but never
+    // got the index.
     db.prepare("CREATE INDEX IF NOT EXISTS idx_memories_external_ref ON memories(external_ref)").run();
 }
 

@@ -3275,15 +3275,18 @@ function initChannelMode() {
             store: supervisorStore,
             runtimeDir: supervisorRuntimeDir,
         });
-        const supervisorEpoch = supervisorRuntime.incrementEpoch();
+        // PR1 does NOT bump epoch: the Runtime module has full epoch +
+        // orphan-cleanup machinery available, but nothing in the PR1 live
+        // path actually consumes epoch-scoped files yet (main.js still
+        // writes the stable-named hook log). Wiring spawnClaudeCode() to
+        // use epoch-scoped paths is deferred to PR4, when respawn needs
+        // per-spawn isolation. Using a fixed epoch=0 here avoids bumping
+        // the counter every boot without any consumer.
+        supervisorRuntime.currentEpoch = 0;
         const supervisorIncidents = new SupervisorIncidentLogger({
             store: supervisorStore,
             jsonlPath: path.join(supervisorRuntimeDir, 'supervisor-incidents.jsonl'),
         });
-        // PR1: tail the existing stable-named hook log that spawnClaudeCode()
-        // writes to. Epoch-scoped paths are available via
-        // supervisorRuntime.resolveEpochPaths() but wiring spawnClaudeCode()
-        // to use them is deferred to PR4.
         const supervisorHookLog = path.join(supervisorRuntimeDir, 'claude-channel-hooks.jsonl');
         supervisor = createSupervisor({
             store: supervisorStore,
@@ -3296,7 +3299,7 @@ function initChannelMode() {
             logDebug(`[SUPERVISOR] start failed: ${err.message}`);
             supervisor = null;
         });
-        logDebug(`[SUPERVISOR] observe-only mode active, epoch=${supervisorEpoch}`);
+        logDebug('[SUPERVISOR] observe-only mode active (PR1)');
     } catch (err) {
         logDebug(`[SUPERVISOR] init failed: ${err.message} — scheduler will use legacy path`);
         supervisor = null;

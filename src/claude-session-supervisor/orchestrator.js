@@ -61,9 +61,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         this.state = STATES.STOPPED;
         this.epoch = runtime.currentEpoch;
-        this.activeDispatch = null;     // { dispatchId, startedAt, lastProgressAt, sendingOrdinalBase }
-        this.pendingResolvers = new Map(); // dispatchId -> { resolve, reject, timer }
-        this.queue = [];                // dispatchIds waiting for activeDispatch to clear
+        // activeDispatch carries its own safety timer (armed at activation, not
+        // at awaitOutcome — queued dispatches that never activate cannot be
+        // auto-abandoned). Shape: { dispatchId, startedAt, lastProgressAt, safetyTimer }
+        this.activeDispatch = null;
+        // pendingResolvers holds ARRAYS of { resolve, reject } per dispatchId so
+        // multiple awaitOutcome() callers on the same dispatch all settle together.
+        this.pendingResolvers = new Map();
+        this.queue = []; // dispatchIds waiting for activeDispatch to clear
 
         this._tailer = null;
         this._shutdown = false;
@@ -147,13 +152,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
         }
 
         return new Promise((resolve, reject) => {
-            const silenceMs = row.silence_ms || DEFAULT_SILENCE_MS;
-            const safetyMs = silenceMs * SAFETY_NET_MULTIPLIER;
-            const timer = setTimeout(() => {
-                this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
-            }, safetyMs);
-            if (timer.unref) timer.unref();
-            this.pendingResolvers.set(dispatchId, { resolve, reject, timer });
+            const existing = this.pendingResolvers.get(dispatchId);
+            if (existing) {
+                existing.push({ resolve, reject });
+            } else {
+                this.pendingResolvers.set(dispatchId, [{ resolve, reject }]);
+            }
+            // No timer here: the safety-net timer is armed when the dispatch
+            // transitions to ACTIVE in _activateNext(). Queued dispatches
+            // cannot be auto-abandoned before they ever start.
         });
     }
 
@@ -170,9 +177,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
         if (this._shutdown) return;
         this._shutdown = true;
         this._stopTailer();
-        for (const [dispatchId, resolver] of this.pendingResolvers) {
-            clearTimeout(resolver.timer);
-            resolver.reject(new Error('supervisor shutdown'));
+        this._clearActiveSafetyTimer();
+        for (const [, waiters] of this.pendingResolvers) {
+            for (const w of waiters) w.reject(new Error('supervisor shutdown'));
         }
         this.pendingResolvers.clear();
         this._transition('shutdown', { occurredAt: this.clock() });
@@ -180,17 +187,30 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     _activateNext() {
         if (this.activeDispatch) return;
-        let dispatchId = this.queue.shift();
-        if (!dispatchId) {
-            // look for any queued dispatch (covers the "enqueued while idle" path
-            // since that one is activated immediately without touching this.queue)
+        // Drain zombie ids: an id popped from the in-memory queue might have
+        // been abandoned/shutdown before activation. Skip any that aren't
+        // still in 'queued' state in the DB.
+        let row = null;
+        let dispatchId = null;
+        while (true) {
+            const candidate = this.queue.shift();
+            if (candidate) {
+                const r = this.store.getDispatch(candidate);
+                if (r && r.state === DISPATCH_STATES.QUEUED) {
+                    row = r;
+                    dispatchId = candidate;
+                    break;
+                }
+                continue;
+            }
+            // In-memory queue empty. Fall back to DB scan (covers "enqueued
+            // while idle and activated immediately without touching queue").
             const open = this.store.listOpenDispatches().find(d => d.state === DISPATCH_STATES.QUEUED);
             if (!open) return;
+            row = open;
             dispatchId = open.dispatch_id;
+            break;
         }
-
-        const row = this.store.getDispatch(dispatchId);
-        if (!row) return;
 
         const now = this.clock();
         this.store.updateDispatchState(dispatchId, {
@@ -201,8 +221,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Send via channelManager. PR1 uses the existing transport.
         // PR2 will remove ChannelManager's internal pending buffer so this is
         // the only path. PR3 converts bridge tools to request/response.
+        let sent;
         try {
-            this.channelManager.sendToChannel(
+            sent = this.channelManager.sendToChannel(
                 row.chat_id || this.defaultChatId,
                 row.payload,
                 row.chat_id || this.defaultChatId
@@ -212,16 +233,34 @@ class ClaudeSessionSupervisor extends EventEmitter {
             return;
         }
 
+        // channelManager returns false when the bridge socket is down and
+        // buffers the payload for later flush. Treat that as a clean
+        // failure rather than marking the dispatch active — otherwise the
+        // dispatch sits waiting for a Stop hook that will never come from
+        // this send (and ChannelManager may later flush the buffered payload
+        // to a different session entirely, which is worse).
+        if (sent === false) {
+            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'bridge_unavailable');
+            return;
+        }
+
         const activateTs = this.clock();
         this.store.updateDispatchState(dispatchId, {
             state: DISPATCH_STATES.ACTIVE,
             activatedAt: activateTs,
             lastProgressAt: activateTs,
         });
+        const silenceMs = row.silence_ms || DEFAULT_SILENCE_MS;
+        const safetyMs = silenceMs * SAFETY_NET_MULTIPLIER;
+        const safetyTimer = setTimeout(() => {
+            this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
+        }, safetyMs);
+        if (safetyTimer.unref) safetyTimer.unref();
         this.activeDispatch = {
             dispatchId,
             startedAt: activateTs,
             lastProgressAt: activateTs,
+            safetyTimer,
         };
         this._transition('dispatch_activated', { occurredAt: activateTs });
         this.incidents.record({
@@ -232,6 +271,13 @@ class ClaudeSessionSupervisor extends EventEmitter {
             stateTo: DISPATCH_STATES.ACTIVE,
             details: { source: row.source },
         });
+    }
+
+    _clearActiveSafetyTimer() {
+        if (this.activeDispatch && this.activeDispatch.safetyTimer) {
+            clearTimeout(this.activeDispatch.safetyTimer);
+            this.activeDispatch.safetyTimer = null;
+        }
     }
 
     _startTailer() {
@@ -305,6 +351,13 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     _completeDispatch(dispatchId, terminalState, error) {
         const now = this.clock();
+        const row = this.store.getDispatch(dispatchId);
+        if (row && TERMINAL_DISPATCH_STATES.has(row.state)) {
+            // Idempotent: never double-complete. Still notify any late awaiters.
+            this._settleResolvers(dispatchId, row.state, row.last_error);
+            return;
+        }
+
         this.store.updateDispatchState(dispatchId, {
             state: terminalState,
             terminalAt: now,
@@ -315,29 +368,36 @@ class ClaudeSessionSupervisor extends EventEmitter {
             kind: `dispatch_${terminalState}`,
             dispatchId,
             epoch: this.epoch,
-            stateFrom: DISPATCH_STATES.ACTIVE,
+            stateFrom: row ? row.state : null,
             stateTo: terminalState,
             details: { error },
         });
 
-        const resolver = this.pendingResolvers.get(dispatchId);
-        if (resolver) {
-            clearTimeout(resolver.timer);
-            resolver.resolve({ state: terminalState, error });
-            this.pendingResolvers.delete(dispatchId);
-        }
+        this._settleResolvers(dispatchId, terminalState, error);
 
         if (this.activeDispatch && this.activeDispatch.dispatchId === dispatchId) {
+            this._clearActiveSafetyTimer();
             this.activeDispatch = null;
             this._transition('dispatch_terminal', { occurredAt: now });
-            // Activate next queued dispatch if any
             this._activateNext();
+        }
+    }
+
+    _settleResolvers(dispatchId, terminalState, error) {
+        const waiters = this.pendingResolvers.get(dispatchId);
+        if (!waiters) return;
+        this.pendingResolvers.delete(dispatchId);
+        for (const w of waiters) {
+            w.resolve({ state: terminalState, error: error || null });
         }
     }
 
     _abandonDispatch(dispatchId, reason) {
         const row = this.store.getDispatch(dispatchId);
         if (!row || TERMINAL_DISPATCH_STATES.has(row.state)) return;
+        // Defensive: if the dispatch is still queued in memory, drop it so
+        // _activateNext() can't promote it after abandon.
+        this.queue = this.queue.filter(id => id !== dispatchId);
         this._completeDispatch(dispatchId, DISPATCH_STATES.ABANDONED, reason);
     }
 

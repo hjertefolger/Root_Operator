@@ -214,3 +214,131 @@ test('enqueue after hardFailed throws', async () => {
     assert.throws(() => supervisor.enqueue({ source: 'scheduler', payload: 'x' }), /hardFailed/);
     store.close();
 });
+
+// --- Codex round 4 follow-ups ---
+
+test('bridge unavailable: sendToChannel returning false marks dispatch failed', async () => {
+    const { supervisor, store, hookLog } = fixture();
+    // Swap channelManager to a disconnected-style one that returns false
+    supervisor.channelManager = {
+        sendToChannel() { return false; },
+    };
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    const outcome = await supervisor.awaitOutcome(dispatchId);
+    assert.equal(outcome.state, DISPATCH_STATES.FAILED);
+    assert.equal(outcome.error, 'bridge_unavailable');
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.equal(row.last_error, 'bridge_unavailable');
+    // Late Stop hook for a FAILED dispatch should be ignored (no activeDispatch)
+    fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
+    await new Promise(r => setTimeout(r, 150));
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.FAILED);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('queued dispatch is NOT auto-abandoned while waiting for activation', async () => {
+    // Covers the Codex High: safety timer must arm at ACTIVATION, not at
+    // awaitOutcome. A dispatch queued behind a long-running active one
+    // should keep its queued state without being auto-abandoned.
+    const { supervisor, store, hookLog } = fixture();
+    await supervisor.start();
+
+    const first = supervisor.enqueue({
+        source: 'scheduler', payload: 'first',
+        silenceMs: 5, // 5ms * 10 = 50ms safety on ACTIVE
+    });
+    const second = supervisor.enqueue({
+        source: 'scheduler', payload: 'second',
+        silenceMs: 5, // same short budget — but should NOT tick while queued
+    });
+
+    // Register waiters for both
+    const outcome1 = supervisor.awaitOutcome(first.dispatchId);
+    const outcome2 = supervisor.awaitOutcome(second.dispatchId);
+
+    // Wait past the safety budget that WOULD have auto-abandoned the queued
+    // dispatch under the old (pre-fix) behaviour. Under the fix, only the
+    // ACTIVE dispatch's timer runs, so first will auto-abandon but second's
+    // safety counter hasn't started yet.
+    await new Promise(r => setTimeout(r, 100));
+
+    // Key assertion: second has NOT been auto-abandoned. It either promoted
+    // to ACTIVE (after first was auto-abandoned and _activateNext ran) or
+    // stayed QUEUED. It must never be ABANDONED while it was queued.
+    const secondState = store.getDispatch(second.dispatchId).state;
+    assert.notEqual(secondState, DISPATCH_STATES.ABANDONED,
+        `second was zombie-abandoned while queued (state=${secondState})`);
+    assert.ok([DISPATCH_STATES.QUEUED, DISPATCH_STATES.ACTIVE, DISPATCH_STATES.FAILED].includes(secondState),
+        `unexpected second state: ${secondState}`);
+
+    // Drain: first has auto-abandoned by now.
+    const firstResult = await outcome1;
+    assert.equal(firstResult.state, DISPATCH_STATES.ABANDONED);
+
+    // Second should activate (if not already) and then eventually safety-net
+    // abandon itself because we never send a Stop hook. Either way, its
+    // resolver settles.
+    const secondResult = await outcome2;
+    assert.ok(
+        [DISPATCH_STATES.ABANDONED, DISPATCH_STATES.COMPLETED].includes(secondResult.state),
+        `second unexpected terminal: ${secondResult.state}`
+    );
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('multiple awaitOutcome callers on same dispatch all settle', async () => {
+    const { supervisor, store, hookLog } = fixture();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    const a = supervisor.awaitOutcome(dispatchId);
+    const b = supervisor.awaitOutcome(dispatchId);
+    const c = supervisor.awaitOutcome(dispatchId);
+    fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
+    const results = await Promise.all([a, b, c]);
+    for (const r of results) {
+        assert.equal(r.state, DISPATCH_STATES.COMPLETED);
+    }
+    // Late awaiter on already-terminal dispatch resolves immediately.
+    const d = await supervisor.awaitOutcome(dispatchId);
+    assert.equal(d.state, DISPATCH_STATES.COMPLETED);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('abandon removes queued id from in-memory queue (defensive)', async () => {
+    // Even with the timer fix, an external caller could in principle call
+    // _abandonDispatch() on a queued (not-yet-active) id. Verify that does
+    // not leave a zombie ready for _activateNext() to promote.
+    const { supervisor, store, hookLog } = fixture();
+    await supervisor.start();
+
+    const first = supervisor.enqueue({ source: 'scheduler', payload: 'first' });
+    const second = supervisor.enqueue({ source: 'scheduler', payload: 'second' });
+    const outcome1 = supervisor.awaitOutcome(first.dispatchId);
+    const outcome2 = supervisor.awaitOutcome(second.dispatchId);
+
+    // Forcibly abandon the queued one before it ever runs.
+    supervisor._abandonDispatch(second.dispatchId, 'force_cancel');
+
+    // Verify second is terminal and no longer in queue.
+    assert.equal(store.getDispatch(second.dispatchId).state, DISPATCH_STATES.ABANDONED);
+    assert.equal(supervisor.queue.includes(second.dispatchId), false);
+    assert.equal((await outcome2).state, DISPATCH_STATES.ABANDONED);
+
+    // Let first finish. _activateNext should NOT promote the abandoned second.
+    fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
+    await outcome1;
+
+    // No active dispatch now, and second stays ABANDONED (not re-sent).
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(supervisor.activeDispatch, null);
+    assert.equal(store.getDispatch(second.dispatchId).state, DISPATCH_STATES.ABANDONED);
+
+    await supervisor.shutdown();
+    store.close();
+});
