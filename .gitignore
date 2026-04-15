@@ -36,3 +36,6 @@ runtime-config.json
 
 # Dynamic memory model (downloaded by scripts/download-model.js)
 models/
+
+# Internal planning / design docs
+docs/
