@@ -343,6 +343,17 @@ async function main() {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
   console.error('[channel-bridge] MCP channel server running');
+
+  // PR2 bridge-ready handshake. ChannelManager's `connected` event fires when
+  // the Unix socket accepts, which is BEFORE mcp.connect() has resolved. For
+  // replay-after-respawn we need the supervisor to gate on the real readiness
+  // of the MCP stdio transport, not just "IPC socket up." Emit an explicit
+  // bridge_ready envelope here so the main process can distinguish the two.
+  emitToElectron({
+    type: 'bridge_ready',
+    pid: process.pid,
+    ts: new Date().toISOString(),
+  });
 }
 
 main().catch((error) => {
