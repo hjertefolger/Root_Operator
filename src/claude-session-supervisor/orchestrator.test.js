@@ -556,7 +556,7 @@ test('hook event with mismatched sessionToken is rejected, no progress update', 
     supervisor.notifyClaudeSpawned('sess-current');
 
     const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
-    supervisor.awaitOutcome(dispatchId);
+    supervisor.awaitOutcome(dispatchId).catch(() => {}); // absorb shutdown rejection
 
     const beforeProgress = store.getDispatch(dispatchId).last_progress_at;
 
@@ -573,6 +573,58 @@ test('hook event with mismatched sessionToken is rejected, no progress update', 
     store.close();
 });
 
+test('hook with empty-string sessionToken is rejected when session is set', async () => {
+    // Regression for Codex review: the shipped hook script always emits
+    // sessionToken, defaulting to '' if ROOT_OPERATOR_SESSION_TOKEN env
+    // propagation breaks. An empty-string token against a non-empty current
+    // token must be rejected, otherwise a broken plumbing path silently
+    // re-opens the bug this patch is supposed to close.
+    const { supervisor, hookLog, store } = fixture();
+    await supervisor.start();
+    supervisor.notifyClaudeSpawned('sess-real');
+
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    supervisor.awaitOutcome(dispatchId).catch(() => {}); // absorb shutdown rejection
+
+    // A hook arrives with sessionToken present but empty (broken env prop).
+    appendHook(hookLog, { hookEventName: 'Stop', sessionToken: '' });
+    await new Promise(r => setTimeout(r, 150));
+
+    // Dispatch must remain ACTIVE — the empty token is a mismatch, not a legacy absence.
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.ACTIVE,
+        'hook with empty token falsely completed active dispatch');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('enqueue after notifyClaudeExited stays queued until notifyClaudeSpawned', async () => {
+    // Locks down the parked-window contract. Between crash and respawn,
+    // new enqueues must NOT activate into the dead bridge.
+    const { supervisor, store, sent } = fixture();
+    await supervisor.start();
+    supervisor.notifyClaudeSpawned('sess-old');
+
+    // Crash before any dispatch is enqueued.
+    supervisor.notifyClaudeExited({ sessionToken: 'sess-old', pid: 1, exitCode: null, signal: 'SIGKILL' });
+    assert.equal(supervisor._awaitingSpawn, true);
+
+    // New enqueue during the parked window.
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'queued-during-park' });
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.QUEUED,
+        'dispatch auto-activated into dead bridge during parked window');
+    assert.equal(sent.length, 0, 'send fired before spawn confirmed');
+
+    // Fresh session arrives; dispatch should now activate.
+    supervisor.notifyClaudeSpawned('sess-new');
+    await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.ACTIVE,
+        { timeoutMs: 1000 });
+    assert.equal(sent.length, 1);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
 test('notifyClaudeExited with stale token does not touch active dispatch', async () => {
     // Extra defensive case: main.js could in principle notify with an already-
     // rotated token (multiple crashes in fast succession). Supervisor must
@@ -582,7 +634,7 @@ test('notifyClaudeExited with stale token does not touch active dispatch', async
     supervisor.notifyClaudeSpawned('sess-a');
 
     const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
-    supervisor.awaitOutcome(dispatchId);
+    supervisor.awaitOutcome(dispatchId).catch(() => {}); // absorb shutdown rejection
 
     // A notify arrives with a token we never issued.
     supervisor.notifyClaudeExited({ sessionToken: 'sess-bogus', pid: 999, exitCode: 0, signal: null });

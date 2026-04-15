@@ -429,9 +429,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Session-token gating: once a session is established, reject any hook
         // whose token doesn't match. This blocks late bytes from a crashed
         // session from falsely terminalizing a freshly-activated dispatch.
-        // Hooks without any token are accepted for backward compatibility with
-        // older hook-script versions (only relevant during the rollout window).
-        if (this.currentSessionToken && hook.sessionToken
+        //
+        // Gate on field PRESENCE, not truthiness: the shipped hook script
+        // always emits `sessionToken`, defaulting to '' if env propagation
+        // breaks. A falsy-but-present token against a non-empty current
+        // token must be rejected, otherwise a broken plumbing path would
+        // silently re-open the exact race we are closing here. Truly absent
+        // fields (legacy hook scripts, test fixtures that don't set the
+        // field) are still accepted — the rollout window.
+        if (this.currentSessionToken && 'sessionToken' in hook
                 && hook.sessionToken !== this.currentSessionToken) {
             this.incidents.record({
                 kind: 'stale_hook_rejected',
