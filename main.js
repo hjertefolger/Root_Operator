@@ -23,9 +23,17 @@ const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
 const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR, WORKSPACE_DIR } = require('./src/workspace');
 const { DynamicMemory } = require('./src/dynamic-memory');
+const {
+    DispatchStore: SupervisorDispatchStore,
+    Runtime: SupervisorRuntime,
+    IncidentLogger: SupervisorIncidentLogger,
+    createSupervisor,
+} = require('./src/claude-session-supervisor');
 
 let store;
 let dynamicMemory = null;
+let supervisor = null;
+let supervisorStore = null;
 const isDev = !app.isPackaged;
 
 if (isDev) {
@@ -3251,9 +3259,56 @@ function initChannelMode() {
 
     channelManager.connect();
 
+    // ClaudeSessionSupervisor (PR1 observe-only).
+    // Initialized best-effort; if setup fails, scheduler falls back to the
+    // legacy direct-send path. See PR1_PLAN.md + design doc v4 for context.
+    supervisor = null;
+    try {
+        const homeDir = app.getPath('home');
+        const supervisorRuntimeDir = path.join(homeDir, '.root-operator', 'runtime');
+        const brainDir = path.join(WORKSPACE_DIR, 'brain');
+        fs.mkdirSync(brainDir, { recursive: true });
+        fs.mkdirSync(supervisorRuntimeDir, { recursive: true });
+
+        supervisorStore = new SupervisorDispatchStore(path.join(brainDir, 'claude-supervisor.db'));
+        const supervisorRuntime = new SupervisorRuntime({
+            store: supervisorStore,
+            runtimeDir: supervisorRuntimeDir,
+        });
+        const supervisorEpoch = supervisorRuntime.incrementEpoch();
+        const supervisorIncidents = new SupervisorIncidentLogger({
+            store: supervisorStore,
+            jsonlPath: path.join(supervisorRuntimeDir, 'supervisor-incidents.jsonl'),
+        });
+        // PR1: tail the existing stable-named hook log that spawnClaudeCode()
+        // writes to. Epoch-scoped paths are available via
+        // supervisorRuntime.resolveEpochPaths() but wiring spawnClaudeCode()
+        // to use them is deferred to PR4.
+        const supervisorHookLog = path.join(supervisorRuntimeDir, 'claude-channel-hooks.jsonl');
+        supervisor = createSupervisor({
+            store: supervisorStore,
+            runtime: supervisorRuntime,
+            incidents: supervisorIncidents,
+            channelManager,
+            hookLogPath: supervisorHookLog,
+        });
+        supervisor.start().catch((err) => {
+            logDebug(`[SUPERVISOR] start failed: ${err.message}`);
+            supervisor = null;
+        });
+        logDebug(`[SUPERVISOR] observe-only mode active, epoch=${supervisorEpoch}`);
+    } catch (err) {
+        logDebug(`[SUPERVISOR] init failed: ${err.message} — scheduler will use legacy path`);
+        supervisor = null;
+        if (supervisorStore) {
+            try { supervisorStore.close(); } catch { /* ignore */ }
+            supervisorStore = null;
+        }
+    }
+
     // Start persistent scheduler (survives session rotation)
     if (store) {
-        scheduler = new Scheduler(store, channelManager);
+        scheduler = new Scheduler(store, channelManager, supervisor);
         scheduler.start();
     }
 
@@ -5393,5 +5448,11 @@ app.on('before-quit', () => {
     stopBridge();
     if (dynamicMemory) {
         try { dynamicMemory.close(); } catch (err) { /* ignore */ }
+    }
+    if (supervisor) {
+        supervisor.shutdown().catch(() => { /* ignore shutdown errors */ });
+    }
+    if (supervisorStore) {
+        try { supervisorStore.close(); } catch (err) { /* ignore */ }
     }
 });

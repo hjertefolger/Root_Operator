@@ -85,6 +85,25 @@ function createSchema(db) {
             INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
         END;
     `);
+
+    ensureExternalRefColumn(db);
+}
+
+/**
+ * Idempotent migration: add `external_ref` column if absent.
+ * Supervisor PR1 schema prep for PR3's effect-ledger writes. PR1 itself
+ * does not populate this column — but later PRs stamp it with the
+ * committing effect_id so the reconcile-on-recovery pass can match
+ * supervisor effects to dynamic-memory rows by direct lookup.
+ *
+ * Design doc: ~/.root-operator/workspace/design/claude-session-supervisor-v4.md §N-v4.2
+ */
+function ensureExternalRefColumn(db) {
+    const info = db.prepare("PRAGMA table_info('memories')").all();
+    const has = info.some(col => col.name === 'external_ref');
+    if (has) return;
+    db.prepare("ALTER TABLE memories ADD COLUMN external_ref TEXT").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_memories_external_ref ON memories(external_ref)").run();
 }
 
 // ============================================================================

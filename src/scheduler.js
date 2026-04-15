@@ -36,11 +36,45 @@ function errorBackoffMs(consecutiveErrors) {
     return BACKOFF_SCHEDULE_MS[Math.max(0, idx)];
 }
 
+// Default silence budgets for scheduler jobs when they hand a dispatch off
+// to the supervisor. Long-running jobs like Night Lab routinely run 30+
+// minutes without hook activity (big tool chains); shorter jobs should
+// surface wedge faster. The jobSilenceFor() helper picks a budget.
+const SUPERVISOR_SILENCE_MS = {
+    'night lab': 30 * 60_000,
+    'signal': 10 * 60_000,
+    'sleep cycle': 5 * 60_000,
+    default: 5 * 60_000,
+};
+
+function jobSilenceFor(job) {
+    if (job && typeof job.silenceMs === 'number' && job.silenceMs > 0) {
+        return job.silenceMs;
+    }
+    const name = (job && job.name ? String(job.name) : '').toLowerCase();
+    for (const key of Object.keys(SUPERVISOR_SILENCE_MS)) {
+        if (key !== 'default' && name.includes(key)) {
+            return SUPERVISOR_SILENCE_MS[key];
+        }
+    }
+    return SUPERVISOR_SILENCE_MS.default;
+}
+
 class Scheduler extends EventEmitter {
-    constructor(store, channelManager) {
+    /**
+     * @param {object} store electron-store-like (get/set)
+     * @param {object} channelManager legacy transport (still used for direct sends)
+     * @param {import('./claude-session-supervisor/orchestrator').ClaudeSessionSupervisor} [supervisor]
+     *        Optional. When provided, _fireJob routes scheduled prompts through
+     *        the supervisor and marks lastRun/lastResult based on the real
+     *        terminal outcome (Stop/StopFailure/abandoned) instead of
+     *        socket-write-returned-true.
+     */
+    constructor(store, channelManager, supervisor = null) {
         super();
         this.store = store;
         this.channelManager = channelManager;
+        this.supervisor = supervisor;
         this.timers = new Map(); // jobId -> cron task
         this._lock = Promise.resolve(); // Async queue lock for serialized CRUD
         this._lastFireTimes = new Map(); // jobId -> timestamp (refire gap)
@@ -286,17 +320,53 @@ class Scheduler extends EventEmitter {
         this._updateJobField(job.id, { runningAt: new Date().toISOString() });
         this._emit('started', job);
 
+        const payload = `[Scheduled: ${job.name}]\n\n${job.prompt}`;
+
+        if (this.supervisor) {
+            // PR1 observe-only: supervisor takes ownership of the dispatch
+            // lifecycle and resolves awaitOutcome() only when Claude emits
+            // Stop / StopFailure / abandoned. This replaces the previous
+            // "socket write returned true = success" lie that caused the
+            // 2026-04-15 overnight silent-failure incident.
+            let dispatchId;
+            try {
+                ({ dispatchId } = this.supervisor.enqueue({
+                    source: 'scheduler',
+                    sourceId: job.id,
+                    payload,
+                    silenceMs: jobSilenceFor(job),
+                }));
+            } catch (err) {
+                console.error(`[Scheduler] supervisor.enqueue failed for "${job.name}": ${err.message}`);
+                this._completeJob(job.id, 'error', `supervisor_enqueue: ${err.message}`, startedAt);
+                return;
+            }
+
+            console.log(`[Scheduler] Dispatched "${job.name}" as ${dispatchId}`);
+
+            try {
+                const outcome = await this.supervisor.awaitOutcome(dispatchId);
+                if (outcome.state === 'completed') {
+                    this._completeJob(job.id, 'success', null, startedAt);
+                } else {
+                    this._completeJob(job.id, 'error', `${outcome.state}: ${outcome.error || 'unknown'}`, startedAt);
+                }
+            } catch (err) {
+                this._completeJob(job.id, 'error', `supervisor_await: ${err.message}`, startedAt);
+            }
+            return;
+        }
+
+        // Legacy path (no supervisor wired yet): behavior unchanged — send and
+        // trust the boolean return. Remove this branch in PR2 when supervisor
+        // is mandatory.
         if (!this.channelManager) {
             console.error(`[Scheduler] No channelManager — cannot fire "${job.name}"`);
             this._completeJob(job.id, 'error', 'No channel manager available', startedAt);
             return;
         }
 
-        const sent = this.channelManager.sendToChannel(
-            '__scheduler__',
-            `[Scheduled: ${job.name}]\n\n${job.prompt}`,
-            '__scheduler__'
-        );
+        const sent = this.channelManager.sendToChannel('__scheduler__', payload, '__scheduler__');
 
         if (sent) {
             console.log(`[Scheduler] Fired "${job.name}"`);
@@ -391,4 +461,4 @@ class Scheduler extends EventEmitter {
     }
 }
 
-module.exports = { Scheduler };
+module.exports = { Scheduler, jobSilenceFor };
