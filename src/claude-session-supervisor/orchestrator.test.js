@@ -422,3 +422,209 @@ test('abandon removes queued id from in-memory queue (defensive)', async () => {
     await supervisor.shutdown();
     store.close();
 });
+
+// --- PR2: self-heal tests ---
+
+const EventEmitter = require('events');
+
+function fixturePR2() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-orch-pr2-'));
+    const dbPath = path.join(dir, 'claude-supervisor.db');
+    const runtimeDir = path.join(dir, 'runtime');
+    const socketPath = path.join(dir, 'fake.sock');
+    const jsonlPath = path.join(runtimeDir, 'supervisor-incidents.jsonl');
+    const store = new DispatchStore(dbPath);
+
+    const killCalls = [];
+    let claudePidProbe = 1234; // pretend Claude is alive by default
+    const runtime = new Runtime({
+        store, runtimeDir, socketPath,
+        onKillRequest: () => { killCalls.push(Date.now()); claudePidProbe = null; },
+        getClaudePid: () => claudePidProbe,
+    });
+    runtime.incrementEpoch();
+    const { hookLog } = runtime.ensureEpochFiles(runtime.currentEpoch);
+    const incidents = new IncidentLogger({ store, jsonlPath });
+
+    // EventEmitter-flavoured channelManager so the supervisor can subscribe
+    // to bridge_ready. Also tracks unbuffered sends (system notices go here).
+    const channelManager = new EventEmitter();
+    const sent = [];
+    const notices = [];
+    channelManager.sendToChannel = function(chatId, content, userId) { sent.push({ chatId, content, userId }); return true; };
+    channelManager.sendToChannelUnbuffered = function(chatId, content, userId) { notices.push({ chatId, content, userId }); return true; };
+    channelManager.simulateRespawn = () => channelManager.emit('bridge_ready', { pid: 9999, ts: new Date().toISOString() });
+    channelManager.simulateClaudeResurrected = () => { claudePidProbe = 5678; };
+
+    const supervisor = createSupervisor({
+        store, runtime, incidents, channelManager,
+        hookLogPath: hookLog,
+    });
+    return { dir, store, runtime, incidents, supervisor, channelManager, sent, notices, hookLog, killCalls };
+}
+
+test('PR2: wedge detection triggers kill + dispatch_awaiting_replay', async () => {
+    const { supervisor, store, killCalls } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'will_hang',
+        silenceMs: 30, // short wedge trigger
+    });
+    assert.equal(supervisor.activeDispatch.dispatchId, dispatchId);
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    assert.equal(killCalls.length, 1, 'runtime.requestKill should fire exactly once on wedge');
+    assert.equal(supervisor.state, STATES.RESPAWNING, 'should be in RESPAWNING after kill_ordered');
+    assert.equal(supervisor.activeDispatch.inRecovery, true, 'activeDispatch must be flagged inRecovery');
+    assert.ok(supervisor._dispatchAwaitingReplay, 'a replay should be pending');
+    assert.equal(supervisor._dispatchAwaitingReplay.dispatchId, dispatchId);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: bridge_ready after wedge replays the SAME dispatchId', async () => {
+    const { supervisor, store, channelManager, killCalls, hookLog } = fixturePR2();
+    await supervisor.start();
+    // Use silenceMs large enough (800ms) that the wedge timer won't fire on
+    // the replay before we can post the Stop hook. But small enough for test
+    // speed. The ORIGINAL silenceMs trigger is driven by clock, so we advance
+    // via setTimeout: first enqueue with a sentinel payload, wait for kill,
+    // then respawn, then post Stop before the new wedge fires.
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'replay_me', silenceMs: 250,
+    });
+    const outcomePromise = supervisor.awaitOutcome(dispatchId);
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 1500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+    await waitForCondition(() => store.getDispatch(dispatchId).replay_count === 1, { timeoutMs: 500 });
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.replay_count, 1, 'replay_count bumped');
+    assert.ok(row.state === DISPATCH_STATES.ACTIVE || row.state === DISPATCH_STATES.SENDING,
+        'dispatch re-entered lifecycle');
+    assert.equal(supervisor.activeDispatch && supervisor.activeDispatch.dispatchId, dispatchId,
+        'same dispatchId is active after replay');
+    // Close the replay cleanly so the test tears down without dangling timers.
+    appendHook(hookLog, { hookEventName: 'Stop' });
+    const final = await outcomePromise;
+    assert.equal(final.state, DISPATCH_STATES.COMPLETED);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: late Stop hook during inRecovery does NOT complete the dispatch', async () => {
+    const { supervisor, store, hookLog, killCalls } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'wedge_then_late_stop', silenceMs: 30,
+    });
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    // Late Stop hook from the dying old Claude
+    appendHook(hookLog, { hookEventName: 'Stop' });
+    await new Promise(r => setTimeout(r, 150));
+    const row = store.getDispatch(dispatchId);
+    assert.notEqual(row.state, DISPATCH_STATES.COMPLETED, 'late Stop must not complete recovery dispatch');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: notifyClaudeExited during active → respawning + awaiting replay', async () => {
+    const { supervisor, store } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x', silenceMs: 60_000 });
+    supervisor.notifyClaudeExited(137); // simulate SIGKILL exit
+    assert.equal(supervisor.state, STATES.RESPAWNING);
+    assert.equal(supervisor.activeDispatch.inRecovery, true);
+    assert.equal(supervisor._dispatchAwaitingReplay.dispatchId, dispatchId);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: notifyClaudeExited with no active dispatch is a no-op', async () => {
+    const { supervisor, store } = fixturePR2();
+    await supervisor.start();
+    // no enqueue → no activeDispatch
+    supervisor.notifyClaudeExited(0);
+    assert.equal(supervisor.state, STATES.IDLE, 'state unchanged when no active dispatch');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: replay cap exceeded → failed + system notice on chat_id', async () => {
+    const { supervisor, store, channelManager, notices, killCalls } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', chatId: 'dev-123', payload: 'hopeless', silenceMs: 30,
+    });
+    // Force replay_count to cap so canReplayDispatch returns false
+    store.incrementReplayCount(dispatchId);
+    store.incrementReplayCount(dispatchId); // now 2 == replay_cap for scheduler
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+    await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.FAILED,
+        { timeoutMs: 500 });
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.match(row.last_error || '', /replay_not_allowed:replay_cap_exceeded/);
+    // Initial dispatch payload also flows through sendToChannelUnbuffered,
+    // so filter to just the system-notice-class messages.
+    const systemNotices = notices.filter(n => /^\[system notice\]/.test(n.content));
+    assert.equal(systemNotices.length, 1, 'one system notice must be emitted');
+    assert.equal(systemNotices[0].chatId, 'dev-123');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: intensity-exhausted → hard_failed, dispatch failed, notice', async () => {
+    const { supervisor, store, channelManager, notices, killCalls } = fixturePR2();
+    await supervisor.start();
+    // Pre-load the ring buffer with 3 recent timestamps (burst exhaustion).
+    const now = Date.now();
+    store.setStateValue('respawn_intensity_ring', JSON.stringify([now - 10_000, now - 8_000, now - 5_000]));
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', chatId: 'dev-xyz', payload: 'nope', silenceMs: 30,
+    });
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+    await waitForCondition(() => supervisor.state === STATES.HARD_FAILED, { timeoutMs: 500 });
+    assert.equal(supervisor.state, STATES.HARD_FAILED);
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.match(row.last_error || '', /intensity_exhausted/);
+    const systemNotices = notices.filter(n => /^\[system notice\]/.test(n.content));
+    assert.equal(systemNotices.length, 1, 'one system notice for intensity exhaustion');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: system notice with no chat_id is log-only (no channel call)', async () => {
+    const { supervisor, store, notices, killCalls, channelManager } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', chatId: null, payload: 'silent_fail', silenceMs: 30,
+    });
+    // Force an immediate hard fail path by exhausting intensity + ensuring cap
+    const now = Date.now();
+    store.setStateValue('respawn_intensity_ring', JSON.stringify([now - 5_000, now - 3_000, now - 1_000]));
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+    await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.FAILED,
+        { timeoutMs: 500 });
+    const systemNotices = notices.filter(n => /^\[system notice\]/.test(n.content));
+    assert.equal(systemNotices.length, 0, 'no chat_id → notice is log-only, no channel call');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: bridge_ready with no pending replay is a no-op walk through STARTING/VERIFYING', async () => {
+    const { supervisor, store, channelManager } = fixturePR2();
+    await supervisor.start();
+    // Supervisor is in IDLE after start() — bridge_ready at rest should not disturb.
+    channelManager.simulateRespawn();
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(supervisor.state, STATES.IDLE, 'supervisor stays IDLE');
+    await supervisor.shutdown();
+    store.close();
+});

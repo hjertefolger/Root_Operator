@@ -35,15 +35,44 @@ class Runtime {
      * @param {import('./dispatch-store').DispatchStore} deps.store
      * @param {string} [deps.runtimeDir] override runtime dir (tests)
      * @param {string} [deps.socketPath] override socket path (tests)
+     * @param {() => void} [deps.onKillRequest] PR2: called by requestKill() to trigger
+     *        main.js's killClaudeCode(). Runtime stays DI-pure (no direct main.js import).
+     * @param {() => number|null} [deps.getClaudePid] PR2: optional probe returning the
+     *        current Claude PID (or null if not running). Used to skip kill if the
+     *        process already died on its own (crash path).
      */
-    constructor({ store, runtimeDir = RUNTIME_DIR, socketPath = SOCKET_PATH_DEFAULT } = {}) {
+    constructor({ store, runtimeDir = RUNTIME_DIR, socketPath = SOCKET_PATH_DEFAULT,
+                  onKillRequest = null, getClaudePid = null } = {}) {
         if (!store) throw new Error('Runtime requires store');
         this.store = store;
         this.runtimeDir = runtimeDir;
         this.socketPath = socketPath;
         this.currentEpoch = null;
+        this.onKillRequest = onKillRequest;
+        this.getClaudePid = getClaudePid;
 
         fs.mkdirSync(this.runtimeDir, { recursive: true });
+    }
+
+    /**
+     * PR2: ask main.js to kill the current Claude subprocess. Returns
+     * { requested: true } if a kill was dispatched, { requested: false, reason }
+     * otherwise (no callback wired, process already dead).
+     */
+    requestKill() {
+        if (this.getClaudePid) {
+            const pid = this.getClaudePid();
+            if (!pid) return { requested: false, reason: 'process_already_dead' };
+        }
+        if (typeof this.onKillRequest !== 'function') {
+            return { requested: false, reason: 'no_kill_callback' };
+        }
+        try {
+            this.onKillRequest();
+            return { requested: true };
+        } catch (err) {
+            return { requested: false, reason: err.message || 'kill_callback_threw' };
+        }
     }
 
     /**

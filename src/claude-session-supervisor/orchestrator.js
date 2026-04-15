@@ -27,10 +27,20 @@ const fs = require('fs');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const { STATES, DISPATCH_STATES, TERMINAL_DISPATCH_STATES,
-        transitionSupervisor, transitionDispatch, replayCapForSource } = require('./policy');
+        transitionSupervisor, transitionDispatch, replayCapForSource,
+        canReplayDispatch, intensityExhausted } = require('./policy');
 
 const DEFAULT_SILENCE_MS = 5 * 60 * 1000; // 5 minutes
 const SAFETY_NET_MULTIPLIER = 10;          // abandon after silence_ms * 10 with no Stop
+// PR2: recovery states during which hook events must NOT complete activeDispatch.
+// Late Stop hooks from the dying old Claude (or the freshly booting new Claude
+// before replay is re-sent) would otherwise spuriously terminate the replay.
+const RECOVERY_STATES = new Set([STATES.SUSPECT, STATES.RESPAWNING, STATES.STARTING, STATES.VERIFYING]);
+// PR2: respawn intensity timestamps (kill_ordered + process_exit_during_active)
+// are persisted as a JSON array in supervisor_state under this key so the
+// budget survives process restarts.
+const INTENSITY_STATE_KEY = 'respawn_intensity_ring';
+const INTENSITY_RING_MAX = 16;
 
 class ClaudeSessionSupervisor extends EventEmitter {
     /**
@@ -63,7 +73,8 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this.epoch = runtime.currentEpoch;
         // activeDispatch carries its own safety timer (armed at activation, not
         // at awaitOutcome — queued dispatches that never activate cannot be
-        // auto-abandoned). Shape: { dispatchId, startedAt, lastProgressAt, safetyTimer }
+        // auto-abandoned). PR2 adds wedgeTimer and inRecovery flag.
+        // Shape: { dispatchId, startedAt, lastProgressAt, safetyTimer, wedgeTimer, inRecovery }
         this.activeDispatch = null;
         // pendingResolvers holds ARRAYS of { resolve, reject } per dispatchId so
         // multiple awaitOutcome() callers on the same dispatch all settle together.
@@ -72,6 +83,12 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         this._tailer = null;
         this._shutdown = false;
+
+        // PR2: dispatch that needs to be replayed on the next bridge_ready.
+        // Shape: { dispatchId, reason }.
+        this._dispatchAwaitingReplay = null;
+        // PR2: cached bridge_ready subscription so shutdown() can remove it.
+        this._bridgeReadyHandler = null;
     }
 
     /**
@@ -86,13 +103,44 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._transition('verify_skipped', { occurredAt: now });
 
         this._startTailer();
+        this._subscribeBridgeReady();
         this.incidents.record({
             kind: 'supervisor_started',
             stateFrom: STATES.STOPPED,
             stateTo: STATES.IDLE,
             epoch: this.epoch,
-            details: { hook_log_path: this.hookLogPath, pr1_observe_only: true },
+            details: { hook_log_path: this.hookLogPath, pr2_self_heal: true },
         });
+    }
+
+    /**
+     * PR2: called by main.js after its claudeProcess.on('exit') handler.
+     * If there's an active dispatch, transition straight through SUSPECT to
+     * RESPAWNING (process is already dead — skip kill_ordered) and mark the
+     * dispatch as awaiting replay. Main.js's existing scheduleClaudeRestart
+     * flow will bring a new Claude back; we'll replay on bridge_ready.
+     */
+    notifyClaudeExited(exitCode) {
+        if (this._shutdown) return;
+        if (!this.activeDispatch || this.state !== STATES.DISPATCHING) {
+            // Clean exit with no active dispatch, or already in recovery. Nothing to do.
+            return;
+        }
+        const dispatchId = this.activeDispatch.dispatchId;
+        this.activeDispatch.inRecovery = true;
+        this._clearActiveSafetyTimer();
+        this._clearActiveWedgeTimer();
+        this.incidents.record({
+            kind: 'process_exit_during_active',
+            dispatchId,
+            epoch: this.epoch,
+            stateFrom: this.state,
+            details: { exit_code: exitCode === undefined ? null : exitCode },
+        });
+        this._transition('process_exit', { occurredAt: this.clock() });           // DISPATCHING -> SUSPECT
+        this._recordIntensityTimestamp(this.clock());
+        this._transition('process_already_dead', { occurredAt: this.clock() });  // SUSPECT -> RESPAWNING
+        this._dispatchAwaitingReplay = { dispatchId, reason: 'process_exit' };
     }
 
     /**
@@ -178,6 +226,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._shutdown = true;
         this._stopTailer();
         this._clearActiveSafetyTimer();
+        this._clearActiveWedgeTimer();
+        this._unsubscribeBridgeReady();
+        this._dispatchAwaitingReplay = null;
         for (const [, waiters] of this.pendingResolvers) {
             for (const w of waiters) w.reject(new Error('supervisor shutdown'));
         }
@@ -259,11 +310,21 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
         }, safetyMs);
         if (safetyTimer.unref) safetyTimer.unref();
+        // PR2: wedge timer at silenceMs (the tighter window). If no hook-log
+        // progress before this fires, the supervisor treats the dispatch as
+        // wedged and initiates kill+respawn. Safety net remains as the backstop
+        // (e.g., if kill/respawn itself misbehaves).
+        const wedgeTimer = setTimeout(() => {
+            this._handleWedge(dispatchId, 'silence_timeout');
+        }, silenceMs);
+        if (wedgeTimer.unref) wedgeTimer.unref();
         this.activeDispatch = {
             dispatchId,
             startedAt: activateTs,
             lastProgressAt: activateTs,
             safetyTimer,
+            wedgeTimer,
+            inRecovery: false,
         };
         this._transition('dispatch_activated', { occurredAt: activateTs });
         this.incidents.record({
@@ -281,6 +342,21 @@ class ClaudeSessionSupervisor extends EventEmitter {
             clearTimeout(this.activeDispatch.safetyTimer);
             this.activeDispatch.safetyTimer = null;
         }
+    }
+
+    _clearActiveWedgeTimer() {
+        if (this.activeDispatch && this.activeDispatch.wedgeTimer) {
+            clearTimeout(this.activeDispatch.wedgeTimer);
+            this.activeDispatch.wedgeTimer = null;
+        }
+    }
+
+    _armWedgeTimer(dispatchId, silenceMs) {
+        if (!this.activeDispatch || this.activeDispatch.dispatchId !== dispatchId) return;
+        this._clearActiveWedgeTimer();
+        const t = setTimeout(() => this._handleWedge(dispatchId, 'silence_timeout'), silenceMs);
+        if (t.unref) t.unref();
+        this.activeDispatch.wedgeTimer = t;
     }
 
     _startTailer() {
@@ -339,8 +415,22 @@ class ClaudeSessionSupervisor extends EventEmitter {
         const now = this.clock();
         const name = hook.hookEventName || hook.hook_event_name;
 
+        // PR2 hook guard: during recovery flight (between kill-ordered and
+        // replay-re-sent) hook events from the dying old Claude or the booting
+        // new Claude MUST NOT complete the dispatch. Progress tracking is also
+        // suspended — lastProgressAt is meaningless while we're mid-recovery.
+        if (this.activeDispatch.inRecovery || RECOVERY_STATES.has(this.state)) {
+            return;
+        }
+
         this.store.markProgress(dispatchId, now);
         this.activeDispatch.lastProgressAt = now;
+        // Progress resets the wedge timer. Use silence_ms from the row (not
+        // DEFAULT_SILENCE_MS) so per-dispatch tuning via jobSilenceFor is respected.
+        const row = this.store.getDispatch(dispatchId);
+        if (row && row.silence_ms) {
+            this._armWedgeTimer(dispatchId, row.silence_ms);
+        }
 
         if (name === 'PreToolUse' && hook.toolName === 'reply') {
             this.store.incrementVisibleEffect(dispatchId);
@@ -349,6 +439,232 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._completeDispatch(dispatchId, DISPATCH_STATES.COMPLETED, null);
         } else if (name === 'StopFailure') {
             this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, hook.error || hook.errorDetails || 'stop_failure');
+        }
+    }
+
+    /**
+     * PR2: dispatch was active and Claude has gone silent for silence_ms.
+     * Transition DISPATCHING -> SUSPECT, mark the dispatch inRecovery so late
+     * hooks are ignored, and ask the runtime to kill the subprocess. Main.js's
+     * existing exit handler will respawn; the bridge_ready event drives replay.
+     */
+    _handleWedge(dispatchId, reason) {
+        if (this._shutdown) return;
+        if (!this.activeDispatch || this.activeDispatch.dispatchId !== dispatchId) return;
+        if (this.activeDispatch.inRecovery) return; // already handled
+        this.activeDispatch.inRecovery = true;
+        // NOTE: we deliberately leave the safety-net timer armed. If kill+respawn+replay
+        // fails to produce a Stop hook before silenceMs * SAFETY_NET_MULTIPLIER, the
+        // dispatch is still abandoned via the safety-net path (see _activateNext) and
+        // the scheduler's awaitOutcome() eventually resolves as ABANDONED rather than
+        // hanging forever.
+        this._clearActiveWedgeTimer();
+
+        const now = this.clock();
+        this.incidents.record({
+            kind: 'wedge_detected',
+            dispatchId,
+            epoch: this.epoch,
+            stateFrom: this.state,
+            details: { reason, last_progress_at: this.activeDispatch.lastProgressAt },
+        });
+        this._transition('silence_timeout', { occurredAt: now }); // DISPATCHING -> SUSPECT
+
+        const killResult = typeof this.runtime.requestKill === 'function'
+            ? this.runtime.requestKill()
+            : { requested: false, reason: 'runtime_has_no_requestKill' };
+
+        this.incidents.record({
+            kind: killResult.requested ? 'kill_ordered' : 'kill_skipped',
+            dispatchId,
+            epoch: this.epoch,
+            stateFrom: STATES.SUSPECT,
+            details: { reason: reason, kill_result: killResult },
+        });
+
+        if (killResult.requested) {
+            this._recordIntensityTimestamp(now);
+            this._transition('kill_ordered', { occurredAt: now }); // SUSPECT -> RESPAWNING
+        } else {
+            // Either runtime doesn't support kill (edge case) or the process
+            // was already dead. Treat both as process_already_dead — main.js's
+            // restart path will eventually bring a new Claude.
+            this._transition('process_already_dead', { occurredAt: now }); // SUSPECT -> RESPAWNING
+        }
+
+        this._dispatchAwaitingReplay = { dispatchId, reason };
+    }
+
+    _recordIntensityTimestamp(ts) {
+        const ring = this._loadIntensityRing();
+        ring.push(ts);
+        // Keep the ring bounded — we only need enough history for the 10-min window.
+        const trimmed = ring.slice(-INTENSITY_RING_MAX);
+        this.store.setStateValue(INTENSITY_STATE_KEY, JSON.stringify(trimmed));
+    }
+
+    _loadIntensityRing() {
+        const raw = this.store.getStateValue(INTENSITY_STATE_KEY, '[]');
+        try {
+            const arr = JSON.parse(raw);
+            return Array.isArray(arr) ? arr : [];
+        } catch {
+            return [];
+        }
+    }
+
+    _subscribeBridgeReady() {
+        if (!this.channelManager || typeof this.channelManager.on !== 'function') return;
+        if (this._bridgeReadyHandler) return;
+        this._bridgeReadyHandler = () => this._onBridgeReady();
+        this.channelManager.on('bridge_ready', this._bridgeReadyHandler);
+    }
+
+    _unsubscribeBridgeReady() {
+        if (!this.channelManager || typeof this.channelManager.off !== 'function') return;
+        if (!this._bridgeReadyHandler) return;
+        this.channelManager.off('bridge_ready', this._bridgeReadyHandler);
+        this._bridgeReadyHandler = null;
+    }
+
+    /**
+     * PR2: triggered when channel-bridge.cjs emits its post-mcp.connect() ready
+     * envelope. If a dispatch was left in flight by a wedge or crash, attempt
+     * the replay FIRST (while still in RESPAWNING) so intensity_exhausted and
+     * replay-cap decisions happen from the right state. Only after the replay
+     * resolution do we walk the supervisor back to IDLE (if applicable).
+     */
+    _onBridgeReady() {
+        if (this._shutdown) return;
+
+        // 1. Replay decision (if any) while still in RESPAWNING state.
+        if (this._dispatchAwaitingReplay) {
+            const { dispatchId, reason } = this._dispatchAwaitingReplay;
+            this._dispatchAwaitingReplay = null;
+            this._retryActiveDispatch(dispatchId, reason);
+            // _retryActiveDispatch handles all state transitions out of RESPAWNING:
+            //   - allowed: activates next (state via _activateNext → DISPATCHING)
+            //   - cap/effect blocked: _completeDispatch transitions back to IDLE
+            //   - intensity exhausted: transitions to HARD_FAILED
+            return;
+        }
+
+        // 2. Normal/fast path (no wedge): RESPAWNING -> STARTING -> VERIFYING -> IDLE.
+        if (this.state === STATES.RESPAWNING) {
+            this._transition('respawn_ok', { occurredAt: this.clock() });
+        }
+        if (this.state === STATES.STARTING) {
+            this._transition('bridge_connected', { occurredAt: this.clock() });
+        }
+        if (this.state === STATES.VERIFYING) {
+            this._transition('verify_skipped', { occurredAt: this.clock() });
+        }
+    }
+
+    _retryActiveDispatch(dispatchId, reason) {
+        const row = this.store.getDispatch(dispatchId);
+        if (!row) {
+            // Dispatch vanished (e.g., manual admin cleanup). Nothing to do.
+            return;
+        }
+        if (TERMINAL_DISPATCH_STATES.has(row.state)) {
+            // Dispatch was already completed by some other path (e.g., the
+            // abandon-safety-net timer fired before bridge_ready). Honour that.
+            return;
+        }
+
+        // Intensity budget check. Uses policy.intensityExhausted (burst OR window).
+        const now = this.clock();
+        const ring = this._loadIntensityRing();
+        if (intensityExhausted(ring, now)) {
+            this.incidents.record({
+                kind: 'intensity_exhausted',
+                dispatchId,
+                epoch: this.epoch,
+                stateFrom: this.state,
+                details: { reason, intensity_count: ring.length, ring: ring.slice(-5) },
+            });
+            this._transition('intensity_exhausted', { occurredAt: now }); // RESPAWNING/IDLE -> HARD_FAILED
+            this._emitSystemNotice(dispatchId, 'intensity_exhausted');
+            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'intensity_exhausted');
+            return;
+        }
+
+        // Replay eligibility (cap, probe, visible-effect guard).
+        const verdict = canReplayDispatch(row);
+        if (!verdict.allowed) {
+            this.incidents.record({
+                kind: 'replay_not_allowed',
+                dispatchId,
+                epoch: this.epoch,
+                details: { wedge_reason: reason, verdict_reason: verdict.reason },
+            });
+            this._emitSystemNotice(dispatchId, verdict.reason);
+            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, `replay_not_allowed:${verdict.reason}`);
+            return;
+        }
+
+        // Same-dispatch replay: bump replay_count, reset lifecycle columns,
+        // re-queue so _activateNext() re-sends the payload. Keeps the same
+        // dispatchId intact so the scheduler's awaitOutcome() still resolves
+        // on the original id.
+        this.store.incrementReplayCount(dispatchId);
+        this.store.resetDispatchToQueued(dispatchId, this.epoch);
+        this.incidents.record({
+            kind: 'dispatch_replay_started',
+            dispatchId,
+            epoch: this.epoch,
+            details: {
+                wedge_reason: reason,
+                replay_count_after: (row.replay_count || 0) + 1,
+                replay_cap: row.replay_cap,
+            },
+        });
+
+        // Walk the supervisor back to IDLE so _activateNext() can legitimately
+        // transition IDLE -> DISPATCHING. Use the existing PR1 sequence:
+        //   RESPAWNING -> STARTING -> VERIFYING -> IDLE.
+        const now2 = this.clock();
+        if (this.state === STATES.RESPAWNING) this._transition('respawn_ok', { occurredAt: now2 });
+        if (this.state === STATES.STARTING) this._transition('bridge_connected', { occurredAt: now2 });
+        if (this.state === STATES.VERIFYING) this._transition('verify_skipped', { occurredAt: now2 });
+
+        // Critical: the old activeDispatch's safety-net timer is STILL armed.
+        // If we don't clear it, it will fire during the replay attempt and
+        // abandon the dispatch we just re-activated. Clear before nulling.
+        this._clearActiveSafetyTimer();
+        this._clearActiveWedgeTimer();
+        this.activeDispatch = null;
+        this.queue.unshift(dispatchId); // replay goes in FRONT of any newer queued work
+        this._activateNext();
+    }
+
+    _emitSystemNotice(dispatchId, reason) {
+        const row = this.store.getDispatch(dispatchId);
+        const chatId = row && row.chat_id;
+        this.incidents.record({
+            kind: 'system_notice_emitted',
+            dispatchId,
+            epoch: this.epoch,
+            details: { reason, chat_id: chatId },
+        });
+        if (!chatId) return; // scheduler jobs without a chat_id: log-only
+
+        const text = `[system notice] Scheduled task could not be delivered. Reason: ${reason}. See logs for details.`;
+        try {
+            const fn = typeof this.channelManager.sendToChannelUnbuffered === 'function'
+                ? this.channelManager.sendToChannelUnbuffered.bind(this.channelManager)
+                : this.channelManager.sendToChannel.bind(this.channelManager);
+            fn(chatId, text, chatId);
+        } catch (err) {
+            // Notices are best-effort — failure should never mask the original
+            // recovery failure.
+            this.incidents.record({
+                kind: 'system_notice_failed',
+                dispatchId,
+                epoch: this.epoch,
+                details: { reason: err.message || String(err) },
+            });
         }
     }
 

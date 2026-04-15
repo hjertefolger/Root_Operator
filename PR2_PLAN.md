@@ -54,13 +54,13 @@ Fallback for already-connected case (fast path when no wedge happens): if `bridg
 
 **Problem:** After SIGKILL the tailer is still watching the shared hook log. `_onHookEvent` completes any `activeDispatch` on Stop/StopFailure — including late events from the dying old Claude.
 
-**Fix:** Activate PR1's dormant epoch-scoped hook logs.
+**Fix:** State-based hook guard (simpler than physically isolating epoch files, and sufficient given existing file truncation).
 
-1. **In `main.js.spawnClaudeCode()`**: replace the static `claude-channel-hooks.jsonl` path with `runtime.resolveEpochPaths(runtime.incrementEpoch()).hookLog`. Bump epoch on every spawn.
-2. **In `main.js.prepareClaudeWorkspaceRuntime()`**: same — use epoch-scoped path from `runtime`.
-3. **In supervisor**: on `spawn_initiated` event from main.js, swap the tailer from the old epoch file to the new one. Drop any pending lineBuffer.
-4. **In supervisor `_onHookEvent`**: ignore events when `activeDispatch` is null (dispatch was already killed/replayed), or when `this.state === SUSPECT | RESPAWNING` (pending kill/respawn).
-5. **PR1's `maintainLatestSymlinks(epoch)` is already implemented** — keeps the stable-named `claude-channel-hooks.jsonl` symlink working for external tooling.
+1. **In supervisor `_onHookEvent`**: skip Stop/StopFailure completion when `this.state ∈ {SUSPECT, RESPAWNING, STARTING, VERIFYING}` OR `activeDispatch.inRecovery === true`. The dispatch is in flight — late hooks must not accidentally complete it.
+2. **In `_handleWedge`**: set `activeDispatch.inRecovery = true` before requesting kill so even a same-tick Stop hook is ignored.
+3. **On replay re-send**: clear `inRecovery` when the dispatch re-enters SENDING/ACTIVE on the new Claude.
+4. **File truncation already drops stale content**: `spawnClaudeCode()` does `fs.writeFileSync(hookLogPath, '')` at line 2978 so the tailer's `if (stat.size < position) { position = 0 }` reset clears any pre-kill bytes. No code change needed for this leg.
+5. **Physical epoch-scoped files** (`runtime.resolveEpochPaths()` from PR1) stay dormant. Activation requires cross-cutting changes in `prepareClaudeWorkspaceRuntime()`, `spawnClaudeCode()`, and the supervisor tailer's lifecycle for marginal additional safety beyond the state guard. **Deferred to PR3** where it pairs naturally with the channel-routing refactor and the MCP reply-tool request/response conversion.
 
 FSM sequence (cleaned up):
 ```

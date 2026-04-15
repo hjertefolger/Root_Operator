@@ -83,11 +83,16 @@ function transitionSupervisor(current, event) {
         case T.SUSPECT:
             if (event === 'kill_ordered') return { ok: true, next: T.RESPAWNING };
             if (event === 'process_already_dead') return { ok: true, next: T.RESPAWNING };
+            // PR2: if the safety-net timer fires while we're in recovery (e.g., runtime
+            // has no kill callback, or respawn never completes), drop back to IDLE.
+            if (event === 'dispatch_terminal') return { ok: true, next: T.IDLE };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.RESPAWNING:
             if (event === 'respawn_ok') return { ok: true, next: T.STARTING };
             if (event === 'intensity_exhausted') return { ok: true, next: T.HARD_FAILED };
+            // PR2: safety-net abandonment during respawn wait → return to IDLE.
+            if (event === 'dispatch_terminal') return { ok: true, next: T.IDLE };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.HARD_FAILED:
