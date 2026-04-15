@@ -39,3 +39,4 @@ models/
 
 # Internal planning / design docs
 docs/
+scripts/.supervisor-test-cache/
