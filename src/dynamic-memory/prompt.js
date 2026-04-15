@@ -34,8 +34,9 @@ function buildMemoryBlock(results) {
         const truncated = raw.length > MAX_CHARS_PER_RESULT
             ? raw.slice(0, MAX_CHARS_PER_RESULT).trimEnd() + '...'
             : raw;
+        const roleTag = r.sourceRole === 'assistant' ? ' — prior assistant reply' : '';
 
-        lines.push(`### Fragment ${idx + 1} (${when})`);
+        lines.push(`### Fragment ${idx + 1} (${when}${roleTag})`);
         lines.push('');
         lines.push(truncated);
         lines.push('');

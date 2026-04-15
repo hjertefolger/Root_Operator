@@ -2147,7 +2147,14 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
                 new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
             ]);
             if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
-                outboundContent = `<memory-context>\n${memoryBlock}\n</memory-context>\n\n${content}`;
+                // Neutralize envelope-breaking closing tags in interpolated segments.
+                // Zero-width space between `<` and `/` keeps the text visually identical
+                // to Claude but prevents parsers (here and upstream) from closing the
+                // wrapper early when fragments or user text mention these tags literally.
+                const sanitizeEnvelope = (s) => String(s).replace(/<\/(system-reminder|memory-context|channel)>/g, '<\u200B/$1>');
+                const safeContent = sanitizeEnvelope(content);
+                const safeBlock = sanitizeEnvelope(memoryBlock);
+                outboundContent = `${safeContent}\n\n<system-reminder>\n<memory-context>\n${safeBlock}\n</memory-context>\n\nReply to the user by calling the mcp__root-operator__reply tool with the chat_id from the <channel> tag above. Do not reply as plain text.\n</system-reminder>`;
             }
             if (process.env.NODE_ENV === 'development' || process.env.DYNAMIC_MEMORY_PERF === '1') {
                 const wall = Date.now() - perfStart;
@@ -2742,6 +2749,7 @@ function showAboutWindow() {
                 font-size: 13px;
                 color: rgba(255,255,255,0.7);
                 margin-bottom: 8px;
+                text-align: center;
             }
             .email {
                 font-size: 13px;

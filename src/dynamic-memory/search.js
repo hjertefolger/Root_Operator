@@ -74,6 +74,7 @@ function combineWithRRF(vectorResults, keywordResults) {
                 content: result.content,
                 timestamp: result.timestamp,
                 chatId: result.chatId,
+                sourceRole: result.sourceRole,
                 sources: new Set(),
             });
         }
@@ -90,6 +91,7 @@ function combineWithRRF(vectorResults, keywordResults) {
                 content: result.content,
                 timestamp: result.timestamp,
                 chatId: result.chatId,
+                sourceRole: result.sourceRole,
                 sources: new Set(),
             });
         }
@@ -114,6 +116,7 @@ function combineWithRRF(vectorResults, keywordResults) {
             source,
             timestamp: data.timestamp,
             chatId: data.chatId,
+            sourceRole: data.sourceRole,
         };
     });
 }
