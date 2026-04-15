@@ -14,6 +14,11 @@ const {
     transitionDispatch,
     replayCapForSource,
     canReplayDispatch,
+    intensityBurst,
+    intensityWindow,
+    intensityExhausted,
+    INTENSITY_BURST_WINDOW_MS,
+    INTENSITY_WINDOW_MS,
 } = require('./policy');
 
 test('supervisor: stopped -> starting on start', () => {
@@ -130,4 +135,91 @@ test('canReplayDispatch: scheduler allowed after visible effect (if cap not exce
 test('canReplayDispatch: user fresh and no effect is allowed', () => {
     const row = { source: 'user', replay_count: 0, replay_cap: 1, visible_effect_count: 0 };
     assert.deepEqual(canReplayDispatch(row), { allowed: true });
+});
+
+// PR2: wedge/recovery transitions
+
+test('supervisor: dispatching -> suspect on silence_timeout', () => {
+    const r = transitionSupervisor(STATES.DISPATCHING, 'silence_timeout');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.SUSPECT);
+});
+
+test('supervisor: dispatching -> suspect on process_exit', () => {
+    const r = transitionSupervisor(STATES.DISPATCHING, 'process_exit');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.SUSPECT);
+});
+
+test('supervisor: suspect -> respawning on kill_ordered', () => {
+    const r = transitionSupervisor(STATES.SUSPECT, 'kill_ordered');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.RESPAWNING);
+});
+
+test('supervisor: suspect -> respawning on process_already_dead (crash case)', () => {
+    const r = transitionSupervisor(STATES.SUSPECT, 'process_already_dead');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.RESPAWNING);
+});
+
+test('supervisor: respawning -> hardFailed on intensity_exhausted', () => {
+    const r = transitionSupervisor(STATES.RESPAWNING, 'intensity_exhausted');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.HARD_FAILED);
+});
+
+test('supervisor: respawning -> starting on respawn_ok', () => {
+    const r = transitionSupervisor(STATES.RESPAWNING, 'respawn_ok');
+    assert.equal(r.ok, true);
+    assert.equal(r.next, STATES.STARTING);
+});
+
+// Intensity budget
+
+test('intensityBurst: 3 kills within 30s exhausts', () => {
+    const now = 1_000_000_000;
+    const timestamps = [now - 25_000, now - 15_000, now - 5_000];
+    assert.equal(intensityBurst(timestamps, now), true);
+});
+
+test('intensityBurst: 3 kills spread beyond 30s does NOT exhaust burst', () => {
+    const now = 1_000_000_000;
+    const timestamps = [now - 45_000, now - 30_000, now - 5_000];
+    assert.equal(intensityBurst(timestamps, now), false);
+});
+
+test('intensityWindow: 3 kills within 10min exhausts', () => {
+    const now = 1_000_000_000;
+    // spread across the window to NOT trip burst, but trip window
+    const timestamps = [now - 400_000, now - 200_000, now - 60_000];
+    assert.equal(intensityBurst(timestamps, now), false);
+    assert.equal(intensityWindow(timestamps, now), true);
+});
+
+test('intensityWindow: 3 kills beyond 10min does NOT exhaust', () => {
+    const now = 1_000_000_000;
+    const timestamps = [now - 700_000, now - 650_000, now - 620_000];
+    assert.equal(intensityWindow(timestamps, now), false);
+});
+
+test('intensityExhausted is burst OR window', () => {
+    const now = 1_000_000_000;
+    // only burst trips:
+    assert.equal(intensityExhausted([now - 25_000, now - 15_000, now - 5_000], now), true);
+    // only window trips:
+    assert.equal(intensityExhausted([now - 400_000, now - 200_000, now - 60_000], now), true);
+    // neither trips:
+    assert.equal(intensityExhausted([now - 700_000, now - 650_000], now), false);
+});
+
+test('intensity: empty timestamps never exhausts', () => {
+    assert.equal(intensityBurst([]), false);
+    assert.equal(intensityWindow([]), false);
+    assert.equal(intensityExhausted([]), false);
+});
+
+test('intensity: fewer than 3 timestamps never exhausts', () => {
+    const now = 1_000_000_000;
+    assert.equal(intensityExhausted([now - 1000, now - 2000], now), false);
 });

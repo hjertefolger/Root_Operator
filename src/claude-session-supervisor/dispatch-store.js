@@ -129,6 +129,22 @@ class DispatchStore {
             incrementVisibleEffect: this.db.prepare(`
                 UPDATE dispatches SET visible_effect_count = visible_effect_count + 1 WHERE dispatch_id = ?
             `),
+            incrementReplayCount: this.db.prepare(`
+                UPDATE dispatches
+                SET replay_count = replay_count + 1
+                WHERE dispatch_id = ?
+            `),
+            resetDispatchToQueued: this.db.prepare(`
+                UPDATE dispatches
+                SET state = 'queued',
+                    sending_at = NULL,
+                    activated_at = NULL,
+                    terminal_at = NULL,
+                    last_progress_at = NULL,
+                    last_error = NULL,
+                    epoch = ?
+                WHERE dispatch_id = ?
+            `),
             getDispatch: this.db.prepare(`
                 SELECT * FROM dispatches WHERE dispatch_id = ?
             `),
@@ -214,6 +230,23 @@ class DispatchStore {
 
     incrementVisibleEffect(dispatchId) {
         this._stmt.incrementVisibleEffect.run(dispatchId);
+    }
+
+    incrementReplayCount(dispatchId) {
+        this._stmt.incrementReplayCount.run(dispatchId);
+    }
+
+    /**
+     * Reset a dispatch back to 'queued' for replay. Clears transient lifecycle
+     * columns (sending_at, activated_at, terminal_at, last_progress_at,
+     * last_error) so _activateNext() treats it like a fresh send. Preserves:
+     * dispatch_id, source, source_id, chat_id, payload, silence_ms, replay_cap,
+     * replay_count (caller should incrementReplayCount before calling),
+     * visible_effect_count (so canReplayDispatch still sees past effects),
+     * enqueued_at (original queue time).
+     */
+    resetDispatchToQueued(dispatchId, newEpoch = null) {
+        this._stmt.resetDispatchToQueued.run(newEpoch, dispatchId);
     }
 
     getDispatch(dispatchId) {
