@@ -1,6 +1,6 @@
 # Root Operator
 
-[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
 [![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
