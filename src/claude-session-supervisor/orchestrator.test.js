@@ -628,3 +628,104 @@ test('PR2: bridge_ready with no pending replay is a no-op walk through STARTING/
     await supervisor.shutdown();
     store.close();
 });
+
+// Codex round-2 regression tests
+
+test('PR2: notifyClaudeExited keeps safety-net so dispatch does not hang if bridge_ready never arrives', async () => {
+    const { supervisor, store } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'crash_then_no_bridge',
+        silenceMs: 30, // → safety 300ms
+    });
+    const outcomePromise = supervisor.awaitOutcome(dispatchId);
+    // Simulate a crash during active dispatch. No bridge_ready will follow.
+    supervisor.notifyClaudeExited(137);
+    // Safety-net must still fire. Without the fix, this await hangs forever.
+    const outcome = await outcomePromise;
+    assert.equal(outcome.state, DISPATCH_STATES.ABANDONED);
+    assert.equal(outcome.error, 'safety_timeout_no_stop');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: HARD_FAILED blocks queued dispatches from auto-activating', async () => {
+    const { supervisor, store, channelManager, killCalls } = fixturePR2();
+    await supervisor.start();
+    // Pre-exhaust the intensity ring so the first wedge → hard_failed.
+    const now = Date.now();
+    store.setStateValue('respawn_intensity_ring', JSON.stringify([now - 10_000, now - 8_000, now - 5_000]));
+
+    const { dispatchId: first } = supervisor.enqueue({
+        source: 'scheduler', chatId: 'dev-hf', payload: 'first', silenceMs: 30,
+    });
+    // Queue a second job while the first is dispatching — it should NOT run after hard-fail.
+    const { dispatchId: second } = supervisor.enqueue({
+        source: 'scheduler', chatId: 'dev-hf', payload: 'second', silenceMs: 30,
+    });
+
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+
+    await waitForCondition(() => supervisor.state === STATES.HARD_FAILED, { timeoutMs: 500 });
+    assert.equal(supervisor.state, STATES.HARD_FAILED);
+    assert.equal(store.getDispatch(first).state, DISPATCH_STATES.FAILED);
+    // Second job must still be queued (not promoted) — HARD_FAILED is terminal
+    // for the supervisor and all pending work halts until manual_reset.
+    assert.equal(store.getDispatch(second).state, DISPATCH_STATES.QUEUED);
+    assert.equal(supervisor.activeDispatch, null, 'no new activeDispatch after hard-fail');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: wedge timer is cleared on normal Stop completion (no leak)', async () => {
+    const { supervisor, store, hookLog } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'normal_complete', silenceMs: 60_000,
+    });
+    await waitForCondition(() => supervisor.activeDispatch && supervisor.activeDispatch.dispatchId === dispatchId);
+    appendHook(hookLog, { hookEventName: 'Stop' });
+    await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.COMPLETED);
+    assert.equal(supervisor.activeDispatch, null);
+    // If wedgeTimer had leaked, shutdown's _clearActiveWedgeTimer would no-op
+    // because activeDispatch is null. The remaining timer would keep the event
+    // loop alive past shutdown. We exit the test normally because of
+    // --test-force-exit, but the leak is visible as asynchronous-activity
+    // warnings in the full test output. This assertion is belt-and-braces.
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('PR2: system_notice_failed incident when bridge send returns false', async () => {
+    const { supervisor, store, channelManager, killCalls } = fixturePR2();
+    await supervisor.start();
+    // Let the initial dispatch send succeed, but the system-notice send
+    // (triggered on cap-exceeded replay attempt) returns false. Distinguish
+    // by content prefix — system notices start with "[system notice]".
+    channelManager.sendToChannelUnbuffered = function(chatId, content) {
+        if (content && content.startsWith('[system notice]')) return false;
+        return true;
+    };
+
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', chatId: 'dev-x', payload: 'p', silenceMs: 30,
+    });
+    store.incrementReplayCount(dispatchId);
+    store.incrementReplayCount(dispatchId);
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    channelManager.simulateClaudeResurrected();
+    channelManager.simulateRespawn();
+    await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.FAILED,
+        { timeoutMs: 500 });
+
+    const rows = store.db.prepare('SELECT kind FROM incidents WHERE dispatch_id = ? ORDER BY incident_id').all(dispatchId);
+    const kinds = rows.map(r => r.kind);
+    assert.ok(kinds.includes('system_notice_failed'),
+        `expected system_notice_failed in ${JSON.stringify(kinds)}`);
+    assert.ok(!kinds.includes('system_notice_emitted'),
+        `must NOT record emitted when send returned false`);
+    await supervisor.shutdown();
+    store.close();
+});

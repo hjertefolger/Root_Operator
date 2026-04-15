@@ -128,7 +128,11 @@ class ClaudeSessionSupervisor extends EventEmitter {
         }
         const dispatchId = this.activeDispatch.dispatchId;
         this.activeDispatch.inRecovery = true;
-        this._clearActiveSafetyTimer();
+        // Clear the wedge timer but DELIBERATELY leave the safety-net timer
+        // armed. If bridge_ready never arrives (e.g. cloudflared down, respawn
+        // stuck) the dispatch still eventually abandons via the safety-net
+        // path — prevents the "silent hang forever" failure mode that PR2 is
+        // specifically built to eliminate.
         this._clearActiveWedgeTimer();
         this.incidents.record({
             kind: 'process_exit_during_active',
@@ -642,30 +646,43 @@ class ClaudeSessionSupervisor extends EventEmitter {
     _emitSystemNotice(dispatchId, reason) {
         const row = this.store.getDispatch(dispatchId);
         const chatId = row && row.chat_id;
-        this.incidents.record({
-            kind: 'system_notice_emitted',
-            dispatchId,
-            epoch: this.epoch,
-            details: { reason, chat_id: chatId },
-        });
-        if (!chatId) return; // scheduler jobs without a chat_id: log-only
+        if (!chatId) {
+            // Scheduler jobs without a chat_id: log-only, no delivery attempt.
+            this.incidents.record({
+                kind: 'system_notice_logged_only',
+                dispatchId,
+                epoch: this.epoch,
+                details: { reason, chat_id: null },
+            });
+            return;
+        }
 
         const text = `[system notice] Scheduled task could not be delivered. Reason: ${reason}. See logs for details.`;
+        let delivered = false;
+        let failureReason = null;
         try {
             const fn = typeof this.channelManager.sendToChannelUnbuffered === 'function'
                 ? this.channelManager.sendToChannelUnbuffered.bind(this.channelManager)
                 : this.channelManager.sendToChannel.bind(this.channelManager);
-            fn(chatId, text, chatId);
+            const result = fn(chatId, text, chatId);
+            // Unbuffered send returns false when the bridge is down. Treat as
+            // failure so the incident record reflects reality — otherwise we'd
+            // lie about emitting a notice that never reached the device.
+            if (result === false) {
+                failureReason = 'bridge_unavailable_on_notice';
+            } else {
+                delivered = true;
+            }
         } catch (err) {
-            // Notices are best-effort — failure should never mask the original
-            // recovery failure.
-            this.incidents.record({
-                kind: 'system_notice_failed',
-                dispatchId,
-                epoch: this.epoch,
-                details: { reason: err.message || String(err) },
-            });
+            failureReason = err.message || String(err);
         }
+
+        this.incidents.record({
+            kind: delivered ? 'system_notice_emitted' : 'system_notice_failed',
+            dispatchId,
+            epoch: this.epoch,
+            details: { reason, chat_id: chatId, failure_reason: failureReason },
+        });
     }
 
     _completeDispatch(dispatchId, terminalState, error) {
@@ -696,8 +713,24 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         if (this.activeDispatch && this.activeDispatch.dispatchId === dispatchId) {
             this._clearActiveSafetyTimer();
+            // PR2: also clear the wedge timer. Without this, every completed
+            // dispatch would leave a stale setTimeout alive until silence_ms
+            // elapsed. Harmless thanks to the activeDispatch guard inside
+            // _handleWedge, but a real timer leak.
+            this._clearActiveWedgeTimer();
             this.activeDispatch = null;
-            this._transition('dispatch_terminal', { occurredAt: now });
+            // HARD_FAILED is terminal for the supervisor itself — no transition
+            // applies. Skip to avoid a spurious invalid_transition incident.
+            if (this.state !== STATES.HARD_FAILED) {
+                this._transition('dispatch_terminal', { occurredAt: now });
+            }
+        }
+
+        // PR2: once we're HARD_FAILED, the intensity budget has been blown
+        // and any queued work should NOT auto-activate. Callers who want to
+        // revive the supervisor go through an explicit manual_reset path.
+        if (this.state === STATES.HARD_FAILED) {
+            return;
         }
 
         // Always try to activate the next queued dispatch — whether this one
