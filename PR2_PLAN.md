@@ -1,186 +1,215 @@
 # PR2 — Self-Heal (Wedge Detection, Kill, Respawn, Replay)
 
-**Status:** Draft (pre-Codex review)
+**Status:** Revised after Codex design review (round 1)
 **Branch:** `supervisor-pr2-self-heal`
-**Base:** `supervisor-pr1-observe-only` (already merged into branch)
+**Base:** `supervisor-pr1-observe-only` (merged)
 **Worktree:** `~/Documents/Dev/55-Root_Operator.wt/supervisor-pr2`
 **Design doc:** `~/.root-operator/workspace/design/claude-session-supervisor-v4.md`
 
-## Scope (one sentence)
+## Scope (one sentence, narrowed)
 
-Make Claude wedging overnight a recoverable event: supervisor detects silence → kills wedged Claude → existing respawn path brings a fresh Claude back → supervisor replays the in-flight prompt → user wakes up to a reply, not silence. If recovery itself fails, user sees a visible `[system notice]` instead of silence.
+**Scheduler-first** self-heal: when a scheduler-source dispatch is active and Claude wedges or crashes, supervisor kills Claude (if still alive), the existing respawn path brings a fresh Claude back, supervisor replays the SAME dispatch (incrementing `replay_count`) exactly once, and if recovery itself fails a `[system notice]` lands on the originating chat_id.
 
-## Why this is cheap vs. PR1
+Channel/user message recovery stays outside PR2 (PR1 already documented as a known gap in `orchestrator.js:14-22`; full coverage requires routing channel traffic through the supervisor, which is PR3 scope).
 
-PR1 landed the observation half: dispatch-store, FSM vocabulary, epoch handling, `replayCapForSource`, `canReplayDispatch`, safety-net timer (`silenceMs * 10`). PR2 wires the action half — but **main.js already has `spawnClaudeCode()`, `killClaudeCode()`, and auto-restart on `claudeProcess.on('exit')` via `scheduleClaudeRestart()`**. We are NOT building spawn/kill. We are building:
+## Why narrower than first draft
 
-1. A stricter silence-timer (at `silenceMs`, not `silenceMs * 10`)
-2. A wire from supervisor → `killClaudeCode()` so the existing exit→respawn path fires
-3. A hook to detect the new bridge is up and replay the in-flight dispatch
-4. Intensity budget so respawn storms can't loop forever
-5. A user-facing failure notice when (4) trips or replay cap is hit
+The first draft implicitly promised channel-source replay. Codex flagged this as inconsistent with current code: `submitChannelUserMessage` still sends directly to `channelManager.sendToChannel`, bypassing the supervisor. PR2 can safely replay only the traffic the supervisor owns — which today is scheduler-only. Rebuilding channel routing is PR3.
 
-## Scope boundary
+## Design changes forced by Codex review
 
-**In scope (PR2):**
-- Wedge detection (silence timeout distinct from safety-net)
-- Kill wedged Claude (trigger existing `killClaudeCode()`)
-- Respawn is **already handled by the existing exit-handler** — PR2 just verifies the handoff works cleanly (new epoch, new bridge, new hook log)
-- Replay in-flight dispatch through `enqueue` with `replay_count++`
-- Intensity budget (e.g., 3 respawns per 10 min → `hardFailed`)
-- User-visible system notice on `hardFailed` or `replay_cap_exceeded`
-- End-to-end smoke test (wedge simulation)
-- FSM extensions (`DISPATCHING → SUSPECT → RESPAWNING → STARTING`) — vocabulary exists in `policy.js`, just wire
+### Blocker 1 — Replay is "same dispatch," not "new dispatch"
 
-**Not in scope (deferred):**
-- `_ping` tool for active liveness probes → PR3
-- Effect ledger / duplicate-reply protection → PR3-4 (column `external_ref` already reserved)
-- ChannelManager pending-buffer removal → PR3
-- Bridge-offline UI pill on the device → cosmetic, separate work
-- App-level / Electron-outside watchdog (cloudflared, tunnel restart) → explicit out-of-scope, separate product layer
-- `--resume <sessionId>` resume-vs-fresh: **default to fresh session**, add resume later if needed. Reasoning: fresh + memory-context rehydration already works (Cortex is live); `--resume` adds edge-case failure modes we don't need for v1.
+**Problem:** Original plan said "re-enqueue." But `enqueue()` mints a new `dispatchId`, and the scheduler is still awaiting the original via `awaitOutcome(dispatchId)`. A new row would sit queued behind the wedged one and the scheduler's awaiter would never resolve.
 
-## Task breakdown
+**Fix:** Add `orchestrator._retryActiveDispatch(dispatchId, reason)`:
+- Check `canReplayDispatch(row)` (DB row, not the activeDispatch struct)
+- If blocked → `_completeDispatch(dispatchId, FAILED, reason)` → emit system notice
+- If allowed:
+  1. Increment `replay_count` in DB via new `store.incrementReplayCount(dispatchId)`
+  2. Reset dispatch state back to `QUEUED` in DB (keeps same row, new attempt)
+  3. Record `dispatch_replay_started` incident
+  4. Set `activeDispatch = null`
+  5. Call `_activateNext()` which now finds the same dispatch queued and re-sends its payload
+- `awaitOutcome` promise is NOT resolved — it stays pending for the replay attempt's outcome
 
-### 1. Policy: extend FSM transitions for PR2
+This means the scheduler sees one terminal outcome, not two. The dispatch's full lifecycle (including replays) is recorded in incidents and `replay_count`.
 
+### Blocker 2 — Real bridge-ready handshake, not socket-connected
+
+**Problem:** `channelManager.connected` flips to `true` the moment the Unix socket connects, which is BEFORE `channel-bridge.cjs` finishes `await mcp.connect()`. Replaying on `connected` races a half-ready bridge.
+
+**Fix:** Wire an explicit "bridge ready" signal:
+
+1. **In `channel-bridge.cjs`**, after line 344 (`await mcp.connect(transport)`), write a JSON message to the IPC socket:
+   ```js
+   socket.write(JSON.stringify({ type: 'bridge_ready', pid: process.pid, ts: Date.now() }) + '\n');
+   ```
+2. **In `src/channel-manager.js`**, parse that message type and emit `'bridge_ready'` event (separate from `'connected'`).
+3. **In supervisor:** replay gate listens for `'bridge_ready'`, not `'connected'`.
+
+Fallback for already-connected case (fast path when no wedge happens): if `bridge_ready` arrived before supervisor start, cache the timestamp on `channelManager._lastBridgeReadyTs` and let supervisor check that on startup.
+
+### Blocker 3 — Fence old-session hooks + FSM consistency
+
+**Problem:** After SIGKILL the tailer is still watching the shared hook log. `_onHookEvent` completes any `activeDispatch` on Stop/StopFailure — including late events from the dying old Claude.
+
+**Fix:** Activate PR1's dormant epoch-scoped hook logs.
+
+1. **In `main.js.spawnClaudeCode()`**: replace the static `claude-channel-hooks.jsonl` path with `runtime.resolveEpochPaths(runtime.incrementEpoch()).hookLog`. Bump epoch on every spawn.
+2. **In `main.js.prepareClaudeWorkspaceRuntime()`**: same — use epoch-scoped path from `runtime`.
+3. **In supervisor**: on `spawn_initiated` event from main.js, swap the tailer from the old epoch file to the new one. Drop any pending lineBuffer.
+4. **In supervisor `_onHookEvent`**: ignore events when `activeDispatch` is null (dispatch was already killed/replayed), or when `this.state === SUSPECT | RESPAWNING` (pending kill/respawn).
+5. **PR1's `maintainLatestSymlinks(epoch)` is already implemented** — keeps the stable-named `claude-channel-hooks.jsonl` symlink working for external tooling.
+
+FSM sequence (cleaned up):
+```
+IDLE -- enqueue --> DISPATCHING (old: idle-with-activeDispatch-null was ambiguous)
+DISPATCHING -- silence_timeout | process_exit_during_active --> SUSPECT
+SUSPECT -- kill_ordered --> RESPAWNING
+RESPAWNING -- respawn_ok (bridge_ready) --> STARTING (or straight to dispatch_replay if replay allowed)
+RESPAWNING -- intensity_exhausted --> HARD_FAILED
+STARTING -- verify_skipped --> IDLE
+```
+
+### Important 1 — Process-exit during ACTIVE = immediate recovery
+
+Silence timeout is one wedge signal; the other is Claude crashing outright. `main.js` already calls `scheduleClaudeRestart()` on process exit, but the supervisor isn't notified.
+
+**Fix:** In `main.js.claudeProcess.on('exit')`, if supervisor is wired, call `supervisor.notifyClaudeExited(exitCode)` BEFORE the scheduled restart. Supervisor checks:
+- If state is `DISPATCHING` and `activeDispatch != null` → transition `DISPATCHING → SUSPECT` immediately, then `SUSPECT → RESPAWNING` (kill already happened — process is dead), skip `kill_ordered` side effect
+- If state is IDLE → no-op (normal restart after clean quit)
+
+This means crashes trigger recovery without waiting for the 5-min silence timer.
+
+### Important 2 — Burst + window intensity budget
+
+**Fix:** Track two thresholds, both must be under:
+- **Burst:** ≥3 kill_ordered + process_exit events in last 30 seconds → `intensity_exhausted` (fast fail — boot loops)
+- **Window:** ≥3 in last 10 minutes → `intensity_exhausted` (rolling fail — distributed failures)
+
+Both push into the same ring buffer (persisted in `supervisor_state`); check both windows on each event. Keep `scheduleClaudeRestart`'s existing logic unchanged — supervisor runs its own budget above it.
+
+### Important 3 — Thread `chatId` through scheduler → supervisor
+
+**Fix:** In `src/scheduler.js:333` change the enqueue call to:
+```js
+this.supervisor.enqueue({
+    source: 'scheduler',
+    sourceId: job.id,
+    chatId: job.chatId || null,   // ← added
+    payload,
+    silenceMs: jobSilenceFor(job),
+});
+```
+
+This makes hard-fail notices land on the originating chat when the scheduler job had one (many scheduler jobs are Tom-facing like Night Lab, Signal).
+
+### Accepted risks (documented, not fixed in PR2)
+
+1. **`canReplayDispatch` is heuristic, not atomic.** `visible_effect_count` comes from `PreToolUse(reply)` hook events. If the hook append is lost or delayed, duplicate replies are possible. Full fix requires the effect ledger (PR3-4). PR2 accepts this risk for scheduler-first because scheduler payloads are idempotent enough (Night Lab may double-build; Signal may double-scan). Worth it to ship tonight vs. delay for PR3.
+2. **Fresh session replay is scheduler-scoped.** Channel/user turns rely on dynamic-memory rehydration in `submitChannelUserMessage()`; supervisor dispatches don't use that path. Fresh-session replay works for scheduler prompts (they're self-contained) but not general channel turns. Not a PR2 problem because channel replay isn't in scope.
+3. **Kill during an external side effect.** If Claude is mid-HTTP-call when we SIGKILL, the remote side effect may have committed. No atomic rollback available. Same accepted-risk as PR1.
+
+## Task breakdown (revised)
+
+### 1. Policy FSM extensions
 File: `src/claude-session-supervisor/policy.js`
+- [ ] `DISPATCHING` adds transitions: `silence_timeout → SUSPECT`, `process_exit → SUSPECT`
+- [ ] `SUSPECT` adds: `kill_ordered → RESPAWNING` (skip when process already dead)
+- [ ] `RESPAWNING` already has `respawn_ok → STARTING`
+- [ ] Pure helpers: `intensityBurst(timestamps, now)` (3-in-30s), `intensityWindow(timestamps, now)` (3-in-10min), both return boolean
+- [ ] Unit tests
 
-- [ ] In `transitionSupervisor`: add `case DISPATCHING: if (event === 'silence_timeout') return { ok: true, next: SUSPECT }`
-- [ ] Add `case SUSPECT: if (event === 'kill_ordered') return { ok: true, next: RESPAWNING }`
-- [ ] Add `case RESPAWNING: respawn_ok → STARTING` (already exists)
-- [ ] Add tracker: `intensityBudget(respawnTimestamps, windowMs=600000, max=3)` → boolean. Pure function.
-- [ ] Unit tests for all new transitions + intensity budget
+### 2. Dispatch store: replay + chat_id support
+File: `src/claude-session-supervisor/dispatch-store.js`
+- [ ] `incrementReplayCount(dispatchId)` — atomic UPDATE with returning
+- [ ] `resetToQueued(dispatchId)` — clears sending_at, activated_at, terminal_at, last_error; sets state='queued'
+- [ ] `persistIntensityRing(timestamps)` + `loadIntensityRing()` via supervisor_state table
+- [ ] Unit tests
 
-### 2. Wedge detection timer
+### 3. Epoch-scoped hook log activation
+File: `main.js`
+- [ ] `spawnClaudeCode()`: use `runtime.incrementEpoch()` + `runtime.ensureEpochFiles(epoch)` + `runtime.maintainLatestSymlinks(epoch)` to get a fresh hookLogPath per spawn
+- [ ] `supervisor.notifyEpochBumped(newEpoch, newHookLogPath)` swaps the tailer
+- [ ] Test: two consecutive spawns write to different epoch files; tailer follows
 
+### 4. Bridge-ready handshake
+Files: `channel-bridge.cjs`, `src/channel-manager.js`
+- [ ] Bridge writes `{type:'bridge_ready', pid, ts}` to IPC after `mcp.connect()` resolves
+- [ ] ChannelManager parses, emits `'bridge_ready'` event + caches `_lastBridgeReadyTs`
+- [ ] Unit test on ChannelManager parse path
+
+### 5. Wedge detector (silence timer)
 File: `src/claude-session-supervisor/orchestrator.js`
+- [ ] In `_activateNext`: arm wedgeTimer at `silenceMs` (DEFAULT_SILENCE_MS=5min) in addition to safety-net at `silenceMs*10`
+- [ ] In `_onHookEvent`: reset wedgeTimer on progress
+- [ ] On fire → `_handleWedge(dispatchId, 'silence_timeout')`
+- [ ] `_handleWedge`: record `wedge_detected`, transition `DISPATCHING → SUSPECT`, call `runtime.requestKill()` if process alive
 
-- [ ] In `_activateNext()`: arm a **wedge timer** at `silenceMs` (configurable; default 5 min for scheduler, tighter for channel) IN ADDITION to the existing safety-net timer at `silenceMs * 10`
-- [ ] In `_onHookEvent()`: reset the wedge timer on every hook event (progress signal)
-- [ ] Wedge timer fires → call `_handleWedge(dispatchId, reason='silence_timeout')`
-- [ ] `_handleWedge`:
-  1. Record `wedge_detected` incident (kind: `wedge_detected`, state_from: `active`, dispatchId, details: reason + lastProgressAt)
-  2. Transition supervisor FSM: `DISPATCHING → SUSPECT`
-  3. Call `runtime.killClaudeAndRespawn(dispatchId)` (new method — see task 3)
-
-### 3. Runtime: bridge from supervisor to main.js spawn/kill
-
+### 6. Runtime: kill + exit hooks
 File: `src/claude-session-supervisor/runtime.js`
+- [ ] Constructor adds DI slots: `onKillRequest`, `onEpochSwap`
+- [ ] `runtime.requestKill()` calls `onKillRequest()`
+- [ ] Main.js wires `onKillRequest: () => killClaudeCode()`
 
-- [ ] Add dependency injection slot: `onKillRequest: () => void` (injected from main.js, wraps `killClaudeCode()`)
-- [ ] Add `runtime.requestKill()` → calls injected callback
-- [ ] Main.js wires `onKillRequest: () => killClaudeCode()` when constructing the runtime
+### 7. Process-exit notification path
+File: `main.js` + orchestrator
+- [ ] `claudeProcess.on('exit')` calls `supervisor.notifyClaudeExited(exitCode)` if supervisor exists
+- [ ] Orchestrator handles: if ACTIVE dispatch + state=DISPATCHING → SUSPECT → RESPAWNING (process already dead, skip kill)
 
-Rationale: runtime module stays DI-pure (no direct import of main.js). The callback is the integration seam.
-
-### 4. Respawn detection + replay
-
+### 8. Respawn + replay coordination
 File: `src/claude-session-supervisor/orchestrator.js`
+- [ ] Subscribe to `channelManager.on('bridge_ready')`
+- [ ] On `bridge_ready` when state=RESPAWNING: check intensity budget (burst + window both under)
+- [ ] If budget ok: `_retryActiveDispatch(dispatchId, 'respawn_replay')` (see blocker 1 fix)
+- [ ] If budget blown: transition → HARD_FAILED, `_completeDispatch(dispatchId, FAILED, 'intensity_exhausted')`, emit system notice
 
-The existing `claudeProcess.on('exit')` handler in main.js already calls `scheduleClaudeRestart` which eventually calls `spawnClaudeCode()` again. When the new Claude boots, it writes to a new epoch's hook log and reconnects the MCP bridge.
-
-Supervisor needs to observe this and replay.
-
-- [ ] Add `runtime.onBridgeReconnected(callback)` hook. Main.js calls this when `channelManager.connected` flips false→true after a kill.
-- [ ] In `orchestrator`: listen for bridge reconnect. If there's an in-flight dispatch in `SUSPECT` state:
-  1. Check `canReplayDispatch(row)` — if false, mark dispatch `failed` with `last_error='replay_not_allowed:<reason>'` and emit system notice
-  2. If allowed: increment `replay_count` in DB, re-enqueue via `enqueue({ ...row, replay: true })`
-  3. Record `dispatch_replayed` incident
-- [ ] Bump epoch + swap tailer to new epoch hook log on reconnect
-
-### 5. Intensity budget
-
+### 9. System notice emission
 File: `src/claude-session-supervisor/orchestrator.js`
-
-- [ ] In-memory ring buffer of respawn timestamps (last 10 min)
-- [ ] On every `kill_ordered` event: push timestamp, then check `intensityBudget(timestamps)` — if exhausted, transition `SUSPECT → HARD_FAILED` (skip respawn), record `intensity_exhausted` incident, emit system notice
-- [ ] Persist ring buffer to `supervisor_state` table so it survives restart
-
-### 6. System notice emission
-
-File: `src/claude-session-supervisor/orchestrator.js`
-
-- [ ] New helper `_emitSystemNotice(dispatchId, reason)`:
-  - For scheduler-source dispatches: no-op (no chat to notify)
-  - For channel-source dispatches: `channelManager.sendToChannel(chatId, '[system notice] Message could not be delivered. Reason: <reason>.', chatId)` — use unbuffered variant
+- [ ] `_emitSystemNotice(dispatchId, reason)`:
+  - If `row.chat_id`: `channelManager.sendToChannelUnbuffered(row.chat_id, '[system notice] Scheduler job failed: ' + reason, row.chat_id)`
+  - If no chat_id (scheduler jobs without one): log-only, no channel emit
 - [ ] Triggered on: `hard_failed`, `replay_cap_exceeded`, `replay_not_allowed`
 - [ ] Record `system_notice_emitted` incident
 
-### 7. Main.js wiring
+### 10. End-to-end smoke test
+File: new test script (can be a CLI helper, not unit-test, since it needs real dev-app)
+- [ ] Schedule a job whose prompt is `Sleep 600 seconds then reply "done"` (or: tool call that hangs)
+- [ ] Set wedge threshold to 15s for the test
+- [ ] Fire via `ro_run_now`
+- [ ] Assert: within 20s → `wedge_detected`, `kill_ordered`, Claude exits, new Claude spawns, `bridge_ready`, `dispatch_replay_started` for same dispatchId
+- [ ] Overnight smoke: leave running on a real scheduler job; Tom reports if anything recovers or fails visibly
 
-File: `main.js`
+### 11. Codex code review (max 1 round, round 2 reserved)
+- [ ] Send diff for review
+- [ ] Fix blockers
+- [ ] Ship unless round 2 surfaces a data-loss-class finding
 
-- [ ] Wire `onKillRequest: () => killClaudeCode()` into supervisor construction
-- [ ] After `spawnClaudeCode()` completes + bridge reconnects: call `supervisor.notifyBridgeReconnected(newEpoch)`
-- [ ] No changes to the spawn path itself — the existing flow is reused
+### 12. Hand off
+- [ ] Commit, push branch
+- [ ] Tom checks out + restarts dev app
+- [ ] Overnight run
 
-### 8. End-to-end smoke test
+## Time box (unchanged)
 
-File: new `test/integration-wedge-recovery.test.js` (or manual script if test harness too heavy)
+12h hard cap. The revisions add real work (bridge-ready handshake, epoch activation, same-dispatch replay semantics, process-exit path) but keep scope narrower (no channel replay). Net: similar budget, different distribution.
 
-- [ ] Deliberately-wedging prompt: fire a scheduled dispatch whose payload instructs Claude to call a tool that never returns (or sleep forever)
-- [ ] Wait for silence timer to fire (short `silenceMs` in test config, e.g., 10s)
-- [ ] Assert: `wedge_detected` incident logged
-- [ ] Assert: Claude process was killed (check PID no longer alive)
-- [ ] Assert: new epoch created
-- [ ] Assert: dispatch row shows `replay_count=1`
-- [ ] Assert: new dispatch activated under new epoch
-- [ ] (If replay dispatch completes successfully) assert reply received
-- [ ] (If intensity budget blown in loop) assert `hard_failed` + system notice
+## Success criteria (revised)
 
-### 9. Codex code review
-
-- [ ] Send diff + this plan to Codex. Max 2 rounds.
-- [ ] Round 1: correctness, race conditions (kill vs. concurrent hook event, reconnect-before-ready), replay correctness, resource leaks (timer cleanup)
-- [ ] Round 2: one production scenario I missed (budget for this explicitly — prior PR1 pattern was round 5 found backup edge case)
-- [ ] After round 2: ship. No round 3 regardless of findings unless findings are data-loss class.
-
-### 10. Hand off
-
-- [ ] Commit + push branch
-- [ ] Ping Tom: branch ready, summary of what's in + what's deferred
-- [ ] Tom runs `git checkout supervisor-pr2-self-heal` in his live tree and restarts the dev app
-- [ ] Overnight smoke: Tom leaves it running; if Claude wedges naturally, system should self-heal
-
-## Risk register (PR2 specific)
-
-1. **MCP bridge reconnect race** — new Claude spawns but MCP bridge takes a few seconds to reconnect. Replay before reconnect = message lost. **Mitigation:** wait for `channelManager.connected === true` before replaying.
-
-2. **Double-reply on wedge-but-not-actually-wedged** — Claude is slow but would eventually reply. We kill, respawn, replay, and now BOTH instances emit reply → duplicate. **Mitigation:** (a) wedge threshold is generous (5min default), (b) `canReplayDispatch` already blocks replay when `visible_effect_count > 0`. Only scheduler jobs (no visible effects yet) get replayed in practice.
-
-3. **Kill signal during a tool call** — SIGKILL mid-tool means the tool's external side effect may or may not have committed. Cannot atomic-rollback. **Mitigation:** for v1, accept the edge case. `external_ref` column (PR1) is prep for the effect-ledger fix in PR3 — not PR2's problem.
-
-4. **Intensity storm** — if Claude wedges instantly on every respawn, we'd burn the budget in seconds and go hard-failed, blocking all scheduler jobs. **Mitigation:** budget 3 per 10 min (configurable). `hard_failed` requires `manual_reset` event, which main.js can expose as a "restart supervisor" button later (out of scope for PR2 — hard failure in v1 means Tom restarts the app).
-
-5. **Supervisor state divergence from Claude reality** — what if main.js calls `killClaudeCode()` but Claude ignores SIGKILL (stuck in kernel call)? **Mitigation:** main.js `claudeProcess.on('exit')` must fire for the respawn path to trigger. If it doesn't fire within N seconds, escalate to SIGKILL again, then give up → hard-failed. (Add a `kill_timeout` timer.)
-
-## Time box
-
-**Hard cap: 12 hours.** If hour 10 shows a deep surprise (bridge reconnect races, SIGKILL behaviour weirdness), ship a minimum-viable version:
-- Wedge detection + kill: yes
-- Respawn + replay: yes (fresh session only, no `--resume`)
-- Intensity budget: yes
-- System notice: yes
-- Duplicate-reply protection: defer to PR3 (document risk in PR description)
-
-If it looks like PR2 won't ship in 12h, stop and tell Tom. Don't burn another day.
-
-## Codex round cap
-
-**Max 2 rounds.** PR1 chewed 3 extra rounds optimizing the least-impactful layer (DB hardening). PR2 is user-visible recovery — ship after round 2 unless a data-loss bug surfaces.
-
-## Success criteria
-
-1. A deliberately-wedged Claude is killed and respawned within ~5 minutes of last progress
-2. The in-flight scheduler dispatch is replayed once on the new Claude and completes normally
-3. If the replay itself wedges, replay cap stops further retries and a system notice is visible on Tom's device
-4. Overnight: Claude never silently leaves a scheduled job hanging without either (a) completing, (b) retrying once, or (c) visibly reporting failure
+1. A scheduler-source dispatch whose Claude wedges is killed within `silenceMs` of last progress
+2. A scheduler-source dispatch whose Claude crashes triggers immediate recovery (not silence-timeout)
+3. The same dispatchId goes through one replay; scheduler sees one terminal outcome
+4. Replay gate waits for real `bridge_ready` (post-MCP-connect), not just socket-connected
+5. Old-session Stop hooks after kill do NOT spuriously complete the replay
+6. Intensity budget trips at either burst (3-in-30s) OR window (3-in-10min)
+7. On hard-fail, a `[system notice]` lands on the originating chat_id if present
+8. Overnight: scheduler jobs either complete normally, self-heal once, or visibly report failure — no silent loss
 
 ## What PR2 does NOT accomplish
 
-- No live `_ping` liveness probe (PR3)
-- No duplicate-reply protection via effect ledger (PR3-4) — relies on `visible_effect_count` guard which covers scheduler but not channel replays
-- No bridge-offline UI pill on the device
+- No channel/user message replay (requires routing change, PR3)
+- No `_ping` liveness probe (PR3)
+- No effect ledger for atomic duplicate protection (PR3-4)
+- No bridge-offline UI pill on device
 - No Electron/tunnel-level watchdog
-- No protection against Claude Code (CLI tool itself) crashing during startup — that's main.js's existing retry loop's problem
