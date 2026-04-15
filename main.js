@@ -3064,6 +3064,14 @@ async function spawnClaudeCode() {
 
         claudeProcess.on('exit', (exitCode) => {
             logDebug(`[CLAUDE] Exited (code: ${exitCode})`);
+            // PR2: notify supervisor before teardown so it can immediately flip
+            // any in-flight dispatch into recovery (instead of waiting for the
+            // silence-timeout wedge path). Best-effort — never throws.
+            if (supervisor && typeof supervisor.notifyClaudeExited === 'function') {
+                try { supervisor.notifyClaudeExited(exitCode); } catch (err) {
+                    logDebug(`[SUPERVISOR] notifyClaudeExited failed: ${err.message}`);
+                }
+            }
             clearChannelStartupTimer();
             clearChannelConfirmTimers();
             stopClaudeDebugWatcher();
@@ -3274,6 +3282,17 @@ function initChannelMode() {
         const supervisorRuntime = new SupervisorRuntime({
             store: supervisorStore,
             runtimeDir: supervisorRuntimeDir,
+            // PR2: wire the kill trigger + PID probe so the supervisor can
+            // drive kill→respawn when a wedge is detected. Existing
+            // claudeProcess.on('exit') handler then calls scheduleClaudeRestart()
+            // which calls spawnClaudeCode() — supervisor observes the new
+            // bridge via channelManager's 'bridge_ready' event.
+            onKillRequest: () => {
+                try { killClaudeCode(); } catch (err) {
+                    logDebug(`[SUPERVISOR] onKillRequest failed: ${err.message}`);
+                }
+            },
+            getClaudePid: () => (claudeProcess && claudeProcess.pid) || null,
         });
         // PR1 does NOT bump epoch: the Runtime module has full epoch +
         // orphan-cleanup machinery available, but nothing in the PR1 live
