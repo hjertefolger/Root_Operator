@@ -13,6 +13,11 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 
+  // Per-spawn token so the supervisor can distinguish hooks emitted by the
+  // current Claude from stale bytes produced by a crashed prior session.
+  // See src/claude-session-supervisor/orchestrator.js:notifyClaudeExited.
+  const sessionToken = process.env.ROOT_OPERATOR_SESSION_TOKEN || '';
+
   let payload = {
     hookEventName: '',
     toolName: '',
@@ -25,6 +30,7 @@ process.stdin.on('end', () => {
     error: '',
     errorDetails: null,
     lastAssistantMessage: '',
+    sessionToken,
     ts: new Date().toISOString(),
   };
 
@@ -42,6 +48,7 @@ process.stdin.on('end', () => {
       error: parsed.error || '',
       errorDetails: parsed.error_details || parsed.errorDetails || null,
       lastAssistantMessage: parsed.last_assistant_message || parsed.lastAssistantMessage || '',
+      sessionToken,
       ts: new Date().toISOString(),
     };
   } catch (error) {

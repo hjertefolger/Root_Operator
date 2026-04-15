@@ -70,6 +70,18 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this.pendingResolvers = new Map();
         this.queue = []; // dispatchIds waiting for activeDispatch to clear
 
+        // Per-spawn session token. main.js generates a UUID per Claude spawn
+        // and passes it via ROOT_OPERATOR_SESSION_TOKEN. Hook records embed
+        // it; supervisor rejects hooks whose token doesn't match the current
+        // spawn. notifyClaudeExited validates the token before terminalizing
+        // the active dispatch. Null until notifyClaudeSpawned() is called.
+        this.currentSessionToken = null;
+        // When true, _completeDispatch will NOT auto-activate the next queued
+        // dispatch. Set by notifyClaudeExited; cleared by notifyClaudeSpawned.
+        // Prevents activating a dispatch into a dead bridge between crash and
+        // respawn.
+        this._awaitingSpawn = false;
+
         this._tailer = null;
         this._shutdown = false;
     }
@@ -129,7 +141,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
             details: { source, source_id: sourceId, chat_id: chatId, silence_ms: silenceMs },
         });
 
-        if (this.state === STATES.IDLE && !this.activeDispatch) {
+        if (this.state === STATES.IDLE && !this.activeDispatch && !this._awaitingSpawn) {
             this._activateNext();
         } else {
             this.queue.push(dispatchId);
@@ -170,7 +182,85 @@ class ClaudeSessionSupervisor extends EventEmitter {
             epoch: this.epoch,
             active_dispatch: this.activeDispatch ? { ...this.activeDispatch } : null,
             queue_depth: this.queue.length,
+            session_token: this.currentSessionToken,
+            awaiting_spawn: this._awaitingSpawn,
         };
+    }
+
+    /**
+     * Called by main.js after a fresh Claude subprocess is spawned. Rotates
+     * the session token used for hook-record validation, unblocks dispatch
+     * activation after a crash, and promotes the next queued dispatch if
+     * the supervisor is idle.
+     */
+    notifyClaudeSpawned(sessionToken) {
+        if (!sessionToken) throw new Error('notifyClaudeSpawned requires a session token');
+        const now = this.clock();
+        this.currentSessionToken = sessionToken;
+        this._awaitingSpawn = false;
+        this.incidents.record({
+            kind: 'claude_spawned',
+            epoch: this.epoch,
+            details: { session_token: sessionToken },
+        });
+        if (this.state === STATES.IDLE && !this.activeDispatch) {
+            this._activateNext();
+        }
+    }
+
+    /**
+     * Called by main.js from the claudeProcess 'exit' handler BEFORE scheduling
+     * the respawn. Validates the dying session token matches the current one
+     * (otherwise the notification is stale and ignored). On match: records the
+     * incident, terminalizes any active dispatch as FAILED with reason
+     * 'claude_exited', clears the session token, and blocks auto-activation
+     * of queued dispatches until notifyClaudeSpawned() confirms a fresh
+     * session.
+     */
+    notifyClaudeExited({ sessionToken, pid = null, exitCode = null, signal = null } = {}) {
+        if (!sessionToken) {
+            this.incidents.record({
+                kind: 'claude_exit_notification_missing_token',
+                epoch: this.epoch,
+                details: { pid, exit_code: exitCode, signal },
+            });
+            return;
+        }
+        if (this.currentSessionToken && sessionToken !== this.currentSessionToken) {
+            this.incidents.record({
+                kind: 'claude_exited_stale_token',
+                epoch: this.epoch,
+                details: {
+                    notified_token: sessionToken,
+                    current_token: this.currentSessionToken,
+                    pid, exit_code: exitCode, signal,
+                },
+            });
+            return;
+        }
+
+        this.incidents.record({
+            kind: 'claude_exited',
+            epoch: this.epoch,
+            dispatchId: this.activeDispatch ? this.activeDispatch.dispatchId : null,
+            details: {
+                session_token: sessionToken,
+                pid, exit_code: exitCode, signal,
+                had_active_dispatch: !!this.activeDispatch,
+            },
+        });
+
+        // Block next-dispatch activation until a fresh spawn is confirmed.
+        // This prevents racing a queued dispatch into a torn-down bridge and
+        // prevents any old-session hook bytes that leak through from touching
+        // a newly-promoted dispatch.
+        this._awaitingSpawn = true;
+        this.currentSessionToken = null;
+
+        if (this.activeDispatch) {
+            const dispatchId = this.activeDispatch.dispatchId;
+            this._completeDispatch(dispatchId, DISPATCH_STATES.FAILED, 'claude_exited');
+        }
     }
 
     async shutdown() {
@@ -335,6 +425,27 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     _onHookEvent(hook) {
         if (!this.activeDispatch) return;
+
+        // Session-token gating: once a session is established, reject any hook
+        // whose token doesn't match. This blocks late bytes from a crashed
+        // session from falsely terminalizing a freshly-activated dispatch.
+        // Hooks without any token are accepted for backward compatibility with
+        // older hook-script versions (only relevant during the rollout window).
+        if (this.currentSessionToken && hook.sessionToken
+                && hook.sessionToken !== this.currentSessionToken) {
+            this.incidents.record({
+                kind: 'stale_hook_rejected',
+                epoch: this.epoch,
+                dispatchId: this.activeDispatch.dispatchId,
+                details: {
+                    hook_token: hook.sessionToken,
+                    current_token: this.currentSessionToken,
+                    hook_event: hook.hookEventName || hook.hook_event_name,
+                },
+            });
+            return;
+        }
+
         const dispatchId = this.activeDispatch.dispatchId;
         const now = this.clock();
         const name = hook.hookEventName || hook.hook_event_name;
@@ -390,7 +501,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // stalled until the next external enqueue arrived.
         // _activateNext() no-ops if activeDispatch is still set, so it is
         // safe to call unconditionally.
-        this._activateNext();
+        //
+        // Exception: when _awaitingSpawn is set, we just crashed and are
+        // waiting for a fresh Claude. Activating the next queued dispatch now
+        // would racing into a torn-down bridge. notifyClaudeSpawned() will
+        // call _activateNext() once the new session is confirmed.
+        if (!this._awaitingSpawn) {
+            this._activateNext();
+        }
     }
 
     _settleResolvers(dispatchId, terminalState, error) {

@@ -422,3 +422,175 @@ test('abandon removes queued id from in-memory queue (defensive)', async () => {
     await supervisor.shutdown();
     store.close();
 });
+
+// --- Session-token isolation (mid-dispatch crash attribution) ---
+
+test('notifyClaudeExited with active dispatch marks it FAILED, not COMPLETED', async () => {
+    // Core incident repro: Claude dies mid-dispatch, active dispatch must be
+    // marked FAILED with reason 'claude_exited'. Late Stop hooks from the
+    // old session must NOT flip the row to COMPLETED.
+    const { supervisor, hookLog, store } = fixture();
+    await supervisor.start();
+    const TOKEN = 'sess-1';
+    supervisor.notifyClaudeSpawned(TOKEN);
+
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'slow_job' });
+    const outcome = supervisor.awaitOutcome(dispatchId);
+
+    // Simulate claudeProcess.on('exit') firing mid-dispatch.
+    supervisor.notifyClaudeExited({ sessionToken: TOKEN, pid: 12345, exitCode: null, signal: 'SIGKILL' });
+
+    const result = await outcome;
+    assert.equal(result.state, DISPATCH_STATES.FAILED);
+    assert.equal(result.error, 'claude_exited');
+
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.equal(row.last_error, 'claude_exited');
+
+    // Later Stop hook from the dead session must be ignored.
+    appendHook(hookLog, { hookEventName: 'Stop', sessionToken: TOKEN });
+    await new Promise(r => setTimeout(r, 150));
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.FAILED,
+        'late Stop re-terminalized a crashed dispatch');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('A crashes mid-dispatch, B queued: late old-session Stop must not complete B', async () => {
+    // The race my original plan would have shipped: A interrupted → B activates
+    // → stale Stop from dead Claude lands → B falsely completes. Session-token
+    // gating on hooks must reject the stale Stop.
+    const { supervisor, hookLog, store, sent } = fixture();
+    await supervisor.start();
+    const OLD = 'sess-old';
+    const NEW = 'sess-new';
+    supervisor.notifyClaudeSpawned(OLD);
+
+    const a = supervisor.enqueue({ source: 'scheduler', payload: 'A' });
+    const b = supervisor.enqueue({ source: 'scheduler', payload: 'B' });
+    const outcomeA = supervisor.awaitOutcome(a.dispatchId);
+    const outcomeB = supervisor.awaitOutcome(b.dispatchId);
+
+    assert.equal(store.getDispatch(a.dispatchId).state, DISPATCH_STATES.ACTIVE);
+    assert.equal(store.getDispatch(b.dispatchId).state, DISPATCH_STATES.QUEUED);
+
+    // Old Claude dies mid-dispatch on A.
+    supervisor.notifyClaudeExited({ sessionToken: OLD, pid: 111, exitCode: null, signal: 'SIGKILL' });
+    const rA = await outcomeA;
+    assert.equal(rA.state, DISPATCH_STATES.FAILED);
+
+    // B must NOT have been auto-activated into a dead bridge — activation
+    // is gated until notifyClaudeSpawned re-confirms a fresh session.
+    assert.equal(store.getDispatch(b.dispatchId).state, DISPATCH_STATES.QUEUED);
+
+    // A stale Stop hook from the dead session arrives. It carries OLD token.
+    appendHook(hookLog, { hookEventName: 'Stop', sessionToken: OLD });
+    await new Promise(r => setTimeout(r, 150));
+
+    // B is still queued (or FAILED if bridge flipped), never COMPLETED.
+    const stateB = store.getDispatch(b.dispatchId).state;
+    assert.notEqual(stateB, DISPATCH_STATES.COMPLETED,
+        'stale old-session Stop falsely completed B');
+
+    // Now a fresh Claude spawns. B activates and completes normally.
+    supervisor.notifyClaudeSpawned(NEW);
+    await waitForCondition(() => store.getDispatch(b.dispatchId).state === DISPATCH_STATES.ACTIVE,
+        { timeoutMs: 1000 });
+    appendHook(hookLog, { hookEventName: 'Stop', sessionToken: NEW });
+    const rB = await outcomeB;
+    assert.equal(rB.state, DISPATCH_STATES.COMPLETED);
+    assert.equal(sent.length, 2);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('notifyClaudeExited with no active dispatch records incident, mutates nothing', async () => {
+    const { supervisor, store, incidents } = fixture();
+    await supervisor.start();
+    supervisor.notifyClaudeSpawned('tok-1');
+
+    assert.equal(supervisor.activeDispatch, null);
+    // Should not throw, should not affect state.
+    supervisor.notifyClaudeExited({ sessionToken: 'tok-1', pid: 42, exitCode: 0, signal: null });
+
+    assert.equal(supervisor.activeDispatch, null);
+    // currentSessionToken cleared; awaitingSpawn flag set so nothing auto-activates.
+    assert.equal(supervisor.currentSessionToken, null);
+
+    // Verify an incident of kind 'claude_exited' was recorded.
+    const rows = store.db.prepare("SELECT kind FROM incidents WHERE kind = 'claude_exited'").all();
+    assert.ok(rows.length >= 1, 'claude_exited incident not recorded');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('Stop arrives first, then notifyClaudeExited: exit does not re-terminalize', async () => {
+    const { supervisor, hookLog, store } = fixture();
+    await supervisor.start();
+    const TOKEN = 'sess-1';
+    supervisor.notifyClaudeSpawned(TOKEN);
+
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    const outcome = supervisor.awaitOutcome(dispatchId);
+    appendHook(hookLog, { hookEventName: 'Stop', sessionToken: TOKEN });
+    const result = await outcome;
+    assert.equal(result.state, DISPATCH_STATES.COMPLETED);
+
+    // Now exit fires (Claude shut down cleanly after Stop).
+    supervisor.notifyClaudeExited({ sessionToken: TOKEN, pid: 1, exitCode: 0, signal: null });
+
+    // Dispatch row stays COMPLETED.
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.COMPLETED);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('hook event with mismatched sessionToken is rejected, no progress update', async () => {
+    const { supervisor, hookLog, store } = fixture();
+    await supervisor.start();
+    supervisor.notifyClaudeSpawned('sess-current');
+
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    supervisor.awaitOutcome(dispatchId);
+
+    const beforeProgress = store.getDispatch(dispatchId).last_progress_at;
+
+    // Stale hook from a dead session.
+    appendHook(hookLog, { hookEventName: 'PreToolUse', toolName: 'reply', sessionToken: 'sess-stale' });
+    await new Promise(r => setTimeout(r, 150));
+
+    // visible_effect_count must NOT increment, progress must NOT update.
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.visible_effect_count, 0, 'stale hook counted as visible effect');
+    assert.equal(row.state, DISPATCH_STATES.ACTIVE);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('notifyClaudeExited with stale token does not touch active dispatch', async () => {
+    // Extra defensive case: main.js could in principle notify with an already-
+    // rotated token (multiple crashes in fast succession). Supervisor must
+    // ignore stale exit notifications once it has moved on.
+    const { supervisor, store } = fixture();
+    await supervisor.start();
+    supervisor.notifyClaudeSpawned('sess-a');
+
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'x' });
+    supervisor.awaitOutcome(dispatchId);
+
+    // A notify arrives with a token we never issued.
+    supervisor.notifyClaudeExited({ sessionToken: 'sess-bogus', pid: 999, exitCode: 0, signal: null });
+
+    // Active dispatch is untouched.
+    assert.equal(store.getDispatch(dispatchId).state, DISPATCH_STATES.ACTIVE);
+    assert.equal(supervisor.currentSessionToken, 'sess-a');
+
+    await supervisor.shutdown();
+    store.close();
+});

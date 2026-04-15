@@ -111,6 +111,7 @@ let channelManager = null;
 let scheduler = null;
 let updater = null;
 let claudeProcess = null; // Claude Code child process
+let claudeSessionToken = null; // Per-spawn UUID passed to Claude via env; used by supervisor to reject stale hook records from crashed sessions
 let chatStore = null; // initialized after app.whenReady()
 const CHANNEL_IPC_PATH = '/tmp/root-operator-channel.sock';
 const CHANNEL_STARTUP_TIMEOUT_MS = 15000;
@@ -2973,6 +2974,12 @@ async function spawnClaudeCode() {
 
 
     logDebug('[CLAUDE] Spawning Claude Code via PTY...');
+    // Per-spawn session token lets the supervisor distinguish hook lines
+    // written by this Claude from late bytes produced by a crashed prior
+    // session. The claude-stop-hook.cjs helper reads this env var and
+    // stamps every hook record with it.
+    const sessionToken = crypto.randomUUID();
+    claudeSessionToken = sessionToken;
     try {
         fs.writeFileSync(debugFilePath, '');
         fs.writeFileSync(hookLogPath, '');
@@ -2996,8 +3003,17 @@ async function spawnClaudeCode() {
                 ...process.env,
                 ROOT_OPERATOR_IPC: CHANNEL_IPC_PATH,
                 ROOT_OPERATOR_HOOK_LOG: hookLogPath,
+                ROOT_OPERATOR_SESSION_TOKEN: sessionToken,
             },
         });
+
+        if (supervisor) {
+            try {
+                supervisor.notifyClaudeSpawned(sessionToken);
+            } catch (err) {
+                logDebug(`[SUPERVISOR] notifyClaudeSpawned failed: ${err.message}`);
+            }
+        }
 
         setChannelRuntime('waiting_confirm', `Waiting for ${assistantName} to confirm local development access.`, {
             attempt: channelStartupAttempt,
@@ -3062,14 +3078,36 @@ async function spawnClaudeCode() {
             }
         }, CHANNEL_STARTUP_TIMEOUT_MS);
 
-        claudeProcess.on('exit', (exitCode) => {
-            logDebug(`[CLAUDE] Exited (code: ${exitCode})`);
+        claudeProcess.on('exit', (exitCode, signal) => {
+            logDebug(`[CLAUDE] Exited (code: ${exitCode}, signal: ${signal ?? 'none'})`);
             clearChannelStartupTimer();
             clearChannelConfirmTimers();
             stopClaudeDebugWatcher();
             stopClaudeHookWatcher();
+            // Capture identifying fields BEFORE clearing claudeProcess, then
+            // notify the supervisor so any in-flight dispatch is terminalized
+            // as FAILED('claude_exited') and queued dispatches stay parked
+            // until the respawn confirms a fresh session. Order is load-
+            // bearing: notifying AFTER scheduleClaudeRestart would let a
+            // stale active-dispatch ledger race with a newly-promoted one.
+            const dyingPid = claudeProcess && claudeProcess.pid;
+            const dyingToken = claudeSessionToken;
             claudeProcess = null;
+            claudeSessionToken = null;
             removeChannelSocket();
+
+            if (supervisor && dyingToken) {
+                try {
+                    supervisor.notifyClaudeExited({
+                        sessionToken: dyingToken,
+                        pid: dyingPid,
+                        exitCode,
+                        signal: signal || null,
+                    });
+                } catch (err) {
+                    logDebug(`[SUPERVISOR] notifyClaudeExited failed: ${err.message}`);
+                }
+            }
 
             if (operatingMode === 'channel' && !isAppQuitting) {
                 const exitMessage = exitCode === 0
@@ -3100,6 +3138,22 @@ async function spawnClaudeCode() {
         stopClaudeDebugWatcher();
         stopClaudeHookWatcher();
         claudeProcess = null;
+        // Supervisor never got notifyClaudeSpawned; tell it the intended token
+        // is dead so it doesn't stay parked on an _awaitingSpawn flag from a
+        // prior crash that was expecting this spawn to confirm.
+        if (supervisor && claudeSessionToken) {
+            try {
+                supervisor.notifyClaudeExited({
+                    sessionToken: claudeSessionToken,
+                    pid: null,
+                    exitCode: null,
+                    signal: null,
+                });
+            } catch {
+                // best-effort
+            }
+        }
+        claudeSessionToken = null;
         setChannelRuntime('error', `Failed to launch ${assistantName}: ${err.message}`, {
             attempt: channelStartupAttempt,
             lastError: err.message,
