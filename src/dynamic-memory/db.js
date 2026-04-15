@@ -179,7 +179,7 @@ function cosineSimilarity(a, b) {
  * undefined => no filter.
  */
 function searchByVector(db, queryEmbedding, chatId, limit = 10) {
-    let sql = `SELECT id, content, embedding, chat_id, timestamp FROM memories`;
+    let sql = `SELECT id, content, embedding, chat_id, source_role, timestamp FROM memories`;
     const params = [];
     if (chatId !== undefined) {
         if (chatId === null) {
@@ -202,6 +202,7 @@ function searchByVector(db, queryEmbedding, chatId, limit = 10) {
             score: similarity,
             timestamp: new Date(row.timestamp),
             chatId: row.chat_id,
+            sourceRole: row.source_role,
         };
     });
 
@@ -234,7 +235,7 @@ function searchByFts5(db, query, chatId, limit) {
     const ftsQuery = tokens.map((t) => `"${t}"`).join(' OR ');
 
     let sql = `
-        SELECT m.id, m.content, m.chat_id, m.timestamp,
+        SELECT m.id, m.content, m.chat_id, m.source_role, m.timestamp,
                bm25(memories_fts) as rank
         FROM memories_fts f
         JOIN memories m ON f.rowid = m.id
@@ -259,6 +260,7 @@ function searchByFts5(db, query, chatId, limit) {
         id: row.id,
         content: row.content,
         chatId: row.chat_id,
+        sourceRole: row.source_role,
         timestamp: new Date(row.timestamp),
         score: Math.abs(row.rank), // BM25 returns negative scores
     }));
@@ -272,7 +274,7 @@ function searchByLike(db, query, chatId, limit) {
     const params = words.map((w) => `%${w}%`);
 
     let sql = `
-        SELECT id, content, chat_id, timestamp
+        SELECT id, content, chat_id, source_role, timestamp
         FROM memories
         WHERE ${conditions.join(' AND ')}
     `;
@@ -294,6 +296,7 @@ function searchByLike(db, query, chatId, limit) {
         id: row.id,
         content: row.content,
         chatId: row.chat_id,
+        sourceRole: row.source_role,
         timestamp: new Date(row.timestamp),
         score: 1 - index * 0.1,
     }));
