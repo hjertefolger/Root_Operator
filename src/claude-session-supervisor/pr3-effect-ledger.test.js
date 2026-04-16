@@ -187,6 +187,59 @@ test('ChatStore findByExternalRef returns matching message', () => {
     assert.equal(nullRef, null);
 });
 
+test('ChatStore strips attachment bytes but preserves metadata', () => {
+    const dir = tempChatDir();
+    const cs = new ChatStore(dir);
+
+    cs.addMessage(
+        {
+            role: 'assistant',
+            content: 'image reply',
+            ts: '2026-04-16T12:05:00Z',
+            attachments: [{
+                id: 'att-1',
+                name: 'diagram.png',
+                mime: 'image/png',
+                size: 128,
+                sha256: 'abc123',
+                kind: 'image',
+                bytesBase64: 'ZmFrZQ==',
+            }],
+        },
+        { externalRef: 'reply:d1:3' },
+    );
+
+    const [message] = cs.loadMessages();
+    assert.deepEqual(message.attachments, [{
+        id: 'att-1',
+        name: 'diagram.png',
+        mime: 'image/png',
+        size: 128,
+        sha256: 'abc123',
+        kind: 'image',
+    }]);
+    assert.equal(message.attachments[0].bytesBase64, undefined);
+});
+
+test('ChatStore truncateIfNeeded returns evicted messages', () => {
+    const dir = tempChatDir();
+    const cs = new ChatStore(dir);
+
+    for (let index = 0; index < 201; index += 1) {
+        cs.appendMessage({
+            role: 'assistant',
+            content: `message-${index}`,
+            ts: `2026-04-16T12:${String(index).padStart(2, '0')}:00Z`,
+        });
+    }
+
+    const evicted = cs.truncateIfNeeded();
+    assert.equal(evicted.length, 1);
+    assert.equal(evicted[0].content, 'message-0');
+    assert.equal(cs.loadMessages().length, 200);
+    assert.equal(cs.loadMessages()[0].content, 'message-1');
+});
+
 // ==========================================================================
 // Orchestrator: activate_dispatch emission + spawn verification
 // ==========================================================================

@@ -6,6 +6,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { stripAttachmentBytes } = require('./outbound-attachments');
 
 const MAX_MESSAGES = 200;
 
@@ -65,15 +66,19 @@ class ChatStore {
      */
     truncateIfNeeded() {
         const messages = this.loadMessages();
-        if (messages.length <= MAX_MESSAGES) return;
+        if (messages.length <= MAX_MESSAGES) return [];
 
+        const evicted = messages.slice(0, -MAX_MESSAGES);
         const kept = messages.slice(-MAX_MESSAGES);
         const data = kept.map(m => JSON.stringify(m)).join('\n') + '\n';
         try {
             fs.writeFileSync(this.tmpPath, data, { encoding: 'utf8' });
             fs.renameSync(this.tmpPath, this.filePath);
+            this._externalRefIndex = null;
+            return evicted;
         } catch {
             // Disk full or permission error — skip truncation, file stays longer
+            return [];
         }
     }
 
@@ -84,14 +89,20 @@ class ChatStore {
      * @param {string} [opts.externalRef] - PR3: supervisor effect_id for reconcile
      */
     addMessage(msg, { externalRef } = {}) {
-        const record = externalRef ? { ...msg, external_ref: externalRef } : msg;
+        const sanitizedAttachments = stripAttachmentBytes(msg?.attachments);
+        const normalized = sanitizedAttachments
+            ? { ...msg, attachments: sanitizedAttachments }
+            : { ...msg };
+        const record = externalRef ? { ...normalized, external_ref: externalRef } : normalized;
         this.appendMessage(record);
         // Invalidate the in-memory index so the next lookup rebuilds it.
-        if (externalRef) this._externalRefIndex = null;
+        this._externalRefIndex = null;
         this._appendCount++;
+        let evicted = [];
         if (this._appendCount % 50 === 0) {
-            this.truncateIfNeeded();
+            evicted = this.truncateIfNeeded();
         }
+        return { record, evicted };
     }
 
     /**
@@ -119,6 +130,7 @@ class ChatStore {
             fs.unlinkSync(this.filePath);
         } catch {}
         this._appendCount = 0;
+        this._externalRefIndex = null;
     }
 }
 

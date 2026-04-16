@@ -21,7 +21,26 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR, WORKSPACE_DIR } = require('./src/workspace');
+const {
+    ensureWorkspace,
+    writeSystemPromptFile,
+    writeProjectMcpConfig,
+    ensureWorkspaceChatHistory,
+    ensureAttachmentsDir,
+    ensureOutboundAttachmentsDir,
+    ATTACHMENTS_DIR,
+    OUTBOUND_ATTACHMENTS_DIR,
+    WORKSPACE_DIR,
+} = require('./src/workspace');
+const {
+    OUTBOUND_ATTACHMENT_GC_GRACE_MS,
+    OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
+    getStagedAttachmentPath,
+    hydrateAttachmentBytes,
+    stageOutboundAttachments,
+    stripAttachmentBytes,
+    touchAttachmentForGc,
+} = require('./src/outbound-attachments');
 const { DynamicMemory } = require('./src/dynamic-memory');
 const {
     DispatchStore: SupervisorDispatchStore,
@@ -132,6 +151,7 @@ let channelReplyPending = false;
 let latestChannelActivity = null;
 let lastChannelActivityKey = '';
 let lastChannelActivityAt = 0;
+let outboundAttachmentSweepTimer = null;
 let claudeDebugFilePath = '';
 let claudeDebugPollTimer = null;
 let claudeDebugReadOffset = 0;
@@ -2100,6 +2120,122 @@ function sendLocalChatEvent(payload) {
     }
 }
 
+function hasStructuredAttachments(message) {
+    return Array.isArray(message?.attachments) && message.attachments.length > 0;
+}
+
+function buildAttachmentFallbackText(content, attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+        return content || '';
+    }
+
+    const fallbackLines = attachments.map((attachment) => `[Attachment: ${attachment.name} — open in a newer client]`);
+    return content ? `${content}\n\n${fallbackLines.join('\n')}` : fallbackLines.join('\n');
+}
+
+function collectReferencedOutboundAttachmentPaths(messages) {
+    const referenced = new Set();
+    const items = Array.isArray(messages) ? messages : [];
+    for (const message of items) {
+        if (!hasStructuredAttachments(message) || !message.external_ref) {
+            continue;
+        }
+        message.attachments.forEach((attachment, index) => {
+            referenced.add(getStagedAttachmentPath(OUTBOUND_ATTACHMENTS_DIR, message.external_ref, index, attachment.name));
+        });
+    }
+    return referenced;
+}
+
+function markOutboundAttachmentsForGc(messages) {
+    const paths = collectReferencedOutboundAttachmentPaths(messages);
+    if (paths.size === 0) {
+        return;
+    }
+
+    const now = new Date();
+    for (const filePath of paths) {
+        touchAttachmentForGc(filePath, now);
+    }
+}
+
+function sweepOutboundAttachments() {
+    try {
+        ensureOutboundAttachmentsDir();
+        const referenced = collectReferencedOutboundAttachmentPaths(chatStore ? chatStore.loadMessages() : []);
+        const entries = fs.readdirSync(OUTBOUND_ATTACHMENTS_DIR, { withFileTypes: true });
+        const now = Date.now();
+
+        for (const entry of entries) {
+            if (!entry.isFile()) {
+                continue;
+            }
+
+            const filePath = path.join(OUTBOUND_ATTACHMENTS_DIR, entry.name);
+            if (referenced.has(filePath)) {
+                continue;
+            }
+
+            const stat = fs.statSync(filePath);
+            if ((now - stat.mtimeMs) < OUTBOUND_ATTACHMENT_GC_GRACE_MS) {
+                continue;
+            }
+
+            fs.unlinkSync(filePath);
+            logDebug(`[ATTACH] Swept outbound attachment ${entry.name}`);
+        }
+    } catch (error) {
+        logDebug(`[ATTACH] Sweep failed: ${error.message}`);
+    }
+}
+
+function startOutboundAttachmentSweep() {
+    clearInterval(outboundAttachmentSweepTimer);
+    sweepOutboundAttachments();
+    outboundAttachmentSweepTimer = setInterval(() => {
+        sweepOutboundAttachments();
+    }, OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS);
+}
+
+function hydratePersistedAttachments(message) {
+    const metadata = stripAttachmentBytes(message.attachments);
+    if (!metadata) {
+        return undefined;
+    }
+    if (!message.external_ref) {
+        return metadata;
+    }
+    return hydrateAttachmentBytes({
+        outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+        effectId: message.external_ref,
+        attachments: metadata,
+    });
+}
+
+function buildTransportChannelMessage(message, { supportsAttachments = true } = {}) {
+    const normalized = {
+        type: 'channel_message',
+        role: message.role || 'assistant',
+        content: message.content || '',
+        ts: message.ts || new Date().toISOString(),
+    };
+
+    if (!hasStructuredAttachments(message)) {
+        return normalized;
+    }
+
+    const attachments = supportsAttachments
+        ? hydratePersistedAttachments(message)
+        : stripAttachmentBytes(message.attachments);
+    if (!supportsAttachments) {
+        normalized.content = buildAttachmentFallbackText(normalized.content, attachments);
+        return normalized;
+    }
+
+    normalized.attachments = attachments;
+    return normalized;
+}
+
 function createChatTimelineItem(activity) {
     const markerTs = activity.ts || new Date().toISOString();
     const activityKey = activity.toolUseId || `${activity.phase || 'idle'}:${activity.label || 'Idle'}:${activity.toolName || ''}:${activity.filePath || ''}`;
@@ -2120,7 +2256,7 @@ function createChatTimelineItem(activity) {
 }
 
 function getLocalChatState() {
-    const messages = chatStore ? chatStore.loadMessages() : [];
+    const messages = chatStore ? chatStore.loadMessages().map((message) => buildTransportChannelMessage(message)) : [];
     const activities = latestChannelActivity ? [createChatTimelineItem(latestChannelActivity)] : [];
 
     return {
@@ -2195,7 +2331,8 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
         detail: `Waiting for the ${assistantName} chat bridge to reconnect.`,
     }, { force: true });
 
-    chatStore.addMessage({ role: 'user', content, ts });
+    const userWrite = chatStore.addMessage({ role: 'user', content, ts });
+    markOutboundAttachmentsForGc(userWrite.evicted);
 
     if (echoToLocalChat) {
         sendLocalChatEvent({
@@ -3153,7 +3290,8 @@ function initChannelMode() {
             content: reply.text,
             ts: reply.ts || new Date().toISOString(),
         };
-        chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+        const legacyWrite = chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+        markOutboundAttachmentsForGc(legacyWrite.evicted);
         if (dynamicMemory && dynamicMemory.isEnabled()) {
             const replyChatId = reply.chat_id || reply.chatId || null;
             dynamicMemory.indexMessage('assistant', msg.content, replyChatId).catch((err) => {
@@ -3353,9 +3491,20 @@ function initChannelMode() {
 async function handleReplyRequest(req) {
     const { callId, dispatch_id, ordinal, chat_id, text, ts } = req;
     const effectId = dispatch_id ? `reply:${dispatch_id}:${ordinal}` : null;
+    const stagingEffectId = effectId || `reply-${callId || 'manual'}-${Date.now()}`;
+    const messageExternalRef = effectId || stagingEffectId;
     const replyTs = ts || new Date().toISOString();
+    let stagedAttachments = [];
 
     try {
+        if (Array.isArray(req.attachments) && req.attachments.length > 0) {
+            stagedAttachments = stageOutboundAttachments({
+                outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+                effectId: stagingEffectId,
+                attachments: req.attachments,
+            });
+        }
+
         // Step 1: prepare effect row (if supervisor store is available)
         if (supervisorStore && effectId) {
             try {
@@ -3380,11 +3529,14 @@ async function handleReplyRequest(req) {
             role: 'assistant',
             content: text,
             ts: replyTs,
+            external_ref: messageExternalRef,
+            attachments: stripAttachmentBytes(stagedAttachments),
         };
-        chatStore.addMessage(
-            { role: msg.role, content: msg.content, ts: msg.ts },
-            { externalRef: effectId },
+        const assistantWrite = chatStore.addMessage(
+            { role: msg.role, content: msg.content, ts: msg.ts, attachments: msg.attachments },
+            { externalRef: messageExternalRef },
         );
+        markOutboundAttachmentsForGc(assistantWrite.evicted);
 
         // Step 3: dynamic-memory index with external_ref.
         // MUST be awaited before markEffectCommitted (Codex critical finding):
@@ -3393,7 +3545,7 @@ async function handleReplyRequest(req) {
         if (dynamicMemory && dynamicMemory.isEnabled()) {
             try {
                 await dynamicMemory.indexMessage('assistant', text, chat_id || null, {
-                    externalRef: effectId,
+                    externalRef: messageExternalRef,
                 });
             } catch (err) {
                 logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
@@ -3406,10 +3558,12 @@ async function handleReplyRequest(req) {
         // Step 4: WebSocket fan-out + notifications
         for (const client of activeClients) {
             if (client.readyState === WebSocket.OPEN) {
-                sendEncryptedOutput(client, JSON.stringify(msg));
+                sendEncryptedOutput(client, JSON.stringify(buildTransportChannelMessage(msg, {
+                    supportsAttachments: client.supportsAttachments === true,
+                })));
             }
         }
-        sendLocalChatEvent(msg);
+        sendLocalChatEvent(buildTransportChannelMessage(msg));
         notifyAssistantReply(msg);
         scheduleChannelIdle();
 
@@ -3439,6 +3593,15 @@ async function handleReplyRequest(req) {
             isError: false,
         });
     } catch (err) {
+        for (const attachment of stagedAttachments) {
+            if (attachment.created && attachment.stagedPath && fs.existsSync(attachment.stagedPath)) {
+                try {
+                    fs.unlinkSync(attachment.stagedPath);
+                } catch {
+                    // Ignore cleanup errors after the original failure.
+                }
+            }
+        }
         logDebug(`[REPLY] handleReplyRequest failed: ${err.message}`);
         channelManager?.sendStructuredMessage({
             type: 'reply_response',
@@ -3697,6 +3860,7 @@ app.whenReady().then(async () => {
     } catch (error) {
         logDebug(`[CHAT] Failed to read history store: ${error.message}`);
     }
+    startOutboundAttachmentSweep();
 
     try {
         dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
@@ -3740,6 +3904,7 @@ app.on('will-quit', () => {
     cachedPushVapidKeys = null;
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
+    clearInterval(outboundAttachmentSweepTimer);
 });
 
 app.on('will-quit', () => {
@@ -4640,6 +4805,7 @@ function handleConnection(ws, req) {
 
     ws.lastActivity = Date.now();
     ws.lastHeartbeat = Date.now();
+    ws.supportsAttachments = false;
     // Start as not-visible — the client will send client_visible:true once it
     // confirms foreground state. Prevents a 35-second race window on reconnect
     // where the server assumes the client is visible and suppresses push.
@@ -4688,6 +4854,12 @@ function handleConnection(ws, req) {
                 ws.lastHeartbeat = Date.now();
             }
             logDebug(`[NOTIFICATIONS] client_visible kid=${(ws.kid || '?').substring(0, 8)} visible=${nowVisible} hb=${ws.lastHeartbeat}`);
+            return;
+        }
+
+        if (m.type === 'client_capabilities') {
+            ws.supportsAttachments = m.supportsAttachments === true;
+            logDebug(`[WS] Client capabilities kid=${(ws.kid || '?').substring(0, 8)} attachments=${ws.supportsAttachments}`);
             return;
         }
 
@@ -5235,7 +5407,9 @@ function startPty(ws) {
     if (operatingMode === 'channel') {
         logDebug('[CHANNEL] Client attached in channel mode, skipping PTY');
         // Send chat history from disk (buffered by sendEncryptedOutput until E2E ready)
-        const history = chatStore.loadMessages();
+        const history = chatStore.loadMessages().map((message) => buildTransportChannelMessage(message, {
+            supportsAttachments: ws.supportsAttachments === true,
+        }));
         if (history.length > 0) {
             sendEncryptedOutput(ws, JSON.stringify({
                 type: 'channel_history',
