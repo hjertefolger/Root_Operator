@@ -18,6 +18,13 @@ class ChannelManager extends EventEmitter {
         this._destroyed = false;
         this.pendingMessages = [];
         this.maxPendingMessages = 100;
+        // PR2 bridge-ready handshake. `connected` above flips true when the
+        // Unix socket accepts, but the MCP stdio transport inside the bridge
+        // is not ready until `mcp.connect(transport)` resolves. The bridge
+        // emits a `bridge_ready` envelope at that point. Track it separately
+        // so the supervisor can gate replay on the real readiness.
+        this.bridgeReady = false;
+        this.lastBridgeReadyTs = null;
     }
 
     connect() {
@@ -57,6 +64,9 @@ class ChannelManager extends EventEmitter {
         this.socket.on('close', () => {
             const wasConnected = this.connected;
             this.connected = false;
+            // bridge_ready must be re-asserted on every reconnect. A stale
+            // flag here would let the supervisor replay into a half-up bridge.
+            this.bridgeReady = false;
             if (wasConnected) {
                 console.log('[ChannelManager] Disconnected from bridge');
                 this.emit('disconnected');
@@ -112,6 +122,14 @@ class ChannelManager extends EventEmitter {
                 args: msg.args,
                 ts: msg.ts,
             });
+            return;
+        }
+
+        if (msg.type === 'bridge_ready') {
+            this.bridgeReady = true;
+            this.lastBridgeReadyTs = Date.now();
+            console.log(`[ChannelManager] Bridge ready (pid=${msg.pid || '?'})`);
+            this.emit('bridge_ready', { pid: msg.pid, ts: msg.ts });
         }
     }
 

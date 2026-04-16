@@ -76,12 +76,23 @@ function transitionSupervisor(current, event) {
             break;
         case T.DISPATCHING:
             if (event === 'dispatch_terminal') return { ok: true, next: T.IDLE };
+            if (event === 'silence_timeout') return { ok: true, next: T.SUSPECT };
+            if (event === 'process_exit') return { ok: true, next: T.SUSPECT };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
-            // PR4: silence_timeout -> SUSPECT
+            break;
+        case T.SUSPECT:
+            if (event === 'kill_ordered') return { ok: true, next: T.RESPAWNING };
+            if (event === 'process_already_dead') return { ok: true, next: T.RESPAWNING };
+            // PR2: if the safety-net timer fires while we're in recovery (e.g., runtime
+            // has no kill callback, or respawn never completes), drop back to IDLE.
+            if (event === 'dispatch_terminal') return { ok: true, next: T.IDLE };
+            if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.RESPAWNING:
             if (event === 'respawn_ok') return { ok: true, next: T.STARTING };
             if (event === 'intensity_exhausted') return { ok: true, next: T.HARD_FAILED };
+            // PR2: safety-net abandonment during respawn wait → return to IDLE.
+            if (event === 'dispatch_terminal') return { ok: true, next: T.IDLE };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.HARD_FAILED:
@@ -147,6 +158,40 @@ function canReplayDispatch(dispatch) {
     return { allowed: true };
 }
 
+/**
+ * Intensity budget helpers (PR2). Both must return false for a respawn to proceed.
+ * `timestamps` is an array of past kill_ordered / process_exit epoch-millis values.
+ *
+ * Burst: 3 or more within the last 30s → exhausted (catches boot-wedge loops).
+ * Window: 3 or more within the last 10min → exhausted (catches distributed flakes).
+ *
+ * Pure functions — callers pass `now` (defaults to Date.now) so tests can be deterministic.
+ */
+const INTENSITY_BURST_WINDOW_MS = 30 * 1000;
+const INTENSITY_WINDOW_MS = 10 * 60 * 1000;
+const INTENSITY_MAX = 3;
+
+function _countWithin(timestamps, windowMs, now) {
+    const cutoff = now - windowMs;
+    let n = 0;
+    for (const ts of timestamps) {
+        if (ts > cutoff) n += 1;
+    }
+    return n;
+}
+
+function intensityBurst(timestamps, now = Date.now()) {
+    return _countWithin(timestamps, INTENSITY_BURST_WINDOW_MS, now) >= INTENSITY_MAX;
+}
+
+function intensityWindow(timestamps, now = Date.now()) {
+    return _countWithin(timestamps, INTENSITY_WINDOW_MS, now) >= INTENSITY_MAX;
+}
+
+function intensityExhausted(timestamps, now = Date.now()) {
+    return intensityBurst(timestamps, now) || intensityWindow(timestamps, now);
+}
+
 module.exports = {
     STATES,
     DISPATCH_STATES,
@@ -155,4 +200,10 @@ module.exports = {
     transitionDispatch,
     replayCapForSource,
     canReplayDispatch,
+    intensityBurst,
+    intensityWindow,
+    intensityExhausted,
+    INTENSITY_BURST_WINDOW_MS,
+    INTENSITY_WINDOW_MS,
+    INTENSITY_MAX,
 };

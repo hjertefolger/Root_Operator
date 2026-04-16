@@ -183,3 +183,74 @@ test('WAL mode is enabled', () => {
     assert.equal(mode, 'wal');
     s.close();
 });
+
+test('PR2: incrementReplayCount bumps by 1', () => {
+    const s = new DispatchStore(tempDbPath());
+    s.insertDispatch({
+        dispatchId: 'r1', source: 'scheduler', sourceId: null, chatId: null,
+        payload: 'p', silenceMs: 1000, replayCap: 2, state: 'queued', epoch: 0,
+        enqueuedAt: 1000,
+    });
+    assert.equal(s.getDispatch('r1').replay_count, 0);
+    s.incrementReplayCount('r1');
+    assert.equal(s.getDispatch('r1').replay_count, 1);
+    s.incrementReplayCount('r1');
+    assert.equal(s.getDispatch('r1').replay_count, 2);
+    s.close();
+});
+
+test('PR2: resetDispatchToQueued clears lifecycle columns and sets epoch', () => {
+    const s = new DispatchStore(tempDbPath());
+    s.insertDispatch({
+        dispatchId: 'q1', source: 'scheduler', sourceId: null, chatId: null,
+        payload: 'p', silenceMs: 1000, replayCap: 2, state: 'queued', epoch: 0,
+        enqueuedAt: 1000,
+    });
+    // Walk it through to a terminal-ish state
+    s.updateDispatchState('q1', {
+        state: 'active',
+        sendingAt: 1100,
+        activatedAt: 1200,
+        lastProgressAt: 1300,
+    });
+    s.updateDispatchState('q1', {
+        state: 'failed',
+        terminalAt: 1400,
+        lastError: 'wedged',
+    });
+    s.incrementVisibleEffect('q1');
+    const before = s.getDispatch('q1');
+    assert.equal(before.state, 'failed');
+    assert.equal(before.visible_effect_count, 1);
+    assert.equal(before.last_error, 'wedged');
+
+    // Reset for replay with new epoch
+    s.resetDispatchToQueued('q1', 5);
+    const after = s.getDispatch('q1');
+    assert.equal(after.state, 'queued');
+    assert.equal(after.sending_at, null);
+    assert.equal(after.activated_at, null);
+    assert.equal(after.terminal_at, null);
+    assert.equal(after.last_progress_at, null);
+    assert.equal(after.last_error, null);
+    assert.equal(after.epoch, 5);
+    // Preserved fields
+    assert.equal(after.payload, 'p');
+    assert.equal(after.replay_cap, 2);
+    assert.equal(after.visible_effect_count, 1, 'visible_effect_count must survive reset so canReplayDispatch still sees past effects');
+    assert.equal(after.enqueued_at, 1000);
+    s.close();
+});
+
+test('PR2: resetDispatchToQueued with null epoch clears epoch column', () => {
+    const s = new DispatchStore(tempDbPath());
+    s.insertDispatch({
+        dispatchId: 'q2', source: 'scheduler', sourceId: null, chatId: null,
+        payload: 'p', silenceMs: 1000, replayCap: 2, state: 'queued', epoch: 3,
+        enqueuedAt: 1000,
+    });
+    s.resetDispatchToQueued('q2', null);
+    const r = s.getDispatch('q2');
+    assert.equal(r.epoch, null);
+    s.close();
+});

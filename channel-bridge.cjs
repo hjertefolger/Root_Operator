@@ -18,6 +18,12 @@ const IPC_PATH = process.env.ROOT_OPERATOR_IPC || '/tmp/root-operator-channel.so
 let electronSocket = null;
 let ipcServer = null;
 let shuttingDown = false;
+// PR2: sticky "MCP is connected" flag. Once mcp.connect() has resolved, every
+// newly-connected Electron socket MUST get a bridge_ready envelope immediately
+// (not just the one that happened to be attached when mcp.connect() resolved).
+// Otherwise an IPC-side reconnect (Electron flakes, bridge stays up) leaves the
+// supervisor waiting for a bridge_ready event that will never come again.
+let mcpReadyTs = null;
 
 function emitToElectron(payload) {
   if (!electronSocket || electronSocket.destroyed) {
@@ -223,6 +229,18 @@ function startIPCServer() {
     electronSocket = socket;
     console.error('[channel-bridge] Electron connected via IPC');
 
+    // PR2: if MCP is already connected (late IPC attach), re-emit bridge_ready
+    // so the supervisor on the other side doesn't miss the edge-triggered
+    // readiness signal.
+    if (mcpReadyTs) {
+      socket.write(JSON.stringify({
+        type: 'bridge_ready',
+        pid: process.pid,
+        ts: new Date(mcpReadyTs).toISOString(),
+        replayed: true,
+      }) + '\n');
+    }
+
     let buffer = '';
     socket.on('data', (data) => {
       buffer += data.toString();
@@ -343,6 +361,19 @@ async function main() {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
   console.error('[channel-bridge] MCP channel server running');
+
+  // PR2 bridge-ready handshake. ChannelManager's `connected` event fires when
+  // the Unix socket accepts, which is BEFORE mcp.connect() has resolved. For
+  // replay-after-respawn we need the supervisor to gate on the real readiness
+  // of the MCP stdio transport, not just "IPC socket up." Emit an explicit
+  // bridge_ready envelope here so the main process can distinguish the two.
+  // Also latch `mcpReadyTs` so later IPC reconnects can re-emit readiness.
+  mcpReadyTs = Date.now();
+  emitToElectron({
+    type: 'bridge_ready',
+    pid: process.pid,
+    ts: new Date(mcpReadyTs).toISOString(),
+  });
 }
 
 main().catch((error) => {

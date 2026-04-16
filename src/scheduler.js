@@ -333,6 +333,7 @@ class Scheduler extends EventEmitter {
                 ({ dispatchId } = this.supervisor.enqueue({
                     source: 'scheduler',
                     sourceId: job.id,
+                    chatId: job.chatId || null, // PR2: propagate so hard-fail notices reach origin device
                     payload,
                     silenceMs: jobSilenceFor(job),
                 }));
