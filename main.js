@@ -36,7 +36,7 @@ const {
     OUTBOUND_ATTACHMENT_GC_GRACE_MS,
     OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
     getStagedAttachmentPath,
-    hydrateAttachmentBytes,
+    loadStagedAttachmentBytes,
     stageOutboundAttachments,
     stripAttachmentBytes,
     touchAttachmentForGc,
@@ -2197,19 +2197,90 @@ function startOutboundAttachmentSweep() {
     }, OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS);
 }
 
-function hydratePersistedAttachments(message) {
-    const metadata = stripAttachmentBytes(message.attachments);
-    if (!metadata) {
-        return undefined;
+function findMessageAttachmentById(message, attachmentId) {
+    const attachments = stripAttachmentBytes(message?.attachments);
+    if (!attachments || !attachmentId) {
+        return null;
     }
-    if (!message.external_ref) {
-        return metadata;
+
+    const attachmentIndex = attachments.findIndex((attachment) => attachment.id === attachmentId);
+    if (attachmentIndex === -1) {
+        return null;
     }
-    return hydrateAttachmentBytes({
-        outboundDir: OUTBOUND_ATTACHMENTS_DIR,
-        effectId: message.external_ref,
-        attachments: metadata,
-    });
+
+    return {
+        attachment: attachments[attachmentIndex],
+        attachmentIndex,
+    };
+}
+
+function buildAttachmentBytesResponsePayload({ requestId, attachmentId, externalRef }) {
+    const response = {
+        type: 'attachment_bytes_response',
+        request_id: requestId,
+        attachment_id: attachmentId,
+    };
+
+    try {
+        if (typeof requestId !== 'string' || !requestId.trim()) {
+            throw new Error('Attachment request id missing');
+        }
+        if (typeof attachmentId !== 'string' || !attachmentId.trim()) {
+            throw new Error('Attachment id missing');
+        }
+        if (typeof externalRef !== 'string' || !externalRef.trim()) {
+            throw new Error('Attachment reference missing');
+        }
+        if (!chatStore) {
+            throw new Error('Chat history unavailable');
+        }
+
+        const message = chatStore.findByExternalRef(externalRef);
+        if (!message) {
+            throw new Error('Attachment message not found');
+        }
+
+        const resolvedAttachment = findMessageAttachmentById(message, attachmentId);
+        if (!resolvedAttachment) {
+            throw new Error('Attachment metadata not found');
+        }
+
+        const attachmentBytes = loadStagedAttachmentBytes({
+            outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+            effectId: externalRef,
+            attachment: resolvedAttachment.attachment,
+            attachmentIndex: resolvedAttachment.attachmentIndex,
+        });
+
+        return {
+            ...response,
+            ...attachmentBytes,
+        };
+    } catch (error) {
+        return {
+            ...response,
+            isError: true,
+            error: error.message || 'Attachment unavailable',
+        };
+    }
+}
+
+function parseStructuredChannelInput(inputData) {
+    if (typeof inputData !== 'string') {
+        return null;
+    }
+
+    const trimmed = inputData.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(trimmed);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
 }
 
 function buildTransportChannelMessage(message, { supportsAttachments = true } = {}) {
@@ -2224,14 +2295,15 @@ function buildTransportChannelMessage(message, { supportsAttachments = true } = 
         return normalized;
     }
 
-    const attachments = supportsAttachments
-        ? hydratePersistedAttachments(message)
-        : stripAttachmentBytes(message.attachments);
+    const attachments = stripAttachmentBytes(message.attachments);
     if (!supportsAttachments) {
         normalized.content = buildAttachmentFallbackText(normalized.content, attachments);
         return normalized;
     }
 
+    if (message.external_ref) {
+        normalized.external_ref = message.external_ref;
+    }
     normalized.attachments = attachments;
     return normalized;
 }
@@ -3946,6 +4018,24 @@ ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
     return { success: true };
 });
 ipcMain.handle('GET_LOCAL_CHAT_STATE', () => getLocalChatState());
+ipcMain.handle('FETCH_LOCAL_CHAT_ATTACHMENT_BYTES', async (event, { attachmentId, externalRef } = {}) => {
+    const response = buildAttachmentBytesResponsePayload({
+        requestId: `desktop-local:${Date.now()}`,
+        attachmentId,
+        externalRef,
+    });
+
+    if (response.isError) {
+        return { success: false, error: response.error || 'Attachment unavailable' };
+    }
+
+    return {
+        success: true,
+        attachmentId: response.attachment_id,
+        bytesBase64: response.bytesBase64,
+        mime: response.mime,
+    };
+});
 ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', async (event, text) => {
     if (typeof text !== 'string' || !text.trim()) {
         return { success: false, error: 'Message is empty' };
@@ -5133,6 +5223,20 @@ function handleConnection(ws, req) {
             if (inputData.length > MAX_INPUT_SIZE) {
                 logDebug('[SECURITY] E2E Input too large, truncating');
                 inputData = inputData.substring(0, MAX_INPUT_SIZE);
+            }
+
+            const structuredInput = parseStructuredChannelInput(inputData);
+            if (structuredInput?.type === 'fetch_attachment_bytes') {
+                const response = buildAttachmentBytesResponsePayload({
+                    requestId: structuredInput.request_id,
+                    attachmentId: structuredInput.attachment_id,
+                    externalRef: structuredInput.external_ref,
+                });
+                if (response.isError) {
+                    logDebug(`[ATTACH] On-demand fetch failed for ${structuredInput.attachment_id || 'unknown'}: ${response.error}`);
+                }
+                sendEncryptedOutput(ws, JSON.stringify(response));
+                return;
             }
 
             if (operatingMode === 'channel') {

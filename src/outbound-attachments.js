@@ -29,11 +29,7 @@ function sanitizeEffectToken(effectId) {
 }
 
 function computeAttachmentId(effectId, index) {
-    return crypto
-        .createHash('sha256')
-        .update(`${effectId || 'reply'}:${index}`)
-        .digest('hex')
-        .slice(0, 24);
+    return `${effectId || 'reply'}-${index}`;
 }
 
 function detectImageMime(buffer) {
@@ -179,23 +175,29 @@ function stripAttachmentBytes(attachments) {
     }));
 }
 
-function hydrateAttachmentBytes({ outboundDir, effectId, attachments }) {
-    if (!Array.isArray(attachments) || attachments.length === 0) {
-        return undefined;
+function loadStagedAttachmentBytes({ outboundDir, effectId, attachment, attachmentIndex }) {
+    if (!attachment || typeof attachment !== 'object') {
+        throw new Error('Attachment metadata missing');
     }
 
-    return attachments.map((attachment, index) => {
-        const stagedPath = getStagedAttachmentPath(outboundDir, effectId, index, attachment.name);
-        if (!fs.existsSync(stagedPath)) {
-            return { ...attachment };
-        }
+    if (!effectId || typeof effectId !== 'string') {
+        throw new Error('Attachment effect id missing');
+    }
 
-        const buffer = fs.readFileSync(stagedPath);
-        return {
-            ...attachment,
-            bytesBase64: buffer.toString('base64'),
-        };
-    });
+    if (!Number.isInteger(attachmentIndex) || attachmentIndex < 0) {
+        throw new Error('Attachment index missing');
+    }
+
+    const stagedPath = getStagedAttachmentPath(outboundDir, effectId, attachmentIndex, attachment.name);
+    if (!fs.existsSync(stagedPath)) {
+        throw new Error('Attachment bytes unavailable');
+    }
+
+    const stagedFile = readValidatedImageFile(stagedPath);
+    return {
+        bytesBase64: stagedFile.buffer.toString('base64'),
+        mime: stagedFile.mime,
+    };
 }
 
 function touchAttachmentForGc(filePath, now = new Date()) {
@@ -215,7 +217,7 @@ module.exports = {
     computeAttachmentId,
     detectImageMime,
     getStagedAttachmentPath,
-    hydrateAttachmentBytes,
+    loadStagedAttachmentBytes,
     sanitizeAttachmentName,
     sanitizeEffectToken,
     stageOutboundAttachments,
