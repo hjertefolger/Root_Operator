@@ -1,7 +1,7 @@
 {
   "name": "root-operator",
   "productName": "Root_Operator",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Personal AI assistant for macOS powered by Claude Code channels",
   "main": "main.js",
   "scripts": {
@@ -148,6 +148,8 @@
       "src/workspace.js",
       "src/updater.js",
       "src/dynamic-memory/**/*",
+      "src/claude-session-supervisor/**/*",
+      "!src/claude-session-supervisor/**/*.test.js",
       "tray_*.png",
       "ui/**/*",
       "public/dist/**/*",
