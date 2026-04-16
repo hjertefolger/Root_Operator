@@ -418,6 +418,12 @@ export function useAuth(socket) {
           setPairingError(null);
         }
         setServerReady(true);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({
+            type: 'client_capabilities',
+            supportsAttachments: true,
+          }));
+        }
       }
 
       // Pairing request accepted - show code

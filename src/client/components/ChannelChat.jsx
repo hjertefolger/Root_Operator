@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
-import { Check, ArrowUp, ChevronDown, Loader, Plus, X } from 'lucide-react';
+import { Check, ArrowUp, ChevronDown, Eye, Image as ImageIcon, Loader, Plus, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -251,9 +251,113 @@ function parseFileAttachments(content) {
   return { text: textLines.join('\n').trim(), files };
 }
 
-const ChatMessageItem = memo(function ChatMessageItem({ role, content }) {
+function getAttachmentPreviewSrc(attachment) {
+  if (!attachment?.bytesBase64 || !attachment?.mime) {
+    return '';
+  }
+  return `data:${attachment.mime};base64,${attachment.bytesBase64}`;
+}
+
+const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachments }) {
+  const [expandedId, setExpandedId] = useState(null);
+
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return null;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: '85%' }}>
+      {attachments.map((attachment, index) => {
+        const previewSrc = getAttachmentPreviewSrc(attachment);
+        const isExpanded = expandedId === (attachment.id || `${attachment.name}-${index}`);
+        const canPreview = Boolean(previewSrc);
+        return (
+          <div
+            key={`assistant-attachment-${attachment.id || attachment.name}-${index}`}
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                if (!canPreview) return;
+                setExpandedId((current) => (current === (attachment.id || `${attachment.name}-${index}`) ? null : (attachment.id || `${attachment.name}-${index}`)));
+              }}
+              disabled={!canPreview}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                width: '100%',
+                padding: '8px 12px',
+                borderRadius: 14,
+                border: '1px solid rgba(255,255,255,0.12)',
+                background: isExpanded ? 'rgba(75,90,255,0.12)' : 'transparent',
+                color: 'inherit',
+                cursor: canPreview ? 'pointer' : 'default',
+                textAlign: 'left',
+              }}
+            >
+              <Eye size={13} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              <span style={{
+                fontSize: 13,
+                color: 'rgba(255,255,255,0.72)',
+                fontFamily: MONO,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                minWidth: 0,
+                flex: 1,
+              }}>
+                {attachment.name}
+              </span>
+              <span style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: 12,
+                color: '#4B5AFF',
+                fontFamily: MONO,
+                flexShrink: 0,
+              }}>
+                <ImageIcon size={12} strokeWidth={2.2} />
+                IMG
+              </span>
+              <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', fontFamily: MONO, flexShrink: 0 }}>
+                {formatFileSize(attachment.size || 0)}
+              </span>
+            </button>
+            {isExpanded && previewSrc && (
+              <div style={{
+                padding: 8,
+                borderRadius: 14,
+                border: '1px solid rgba(255,255,255,0.08)',
+                background: 'rgba(255,255,255,0.04)',
+              }}>
+                <img
+                  src={previewSrc}
+                  alt={attachment.name}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    maxHeight: 360,
+                    objectFit: 'contain',
+                    borderRadius: 10,
+                    background: 'rgba(0,0,0,0.28)',
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+const ChatMessageItem = memo(function ChatMessageItem({ role, content, attachments }) {
   const isUser = role === 'user';
   const { text, files } = isUser ? parseFileAttachments(content) : { text: content, files: [] };
+  const assistantAttachments = isUser ? [] : (Array.isArray(attachments) ? attachments : []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start', gap: 4 }}>
@@ -309,6 +413,9 @@ const ChatMessageItem = memo(function ChatMessageItem({ role, content }) {
             );
           })}
         </div>
+      )}
+      {!isUser && assistantAttachments.length > 0 && (
+        <AssistantAttachmentList attachments={assistantAttachments} />
       )}
     </div>
   );
@@ -379,7 +486,7 @@ const ChatMessages = memo(function ChatMessages({
 
       {messages.map((msg, i) => {
         const messageKey = msg.ts
-          ? `${msg.role}:${msg.ts}`
+          ? `${msg.role}:${msg.ts}:${Array.isArray(msg.attachments) ? msg.attachments.map((attachment) => attachment.id || attachment.name).join('|') : ''}`
           : `${msg.role}:${i}:${msg.content}`;
 
         return (
@@ -387,6 +494,7 @@ const ChatMessages = memo(function ChatMessages({
             key={messageKey}
             role={msg.role}
             content={msg.content}
+            attachments={msg.attachments}
           />
         );
       })}

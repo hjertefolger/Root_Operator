@@ -12,7 +12,10 @@ import { useFileAttachment } from './hooks/useFileAttachment';
 import { mergeChannelActivity } from './lib/channelActivity';
 
 function getMessageKey(item) {
-  return `${item.role}:${item.ts || ''}:${item.content}`;
+  const attachmentKey = Array.isArray(item.attachments)
+    ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+    : '';
+  return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
 }
 
 function mergeMessages(prev, incoming) {
@@ -196,6 +199,7 @@ function App() {
             role: parsed.role || 'assistant',
             content: parsed.content,
             ts: parsed.ts || new Date().toISOString(),
+            attachments: parsed.attachments,
           }]));
           setChannelActivities(prev => prev.map((item) => (
             item.active

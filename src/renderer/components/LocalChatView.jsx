@@ -17,10 +17,18 @@ function mergeMessages(prev, incoming) {
   }
 
   const next = [...prev];
-  const seen = new Set(prev.map((item) => `${item.role}:${item.ts || ''}:${item.content}`));
+  const seen = new Set(prev.map((item) => {
+    const attachmentKey = Array.isArray(item.attachments)
+      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+      : '';
+    return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
+  }));
 
   for (const item of incoming) {
-    const key = `${item.role}:${item.ts || ''}:${item.content}`;
+    const attachmentKey = Array.isArray(item.attachments)
+      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+      : '';
+    const key = `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
     if (!seen.has(key)) {
       seen.add(key);
       next.push(item);
@@ -53,6 +61,7 @@ function LocalChatView({ tunnelState }) {
           role: payload.role || 'assistant',
           content: payload.content,
           ts: payload.ts || new Date().toISOString(),
+          attachments: payload.attachments,
         }]));
         setActivities((prev) => prev.map((item) => (
           item.active
