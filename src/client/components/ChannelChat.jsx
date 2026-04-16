@@ -258,8 +258,43 @@ function getAttachmentPreviewSrc(attachment) {
   return `data:${attachment.mime};base64,${attachment.bytesBase64}`;
 }
 
-const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachments }) {
+const AssistantAttachmentList = memo(function AssistantAttachmentList({
+  attachments,
+  externalRef,
+  attachmentCache,
+  attachmentFetchState,
+  onRequestAttachment,
+}) {
   const [expandedId, setExpandedId] = useState(null);
+
+  const handleAttachmentClick = useCallback(async (attachment, attachmentKey, hasPreview, isLoading, canFetch) => {
+    if (hasPreview) {
+      setExpandedId((current) => (current === attachmentKey ? null : attachmentKey));
+      return;
+    }
+
+    if (isLoading || !canFetch) {
+      return;
+    }
+
+    setExpandedId(attachmentKey);
+    try {
+      await onRequestAttachment?.({ attachment, externalRef });
+    } catch (error) {
+      console.warn('[CHAT] Failed to fetch attachment bytes:', error.message);
+    }
+  }, [externalRef, onRequestAttachment]);
+
+  const handleRetry = useCallback(async (event, attachment, attachmentKey) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setExpandedId(attachmentKey);
+    try {
+      await onRequestAttachment?.({ attachment, externalRef });
+    } catch (error) {
+      console.warn('[CHAT] Failed to fetch attachment bytes:', error.message);
+    }
+  }, [externalRef, onRequestAttachment]);
 
   if (!Array.isArray(attachments) || attachments.length === 0) {
     return null;
@@ -268,21 +303,26 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachme
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: '85%' }}>
       {attachments.map((attachment, index) => {
-        const previewSrc = getAttachmentPreviewSrc(attachment);
-        const isExpanded = expandedId === (attachment.id || `${attachment.name}-${index}`);
+        const attachmentKey = attachment.id || `${attachment.name}-${index}`;
+        const cachedAttachment = attachment.id ? attachmentCache?.[attachment.id] : null;
+        const fetchState = attachment.id ? attachmentFetchState?.[attachment.id] : null;
+        const previewSrc = getAttachmentPreviewSrc(cachedAttachment
+          ? { ...attachment, ...cachedAttachment }
+          : attachment);
+        const isExpanded = expandedId === attachmentKey;
         const canPreview = Boolean(previewSrc);
+        const isLoading = fetchState?.loading === true;
+        const errorMessage = fetchState?.error || '';
+        const canFetch = Boolean(!canPreview && typeof onRequestAttachment === 'function' && attachment.id && externalRef);
         return (
           <div
-            key={`assistant-attachment-${attachment.id || attachment.name}-${index}`}
+            key={`assistant-attachment-${attachmentKey}`}
             style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
           >
             <button
               type="button"
-              onClick={() => {
-                if (!canPreview) return;
-                setExpandedId((current) => (current === (attachment.id || `${attachment.name}-${index}`) ? null : (attachment.id || `${attachment.name}-${index}`)));
-              }}
-              disabled={!canPreview}
+              onClick={() => handleAttachmentClick(attachment, attachmentKey, canPreview, isLoading, canFetch)}
+              disabled={!canPreview && !canFetch}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -293,11 +333,16 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachme
                 border: '1px solid rgba(255,255,255,0.12)',
                 background: isExpanded ? 'rgba(75,90,255,0.12)' : 'transparent',
                 color: 'inherit',
-                cursor: canPreview ? 'pointer' : 'default',
+                cursor: canPreview || canFetch ? 'pointer' : 'default',
                 textAlign: 'left',
+                opacity: !canPreview && !canFetch ? 0.72 : 1,
               }}
             >
-              <Eye size={13} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              {isLoading ? (
+                <Loader size={13} strokeWidth={2.2} className="animate-spin" style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              ) : (
+                <Eye size={13} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              )}
               <span style={{
                 fontSize: 13,
                 color: 'rgba(255,255,255,0.72)',
@@ -320,12 +365,53 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachme
                 flexShrink: 0,
               }}>
                 <ImageIcon size={12} strokeWidth={2.2} />
-                IMG
+                {isLoading ? 'LOAD' : 'IMG'}
               </span>
               <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', fontFamily: MONO, flexShrink: 0 }}>
                 {formatFileSize(attachment.size || 0)}
               </span>
             </button>
+            {isExpanded && isLoading && (
+              <div style={{
+                height: 112,
+                borderRadius: 14,
+                border: '1px solid rgba(255,255,255,0.08)',
+                background: 'linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))',
+              }} />
+            )}
+            {isExpanded && !isLoading && errorMessage && (
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                padding: '10px 12px',
+                borderRadius: 14,
+                border: '1px solid rgba(255,255,255,0.08)',
+                background: 'rgba(255,255,255,0.04)',
+              }}>
+                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.62)' }}>
+                  Image unavailable
+                </span>
+                {canFetch && (
+                  <button
+                    type="button"
+                    onClick={(event) => handleRetry(event, attachment, attachmentKey)}
+                    style={{
+                      border: '1px solid rgba(75,90,255,0.28)',
+                      background: 'rgba(75,90,255,0.12)',
+                      color: '#8b9aff',
+                      borderRadius: 999,
+                      padding: '4px 10px',
+                      fontSize: 12,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
             {isExpanded && previewSrc && (
               <div style={{
                 padding: 8,
@@ -354,7 +440,15 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({ attachme
   );
 });
 
-const ChatMessageItem = memo(function ChatMessageItem({ role, content, attachments }) {
+const ChatMessageItem = memo(function ChatMessageItem({
+  role,
+  content,
+  attachments,
+  externalRef,
+  attachmentCache,
+  attachmentFetchState,
+  onRequestAttachment,
+}) {
   const isUser = role === 'user';
   const { text, files } = isUser ? parseFileAttachments(content) : { text: content, files: [] };
   const assistantAttachments = isUser ? [] : (Array.isArray(attachments) ? attachments : []);
@@ -415,7 +509,13 @@ const ChatMessageItem = memo(function ChatMessageItem({ role, content, attachmen
         </div>
       )}
       {!isUser && assistantAttachments.length > 0 && (
-        <AssistantAttachmentList attachments={assistantAttachments} />
+        <AssistantAttachmentList
+          attachments={assistantAttachments}
+          externalRef={externalRef}
+          attachmentCache={attachmentCache}
+          attachmentFetchState={attachmentFetchState}
+          onRequestAttachment={onRequestAttachment}
+        />
       )}
     </div>
   );
@@ -428,6 +528,9 @@ const ChatMessages = memo(function ChatMessages({
   assistantName,
   scrollContainerRef,
   messagesEndRef,
+  attachmentCache,
+  attachmentFetchState,
+  onRequestAttachment,
 }) {
   return (
     <div
@@ -495,6 +598,10 @@ const ChatMessages = memo(function ChatMessages({
             role={msg.role}
             content={msg.content}
             attachments={msg.attachments}
+            externalRef={msg.external_ref}
+            attachmentCache={attachmentCache}
+            attachmentFetchState={attachmentFetchState}
+            onRequestAttachment={onRequestAttachment}
           />
         );
       })}
@@ -825,6 +932,7 @@ function ChannelChat({
   draftStorageKey = '',
   forceScrollToBottomKey = 0,
   focusInputKey = 0,
+  onRequestAttachmentBytes,
 }) {
   const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -836,10 +944,119 @@ function ChannelChat({
   const lastScrollTopRef = useRef(0);
   const shouldAutoScrollRef = useRef(true);
   const nextScrollBehaviorRef = useRef('auto');
+  const attachmentRequestPromisesRef = useRef(new Map());
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [attachmentCache, setAttachmentCache] = useState({});
+  const [attachmentFetchState, setAttachmentFetchState] = useState({});
   const canSend = typeof canSendOverride === 'boolean'
     ? canSendOverride
     : Boolean(socket && e2eReady);
+
+  useEffect(() => {
+    const seededAttachments = [];
+
+    for (const message of messages) {
+      if (!Array.isArray(message.attachments)) {
+        continue;
+      }
+      for (const attachment of message.attachments) {
+        if (attachment?.id && attachment?.bytesBase64 && attachment?.mime) {
+          seededAttachments.push({
+            id: attachment.id,
+            bytesBase64: attachment.bytesBase64,
+            mime: attachment.mime,
+          });
+        }
+      }
+    }
+
+    if (seededAttachments.length === 0) {
+      return;
+    }
+
+    setAttachmentCache((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const attachment of seededAttachments) {
+        const existing = next[attachment.id];
+        if (!existing || existing.bytesBase64 !== attachment.bytesBase64 || existing.mime !== attachment.mime) {
+          next[attachment.id] = {
+            bytesBase64: attachment.bytesBase64,
+            mime: attachment.mime,
+          };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [messages]);
+
+  const requestAttachmentBytes = useCallback(async ({ attachment, externalRef }) => {
+    const attachmentId = attachment?.id;
+    if (!attachmentId) {
+      throw new Error('Attachment id missing');
+    }
+
+    if (attachment.bytesBase64 && attachment.mime) {
+      return {
+        bytesBase64: attachment.bytesBase64,
+        mime: attachment.mime,
+      };
+    }
+
+    if (attachmentCache[attachmentId]?.bytesBase64) {
+      return attachmentCache[attachmentId];
+    }
+
+    const existingRequest = attachmentRequestPromisesRef.current.get(attachmentId);
+    if (existingRequest) {
+      return existingRequest;
+    }
+
+    if (typeof onRequestAttachmentBytes !== 'function') {
+      throw new Error('Attachment fetch unavailable');
+    }
+
+    setAttachmentFetchState((prev) => ({
+      ...prev,
+      [attachmentId]: { loading: true, error: '' },
+    }));
+
+    const request = onRequestAttachmentBytes({ attachmentId, externalRef })
+      .then((response) => {
+        if (!response?.bytesBase64) {
+          throw new Error('Image unavailable');
+        }
+
+        const resolvedAttachment = {
+          bytesBase64: response.bytesBase64,
+          mime: response.mime || attachment.mime || '',
+        };
+
+        setAttachmentCache((prev) => ({
+          ...prev,
+          [attachmentId]: resolvedAttachment,
+        }));
+        setAttachmentFetchState((prev) => ({
+          ...prev,
+          [attachmentId]: { loading: false, error: '' },
+        }));
+        return resolvedAttachment;
+      })
+      .catch((error) => {
+        setAttachmentFetchState((prev) => ({
+          ...prev,
+          [attachmentId]: { loading: false, error: error.message || 'Image unavailable' },
+        }));
+        throw error;
+      })
+      .finally(() => {
+        attachmentRequestPromisesRef.current.delete(attachmentId);
+      });
+
+    attachmentRequestPromisesRef.current.set(attachmentId, request);
+    return request;
+  }, [attachmentCache, onRequestAttachmentBytes]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -1030,6 +1247,9 @@ function ChannelChat({
         assistantName={assistantName}
         scrollContainerRef={scrollContainerRef}
         messagesEndRef={messagesEndRef}
+        attachmentCache={attachmentCache}
+        attachmentFetchState={attachmentFetchState}
+        onRequestAttachment={requestAttachmentBytes}
       />
       <div
         style={{

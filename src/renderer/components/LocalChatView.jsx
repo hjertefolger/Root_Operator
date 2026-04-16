@@ -62,6 +62,7 @@ function LocalChatView({ tunnelState }) {
           content: payload.content,
           ts: payload.ts || new Date().toISOString(),
           attachments: payload.attachments,
+          external_ref: payload.external_ref,
         }]));
         setActivities((prev) => prev.map((item) => (
           item.active
@@ -123,6 +124,23 @@ function LocalChatView({ tunnelState }) {
     if (!result?.success) {
       throw new Error(result?.error || 'Failed to send file');
     }
+  }, [invoke]);
+
+  const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
+    const result = await invoke('FETCH_LOCAL_CHAT_ATTACHMENT_BYTES', {
+      attachmentId,
+      externalRef,
+    });
+
+    if (!result?.success) {
+      throw new Error(result?.error || 'Image unavailable');
+    }
+
+    return {
+      attachmentId: result.attachmentId,
+      bytesBase64: result.bytesBase64,
+      mime: result.mime,
+    };
   }, [invoke]);
 
   const handleToggleAlwaysOnTop = useCallback(async () => {
@@ -219,6 +237,7 @@ function LocalChatView({ tunnelState }) {
         setWaiting={setWaiting}
         onSubmitMessage={handleSubmitMessage}
         onSendFile={handleSendFile}
+        onRequestAttachmentBytes={handleRequestAttachmentBytes}
         canSendOverride={canSend}
       />
     </div>
