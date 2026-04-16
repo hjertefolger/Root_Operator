@@ -128,16 +128,19 @@ test('StopFailure hook marks failed with error reason', async () => {
     store.close();
 });
 
-test('PreToolUse reply increments visible_effect_count', async () => {
+test('PreToolUse reply no longer increments visible_effect_count (PR3: moved to effect-ledger)', async () => {
+    // PR3 moved visible_effect_count increment to the effect-ledger path in
+    // main.js handleReplyRequest(). Hook-based counting was removed to
+    // prevent double-counting (Codex finding #4).
     const { supervisor, hookLog, store } = fixture();
     await supervisor.start();
     const { dispatchId } = supervisor.enqueue({ source: 'channel', chatId: 'c1', payload: 'hi' });
     const outcome = supervisor.awaitOutcome(dispatchId);
     appendHook(hookLog, { hookEventName: 'PreToolUse', toolName: 'reply' });
     appendHook(hookLog, { hookEventName: 'PreToolUse', toolName: 'reply' });
-    // Wait a tick for tailer to read the lines via fs.watchFile poller
-    await waitForCondition(() => store.getDispatch(dispatchId).visible_effect_count >= 2, { timeoutMs: 2000 });
-    assert.equal(store.getDispatch(dispatchId).visible_effect_count, 2);
+    await new Promise(r => setTimeout(r, 300));
+    // visible_effect_count should remain 0 — hook-based increment removed in PR3.
+    assert.equal(store.getDispatch(dispatchId).visible_effect_count, 0);
     appendHook(hookLog, { hookEventName: 'Stop' });
     await outcome;
     await supervisor.shutdown();

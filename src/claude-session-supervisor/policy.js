@@ -63,9 +63,6 @@ function transitionSupervisor(current, event) {
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.VERIFYING:
-            // PR1: we don't implement real _ping yet, but the transition exists
-            // so the wiring through orchestrator.js is future-proof. PR1 treats
-            // verifying as "done" the moment bridge connects (skip=true).
             if (event === 'verify_ok' || event === 'verify_skipped') return { ok: true, next: T.IDLE };
             if (event === 'verify_failed') return { ok: true, next: T.RESPAWNING };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };

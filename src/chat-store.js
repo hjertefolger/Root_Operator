@@ -14,6 +14,9 @@ class ChatStore {
         this.filePath = path.join(userDataPath, filename);
         this.tmpPath = this.filePath + '.tmp';
         this._appendCount = 0;
+        // PR3: in-memory index for O(1) reconcile lookups by external_ref.
+        // Built lazily on first findByExternalRef() call.
+        this._externalRefIndex = null;
     }
 
     /**
@@ -76,13 +79,36 @@ class ChatStore {
 
     /**
      * Append + truncate every 50 writes.
+     * @param {object} msg - message with role, content, ts
+     * @param {object} [opts]
+     * @param {string} [opts.externalRef] - PR3: supervisor effect_id for reconcile
      */
-    addMessage(msg) {
-        this.appendMessage(msg);
+    addMessage(msg, { externalRef } = {}) {
+        const record = externalRef ? { ...msg, external_ref: externalRef } : msg;
+        this.appendMessage(record);
+        // Invalidate the in-memory index so the next lookup rebuilds it.
+        if (externalRef) this._externalRefIndex = null;
         this._appendCount++;
         if (this._appendCount % 50 === 0) {
             this.truncateIfNeeded();
         }
+    }
+
+    /**
+     * PR3: Find a message by its external_ref (supervisor effect_id).
+     * Returns the message object or null. Used by boot-time reconcile (PR4).
+     */
+    findByExternalRef(ref) {
+        if (!ref) return null;
+        if (!this._externalRefIndex) {
+            this._externalRefIndex = new Map();
+            for (const msg of this.loadMessages()) {
+                if (msg.external_ref) {
+                    this._externalRefIndex.set(msg.external_ref, msg);
+                }
+            }
+        }
+        return this._externalRefIndex.get(ref) || null;
     }
 
     /**
