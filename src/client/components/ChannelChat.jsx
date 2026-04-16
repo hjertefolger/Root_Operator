@@ -408,7 +408,7 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, uploadProgress, onAbortUpload, draftStorageKey }) {
+const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, uploadProgress, onAbortUpload, draftStorageKey, focusInputKey = 0 }) {
   const [input, setInput] = useState(() => loadStoredDraft(draftStorageKey));
   const [isSending, setIsSending] = useState(false);
   const [pendingFiles, setPendingFiles] = useState([]);
@@ -438,6 +438,12 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
 
     setInput(loadStoredDraft(draftStorageKey));
   }, [draftStorageKey]);
+
+  useEffect(() => {
+    if (focusInputKey > 0) {
+      textareaRef.current?.focus();
+    }
+  }, [focusInputKey]);
 
   useEffect(() => {
     const ta = textareaRef.current;
@@ -710,6 +716,7 @@ function ChannelChat({
   canSendOverride,
   draftStorageKey = '',
   forceScrollToBottomKey = 0,
+  focusInputKey = 0,
 }) {
   const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -973,6 +980,7 @@ function ChannelChat({
         uploadProgress={uploadProgress}
         onAbortUpload={onAbortUpload}
         draftStorageKey={draftStorageKey}
+        focusInputKey={focusInputKey}
       />
     </div>
   );

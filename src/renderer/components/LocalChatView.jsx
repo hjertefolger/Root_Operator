@@ -37,6 +37,7 @@ function LocalChatView({ tunnelState }) {
   const [waiting, setWaiting] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [forceScrollToBottomKey, setForceScrollToBottomKey] = useState(0);
+  const [focusInputKey, setFocusInputKey] = useState(0);
 
   useEffect(() => {
     let mounted = true;
@@ -67,6 +68,7 @@ function LocalChatView({ tunnelState }) {
     });
     const offShown = on('LOCAL_CHAT_WINDOW_SHOWN', () => {
       setForceScrollToBottomKey((prev) => prev + 1);
+      setFocusInputKey((prev) => prev + 1);
     });
 
     async function loadInitialState() {
@@ -199,6 +201,7 @@ function LocalChatView({ tunnelState }) {
       <ChannelChat
         assistantName={channelStatus?.assistantName || 'Operator'}
         forceScrollToBottomKey={forceScrollToBottomKey}
+        focusInputKey={focusInputKey}
         messages={messages}
         setMessages={setMessages}
         activities={activities}
