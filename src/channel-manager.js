@@ -125,6 +125,11 @@ class ChannelManager extends EventEmitter {
             return;
         }
 
+        if (msg.type === 'reply_request') {
+            this.emit('reply_request', msg);
+            return;
+        }
+
         if (msg.type === 'bridge_ready') {
             this.bridgeReady = true;
             this.lastBridgeReadyTs = Date.now();
@@ -198,6 +203,21 @@ class ChannelManager extends EventEmitter {
 
         try {
             this.socket.write(payload);
+        } catch {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * PR3: Send an arbitrary structured JSON message to the bridge.
+     * Used for activate_dispatch and future protocol messages.
+     * Returns true on success, false if bridge is unavailable.
+     */
+    sendStructuredMessage(msg) {
+        if (!this.socket || !this.connected) return false;
+        try {
+            this.socket.write(JSON.stringify(msg) + '\n');
         } catch {
             return false;
         }

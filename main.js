@@ -3140,6 +3140,12 @@ function initChannelMode() {
     // Connect to channel bridge IPC
     channelManager = new ChannelManager();
 
+    // PR3: reply_request from bridge (effect-ledger path). Replaces fire-and-forget claude_reply.
+    channelManager.on('reply_request', (req) => {
+        handleReplyRequest(req);
+    });
+
+    // Legacy claude_reply kept as fallback for bridge protocol mismatch.
     channelManager.on('claude_reply', (reply) => {
         const msg = {
             type: 'channel_message',
@@ -3147,24 +3153,18 @@ function initChannelMode() {
             content: reply.text,
             ts: reply.ts || new Date().toISOString(),
         };
-
-        // Store in history (file-backed)
         chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
-
         if (dynamicMemory && dynamicMemory.isEnabled()) {
             const replyChatId = reply.chat_id || reply.chatId || null;
             dynamicMemory.indexMessage('assistant', msg.content, replyChatId).catch((err) => {
                 logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
             });
         }
-
-        // Send to all connected clients
         for (const client of activeClients) {
             if (client.readyState === WebSocket.OPEN) {
                 sendEncryptedOutput(client, JSON.stringify(msg));
             }
         }
-
         sendLocalChatEvent(msg);
         notifyAssistantReply(msg);
         scheduleChannelIdle();
@@ -3313,12 +3313,13 @@ function initChannelMode() {
             incidents: supervisorIncidents,
             channelManager,
             hookLogPath: supervisorHookLog,
+            enableProbe: true,
         });
         supervisor.start().catch((err) => {
             logDebug(`[SUPERVISOR] start failed: ${err.message}`);
             supervisor = null;
         });
-        logDebug('[SUPERVISOR] observe-only mode active (PR1)');
+        logDebug('[SUPERVISOR] PR3 effect-ledger mode active');
     } catch (err) {
         logDebug(`[SUPERVISOR] init failed: ${err.message} — scheduler will use legacy path`);
         supervisor = null;
@@ -3338,10 +3339,133 @@ function initChannelMode() {
     spawnClaudeCode();
 }
 
+/**
+ * PR3: Handle reply_request from bridge. Full effect-ledger prepare→commit cycle.
+ * Ordering contract (§3.4 / Codex finding #3):
+ *   1. insertPreparedEffect (SQLite)
+ *   2. chatStore.addMessage with external_ref baked in (JSONL append, atomic)
+ *   3. dynamicMemory.indexMessage with externalRef (SQLite)
+ *   4. WebSocket fan-out + notifications (non-durable)
+ *   5. markEffectCommitted (only after 2+3 succeed)
+ *   6. incrementVisibleEffect
+ *   7. reply_response to bridge
+ */
+async function handleReplyRequest(req) {
+    const { callId, dispatch_id, ordinal, chat_id, text, ts } = req;
+    const effectId = dispatch_id ? `reply:${dispatch_id}:${ordinal}` : null;
+    const replyTs = ts || new Date().toISOString();
+
+    try {
+        // Step 1: prepare effect row (if supervisor store is available)
+        if (supervisorStore && effectId) {
+            try {
+                supervisorStore.insertPreparedEffect({
+                    effectId,
+                    dispatchId: dispatch_id,
+                    ordinal: ordinal || 0,
+                    kind: 'reply',
+                    preparedAt: Date.now(),
+                });
+            } catch (err) {
+                // UNIQUE constraint = effect already prepared (replay). Carry on.
+                if (!/UNIQUE/i.test(err.message)) {
+                    logDebug(`[SUPERVISOR] insertPreparedEffect failed: ${err.message}`);
+                }
+            }
+        }
+
+        // Step 2: ChatStore write with external_ref
+        const msg = {
+            type: 'channel_message',
+            role: 'assistant',
+            content: text,
+            ts: replyTs,
+        };
+        chatStore.addMessage(
+            { role: msg.role, content: msg.content, ts: msg.ts },
+            { externalRef: effectId },
+        );
+
+        // Step 3: dynamic-memory index with external_ref
+        if (dynamicMemory && dynamicMemory.isEnabled()) {
+            dynamicMemory.indexMessage('assistant', text, chat_id || null, {
+                externalRef: effectId,
+            }).catch((err) => {
+                logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
+            });
+        }
+
+        // Step 4: WebSocket fan-out + notifications
+        for (const client of activeClients) {
+            if (client.readyState === WebSocket.OPEN) {
+                sendEncryptedOutput(client, JSON.stringify(msg));
+            }
+        }
+        sendLocalChatEvent(msg);
+        notifyAssistantReply(msg);
+        scheduleChannelIdle();
+
+        // Step 5: mark effect committed
+        if (supervisorStore && effectId) {
+            try {
+                supervisorStore.markEffectCommitted(effectId, Date.now());
+            } catch (err) {
+                logDebug(`[SUPERVISOR] markEffectCommitted failed: ${err.message}`);
+            }
+        }
+
+        // Step 6: increment visible effect count
+        if (supervisorStore && dispatch_id) {
+            try {
+                supervisorStore.incrementVisibleEffect(dispatch_id);
+            } catch (err) {
+                logDebug(`[SUPERVISOR] incrementVisibleEffect failed: ${err.message}`);
+            }
+        }
+
+        // Step 7: reply_response to bridge
+        channelManager?.sendStructuredMessage({
+            type: 'reply_response',
+            callId,
+            chat_id,
+            isError: false,
+        });
+    } catch (err) {
+        logDebug(`[REPLY] handleReplyRequest failed: ${err.message}`);
+        channelManager?.sendStructuredMessage({
+            type: 'reply_response',
+            callId,
+            chat_id,
+            isError: true,
+            error: err.message,
+        });
+    }
+}
+
 async function handleSchedulerRequest(req) {
     if (!scheduler) {
         channelManager?.sendSchedulerResponse(req.callId, 'Scheduler not initialized', true);
         return;
+    }
+
+    const { dispatch_id, ordinal } = req;
+    const effectId = dispatch_id ? `scheduler_tool:${dispatch_id}:${ordinal}` : null;
+
+    // PR3: prepare effect before executing the scheduler operation.
+    if (supervisorStore && effectId) {
+        try {
+            supervisorStore.insertPreparedEffect({
+                effectId,
+                dispatchId: dispatch_id,
+                ordinal: ordinal || 0,
+                kind: 'scheduler_tool',
+                preparedAt: Date.now(),
+            });
+        } catch (err) {
+            if (!/UNIQUE/i.test(err.message)) {
+                logDebug(`[SUPERVISOR] scheduler insertPreparedEffect failed: ${err.message}`);
+            }
+        }
     }
 
     try {
@@ -3394,6 +3518,16 @@ async function handleSchedulerRequest(req) {
 
             default:
                 result = `Unknown scheduler tool: ${req.tool}`;
+        }
+
+        // PR3: mark effect committed after successful execution.
+        if (supervisorStore && effectId) {
+            try {
+                supervisorStore.markEffectCommitted(effectId, Date.now());
+                if (dispatch_id) supervisorStore.incrementVisibleEffect(dispatch_id);
+            } catch (err) {
+                logDebug(`[SUPERVISOR] scheduler markEffectCommitted failed: ${err.message}`);
+            }
         }
 
         channelManager?.sendSchedulerResponse(req.callId, result, false);

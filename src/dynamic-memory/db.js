@@ -166,7 +166,7 @@ function contentExists(db, content) {
 
 /**
  * Insert a memory. Returns { id, isDuplicate }.
- * memory: { content, embedding (Float32Array), chatId, sourceRole, timestamp (Date) }
+ * memory: { content, embedding (Float32Array), chatId, sourceRole, timestamp (Date), externalRef? }
  */
 function insertMemory(db, memory) {
     const hash = hashContent(memory.content);
@@ -178,8 +178,8 @@ function insertMemory(db, memory) {
 
     const info = db
         .prepare(
-            `INSERT INTO memories (content, content_hash, embedding, chat_id, source_role, timestamp)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO memories (content, content_hash, embedding, chat_id, source_role, timestamp, external_ref)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
             memory.content,
@@ -188,6 +188,7 @@ function insertMemory(db, memory) {
             memory.chatId == null ? null : memory.chatId,
             memory.sourceRole,
             (memory.timestamp instanceof Date ? memory.timestamp : new Date(memory.timestamp)).toISOString(),
+            memory.externalRef || null,
         );
 
     return { id: Number(info.lastInsertRowid), isDuplicate: false };

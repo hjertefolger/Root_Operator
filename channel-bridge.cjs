@@ -25,6 +25,11 @@ let shuttingDown = false;
 // supervisor waiting for a bridge_ready event that will never come again.
 let mcpReadyTs = null;
 
+// PR3: per-dispatch ordinal counter (§N-v4.6). Reset to 0 when supervisor
+// sends activate_dispatch. Incremented BEFORE each side-effecting tool call.
+let activeDispatchId = null;
+let dispatchOrdinal = 0;
+
 function emitToElectron(payload) {
   if (!electronSocket || electronSocket.destroyed) {
     return;
@@ -126,70 +131,103 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['id'],
       },
     },
+    {
+      name: '_ping',
+      description: 'Internal health check. Call this when asked to verify spawn.',
+      inputSchema: { type: 'object', properties: {} },
+    },
   ],
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === 'reply') {
+  const toolName = request.params.name;
+
+  // PR3: _ping — local-only health check, no IPC round-trip.
+  if (toolName === '_ping') {
+    return {
+      content: [{ type: 'text', text: 'pong' }],
+    };
+  }
+
+  // PR3: increment ordinal BEFORE any side-effecting tool call.
+  const ordinal = ++dispatchOrdinal;
+
+  if (toolName === 'reply') {
     const { chat_id, text } = request.params.arguments;
 
-    if (electronSocket && !electronSocket.destroyed) {
-      emitToElectron({
-        type: 'claude_activity',
-        phase: 'replying',
-        label: 'Sending reply',
-        detail: 'Claude is sending the final answer back to chat.',
-        toolName: 'reply',
-        ts: new Date().toISOString(),
-      });
+    // PR3: reply is now request/response through the effect ledger.
+    // Forward to Electron, await commit confirmation.
+    emitToElectron({
+      type: 'claude_activity',
+      phase: 'replying',
+      label: 'Sending reply',
+      detail: 'Claude is sending the final answer back to chat.',
+      toolName: 'reply',
+      ts: new Date().toISOString(),
+    });
 
-      emitToElectron({
-        type: 'claude_reply',
-        chat_id,
-        text,
-        ts: new Date().toISOString(),
-      });
-
-      return {
-        content: [
-          { type: 'text', text: `Reply sent to device ${chat_id}` },
-        ],
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: 'Error: No Electron connection available',
-        },
-      ],
-      isError: true,
-    };
+    return handleReplyRequest(chat_id, text, ordinal);
   }
 
   // --- Scheduler tools: forward to Electron and await response ---
   const schedulerTools = ['ro_schedule', 'ro_list_schedules', 'ro_delete_schedule', 'ro_toggle_schedule', 'ro_run_now'];
-  if (schedulerTools.includes(request.params.name)) {
-    return handleSchedulerTool(request.params.name, request.params.arguments || {});
+  if (schedulerTools.includes(toolName)) {
+    return handleSchedulerTool(toolName, request.params.arguments || {}, ordinal);
   }
 
   return {
     content: [
       {
         type: 'text',
-        text: `Unknown tool: ${request.params.name}`,
+        text: `Unknown tool: ${toolName}`,
       },
     ],
     isError: true,
   };
 });
 
+// --- PR3: Reply request/response (effect-ledger path) ---
+let replyCallbacks = new Map();
+let replyCallId = 0;
+
+function handleReplyRequest(chatId, text, ordinal) {
+  return new Promise((resolve) => {
+    if (!electronSocket || electronSocket.destroyed) {
+      resolve({
+        content: [{ type: 'text', text: 'Error: No Electron connection available' }],
+        isError: true,
+      });
+      return;
+    }
+
+    const callId = ++replyCallId;
+    const timeout = setTimeout(() => {
+      replyCallbacks.delete(callId);
+      resolve({
+        content: [{ type: 'text', text: 'Error: Reply request timed out' }],
+        isError: true,
+      });
+    }, 15000);
+
+    replyCallbacks.set(callId, { resolve, timeout });
+
+    emitToElectron({
+      type: 'reply_request',
+      callId,
+      dispatch_id: activeDispatchId,
+      ordinal,
+      chat_id: chatId,
+      text,
+      ts: new Date().toISOString(),
+    });
+  });
+}
+
 // --- Scheduler tool forwarding ---
 let schedulerCallbacks = new Map();
 let schedulerCallId = 0;
 
-function handleSchedulerTool(toolName, args) {
+function handleSchedulerTool(toolName, args, ordinal) {
   return new Promise((resolve) => {
     if (!electronSocket || electronSocket.destroyed) {
       resolve({
@@ -213,6 +251,8 @@ function handleSchedulerTool(toolName, args) {
     emitToElectron({
       type: 'scheduler_request',
       callId,
+      dispatch_id: activeDispatchId,
+      ordinal,
       tool: toolName,
       args,
       ts: new Date().toISOString(),
@@ -315,6 +355,33 @@ function shutdown(signal = 'shutdown') {
 }
 
 async function handleElectronMessage(msg) {
+  // PR3: supervisor tells bridge which dispatch is active so ordinal resets.
+  if (msg.type === 'activate_dispatch') {
+    activeDispatchId = msg.dispatch_id || null;
+    dispatchOrdinal = 0;
+    return;
+  }
+
+  // PR3: reply committed by main.js, resolve the pending reply call.
+  if (msg.type === 'reply_response') {
+    const cb = replyCallbacks.get(msg.callId);
+    if (cb) {
+      clearTimeout(cb.timeout);
+      replyCallbacks.delete(msg.callId);
+      if (msg.isError) {
+        cb.resolve({
+          content: [{ type: 'text', text: msg.error || 'Reply commit failed' }],
+          isError: true,
+        });
+      } else {
+        cb.resolve({
+          content: [{ type: 'text', text: `Reply sent to device ${msg.chat_id || '?'}` }],
+        });
+      }
+    }
+    return;
+  }
+
   if (msg.type === 'scheduler_response') {
     const cb = schedulerCallbacks.get(msg.callId);
     if (cb) {

@@ -53,7 +53,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
      * @param {() => number} [deps.clock]
      * @param {string} [deps.defaultChatId] chat_id used for scheduler-origin dispatches
      */
-    constructor({ store, runtime, incidents, channelManager, hookLogPath, clock, defaultChatId }) {
+    constructor({ store, runtime, incidents, channelManager, hookLogPath, clock, defaultChatId, enableProbe = false }) {
         super();
         if (!store) throw new Error('supervisor requires store');
         if (!runtime) throw new Error('supervisor requires runtime');
@@ -68,6 +68,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this.hookLogPath = hookLogPath;
         this.clock = clock || Date.now;
         this.defaultChatId = defaultChatId || '__supervisor__';
+        this._enableProbe = enableProbe;
 
         this.state = STATES.STOPPED;
         this.epoch = runtime.currentEpoch;
@@ -93,8 +94,11 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     /**
      * Start the supervisor. Transitions through STARTING -> VERIFYING -> IDLE.
-     * PR1: verify is skipped (verify_skipped event) since _ping tool is not in
-     * the bridge yet — that's PR3.
+     * PR3: after reaching IDLE, a probe dispatch verifies Claude can complete
+     * a turn end-to-end. The probe runs as a normal dispatch (source='probe')
+     * and does NOT block external dispatches — it's observational. If the probe
+     * completes, we log verify_ok. If it fails, we log verify_failed but the
+     * system remains functional.
      */
     async start() {
         const now = this.clock();
@@ -104,13 +108,38 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         this._startTailer();
         this._subscribeBridgeReady();
+
         this.incidents.record({
             kind: 'supervisor_started',
             stateFrom: STATES.STOPPED,
-            stateTo: STATES.IDLE,
+            stateTo: this.state,
             epoch: this.epoch,
-            details: { hook_log_path: this.hookLogPath, pr2_self_heal: true },
+            details: { hook_log_path: this.hookLogPath, pr3_effect_ledger: true },
         });
+
+        // PR3: fire-and-forget probe dispatch for spawn verification.
+        // Non-blocking — external dispatches can proceed immediately.
+        // The probe proves the bridge can mediate a full turn to Stop.
+        // Gated by enableProbe (off in tests, on in production).
+        if (this._enableProbe) {
+            try {
+                const { dispatchId } = this.enqueue({
+                    source: 'probe',
+                    payload: '[system] Verify spawn by calling _ping tool now.',
+                    silenceMs: 15000,
+                });
+                this.awaitOutcome(dispatchId).then((outcome) => {
+                    if (this._shutdown) return;
+                    this.incidents.record({
+                        kind: outcome.state === 'completed' ? 'verify_ok' : 'verify_probe_failed',
+                        epoch: this.epoch,
+                        details: { outcome },
+                    });
+                }).catch(() => { /* shutdown race — ignore */ });
+            } catch (_) {
+                // enqueue may fail if hardFailed/shutdown. Non-fatal.
+            }
+        }
     }
 
     /**
@@ -321,6 +350,16 @@ class ClaudeSessionSupervisor extends EventEmitter {
             return;
         }
 
+        // PR3: tell the bridge which dispatch is now active so it can reset
+        // its ordinal counter. Best-effort — if this fails, ordinals default
+        // to the previous counter state (degraded but non-fatal).
+        if (typeof this.channelManager.sendStructuredMessage === 'function') {
+            this.channelManager.sendStructuredMessage({
+                type: 'activate_dispatch',
+                dispatch_id: dispatchId,
+            });
+        }
+
         const activateTs = this.clock();
         this.store.updateDispatchState(dispatchId, {
             state: DISPATCH_STATES.ACTIVE,
@@ -455,9 +494,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._armWedgeTimer(dispatchId, row.silence_ms);
         }
 
-        if (name === 'PreToolUse' && hook.toolName === 'reply') {
-            this.store.incrementVisibleEffect(dispatchId);
-        }
+        // PR3: visible_effect_count is now incremented by the effect-ledger
+        // path in main.js handleReplyRequest(). The old hook-based increment
+        // was removed to prevent double-counting (Codex finding #4).
         if (name === 'Stop') {
             this._completeDispatch(dispatchId, DISPATCH_STATES.COMPLETED, null);
         } else if (name === 'StopFailure') {

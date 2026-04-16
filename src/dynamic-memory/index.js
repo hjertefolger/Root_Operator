@@ -329,7 +329,7 @@ class DynamicMemory {
      * Re-checks this._enabled after each async step so mid-operation disable
      * wastes minimal work.
      */
-    async indexMessage(role, content, chatId) {
+    async indexMessage(role, content, chatId, { externalRef } = {}) {
         if (!this.isEnabled()) return;
         if (typeof content !== 'string' || !content.trim()) return;
 
@@ -392,6 +392,7 @@ class DynamicMemory {
                     chatId: chatId || null,
                     sourceRole: effectiveRole,
                     timestamp: ts,
+                    externalRef: externalRef || null,
                 });
             } catch (err) {
                 // UNIQUE constraint on content_hash is the backstop for races.
