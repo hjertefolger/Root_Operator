@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, ChevronRight, Loader, PenLine, Redo2, SendHorizontal, Trash2, Undo2, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Loader, PenLine, Redo2, Trash2, Undo2, X } from 'lucide-react';
 
 const MAX_SCALE = 6;
 const MIN_SCALE = 1;
@@ -1319,24 +1319,41 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                 type="button"
                 onClick={sendAnnotatedImage}
                 disabled={!canSendAnnotated}
+                // Matches the tray Settings "Save" button styling:
+                // rounded-full, text-xs, px-3 h-7, bg-[#4B5AFF] active /
+                // bg-muted disabled. Inline styles to stay consistent
+                // with the rest of this component.
                 style={{
-                  height: 36,
-                  padding: '0 14px',
+                  height: 28,
+                  padding: '0 12px',
                   borderRadius: 999,
-                  border: '1px solid rgba(75,90,255,0.24)',
-                  background: canSendAnnotated ? 'rgba(75,90,255,0.18)' : 'rgba(255,255,255,0.04)',
-                  color: canSendAnnotated ? '#d7dcff' : 'rgba(255,255,255,0.42)',
+                  border: 'none',
+                  background: canSendAnnotated
+                    ? '#4B5AFF'
+                    : 'rgba(255,255,255,0.06)',
+                  color: canSendAnnotated ? '#ffffff' : 'rgba(255,255,255,0.42)',
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: 8,
+                  gap: 6,
+                  fontSize: 12,
+                  cursor: canSendAnnotated ? 'pointer' : 'default',
+                  transition: 'background-color 200ms ease',
+                }}
+                onMouseEnter={(e) => {
+                  if (canSendAnnotated) {
+                    e.currentTarget.style.background = 'rgba(75,90,255,0.9)';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (canSendAnnotated) {
+                    e.currentTarget.style.background = '#4B5AFF';
+                  }
                 }}
               >
                 {isSending ? (
-                  <Loader size={15} strokeWidth={2.1} className="animate-spin" />
-                ) : (
-                  <SendHorizontal size={15} strokeWidth={2.1} />
-                )}
-                Send Back
+                  <Loader size={13} strokeWidth={2.1} className="animate-spin" />
+                ) : null}
+                {isSending ? 'Saving' : 'Save'}
               </button>
             </div>
           </div>
