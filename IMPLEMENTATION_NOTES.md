@@ -10,7 +10,12 @@
 - Added a WebSocket capability handshake via `client_capabilities { supportsAttachments: true }`.
 - Added downgrade behavior for older clients: assistant text is preserved and attachments become `"[Attachment: <name> — open in a newer client]"`.
 - Added authenticated on-demand fetch via `fetch_attachment_bytes { request_id, attachment_id, external_ref }`, with `attachment_bytes_response` returned over the same E2E wrapper as chat traffic.
-- Updated the shared chat UI (web + desktop local chat) to lazily fetch attachment bytes on first open, cache them in memory, and show loading/error states with retry.
+- Replaced the inline `360px` preview with a shared fullscreen overlay viewer (web + desktop local chat) rendered via portal, with `Escape`, backdrop click, top-right close button, and body-scroll locking.
+- Added message-local attachment navigation inside the fullscreen viewer via keyboard arrow keys plus on-screen prev/next chevrons.
+- Added viewport-fit image scaling with wheel zoom, touch-friendly pinch/pan gestures, and automatic re-fit on resize/orientation changes.
+- Added a canvas-backed annotation layer in the fullscreen viewer with a pen toggle, six color swatches, four stroke widths, undo/redo (`Cmd/Ctrl+Z`, `Cmd/Ctrl+Shift+Z`, `Ctrl+Y`), and clear-all.
+- Stored annotation strokes in source-image coordinates so the overlay stays aligned while zooming/panning and export can composite at the original image resolution.
+- Added `Send back` in the fullscreen viewer: it flattens the current image plus annotations into a PNG, names it `<original>-annotated-<timestamp>.png`, and routes it through the existing inbound file upload path so chat history shows it as a normal user attachment.
 
 ## GC Design
 
