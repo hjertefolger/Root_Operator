@@ -531,12 +531,24 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, uploadProgress, onAbortUpload, draftStorageKey, focusInputKey = 0 }) {
+const ChatComposer = memo(function ChatComposer({
+  canSend,
+  onSend,
+  onSendFile,
+  uploadProgress,
+  onAbortUpload,
+  draftStorageKey,
+  focusInputKey = 0,
+  pendingFiles = [],
+  onAddPendingFiles,
+  onRemovePendingFile,
+  onClearPendingFiles,
+}) {
   const [input, setInput] = useState(() => loadStoredDraft(draftStorageKey));
   const [isSending, setIsSending] = useState(false);
-  const [pendingFiles, setPendingFiles] = useState([]);
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
+  const previousPendingCountRef = useRef(pendingFiles.length);
 
   useEffect(() => {
     if (!draftStorageKey || typeof window === 'undefined') {
@@ -569,6 +581,13 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
   }, [focusInputKey]);
 
   useEffect(() => {
+    if (pendingFiles.length > previousPendingCountRef.current) {
+      textareaRef.current?.focus();
+    }
+    previousPendingCountRef.current = pendingFiles.length;
+  }, [pendingFiles.length]);
+
+  useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = '0px';
@@ -586,7 +605,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
 
     setIsSending(true);
     setInput('');
-    setPendingFiles([]);
+    onClearPendingFiles?.();
     if (textareaRef.current) textareaRef.current.style.height = '0px';
 
     try {
@@ -603,7 +622,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
       setIsSending(false);
       textareaRef.current?.focus();
     }
-  }, [input, pendingFiles, canSend, isSending, onSend, onSendFile]);
+  }, [canSend, input, isSending, onClearPendingFiles, onSend, onSendFile, pendingFiles]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key !== 'Enter' || e.nativeEvent?.isComposing) {
@@ -631,16 +650,12 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
   const handleFileChange = useCallback((e) => {
     const files = e.target.files;
     if (files?.length) {
-      setPendingFiles(prev => [...prev, ...Array.from(files)]);
+      onAddPendingFiles?.(Array.from(files));
       textareaRef.current?.focus();
     }
     // Reset input so same file can be re-selected
     e.target.value = '';
-  }, []);
-
-  const removePendingFile = useCallback((index) => {
-    setPendingFiles(prev => prev.filter((_, i) => i !== index));
-  }, []);
+  }, [onAddPendingFiles]);
 
   const hasContent = input.trim().length > 0 || pendingFiles.length > 0;
   const isUploading = uploadProgress !== null;
@@ -682,7 +697,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
                   {formatFileSize(file.size)}
                 </span>
                 <button
-                  onClick={() => removePendingFile(i)}
+                  onClick={() => onRemovePendingFile?.(i)}
                   style={{
                     background: 'none', border: 'none', padding: 2, cursor: 'pointer',
                     display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
@@ -857,6 +872,7 @@ function ChannelChat({
   const [attachmentCache, setAttachmentCache] = useState({});
   const [attachmentFetchState, setAttachmentFetchState] = useState({});
   const [viewerState, setViewerState] = useState(null);
+  const [pendingFiles, setPendingFiles] = useState([]);
   const canSend = typeof canSendOverride === 'boolean'
     ? canSendOverride
     : Boolean(socket && e2eReady);
@@ -982,6 +998,22 @@ function ChannelChat({
 
   const closeAttachmentViewer = useCallback(() => {
     setViewerState(null);
+  }, []);
+
+  const addPendingFiles = useCallback((files) => {
+    const nextFiles = (Array.isArray(files) ? files : [files]).filter((file) => file instanceof File);
+    if (nextFiles.length === 0) {
+      return;
+    }
+    setPendingFiles((prev) => [...prev, ...nextFiles]);
+  }, []);
+
+  const removePendingFile = useCallback((index) => {
+    setPendingFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
+  }, []);
+
+  const clearPendingFiles = useCallback(() => {
+    setPendingFiles([]);
   }, []);
 
   useEffect(() => {
@@ -1168,6 +1200,10 @@ function ChannelChat({
     await handleSendFile(file, '');
   }, [handleSendFile]);
 
+  const handleQueueAnnotatedAttachment = useCallback(async (file) => {
+    addPendingFiles(file);
+  }, [addPendingFiles]);
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000', position: 'relative' }}>
       <ChatMessages
@@ -1240,6 +1276,10 @@ function ChannelChat({
         onAbortUpload={onAbortUpload}
         draftStorageKey={draftStorageKey}
         focusInputKey={focusInputKey}
+        pendingFiles={pendingFiles}
+        onAddPendingFiles={addPendingFiles}
+        onRemovePendingFile={removePendingFile}
+        onClearPendingFiles={clearPendingFiles}
       />
       {viewerState && (
         <AttachmentViewerOverlay
@@ -1250,6 +1290,7 @@ function ChannelChat({
           attachmentCache={attachmentCache}
           attachmentFetchState={attachmentFetchState}
           onRequestAttachment={requestAttachmentBytes}
+          onQueueAnnotatedAttachment={onSendFile ? handleQueueAnnotatedAttachment : undefined}
           onSendAnnotatedAttachment={onSendFile ? handleSendAnnotatedAttachment : undefined}
           onClose={closeAttachmentViewer}
         />

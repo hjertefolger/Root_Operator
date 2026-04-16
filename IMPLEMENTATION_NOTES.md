@@ -15,7 +15,7 @@
 - Added viewport-fit image scaling with wheel zoom, touch-friendly pinch/pan gestures, and automatic re-fit on resize/orientation changes.
 - Added a canvas-backed annotation layer in the fullscreen viewer with a pen toggle, six color swatches, four stroke widths, undo/redo (`Cmd/Ctrl+Z`, `Cmd/Ctrl+Shift+Z`, `Ctrl+Y`), and clear-all.
 - Stored annotation strokes in source-image coordinates so the overlay stays aligned while zooming/panning and export can composite at the original image resolution.
-- Added `Send back` in the fullscreen viewer: it flattens the current image plus annotations into a PNG, names it `<original>-annotated-<timestamp>.png`, and routes it through the existing inbound file upload path so chat history shows it as a normal user attachment.
+- Added `Send back` in the fullscreen viewer: it flattens the current image plus annotations into a PNG, names it `<original>-annotated-<timestamp>.png`, and queues it into the same pending attachment composer state as normal user uploads so the user can add an optional caption before sending.
 
 ## GC Design
 

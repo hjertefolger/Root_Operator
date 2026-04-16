@@ -154,6 +154,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   attachmentCache,
   attachmentFetchState,
   onRequestAttachment,
+  onQueueAnnotatedAttachment,
   onSendAnnotatedAttachment,
   onClose,
 }) {
@@ -196,10 +197,11 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const strokes = currentAnnotations.strokes || EMPTY_ANNOTATIONS.strokes;
   const redoStack = currentAnnotations.redo || EMPTY_ANNOTATIONS.redo;
   const hasAnnotations = strokes.length > 0;
+  const annotatedAttachmentHandler = onQueueAnnotatedAttachment || onSendAnnotatedAttachment;
   const canSendAnnotated = Boolean(
     hasAnnotations
     && !isSending
-    && typeof onSendAnnotatedAttachment === 'function'
+    && typeof annotatedAttachmentHandler === 'function'
     && imageRef.current
     && naturalSize.width > 0
     && naturalSize.height > 0
@@ -398,14 +400,14 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
         lastModified: Date.now(),
       });
 
-      await onSendAnnotatedAttachment?.(file);
+      await annotatedAttachmentHandler?.(file);
       onClose?.();
       return;
     } catch (error) {
       setSendError(error?.message || 'Failed to send annotated image');
       setIsSending(false);
     }
-  }, [activeAttachment?.name, canSendAnnotated, naturalSize.height, naturalSize.width, onClose, onSendAnnotatedAttachment, strokes]);
+  }, [activeAttachment?.name, annotatedAttachmentHandler, canSendAnnotated, naturalSize.height, naturalSize.width, onClose, strokes]);
 
   useEffect(() => {
     setActiveIndex(initialIndex);
@@ -864,7 +866,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               minWidth: 0,
               maxWidth: 'min(520px, 100%)',
               padding: '12px 14px',
-              borderRadius: 16,
+              borderRadius: 999,
               background: 'rgba(16,16,16,0.82)',
               border: '1px solid rgba(255,255,255,0.08)',
               boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
