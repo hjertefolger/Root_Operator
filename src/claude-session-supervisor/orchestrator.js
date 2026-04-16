@@ -232,6 +232,25 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._clearActiveSafetyTimer();
         this._clearActiveWedgeTimer();
         this._unsubscribeBridgeReady();
+        // Terminalize any in-flight dispatch so it doesn't look permanently active
+        if (this.activeDispatch) {
+            const dispatchId = this.activeDispatch.dispatchId;
+            try {
+                this.store.updateDispatchState(dispatchId, {
+                    state: DISPATCH_STATES.ABANDONED,
+                    terminalAt: this.clock(),
+                    lastError: 'shutdown_while_active',
+                });
+                this.incidents.record({
+                    kind: 'dispatch_abandoned',
+                    dispatchId,
+                    epoch: this.epoch,
+                    details: { error: 'shutdown_while_active' },
+                    occurredAt: this.clock(),
+                });
+            } catch (_) { /* best-effort during shutdown */ }
+            this.activeDispatch = null;
+        }
         this._dispatchAwaitingReplay = null;
         for (const [, waiters] of this.pendingResolvers) {
             for (const w of waiters) w.reject(new Error('supervisor shutdown'));

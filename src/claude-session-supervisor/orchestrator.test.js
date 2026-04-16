@@ -539,6 +539,18 @@ test('PR2: notifyClaudeExited during active → respawning + awaiting replay', a
     store.close();
 });
 
+test('shutdown with active dispatch marks it abandoned', async () => {
+    const { supervisor, store } = fixturePR2();
+    await supervisor.start();
+    const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'long-job', silenceMs: 300_000 });
+    assert.equal(supervisor.state, STATES.DISPATCHING);
+    await supervisor.shutdown();
+    const row = store.getDispatch(dispatchId);
+    assert.equal(row.state, DISPATCH_STATES.ABANDONED, 'in-flight dispatch must be abandoned on shutdown');
+    assert.match(row.last_error || '', /shutdown_while_active/);
+    store.close();
+});
+
 test('PR2: notifyClaudeExited with no active dispatch is a no-op', async () => {
     const { supervisor, store } = fixturePR2();
     await supervisor.start();
