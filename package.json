@@ -148,6 +148,8 @@
       "src/workspace.js",
       "src/updater.js",
       "src/dynamic-memory/**/*",
+      "src/claude-session-supervisor/**/*",
+      "!src/claude-session-supervisor/**/*.test.js",
       "tray_*.png",
       "ui/**/*",
       "public/dist/**/*",
