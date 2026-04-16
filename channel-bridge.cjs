@@ -187,6 +187,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // --- PR3: Reply request/response (effect-ledger path) ---
+//
+// No wall-clock timeouts on reply or scheduler tool calls. The previous 15s/10s
+// timeouts created a duplicate-effect hole: if main.js's commit cycle (or a
+// scheduler job's full execution) exceeded the timeout, the bridge resolved the
+// tool call as an error while the effect actually completed — Claude would see
+// failure, retry, and emit a second effect with a fresh ordinal that bypassed
+// any (dispatch_id, ordinal) dedupe. Scheduler jobs in particular run 5–30 min
+// (Night Lab budget = 30 min) — a 10s wall clock guaranteed false-error retries.
+//
+// Failure modes we DO surface:
+//   - No IPC connection at call time → immediate error.
+//   - IPC close/error while a call is pending → resolve all pending callbacks
+//     as transport errors (see `failPendingCallbacks` below).
+//
+// If main.js wedges *with* the IPC socket up, the call hangs forever. That is
+// strictly better than a false retry: the supervisor's own wedge timer will
+// detect the silence and self-heal at the dispatch level.
 let replyCallbacks = new Map();
 let replyCallId = 0;
 
@@ -201,15 +218,7 @@ function handleReplyRequest(chatId, text, ordinal) {
     }
 
     const callId = ++replyCallId;
-    const timeout = setTimeout(() => {
-      replyCallbacks.delete(callId);
-      resolve({
-        content: [{ type: 'text', text: 'Error: Reply request timed out' }],
-        isError: true,
-      });
-    }, 15000);
-
-    replyCallbacks.set(callId, { resolve, timeout });
+    replyCallbacks.set(callId, { resolve });
 
     emitToElectron({
       type: 'reply_request',
@@ -238,15 +247,7 @@ function handleSchedulerTool(toolName, args, ordinal) {
     }
 
     const callId = ++schedulerCallId;
-    const timeout = setTimeout(() => {
-      schedulerCallbacks.delete(callId);
-      resolve({
-        content: [{ type: 'text', text: 'Error: Scheduler request timed out' }],
-        isError: true,
-      });
-    }, 10000);
-
-    schedulerCallbacks.set(callId, { resolve, timeout });
+    schedulerCallbacks.set(callId, { resolve });
 
     emitToElectron({
       type: 'scheduler_request',
@@ -258,6 +259,29 @@ function handleSchedulerTool(toolName, args, ordinal) {
       ts: new Date().toISOString(),
     });
   });
+}
+
+// Resolve all in-flight reply/scheduler callbacks with a transport error.
+// Called when the IPC socket closes or errors out while calls are pending —
+// without this, `Map`s would retain unresolved promises forever.
+function failPendingCallbacks(reason) {
+  const replyError = `Error: Bridge transport closed: ${reason}`;
+  for (const [, cb] of replyCallbacks) {
+    cb.resolve({
+      content: [{ type: 'text', text: replyError }],
+      isError: true,
+    });
+  }
+  replyCallbacks.clear();
+
+  const schedError = `Error: Bridge transport closed: ${reason}`;
+  for (const [, cb] of schedulerCallbacks) {
+    cb.resolve({
+      content: [{ type: 'text', text: schedError }],
+      isError: true,
+    });
+  }
+  schedulerCallbacks.clear();
 }
 
 function startIPCServer() {
@@ -310,10 +334,12 @@ function startIPCServer() {
     socket.on('close', () => {
       console.error('[channel-bridge] Electron disconnected');
       electronSocket = null;
+      failPendingCallbacks('socket closed');
     });
 
     socket.on('error', (error) => {
       console.error(`[channel-bridge] IPC socket error: ${error.message}`);
+      failPendingCallbacks(error.message);
     });
   });
 
@@ -366,7 +392,6 @@ async function handleElectronMessage(msg) {
   if (msg.type === 'reply_response') {
     const cb = replyCallbacks.get(msg.callId);
     if (cb) {
-      clearTimeout(cb.timeout);
       replyCallbacks.delete(msg.callId);
       if (msg.isError) {
         cb.resolve({
@@ -385,7 +410,6 @@ async function handleElectronMessage(msg) {
   if (msg.type === 'scheduler_response') {
     const cb = schedulerCallbacks.get(msg.callId);
     if (cb) {
-      clearTimeout(cb.timeout);
       schedulerCallbacks.delete(msg.callId);
       cb.resolve({
         content: [{ type: 'text', text: msg.result }],
