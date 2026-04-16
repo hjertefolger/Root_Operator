@@ -3386,13 +3386,21 @@ async function handleReplyRequest(req) {
             { externalRef: effectId },
         );
 
-        // Step 3: dynamic-memory index with external_ref
+        // Step 3: dynamic-memory index with external_ref.
+        // MUST be awaited before markEffectCommitted (Codex critical finding):
+        // if marked committed but dynamic-memory write never lands, reconcile
+        // skips re-indexing and the assistant message is lost from memory forever.
         if (dynamicMemory && dynamicMemory.isEnabled()) {
-            dynamicMemory.indexMessage('assistant', text, chat_id || null, {
-                externalRef: effectId,
-            }).catch((err) => {
+            try {
+                await dynamicMemory.indexMessage('assistant', text, chat_id || null, {
+                    externalRef: effectId,
+                });
+            } catch (err) {
                 logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
-            });
+                // Non-fatal: ChatStore has the message. Dynamic-memory is
+                // best-effort — failing here means the message won't appear
+                // in memory-context retrieval, but it IS in chat history.
+            }
         }
 
         // Step 4: WebSocket fan-out + notifications
