@@ -113,6 +113,7 @@ if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
 // GLOBAL STATE
 let mainWindow;
 let localChatWindow;
+const viewerWindowStateByWebContentsId = new Map();
 let tray;
 let server;
 let wss;
@@ -1213,6 +1214,116 @@ function createLocalChatWindow() {
     return localChatWindow;
 }
 
+function normalizeViewerInitState(payload = {}) {
+    const attachments = Array.isArray(payload.attachments)
+        ? payload.attachments.filter((attachment) => attachment && typeof attachment === 'object')
+        : [];
+    const resolvedInitialIndex = Number.isInteger(payload.initialIndex)
+        ? payload.initialIndex
+        : Number.parseInt(payload.initialIndex, 10);
+    const initialIndex = attachments.length > 0
+        ? Math.max(0, Math.min(Number.isNaN(resolvedInitialIndex) ? 0 : resolvedInitialIndex, attachments.length - 1))
+        : 0;
+
+    return {
+        attachments,
+        externalRef: typeof payload.externalRef === 'string' && payload.externalRef.trim()
+            ? payload.externalRef.trim()
+            : null,
+        initialIndex,
+        parentChatId: typeof payload.parentChatId === 'string' && payload.parentChatId.trim()
+            ? payload.parentChatId.trim()
+            : null,
+    };
+}
+
+function createAttachmentViewerWindow({ attachments, externalRef, initialIndex, parentChatId, parentWindow }) {
+    const viewerWindow = new BrowserWindow({
+        width: 1180,
+        height: 860,
+        minWidth: 720,
+        minHeight: 520,
+        show: false,
+        parent: parentWindow,
+        titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+        backgroundColor: '#0a0b10',
+        title: 'Attachment Viewer',
+        autoHideMenuBar: true,
+        resizable: true,
+        maximizable: true,
+        minimizable: true,
+        fullscreenable: true,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js'),
+            sandbox: true
+        }
+    });
+
+    viewerWindowStateByWebContentsId.set(viewerWindow.webContents.id, {
+        attachments,
+        externalRef,
+        initialIndex,
+        parentChatId,
+        parentWindowId: parentWindow && !parentWindow.isDestroyed() ? parentWindow.id : null,
+    });
+
+    if (isDev) {
+        viewerWindow.loadURL(`http://localhost:${VITE_RENDERER_PORT}/renderer.html?view=viewer`);
+    } else {
+        viewerWindow.loadFile('ui/dist/renderer.html', { search: '?view=viewer' });
+    }
+
+    viewerWindow.once('ready-to-show', () => {
+        if (!viewerWindow.isDestroyed()) {
+            viewerWindow.center();
+            viewerWindow.show();
+            viewerWindow.focus();
+        }
+    });
+
+    viewerWindow.on('closed', () => {
+        viewerWindowStateByWebContentsId.delete(viewerWindow.webContents.id);
+    });
+
+    return viewerWindow;
+}
+
+function getAttachmentViewerContext(event) {
+    const viewerWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!viewerWindow || viewerWindow.isDestroyed()) {
+        throw new Error('Viewer window unavailable');
+    }
+
+    const state = viewerWindowStateByWebContentsId.get(event.sender.id);
+    if (!state) {
+        throw new Error('Viewer state unavailable');
+    }
+
+    const parentWindow = state.parentWindowId ? BrowserWindow.fromId(state.parentWindowId) : null;
+
+    return { viewerWindow, state, parentWindow };
+}
+
+function normalizeViewerResultPayload(payload = {}) {
+    if (typeof payload.filename !== 'string' || !payload.filename.trim()) {
+        throw new Error('Viewer filename missing');
+    }
+    if (typeof payload.mimeType !== 'string' || !payload.mimeType.trim()) {
+        throw new Error('Viewer mime type missing');
+    }
+    if (!Array.isArray(payload.data) || payload.data.length === 0) {
+        throw new Error('Viewer image data missing');
+    }
+
+    return {
+        filename: path.basename(payload.filename.trim()),
+        mimeType: payload.mimeType.trim(),
+        data: payload.data.map((value) => Number(value) & 0xff),
+    };
+}
+
 function registerGlobalShortcuts() {
     const startTunnelRegistered = globalShortcut.register('CommandOrControl+Shift+J', async () => {
         if (isConnecting || server || tunnelProcess) {
@@ -2114,10 +2225,16 @@ function scheduleChannelIdle(detail = `${getActivityAssistantName()} is ready fo
     }, CHANNEL_ACTIVITY_IDLE_MS);
 }
 
-function sendLocalChatEvent(payload) {
-    if (localChatWindow && !localChatWindow.isDestroyed()) {
-        localChatWindow.webContents.send('LOCAL_CHAT_EVENT', payload);
+function sendLocalChatEventToWindow(targetWindow, payload) {
+    if (targetWindow && !targetWindow.isDestroyed()) {
+        targetWindow.webContents.send('LOCAL_CHAT_EVENT', payload);
+        return true;
     }
+    return false;
+}
+
+function sendLocalChatEvent(payload) {
+    sendLocalChatEventToWindow(localChatWindow, payload);
 }
 
 function hasStructuredAttachments(message) {
@@ -4018,6 +4135,54 @@ ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
     return { success: true };
 });
 ipcMain.handle('GET_LOCAL_CHAT_STATE', () => getLocalChatState());
+ipcMain.handle('viewer:open', async (event, payload = {}) => {
+    try {
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        if (!parentWindow || parentWindow.isDestroyed()) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        const {
+            attachments,
+            externalRef,
+            initialIndex,
+            parentChatId,
+        } = normalizeViewerInitState(payload);
+
+        if (attachments.length === 0) {
+            throw new Error('Viewer attachments missing');
+        }
+        if (!parentChatId) {
+            throw new Error('Viewer parent chat missing');
+        }
+
+        const viewerWindow = createAttachmentViewerWindow({
+            attachments,
+            externalRef,
+            initialIndex,
+            parentChatId,
+            parentWindow,
+        });
+
+        return { success: true, windowId: viewerWindow.id };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to open attachment viewer' };
+    }
+});
+ipcMain.handle('viewer:get-state', async (event) => {
+    try {
+        const { state } = getAttachmentViewerContext(event);
+        return {
+            success: true,
+            attachments: state.attachments,
+            externalRef: state.externalRef,
+            initialIndex: state.initialIndex,
+            parentChatId: state.parentChatId,
+        };
+    } catch (error) {
+        return { success: false, error: error.message || 'Viewer state unavailable' };
+    }
+});
 ipcMain.handle('FETCH_LOCAL_CHAT_ATTACHMENT_BYTES', async (event, { attachmentId, externalRef } = {}) => {
     const response = buildAttachmentBytesResponsePayload({
         requestId: `desktop-local:${Date.now()}`,
@@ -4103,6 +4268,57 @@ ipcMain.handle('SEND_LOCAL_CHAT_FILE', async (event, { data, filename, mimeType,
     }
     parts.push(`[File attached: ${filename}]\nSaved to: ${destPath}`);
     return await submitChannelUserMessage('desktop-local', parts.join('\n\n'), 'desktop-local');
+});
+ipcMain.handle('viewer:annotated', async (event, payload = {}) => {
+    try {
+        const { state, parentWindow } = getAttachmentViewerContext(event);
+        const file = normalizeViewerResultPayload(payload);
+        const delivered = sendLocalChatEventToWindow(parentWindow, {
+            type: 'viewer_annotated',
+            parentChatId: state.parentChatId,
+            filename: file.filename,
+            mimeType: file.mimeType,
+            data: file.data,
+        });
+
+        if (!delivered) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to return annotated attachment' };
+    }
+});
+ipcMain.handle('viewer:send-back', async (event, payload = {}) => {
+    try {
+        const { state, parentWindow } = getAttachmentViewerContext(event);
+        const file = normalizeViewerResultPayload(payload);
+        const delivered = sendLocalChatEventToWindow(parentWindow, {
+            type: 'viewer_send_back',
+            parentChatId: state.parentChatId,
+            filename: file.filename,
+            mimeType: file.mimeType,
+            data: file.data,
+        });
+
+        if (!delivered) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to send attachment back to chat' };
+    }
+});
+ipcMain.handle('viewer:close', async (event) => {
+    try {
+        const { viewerWindow } = getAttachmentViewerContext(event);
+        viewerWindow.close();
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to close attachment viewer' };
+    }
 });
 ipcMain.handle('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP', () => {
     if (!localChatWindow || localChatWindow.isDestroyed()) {
