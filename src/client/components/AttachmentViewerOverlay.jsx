@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, ChevronRight, Loader, PenLine, Redo2, Trash2, Undo2, X } from 'lucide-react';
+import { ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
 
 const MAX_SCALE = 6;
 const MIN_SCALE = 1;
@@ -147,6 +147,48 @@ function canvasToBlob(canvas) {
   });
 }
 
+function IconButton({ children, onClick, disabled, active, activeStrong, accent, ariaLabel }) {
+  let background = 'transparent';
+  let color = 'rgba(255,255,255,0.82)';
+  if (accent) {
+    background = disabled ? 'rgba(255,255,255,0.06)' : '#4B5AFF';
+    color = disabled ? 'rgba(255,255,255,0.42)' : '#ffffff';
+  } else if (activeStrong && active) {
+    background = '#4B5AFF';
+    color = '#ffffff';
+  } else if (active) {
+    background = 'rgba(75,90,255,0.18)';
+    color = '#c8ceff';
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      aria-pressed={active || undefined}
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: 999,
+        border: 'none',
+        background,
+        color,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        opacity: disabled ? 0.36 : 1,
+        cursor: disabled ? 'default' : 'pointer',
+        padding: 0,
+        transition: 'background-color 160ms ease',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   attachments,
   externalRef,
@@ -178,6 +220,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const [selectedWidth, setSelectedWidth] = useState(STROKE_WIDTHS[1].value);
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState('');
+  const [openPicker, setOpenPicker] = useState(null);
 
   const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
   const activeAttachment = attachmentCount > 0 ? attachments[activeIndex] : null;
@@ -865,84 +908,43 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
         <div
           style={{
             display: 'flex',
-            alignItems: 'flex-start',
+            alignItems: 'center',
             justifyContent: 'space-between',
             gap: 12,
             pointerEvents: 'none',
           }}
         >
-          <div
+          <span
             style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 4,
-              minWidth: 0,
-              maxWidth: 'min(520px, 100%)',
-              padding: '12px 14px',
-              borderRadius: 999,
-              background: 'rgba(16,16,16,0.82)',
-              border: '1px solid rgba(255,255,255,0.08)',
-              boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
-              backdropFilter: 'blur(14px)',
+              fontSize: 12,
+              lineHeight: 1,
+              color: 'rgba(255,255,255,0.6)',
+              fontFamily: "var(--font-mono, ui-monospace, monospace)",
               pointerEvents: 'auto',
             }}
           >
-            <span
-              style={{
-                fontSize: 11,
-                lineHeight: 1.2,
-                letterSpacing: '0.08em',
-                textTransform: 'uppercase',
-                color: 'rgba(255,255,255,0.45)',
-                fontFamily: "var(--font-mono, ui-monospace, monospace)",
-              }}
-            >
-              Attachment {activeIndex + 1} / {attachmentCount}
-            </span>
-            <span
-              style={{
-                fontSize: 14,
-                lineHeight: 1.35,
-                color: 'rgba(255,255,255,0.92)',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {activeAttachment.name}
-            </span>
-            <span
-              style={{
-                fontSize: 12,
-                lineHeight: 1.2,
-                color: 'rgba(255,255,255,0.48)',
-                fontFamily: "var(--font-mono, ui-monospace, monospace)",
-              }}
-            >
-              {Math.round(transform.scale * 100)}% zoom
-            </span>
-          </div>
+            {activeIndex + 1}/{attachmentCount}
+          </span>
 
           <button
             type="button"
             onClick={() => onClose?.()}
             aria-label="Close attachment viewer"
             style={{
-              width: 44,
-              height: 44,
+              width: 28,
+              height: 28,
               borderRadius: 999,
-              border: '1px solid rgba(255,255,255,0.12)',
-              background: 'rgba(16,16,16,0.82)',
-              color: '#fff',
+              border: 'none',
+              background: 'transparent',
+              color: 'rgba(255,255,255,0.72)',
               display: 'inline-flex',
               alignItems: 'center',
               justifyContent: 'center',
-              boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
-              backdropFilter: 'blur(14px)',
               pointerEvents: 'auto',
+              cursor: 'pointer',
             }}
           >
-            <X size={18} strokeWidth={2.2} />
+            <X size={16} strokeWidth={2} />
           </button>
         </div>
 
@@ -958,10 +960,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             position: 'relative',
             flex: 1,
             minHeight: 0,
-            borderRadius: 18,
-            border: '1px solid rgba(255,255,255,0.06)',
-            background: 'rgba(255,255,255,0.03)',
-            boxShadow: '0 28px 80px rgba(0,0,0,0.38)',
+            background: 'transparent',
             overflow: 'hidden',
             touchAction: 'pinch-zoom',
           }}
@@ -1058,8 +1057,6 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   width: '100%',
                   height: '100%',
                   objectFit: 'contain',
-                  borderRadius: 16,
-                  boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
                   userSelect: 'none',
                   WebkitUserSelect: 'none',
                   WebkitTouchCallout: 'none',
@@ -1077,7 +1074,6 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   inset: 0,
                   width: '100%',
                   height: '100%',
-                  borderRadius: 16,
                   pointerEvents: drawEnabled ? 'auto' : 'none',
                   touchAction: 'none',
                 }}
@@ -1177,14 +1173,108 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                 {sendError}
               </div>
             )}
+            {openPicker === 'color' && (
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '8px 12px',
+                  borderRadius: 999,
+                  background: 'rgba(10,10,10,0.82)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
+                  backdropFilter: 'blur(18px)',
+                  pointerEvents: 'auto',
+                }}
+              >
+                {ANNOTATION_COLORS.map((color) => (
+                  <button
+                    key={color.value}
+                    type="button"
+                    onClick={() => {
+                      setSelectedColor(color.value);
+                      setOpenPicker(null);
+                    }}
+                    aria-label={color.label}
+                    aria-pressed={selectedColor === color.value}
+                    style={{
+                      width: 26,
+                      height: 26,
+                      borderRadius: 999,
+                      border: selectedColor === color.value ? '2px solid rgba(255,255,255,0.9)' : '1px solid rgba(255,255,255,0.16)',
+                      background: color.value,
+                      boxShadow: color.value === '#ffffff' ? 'inset 0 0 0 1px rgba(0,0,0,0.24)' : 'none',
+                      cursor: 'pointer',
+                      padding: 0,
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+
+            {openPicker === 'thickness' && (
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '8px 12px',
+                  borderRadius: 999,
+                  background: 'rgba(10,10,10,0.82)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
+                  backdropFilter: 'blur(18px)',
+                  pointerEvents: 'auto',
+                }}
+              >
+                {STROKE_WIDTHS.map((strokeWidth) => {
+                  const isSelected = selectedWidth === strokeWidth.value;
+                  const dotSize = 4 + strokeWidth.value;
+                  return (
+                    <button
+                      key={strokeWidth.value}
+                      type="button"
+                      onClick={() => {
+                        setSelectedWidth(strokeWidth.value);
+                        setOpenPicker(null);
+                      }}
+                      aria-label={strokeWidth.label}
+                      aria-pressed={isSelected}
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 999,
+                        border: isSelected ? '2px solid rgba(255,255,255,0.9)' : '1px solid rgba(255,255,255,0.16)',
+                        background: 'transparent',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        cursor: 'pointer',
+                        padding: 0,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: dotSize,
+                          height: dotSize,
+                          borderRadius: 999,
+                          background: 'rgba(255,255,255,0.85)',
+                        }}
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
             <div
               style={{
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: 8,
-                flexWrap: 'wrap',
-                padding: '10px 12px',
+                gap: 4,
+                padding: '6px 8px',
                 borderRadius: 999,
                 background: 'rgba(10,10,10,0.82)',
                 border: '1px solid rgba(255,255,255,0.08)',
@@ -1193,181 +1283,99 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                 pointerEvents: 'auto',
               }}
             >
-              <button
-                type="button"
-                onClick={() => setDrawEnabled((current) => !current)}
-                aria-pressed={drawEnabled}
-                style={{
-                  height: 36,
-                  padding: '0 12px',
-                  borderRadius: 999,
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  background: drawEnabled ? 'rgba(75,90,255,0.18)' : 'rgba(255,255,255,0.04)',
-                  color: drawEnabled ? '#c8ceff' : 'rgba(255,255,255,0.78)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  fontSize: 13,
-                  lineHeight: 1,
+              <IconButton
+                onClick={() => {
+                  setDrawEnabled((current) => !current);
+                  setOpenPicker(null);
                 }}
+                active={drawEnabled}
+                activeStrong
+                ariaLabel="Toggle annotation"
               >
-                <PenLine size={15} strokeWidth={2.1} />
-                Draw
-              </button>
+                <Highlighter size={16} strokeWidth={2.1} />
+              </IconButton>
 
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                {ANNOTATION_COLORS.map((color) => (
-                  <button
-                    key={color.value}
-                    type="button"
-                    onClick={() => setSelectedColor(color.value)}
-                    aria-label={color.label}
-                    aria-pressed={selectedColor === color.value}
+              <IconButton
+                onClick={() => setOpenPicker((current) => (current === 'thickness' ? null : 'thickness'))}
+                active={openPicker === 'thickness'}
+                ariaLabel="Stroke thickness"
+              >
+                <span
+                  style={{
+                    width: 18,
+                    height: 18,
+                    borderRadius: 999,
+                    border: '1.5px solid rgba(255,255,255,0.6)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <span
                     style={{
-                      width: 28,
-                      height: 28,
+                      width: 4 + selectedWidth,
+                      height: 4 + selectedWidth,
                       borderRadius: 999,
-                      border: selectedColor === color.value ? '2px solid rgba(255,255,255,0.9)' : '1px solid rgba(255,255,255,0.16)',
-                      background: color.value,
-                      boxShadow: color.value === '#ffffff' ? 'inset 0 0 0 1px rgba(0,0,0,0.24)' : 'none',
+                      background: 'rgba(255,255,255,0.9)',
                     }}
                   />
-                ))}
-              </div>
+                </span>
+              </IconButton>
 
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                {STROKE_WIDTHS.map((strokeWidth) => (
-                  <button
-                    key={strokeWidth.value}
-                    type="button"
-                    onClick={() => setSelectedWidth(strokeWidth.value)}
-                    aria-label={strokeWidth.label}
-                    aria-pressed={selectedWidth === strokeWidth.value}
-                    style={{
-                      width: 38,
-                      height: 32,
-                      borderRadius: 999,
-                      border: '1px solid rgba(255,255,255,0.08)',
-                      background: selectedWidth === strokeWidth.value ? 'rgba(75,90,255,0.18)' : 'rgba(255,255,255,0.04)',
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: 18,
-                        height: strokeWidth.value,
-                        borderRadius: 999,
-                        background: selectedColor,
-                        boxShadow: selectedColor === '#ffffff' ? 'inset 0 0 0 1px rgba(0,0,0,0.2)' : 'none',
-                      }}
-                    />
-                  </button>
-                ))}
-              </div>
+              <IconButton
+                onClick={() => setOpenPicker((current) => (current === 'color' ? null : 'color'))}
+                active={openPicker === 'color'}
+                ariaLabel="Stroke color"
+              >
+                <span
+                  style={{
+                    width: 16,
+                    height: 16,
+                    borderRadius: 999,
+                    background: selectedColor,
+                    boxShadow: selectedColor === '#ffffff'
+                      ? 'inset 0 0 0 1px rgba(0,0,0,0.24)'
+                      : 'inset 0 0 0 1px rgba(255,255,255,0.12)',
+                  }}
+                />
+              </IconButton>
 
-              <button
-                type="button"
+              <IconButton
                 onClick={undoStroke}
                 disabled={!hasAnnotations}
-                style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 999,
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  background: 'rgba(255,255,255,0.04)',
-                  color: 'rgba(255,255,255,0.8)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  opacity: hasAnnotations ? 1 : 0.36,
-                }}
+                ariaLabel="Undo"
               >
-                <Undo2 size={15} strokeWidth={2.1} />
-              </button>
+                <Undo2 size={16} strokeWidth={2.1} />
+              </IconButton>
 
-              <button
-                type="button"
+              <IconButton
                 onClick={redoStroke}
                 disabled={redoStack.length === 0}
-                style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 999,
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  background: 'rgba(255,255,255,0.04)',
-                  color: 'rgba(255,255,255,0.8)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  opacity: redoStack.length > 0 ? 1 : 0.36,
-                }}
+                ariaLabel="Redo"
               >
-                <Redo2 size={15} strokeWidth={2.1} />
-              </button>
+                <Redo2 size={16} strokeWidth={2.1} />
+              </IconButton>
 
-              <button
-                type="button"
+              <IconButton
                 onClick={clearAnnotations}
                 disabled={!hasAnnotations}
-                style={{
-                  height: 36,
-                  padding: '0 12px',
-                  borderRadius: 999,
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  background: 'rgba(255,255,255,0.04)',
-                  color: 'rgba(255,255,255,0.78)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  opacity: hasAnnotations ? 1 : 0.36,
-                }}
+                ariaLabel="Clear annotations"
               >
-                <Trash2 size={15} strokeWidth={2.1} />
-                Clear
-              </button>
+                <Trash size={16} strokeWidth={2.1} />
+              </IconButton>
 
-              <button
-                type="button"
+              <IconButton
                 onClick={sendAnnotatedImage}
                 disabled={!canSendAnnotated}
-                // Matches the tray Settings "Save" button styling:
-                // rounded-full, text-xs, px-3 h-7, bg-[#4B5AFF] active /
-                // bg-muted disabled. Inline styles to stay consistent
-                // with the rest of this component.
-                style={{
-                  height: 28,
-                  padding: '0 12px',
-                  borderRadius: 999,
-                  border: 'none',
-                  background: canSendAnnotated
-                    ? '#4B5AFF'
-                    : 'rgba(255,255,255,0.06)',
-                  color: canSendAnnotated ? '#ffffff' : 'rgba(255,255,255,0.42)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  fontSize: 12,
-                  cursor: canSendAnnotated ? 'pointer' : 'default',
-                  transition: 'background-color 200ms ease',
-                }}
-                onMouseEnter={(e) => {
-                  if (canSendAnnotated) {
-                    e.currentTarget.style.background = 'rgba(75,90,255,0.9)';
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (canSendAnnotated) {
-                    e.currentTarget.style.background = '#4B5AFF';
-                  }
-                }}
+                ariaLabel="Send annotated image"
+                accent
               >
                 {isSending ? (
-                  <Loader size={13} strokeWidth={2.1} className="animate-spin" />
-                ) : null}
-                {isSending ? 'Saving' : 'Save'}
-              </button>
+                  <Loader size={16} strokeWidth={2.1} className="animate-spin" />
+                ) : (
+                  <ArrowUp size={16} strokeWidth={2.3} />
+                )}
+              </IconButton>
             </div>
           </div>
         )}

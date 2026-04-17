@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
-import { Check, ArrowUp, ChevronDown, Eye, Image as ImageIcon, Loader, Plus, X } from 'lucide-react';
+import { Check, ArrowUp, ChevronDown, Eye, Loader, Plus, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import AttachmentViewerOverlay from './AttachmentViewerOverlay';
@@ -296,7 +296,7 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({
                 gap: 8,
                 width: '100%',
                 padding: '8px 12px',
-                borderRadius: 14,
+                borderRadius: 999,
                 border: '1px solid rgba(255,255,255,0.12)',
                 background: 'transparent',
                 color: 'inherit',
@@ -321,18 +321,6 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({
                 flex: 1,
               }}>
                 {attachment.name}
-              </span>
-              <span style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: 12,
-                color: '#4B5AFF',
-                fontFamily: MONO,
-                flexShrink: 0,
-              }}>
-                <ImageIcon size={12} strokeWidth={2.2} />
-                {isLoading ? 'LOAD' : 'OPEN'}
               </span>
               <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', fontFamily: MONO, flexShrink: 0 }}>
                 {formatFileSize(attachment.size || 0)}
@@ -543,6 +531,7 @@ const ChatComposer = memo(function ChatComposer({
   onAddPendingFiles,
   onRemovePendingFile,
   onClearPendingFiles,
+  onPreviewPendingFile,
 }) {
   const [input, setInput] = useState(() => loadStoredDraft(draftStorageKey));
   const [isSending, setIsSending] = useState(false);
@@ -675,27 +664,51 @@ const ChatComposer = memo(function ChatComposer({
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
           {pendingFiles.map((file, i) => {
             const { stem, ext } = splitFileNameExt(file.name);
+            const canPreview = Boolean(
+              onPreviewPendingFile && typeof file.type === 'string' && file.type.startsWith('image/'),
+            );
             return (
-              <div key={`${file.name}-${i}`} style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 7,
-                padding: '6px 12px',
-                background: 'transparent',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 999,
-                maxWidth: 'fit-content',
-              }}>
-                <Plus size={12} strokeWidth={2.5} style={{ color: '#4B5AFF', flexShrink: 0 }} />
-                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.55)', fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120, minWidth: 0 }}>
-                  {stem}
-                </span>
-                {ext && <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
-                  {ext}
-                </span>}
-                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
-                  {formatFileSize(file.size)}
-                </span>
+              <div
+                key={`${file.name}-${i}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 7,
+                  padding: '6px 12px',
+                  background: 'transparent',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 999,
+                  maxWidth: 'fit-content',
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => canPreview && onPreviewPendingFile?.(file, i)}
+                  disabled={!canPreview}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 7,
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    margin: 0,
+                    cursor: canPreview ? 'pointer' : 'default',
+                    color: 'inherit',
+                    minWidth: 0,
+                  }}
+                >
+                  <Eye size={12} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+                  <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.55)', fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120, minWidth: 0 }}>
+                    {stem}
+                  </span>
+                  {ext && <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
+                    {ext}
+                  </span>}
+                  <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
+                    {formatFileSize(file.size)}
+                  </span>
+                </button>
                 <button
                   onClick={() => onRemovePendingFile?.(i)}
                   style={{
@@ -1000,6 +1013,42 @@ function ChannelChat({
     setViewerState(null);
   }, []);
 
+  const previewPendingFile = useCallback(async (file, index) => {
+    if (!(file instanceof File) || !file.type?.startsWith('image/')) {
+      return;
+    }
+
+    const bytesBase64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        const commaIndex = result.indexOf(',');
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : '');
+      };
+      reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+      reader.readAsDataURL(file);
+    }).catch((error) => {
+      console.warn('[CHAT] Failed to preview pending file:', error.message);
+      return '';
+    });
+
+    if (!bytesBase64) {
+      return;
+    }
+
+    openAttachmentViewer({
+      attachments: [{
+        id: `pending-${index}-${file.name}`,
+        name: file.name,
+        mime: file.type,
+        size: file.size,
+        bytesBase64,
+      }],
+      externalRef: null,
+      initialIndex: 0,
+    });
+  }, [openAttachmentViewer]);
+
   const addPendingFiles = useCallback((files) => {
     const nextFiles = (Array.isArray(files) ? files : [files]).filter((file) => file instanceof File);
     if (nextFiles.length === 0) {
@@ -1280,6 +1329,7 @@ function ChannelChat({
         onAddPendingFiles={addPendingFiles}
         onRemovePendingFile={removePendingFile}
         onClearPendingFiles={clearPendingFiles}
+        onPreviewPendingFile={previewPendingFile}
       />
       {viewerState && (
         <AttachmentViewerOverlay
