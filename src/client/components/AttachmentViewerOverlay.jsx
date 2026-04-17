@@ -208,8 +208,21 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     && !errorMessage
   );
 
+  // Clamp fit-scale so we never display the bitmap above its native pixel
+  // budget — on Retina displays the browser would otherwise upscale past
+  // 1 CSS px = (devicePixelRatio) device px and the image renders soft
+  // even though the transported bytes are clean. `1 / devicePixelRatio`
+  // keeps one source pixel on one device pixel.
+  const maxScale =
+    typeof window !== 'undefined' && window.devicePixelRatio > 0
+      ? 1 / window.devicePixelRatio
+      : 1;
   const fitScale = (naturalSize.width > 0 && naturalSize.height > 0 && viewportRect.width > 0 && viewportRect.height > 0)
-    ? Math.min(viewportRect.width / naturalSize.width, viewportRect.height / naturalSize.height)
+    ? Math.min(
+        viewportRect.width / naturalSize.width,
+        viewportRect.height / naturalSize.height,
+        maxScale
+      )
     : 0;
   const stageWidth = fitScale > 0 ? naturalSize.width * fitScale : 0;
   const stageHeight = fitScale > 0 ? naturalSize.height * fitScale : 0;
