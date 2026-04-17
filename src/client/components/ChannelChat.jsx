@@ -869,6 +869,9 @@ function ChannelChat({
   forceScrollToBottomKey = 0,
   focusInputKey = 0,
   onRequestAttachmentBytes,
+  onOpenDesktopAttachmentViewer,
+  viewerReturnedAttachments = [],
+  onConsumeViewerReturnedAttachments,
 }) {
   const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -881,6 +884,7 @@ function ChannelChat({
   const shouldAutoScrollRef = useRef(true);
   const nextScrollBehaviorRef = useRef('auto');
   const attachmentRequestPromisesRef = useRef(new Map());
+  const processedViewerAttachmentIdsRef = useRef(new Set());
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [attachmentCache, setAttachmentCache] = useState({});
   const [attachmentFetchState, setAttachmentFetchState] = useState({});
@@ -996,7 +1000,7 @@ function ChannelChat({
     return request;
   }, [attachmentCache, onRequestAttachmentBytes]);
 
-  const openAttachmentViewer = useCallback(({ attachments, externalRef, initialIndex = 0 }) => {
+  const openInlineAttachmentViewer = useCallback(({ attachments, externalRef, initialIndex = 0 }) => {
     if (!Array.isArray(attachments) || attachments.length === 0) {
       return;
     }
@@ -1008,6 +1012,27 @@ function ChannelChat({
       key: globalThis.crypto?.randomUUID?.() || `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     });
   }, []);
+
+  const openAssistantAttachmentViewer = useCallback(async ({ attachments, externalRef, initialIndex = 0 }) => {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return;
+    }
+
+    if (typeof onOpenDesktopAttachmentViewer === 'function') {
+      try {
+        const result = await onOpenDesktopAttachmentViewer({ attachments, externalRef, initialIndex });
+        if (result?.success) {
+          return;
+        }
+
+        console.warn('[CHAT] Failed to open desktop attachment viewer:', result?.error || 'Unknown error');
+      } catch (error) {
+        console.warn('[CHAT] Failed to open desktop attachment viewer:', error?.message || error);
+      }
+    }
+
+    openInlineAttachmentViewer({ attachments, externalRef, initialIndex });
+  }, [onOpenDesktopAttachmentViewer, openInlineAttachmentViewer]);
 
   const closeAttachmentViewer = useCallback(() => {
     setViewerState(null);
@@ -1036,7 +1061,7 @@ function ChannelChat({
       return;
     }
 
-    openAttachmentViewer({
+    openInlineAttachmentViewer({
       attachments: [{
         id: `pending-${index}-${file.name}`,
         name: file.name,
@@ -1047,7 +1072,7 @@ function ChannelChat({
       externalRef: null,
       initialIndex: 0,
     });
-  }, [openAttachmentViewer]);
+  }, [openInlineAttachmentViewer]);
 
   const addPendingFiles = useCallback((files) => {
     const nextFiles = (Array.isArray(files) ? files : [files]).filter((file) => file instanceof File);
@@ -1064,6 +1089,45 @@ function ChannelChat({
   const clearPendingFiles = useCallback(() => {
     setPendingFiles([]);
   }, []);
+
+  useEffect(() => {
+    if (!Array.isArray(viewerReturnedAttachments) || viewerReturnedAttachments.length === 0) {
+      return;
+    }
+
+    const consumedIds = [];
+
+    for (const item of viewerReturnedAttachments) {
+      if (!item?.id || processedViewerAttachmentIdsRef.current.has(item.id)) {
+        continue;
+      }
+
+      processedViewerAttachmentIdsRef.current.add(item.id);
+      consumedIds.push(item.id);
+
+      if (!Array.isArray(item.data) || item.data.length === 0) {
+        continue;
+      }
+
+      try {
+        const file = new File(
+          [new Uint8Array(item.data)],
+          item.filename || 'attachment.png',
+          {
+            type: item.mimeType || 'application/octet-stream',
+            lastModified: Date.now(),
+          },
+        );
+        addPendingFiles(file);
+      } catch (error) {
+        console.warn('[CHAT] Failed to restore viewer attachment:', error?.message || error);
+      }
+    }
+
+    if (consumedIds.length > 0) {
+      onConsumeViewerReturnedAttachments?.(consumedIds);
+    }
+  }, [addPendingFiles, onConsumeViewerReturnedAttachments, viewerReturnedAttachments]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -1265,7 +1329,7 @@ function ChannelChat({
         attachmentCache={attachmentCache}
         attachmentFetchState={attachmentFetchState}
         onRequestAttachment={requestAttachmentBytes}
-        onOpenAttachmentViewer={openAttachmentViewer}
+        onOpenAttachmentViewer={openAssistantAttachmentViewer}
       />
       <div
         style={{

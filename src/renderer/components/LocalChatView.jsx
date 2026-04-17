@@ -10,6 +10,7 @@ const STATUS_COLORS = {
   orange: '#f59e0b',
   red: '#d44d69',
 };
+const DESKTOP_LOCAL_CHAT_ID = 'desktop-local';
 
 function mergeMessages(prev, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) {
@@ -46,12 +47,31 @@ function LocalChatView({ tunnelState }) {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [forceScrollToBottomKey, setForceScrollToBottomKey] = useState(0);
   const [focusInputKey, setFocusInputKey] = useState(0);
+  const [viewerReturnedAttachments, setViewerReturnedAttachments] = useState([]);
 
   useEffect(() => {
     let mounted = true;
 
     const off = on('LOCAL_CHAT_EVENT', (payload) => {
       if (!payload || typeof payload !== 'object') {
+        return;
+      }
+
+      if (payload.type === 'viewer_annotated' || payload.type === 'viewer_send_back') {
+        if (payload.parentChatId && payload.parentChatId !== DESKTOP_LOCAL_CHAT_ID) {
+          return;
+        }
+        if (!Array.isArray(payload.data) || payload.data.length === 0) {
+          return;
+        }
+
+        setViewerReturnedAttachments((prev) => [...prev, {
+          id: globalThis.crypto?.randomUUID?.() || `viewer-return-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          type: payload.type,
+          filename: typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename.trim() : 'attachment.png',
+          mimeType: typeof payload.mimeType === 'string' && payload.mimeType.trim() ? payload.mimeType.trim() : 'application/octet-stream',
+          data: payload.data,
+        }]);
         return;
       }
 
@@ -154,6 +174,29 @@ function LocalChatView({ tunnelState }) {
     }
   }, [invoke]);
 
+  const handleOpenDesktopAttachmentViewer = useCallback(async ({ attachments, externalRef, initialIndex = 0 }) => {
+    const openViewer = window.electronAPI?.viewer?.open;
+    if (typeof openViewer !== 'function') {
+      return { success: false, error: 'Attachment viewer unavailable' };
+    }
+
+    return await openViewer({
+      attachments,
+      externalRef,
+      initialIndex,
+      parentChatId: DESKTOP_LOCAL_CHAT_ID,
+    });
+  }, []);
+
+  const handleConsumeViewerReturnedAttachments = useCallback((consumedIds) => {
+    if (!Array.isArray(consumedIds) || consumedIds.length === 0) {
+      return;
+    }
+
+    const consumedSet = new Set(consumedIds);
+    setViewerReturnedAttachments((prev) => prev.filter((item) => !consumedSet.has(item.id)));
+  }, []);
+
   const channelStatus = tunnelState?.health?.channel || {
     level: 'orange',
     label: 'Channel status loading',
@@ -239,6 +282,9 @@ function LocalChatView({ tunnelState }) {
         onSendFile={handleSendFile}
         onRequestAttachmentBytes={handleRequestAttachmentBytes}
         canSendOverride={canSend}
+        onOpenDesktopAttachmentViewer={handleOpenDesktopAttachmentViewer}
+        viewerReturnedAttachments={viewerReturnedAttachments}
+        onConsumeViewerReturnedAttachments={handleConsumeViewerReturnedAttachments}
       />
     </div>
   );
