@@ -646,14 +646,30 @@ class ClaudeSessionSupervisor extends EventEmitter {
      * hitting the bridge gate would wait forever on awaitOutcome,
      * leaving runningAt set and blocking subsequent cron ticks.
      *
-     * Timeout budget = 10× default silence (50 min). Matches the
-     * safety-net window that would have fired if the dispatch had
-     * activated normally and never emitted a Stop. Cleared whenever
-     * _activateNext successfully activates a dispatch.
+     * Budget scales with the MAX silence_ms across currently-queued
+     * rows × SAFETY_NET_MULTIPLIER. This matches what the same dispatch
+     * would have gotten from the safety timer if activation had
+     * succeeded normally — so Night Lab's 30-min silence gets a 5h
+     * bridge-wait window, preventing spurious bridge_never_ready on
+     * outages shorter than the job's own tolerance.
+     *
+     * Also runs from _recoverOrphanedDispatches (not only _activateNext)
+     * so recovery-requeued rows that never transit _activateNext on
+     * cold boot still get a bounded wait.
      */
     _armGatedActivationTimeout() {
         if (this._gatedActivationTimer) return;
-        const budgetMs = DEFAULT_SILENCE_MS * SAFETY_NET_MULTIPLIER;
+        let maxSilence = DEFAULT_SILENCE_MS;
+        try {
+            const open = this.store.listOpenDispatches();
+            for (const row of open) {
+                if (!row || row.state !== DISPATCH_STATES.QUEUED) continue;
+                if ((row.epoch || 0) !== this.epoch) continue;
+                const s = this._sanitizedBaseSilenceMs(row.silence_ms);
+                if (s > maxSilence) maxSilence = s;
+            }
+        } catch (_) { /* best-effort, fall back to default */ }
+        const budgetMs = maxSilence * SAFETY_NET_MULTIPLIER;
         this._gatedActivationTimer = setTimeout(() => {
             this._gatedActivationTimer = null;
             if (this._shutdown) return;
@@ -1488,6 +1504,16 @@ class ClaudeSessionSupervisor extends EventEmitter {
                     requeued_ids: requeued.slice(0, 16),
                 },
             });
+        }
+
+        // Arm the bridge-wait timeout for requeued rows. They live in
+        // this.queue but don't hit _activateNext's arming path until
+        // bridge_ready eventually fires. If the bridge never comes back
+        // (Claude respawn broken, tunnel down), without this arming call
+        // the recovered scheduler rows would sit forever and leave
+        // runningAt unreconciled.
+        if (requeued.length > 0) {
+            this._armGatedActivationTimeout();
         }
     }
 

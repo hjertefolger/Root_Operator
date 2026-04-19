@@ -3840,30 +3840,21 @@ app.on('will-quit', () => {
     cachedPushVapidKeys = null;
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
-    // Clean-quit marker: remove the supervisor pidfile so the next boot
-    // does not mistake this orderly shutdown for a crash that left an
-    // orphan Claude alive. Claude-process exits during normal operation
-    // leave the pidfile in place (the next spawn overwrites it); only
-    // a true app-level quit clears it.
+    // NOTE: we deliberately do NOT clear the pidfile on will-quit.
+    // killClaudeCode() above asks node-pty to terminate the child but
+    // doesn't synchronously wait for exit. If the PTY child lingers
+    // (hung Claude, kill race) we'd clear the only durable orphan
+    // marker before the child has actually exited, and next boot's
+    // bootCleanup would have no PID+signature to probe — letting a
+    // surviving orphan bypass the new boot cleanup logic.
     //
-    // Exception: if this boot entered the HARD_FAILED state because
-    // bootCleanup flagged the orphan as still alive (EPERM, EACCES, or
-    // unverifiable pidfile + prior-epoch orphans), the kill never actually
-    // succeeded. Deleting the pidfile now would erase the only durable
-    // record of that PID + signature. Next boot would see "no pidfile +
-    // no prior-epoch orphans" (recovery already abandoned them during the
-    // failed boot), skip the unsafe branch, and accept fresh dispatches
-    // against a still-live orphan's shared hook log. Keep the pidfile so
-    // the next boot can retry the kill.
-    // Check both the live supervisor (if present) AND the sticky flag that
-    // survives teardownChannelMode() nulling the supervisor object — either
-    // signal means "orphan may still be alive, don't erase the PID marker."
-    const hardFailedOrphanUnsafe = supervisorOrphanUnsafeThisBoot
-        || (supervisor && supervisor.orphanUnsafe);
-    if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function'
-        && !hardFailedOrphanUnsafe) {
-        try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
-    }
+    // Instead we rely on next-boot probing: runtime.probeOrphanStatus
+    // runs kill(pid, 0) which returns ESRCH when the PID is gone, and
+    // bootCleanup clears the pidfile naturally on that certain-no-orphan
+    // path. If the PID is still alive AND it's our recorded Claude, we
+    // correctly detect and kill. If it's alive but someone else (PID
+    // reuse), signature mismatch returns certain-no-orphan too and the
+    // file gets cleared.
 });
 
 app.on('will-quit', () => {
