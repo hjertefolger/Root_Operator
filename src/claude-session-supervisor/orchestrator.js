@@ -294,20 +294,16 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // down on cold boot, which triggers _activateNext and drains any
         // recovered orphans through a disconnected bridge (pass-7 P1).
 
-        // Late-attach drain: ONLY when the channelManager had truly cached
-        // a bridge_ready before subscribe (_bridgeReadyCached === true).
-        // The auto-ready path for mocks without `.on` sets
-        // _bridgeReadyFired but shouldn't trigger an immediate drain —
-        // those tests expect activation to happen only on explicit
-        // enqueue/bridge_ready calls. _bridgeReadyCached distinguishes
-        // "production saw a real bridge_ready before we attached" from
-        // "test mock has no bridge lifecycle."
-        if (this._bridgeReadyCached
-            && this.state === STATES.IDLE
-            && !this.activeDispatch) {
-            this._activateNext();
-            this._fireStartupProbe();
-        }
+        // NOTE: pass-19 added a late-attach drain here for the case where
+        // channelManager.bridgeReady was already true at subscribe time.
+        // Pass-20 pointed out that in the real boot sequence, supervisor.start()
+        // runs BEFORE spawnClaudeCode(), so any cached bridgeReady at this
+        // point must come from a stale previous session — draining against
+        // it would target the old bridge. Dropped the auto-drain; the fresh
+        // post-spawn bridge_ready event drives drain via _onBridgeReady() as
+        // normal. The pass-19 scenario (hot re-init mid-process without
+        // spawning a new Claude) doesn't happen in the shipped flow —
+        // teardownChannelMode always kills Claude before init rebuilds.
     }
 
     /**
@@ -480,7 +476,23 @@ class ClaudeSessionSupervisor extends EventEmitter {
             epoch: this.epoch,
             active_dispatch: this.activeDispatch ? { ...this.activeDispatch } : null,
             queue_depth: this.queue.length,
+            orphan_unsafe: !!this._orphanStatusUnsafe,
         };
+    }
+
+    /**
+     * True only if the supervisor is HARD_FAILED specifically because of
+     * orphan-unsafe boot conditions (kill failure, missing pidfile +
+     * prior-epoch orphans, or uncertain identity probe). Distinct from
+     * intensity_exhausted HARD_FAILED, which is a runtime respawn-loop
+     * failure where the fresh Claude session is still usable.
+     *
+     * Used by main.js to scope the "refuse user sends" quarantine to
+     * orphan-unsafe only, rather than treating every HARD_FAILED as a
+     * hostile-orphan scenario.
+     */
+    get orphanUnsafe() {
+        return !!this._orphanStatusUnsafe;
     }
 
     async shutdown() {
@@ -924,15 +936,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this.channelManager.on('bridge_lost', this._bridgeLostHandler);
         }
 
-        // Seed from cached bridge state: ChannelManager.bridgeReady may have
-        // flipped true BEFORE the supervisor subscribed (connect() happens
-        // earlier in initChannelMode than supervisor.start()). Without this
-        // seed, a late attach to an already-ready bridge leaves the gate
-        // closed and dispatches queue indefinitely.
-        if (this.channelManager.bridgeReady === true) {
-            this._bridgeReadyFired = true;
-            this._bridgeReadyCached = true; // signals late-attach drain
-        }
+        // NOTE: pass-19 seeded _bridgeReadyFired from channelManager.bridgeReady
+        // at subscribe time. Pass-20 flagged the hazard: at supervisor.start()
+        // time the new Claude hasn't spawned yet, so a cached bridgeReady
+        // must be from a stale previous session. Don't seed — wait for a
+        // fresh post-spawn bridge_ready event. ChannelManager resets
+        // bridgeReady=false in its constructor, and teardownChannelMode
+        // always kills Claude before a rebuild, so there's no legitimate
+        // pre-start bridgeReady=true case in the shipped flow.
     }
 
     _unsubscribeBridgeReady() {

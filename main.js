@@ -2144,12 +2144,13 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
     if (operatingMode !== 'channel' || !channelManager || !channelManager.connected) {
         return { success: false, error: 'Chat bridge unavailable' };
     }
-    // Quarantine: if the supervisor hard-failed on boot because a prior
-    // Claude may still be alive (orphan_unsafe), do NOT forward user
-    // messages through the bridge either — they would land in the
-    // surviving orphan's hook stream. Surface a clear error; operator
-    // must restart the host after terminating the orphan.
-    if ((supervisor && supervisor.state === 'hardFailed')
+    // Quarantine: if the supervisor is in orphan-unsafe (prior Claude may
+    // still be alive), do NOT forward user messages through the bridge —
+    // they would land in the surviving orphan's hook stream. Scoped to
+    // orphan_unsafe specifically so other HARD_FAILED causes (intensity
+    // exhausted during runtime respawn loop) don't block normal chat
+    // where the fresh Claude is still fine.
+    if ((supervisor && supervisor.orphanUnsafe)
         || supervisorOrphanUnsafeThisBoot) {
         return {
             success: false,
@@ -3365,9 +3366,9 @@ function initChannelMode() {
         // original orphan, and the fresh Claude would share the orphan's
         // hook log stream with no way to correlate.
         supervisor.start().then(() => {
-            if (supervisor && supervisor.state === 'hardFailed') {
+            if (supervisor && supervisor.orphanUnsafe) {
                 supervisorOrphanUnsafeThisBoot = true;
-                logDebug('[SUPERVISOR] HARD_FAILED on boot — refusing to spawn Claude. Restart after resolving orphan.');
+                logDebug('[SUPERVISOR] orphan_unsafe on boot — refusing to spawn Claude. Restart after resolving orphan.');
                 setChannelRuntime('error',
                     'Previous Claude process may still be alive. Restart the app to retry.',
                     { attempt: channelStartupAttempt });
@@ -3635,7 +3636,10 @@ function teardownChannelMode() {
         // Latch orphan-unsafe BEFORE nulling the reference, so will-quit
         // (which may run later after mode has toggled) still knows to
         // preserve the pidfile for next-boot retry.
-        if (supervisor.state === 'hardFailed') {
+        // Latch only the orphan-unsafe variant — other HARD_FAILED causes
+        // (intensity_exhausted from respawn loops) don't imply a surviving
+        // orphan Claude, so they shouldn't permanently preserve the pidfile.
+        if (supervisor.orphanUnsafe) {
             supervisorOrphanUnsafeThisBoot = true;
         }
         supervisor.shutdown().catch(() => { /* best-effort during teardown */ });
@@ -3846,7 +3850,7 @@ app.on('will-quit', () => {
     // survives teardownChannelMode() nulling the supervisor object — either
     // signal means "orphan may still be alive, don't erase the PID marker."
     const hardFailedOrphanUnsafe = supervisorOrphanUnsafeThisBoot
-        || (supervisor && supervisor.state === 'hardFailed');
+        || (supervisor && supervisor.orphanUnsafe);
     if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function'
         && !hardFailedOrphanUnsafe) {
         try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
