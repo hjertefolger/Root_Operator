@@ -19,10 +19,10 @@ async function main() {
     fs.mkdirSync(TARGET_DIR, { recursive: true });
 
     console.log(`[download-model] Target: ${TARGET_DIR}`);
-    console.log('[download-model] Loading @xenova/transformers (dynamic import)...');
+    console.log('[download-model] Loading @huggingface/transformers (dynamic import)...');
 
     // ESM-only package — use dynamic import from CommonJS.
-    const { env, pipeline } = await import('@xenova/transformers');
+    const { env, pipeline } = await import('@huggingface/transformers');
 
     // Point transformers.js cache at our target dir so the HF hub copy lands there.
     // This avoids double-copying from ~/.cache/huggingface/hub.
@@ -33,7 +33,7 @@ async function main() {
     console.log(`[download-model] Downloading ${MODEL_ID} (quantized)...`);
     // Instantiating the pipeline triggers download + caching.
     const pipe = await pipeline('feature-extraction', MODEL_ID, {
-        quantized: true,
+        dtype: 'q8',
     });
 
     // Run a single inference to ensure the graph loads OK.

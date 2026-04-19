@@ -24,7 +24,7 @@ let transformersEnv = null;
 
 async function loadTransformers() {
     if (pipelineFunc && transformersEnv) return { pipeline: pipelineFunc, env: transformersEnv };
-    const transformers = await import('@xenova/transformers');
+    const transformers = await import('@huggingface/transformers');
     pipelineFunc = transformers.pipeline;
     transformersEnv = transformers.env;
     return { pipeline: pipelineFunc, env: transformersEnv };
@@ -76,7 +76,7 @@ async function initEmbedder(modelBaseDir) {
             }
 
             embedder = await pipeline('feature-extraction', effectiveModelId, {
-                quantized: true,
+                dtype: 'q8',
             });
             return embedder;
         } catch (error) {
