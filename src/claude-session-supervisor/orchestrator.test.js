@@ -839,6 +839,95 @@ test('start(): recovery runs at most once per supervisor instance', async () => 
     store.close();
 });
 
+test('start(): channel/user QUEUED orphans are re-queued, not abandoned', async () => {
+    const { supervisor, store, runtime } = fixture();
+    store.insertDispatch({
+        dispatchId: 'orphan-channel-queued', source: 'channel', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+    store.insertDispatch({
+        dispatchId: 'orphan-user-queued', source: 'user', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 2,
+    });
+    store.insertDispatch({
+        dispatchId: 'orphan-scheduler-queued', source: 'scheduler', payload: 'nightly',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 3,
+    });
+    store.insertDispatch({
+        dispatchId: 'orphan-channel-active', source: 'channel', payload: 'mid-send',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.ACTIVE,
+        epoch: 0, enqueuedAt: 4,
+    });
+
+    await supervisor.start();
+
+    // Channel + user QUEUED were re-adopted into current epoch (still queued,
+    // waiting for _activateNext; they'll be picked up when supervisor has a
+    // chance). Scheduler QUEUED stays abandoned (scheduler owns retry cadence).
+    // Any SENDING/ACTIVE regardless of source is abandoned (effect ambiguity).
+    const channelRow = store.getDispatch('orphan-channel-queued');
+    assert.equal(channelRow.state, DISPATCH_STATES.QUEUED,
+        'channel QUEUED must stay queued (re-adopted)');
+    assert.equal(channelRow.epoch, runtime.currentEpoch,
+        'channel QUEUED epoch must advance to current');
+
+    const userRow = store.getDispatch('orphan-user-queued');
+    assert.equal(userRow.state, DISPATCH_STATES.QUEUED);
+    assert.equal(userRow.epoch, runtime.currentEpoch);
+
+    const schedRow = store.getDispatch('orphan-scheduler-queued');
+    assert.equal(schedRow.state, DISPATCH_STATES.ABANDONED);
+    assert.match(schedRow.last_error || '', /orphaned_by_restart/);
+
+    const activeRow = store.getDispatch('orphan-channel-active');
+    assert.equal(activeRow.state, DISPATCH_STATES.ABANDONED);
+
+    // Summary should count 2 requeued + 2 abandoned.
+    const summary = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'recovery_summary'")
+        .get();
+    const details = JSON.parse(summary.details_json);
+    assert.equal(details.requeued_count, 2);
+    assert.equal(details.abandoned_count, 2);
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('_onHookEvent: re-arms wedge timer from sanitized base when silence_ms is bad', async () => {
+    const { supervisor, store, hookLog } = fixture();
+    await supervisor.start();
+    // Insert a dispatch with silence_ms = 0 (bad caller input). Activation
+    // should fall back to DEFAULT_SILENCE_MS, and _onHookEvent must do the same
+    // so the first progress hook doesn't re-arm the wedge timer at 0ms.
+    const { dispatchId } = supervisor.enqueue({
+        source: 'scheduler', payload: 'bad-silence', silenceMs: 0,
+    });
+    // Wait briefly for activation to happen.
+    await waitForCondition(
+        () => store.getDispatch(dispatchId).state === DISPATCH_STATES.ACTIVE,
+        { timeoutMs: 500 },
+    );
+
+    // Fire a progress-bearing hook; this exercises the re-arm path in
+    // _onHookEvent that previously read row.silence_ms raw.
+    appendHook(hookLog, { hookEventName: 'PreToolUse', sessionId: 's', dispatchId });
+
+    // Give the tailer time to process the hook AND let a would-be 0-ms
+    // wedge fire if we regressed. Dispatch must NOT transition to
+    // suspect/abandoned over this window.
+    await new Promise(r => setTimeout(r, 120));
+    const after = store.getDispatch(dispatchId);
+    assert.equal(after.state, DISPATCH_STATES.ACTIVE,
+        'dispatch must remain active after progress — wedge timer must not fire at 0ms');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
 test('start(): no recovery work when all dispatches are already terminal', async () => {
     const { supervisor, store } = fixture();
     store.insertDispatch({

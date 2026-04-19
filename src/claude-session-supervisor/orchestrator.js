@@ -375,9 +375,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
             lastProgressAt: activateTs,
         });
         // Sanitize the caller-supplied silence budget. A negative or non-numeric
-        // value would otherwise arm an immediate safety-net kill on activation.
-        const rawBase = Number(row.silence_ms);
-        const baseSilenceMs = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : DEFAULT_SILENCE_MS;
+        // value would otherwise arm an immediate safety-net kill on activation
+        // or re-arm a zero-ms wedge timer via _onHookEvent after progress.
+        const baseSilenceMs = this._sanitizedBaseSilenceMs(row.silence_ms);
         // Safety net is bounded to the caller's (sanitized) base silence budget
         // so that exponential wedge backoff (effectiveSilenceMs below) cannot
         // stretch the no-Stop abandon window. Base × 10 stays stable across replays.
@@ -411,6 +411,19 @@ class ClaudeSessionSupervisor extends EventEmitter {
             stateTo: DISPATCH_STATES.ACTIVE,
             details: { source: row.source },
         });
+    }
+
+    /**
+     * Sanitize a caller-supplied silence_ms value. Shared by _activateNext()
+     * and _onHookEvent() so every wedge/safety-net timer is armed from the
+     * same finite-positive budget. A DB row with silence_ms = 0/null/NaN
+     * (bad caller input, schema migration hole, or corrupted column) would
+     * otherwise fire an immediate abandon on activation or a zero-ms wedge
+     * on the first progress hook.
+     */
+    _sanitizedBaseSilenceMs(raw) {
+        const n = Number(raw);
+        return Number.isFinite(n) && n > 0 ? n : DEFAULT_SILENCE_MS;
     }
 
     _clearActiveSafetyTimer() {
@@ -503,10 +516,13 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this.activeDispatch.lastProgressAt = now;
         // Progress resets the wedge timer. Recompute effective silence from
         // the immutable base and current replay_count so post-replay timers
-        // stay on the same backoff ladder used at activation.
+        // stay on the same backoff ladder used at activation. Sanitize base
+        // via the same helper as _activateNext() so a bad silence_ms column
+        // value can't re-arm at 0 ms after the first progress hook.
         const row = this.store.getDispatch(dispatchId);
-        if (row && row.silence_ms) {
-            const wedgeSilenceMs = effectiveSilenceMs(row.silence_ms, row.replay_count || 0);
+        if (row) {
+            const baseSilenceMs = this._sanitizedBaseSilenceMs(row.silence_ms);
+            const wedgeSilenceMs = effectiveSilenceMs(baseSilenceMs, row.replay_count || 0);
             this._armWedgeTimer(dispatchId, wedgeSilenceMs);
         }
 
@@ -841,20 +857,37 @@ class ClaudeSessionSupervisor extends EventEmitter {
     /**
      * Post-start crash recovery.
      *
-     * If the previous process died while a dispatch was queued/sending/active,
-     * the row survives in SQLite but none of the in-memory state does — no
-     * active subprocess, no wedge/safety timers, no awaitOutcome resolvers.
-     * Resuming cleanly is not possible (we would replay side-effects without
-     * knowing which hooks already fired), and leaving the row non-terminal
-     * would cause listOpenDispatches() to return ghosts forever.
+     * If the previous process died mid-dispatch, the row survives in SQLite
+     * but none of the in-memory state does — no active subprocess, no wedge
+     * or safety timer, no awaitOutcome resolver. Scoped to prior-epoch rows
+     * (row.epoch < this.epoch) so current-epoch work is never touched, and
+     * guarded by _recoveryDone so a repeated start() is a no-op.
      *
-     * Policy: mark every non-terminal row from a PRIOR epoch as ABANDONED
-     * with reason 'orphaned_by_restart'. Rows with `row.epoch >= this.epoch`
-     * are live work of the current process — never touch them (prevents
-     * split-brain if start() is ever called twice, and prevents recovery
-     * from racing enqueue paths that insert before start() returns).
+     * Per-state policy:
      *
-     * Runs exactly once per supervisor instance (guarded by _recoveryDone).
+     *   SENDING / ACTIVE (any source)
+     *     → ABANDONED with reason 'orphaned_by_restart'.
+     *       These rows either hit the bridge or were in the middle of it.
+     *       Side-effect state is ambiguous — replay could double-commit.
+     *
+     *   QUEUED, source = 'channel' or 'user'
+     *     → re-adopted into the current epoch (via resetDispatchToQueued)
+     *       and pushed onto this.queue for normal activation. These payloads
+     *       never touched Claude, so there's no side-effect ambiguity. The
+     *       original caller's awaitOutcome() died with the old process, but
+     *       the message itself was a one-shot with no alternate retry path —
+     *       dropping it would silently lose user-visible work.
+     *
+     *   QUEUED, source = 'scheduler'
+     *     → ABANDONED. The scheduler has its own cron-based retry cadence;
+     *       re-activating here would also decouple the dispatch from the
+     *       scheduler's awaitOutcome/_completeJob path, leaving runningAt
+     *       unreconciled until the next tick. Abandon lets the scheduler's
+     *       supervisor-aware stuck-run check (pass-3 fix) clear runningAt
+     *       on the next fire.
+     *
+     *   QUEUED, any other source (probe, unknown)
+     *     → ABANDONED (same as today; no caller semantics to preserve).
      */
     _recoverOrphanedDispatches() {
         if (this._recoveryDone) return;
@@ -875,32 +908,57 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         const currentEpoch = this.epoch;
         const abandoned = [];
+        const requeued = [];
+        const REQUEUE_SOURCES = new Set(['channel', 'user']);
+
         for (const row of open) {
             if (!row || !row.dispatch_id) continue;
             if (TERMINAL_DISPATCH_STATES.has(row.state)) continue;
-            // Never touch rows from the current (or a future, which shouldn't
-            // happen) epoch — those belong to the live supervisor.
             if ((row.epoch || 0) >= currentEpoch) continue;
+
+            const isReplayableQueued =
+                row.state === DISPATCH_STATES.QUEUED && REQUEUE_SOURCES.has(row.source);
+
             try {
-                this.store.updateDispatchState(row.dispatch_id, {
-                    state: DISPATCH_STATES.ABANDONED,
-                    terminalAt: this.clock(),
-                    lastError: 'orphaned_by_restart',
-                });
-                this.incidents.record({
-                    kind: 'dispatch_abandoned',
-                    dispatchId: row.dispatch_id,
-                    epoch: currentEpoch,
-                    stateFrom: row.state,
-                    stateTo: DISPATCH_STATES.ABANDONED,
-                    details: {
-                        error: 'orphaned_by_restart',
-                        prior_state: row.state,
-                        prior_epoch: row.epoch || 0,
-                        prior_replay_count: row.replay_count || 0,
-                    },
-                });
-                abandoned.push(row.dispatch_id);
+                if (isReplayableQueued) {
+                    // Re-adopt into current epoch; next tick of _activateNext()
+                    // will pick it up and send it normally.
+                    this.store.resetDispatchToQueued(row.dispatch_id, currentEpoch);
+                    this.queue.push(row.dispatch_id);
+                    this.incidents.record({
+                        kind: 'dispatch_requeued_on_recovery',
+                        dispatchId: row.dispatch_id,
+                        epoch: currentEpoch,
+                        stateFrom: row.state,
+                        stateTo: DISPATCH_STATES.QUEUED,
+                        details: {
+                            source: row.source,
+                            prior_epoch: row.epoch || 0,
+                        },
+                    });
+                    requeued.push(row.dispatch_id);
+                } else {
+                    this.store.updateDispatchState(row.dispatch_id, {
+                        state: DISPATCH_STATES.ABANDONED,
+                        terminalAt: this.clock(),
+                        lastError: 'orphaned_by_restart',
+                    });
+                    this.incidents.record({
+                        kind: 'dispatch_abandoned',
+                        dispatchId: row.dispatch_id,
+                        epoch: currentEpoch,
+                        stateFrom: row.state,
+                        stateTo: DISPATCH_STATES.ABANDONED,
+                        details: {
+                            error: 'orphaned_by_restart',
+                            prior_state: row.state,
+                            prior_source: row.source,
+                            prior_epoch: row.epoch || 0,
+                            prior_replay_count: row.replay_count || 0,
+                        },
+                    });
+                    abandoned.push(row.dispatch_id);
+                }
             } catch (err) {
                 this.incidents.record({
                     kind: 'recovery_error',
@@ -909,19 +967,22 @@ class ClaudeSessionSupervisor extends EventEmitter {
                     details: {
                         error: err && err.message ? err.message : String(err),
                         prior_state: row.state,
+                        prior_source: row.source,
                         prior_epoch: row.epoch || 0,
                     },
                 });
             }
         }
 
-        if (abandoned.length > 0) {
+        if (abandoned.length > 0 || requeued.length > 0) {
             this.incidents.record({
                 kind: 'recovery_summary',
                 epoch: currentEpoch,
                 details: {
                     abandoned_count: abandoned.length,
+                    requeued_count: requeued.length,
                     dispatch_ids: abandoned.slice(0, 16),
+                    requeued_ids: requeued.slice(0, 16),
                 },
             });
         }
