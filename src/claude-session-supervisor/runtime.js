@@ -388,14 +388,19 @@ class Runtime {
                 ? null
                 : (result.reason || 'unknown');
         }
-        // Keep the pidfile around when a real kill failure occurred
-        // (orphan is still alive). Next boot's bootCleanup() will try
-        // again. Clearing would permanently lose the identity of the
-        // surviving orphan after a single transient EPERM/EACCES.
+        // Keep the pidfile around when:
+        //   (a) a real kill failure occurred (orphan still alive, real error)
+        //   (b) the probe was inconclusive (certain=false) — kill(pid,0) may
+        //       have already shown a live PID; losing the pidfile now means
+        //       later boots can't retry identifying/killing the orphan.
+        // Clearing only runs for definitive-safe outcomes: no pidfile,
+        // probe was certain AND orphan was absent, or orphan was
+        // benignly gone ('already_dead').
         const killTrulyFailed = !!(pid
             && report.orphan_killed === false
             && report.orphan_kill_reason !== 'already_dead');
-        if (!killTrulyFailed) {
+        const probeInconclusive = !report.orphan_status_certain;
+        if (!killTrulyFailed && !probeInconclusive) {
             this.clearPidfile();
         }
 

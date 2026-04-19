@@ -400,6 +400,33 @@ class ClaudeSessionSupervisor extends EventEmitter {
             } catch (_) { /* best-effort during shutdown */ }
             this.activeDispatch = null;
         }
+        // Also terminalize ANY queued dispatches in the current epoch. Without
+        // this, a channel-mode toggle with queued scheduler work would reject
+        // the scheduler's awaitOutcome (clearing runningAt), leave the row
+        // non-terminal in SQLite, and then next-boot recovery would re-queue
+        // an orphan with no scheduler waiter to reconcile its outcome. The
+        // activeDispatch branch above covers the in-flight one; this loop
+        // covers everything queued behind it.
+        try {
+            const open = this.store.listOpenDispatches();
+            for (const row of open) {
+                if (!row || !row.dispatch_id) continue;
+                if ((row.epoch || 0) !== this.epoch) continue;
+                if (TERMINAL_DISPATCH_STATES.has(row.state)) continue;
+                this.store.updateDispatchState(row.dispatch_id, {
+                    state: DISPATCH_STATES.ABANDONED,
+                    terminalAt: this.clock(),
+                    lastError: 'shutdown_while_queued',
+                });
+                this.incidents.record({
+                    kind: 'dispatch_abandoned',
+                    dispatchId: row.dispatch_id,
+                    epoch: this.epoch,
+                    details: { error: 'shutdown_while_queued', prior_state: row.state },
+                });
+            }
+        } catch (_) { /* best-effort during shutdown */ }
+        this.queue = [];
         this._dispatchAwaitingReplay = null;
         for (const [, waiters] of this.pendingResolvers) {
             for (const w of waiters) w.reject(new Error('supervisor shutdown'));

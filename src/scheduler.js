@@ -239,27 +239,34 @@ class Scheduler extends EventEmitter {
         }
 
         // Reconcile each crash-suspect job against the supervisor's record
-        // of the most recent dispatch. There's a real race between
-        // supervisor terminalization and scheduler._completeJob clearing
-        // runningAt — if main.js crashed in that window, the dispatch is
-        // already terminal (possibly COMPLETED) but scheduler still thinks
-        // the job is running. Blindly recording every such job as
-        // crash_mid_run_orphaned would rewrite a successful run as a
-        // failure, bump consecutiveErrors, and eventually auto-disable a
-        // job that actually finished. Ask the supervisor what really
-        // happened.
+        // of the most recent dispatch. Two races to untangle:
+        //   (A) crash between supervisor terminalization and _completeJob:
+        //       supervisor row is terminal, scheduler runningAt still set.
+        //       We should trust the supervisor's outcome for THIS run.
+        //   (B) crash between _fireJob setting runningAt and supervisor.enqueue
+        //       creating the dispatch row: supervisor's latest row is from a
+        //       PREVIOUS run (possibly completed success), which has nothing
+        //       to do with the crashed one.
+        // To distinguish (A) from (B): compare the dispatch's enqueued_at to
+        // the current runningAt timestamp. Only trust the dispatch outcome
+        // when the dispatch was enqueued AT OR AFTER runningAt.
         for (const job of crashFailedJobs) {
-            const startedAt = job.runningAt ? new Date(job.runningAt).getTime() : Date.now();
+            const runningAtMs = job.runningAt ? new Date(job.runningAt).getTime() : NaN;
+            const startedAt = Number.isFinite(runningAtMs) ? runningAtMs : Date.now();
             const latest = this._getLatestSupervisorDispatch(job.id);
-            if (latest && latest.state === 'completed') {
+            const dispatchMatchesRun = !!(latest
+                && Number.isFinite(runningAtMs)
+                && typeof latest.enqueued_at === 'number'
+                && latest.enqueued_at >= runningAtMs);
+            if (dispatchMatchesRun && latest.state === 'completed') {
                 this._completeJob(job.id, 'success', null, startedAt);
-            } else if (latest && (latest.state === 'failed' || latest.state === 'abandoned')) {
+            } else if (dispatchMatchesRun && (latest.state === 'failed' || latest.state === 'abandoned')) {
                 const err = latest.last_error || `${latest.state}_no_error_recorded`;
                 this._completeJob(job.id, 'error', err, startedAt);
             } else {
-                // No supervisor record, or latest row was non-terminal and
-                // should have been in reattachQueue — treat as genuine
-                // mid-run crash.
+                // Either no supervisor record, or the latest dispatch predates
+                // this runningAt (pre-enqueue crash). Either way, the crashed
+                // run itself has no terminal record — report it as such.
                 this._completeJob(job.id, 'error', 'crash_mid_run_orphaned', startedAt);
             }
             cleaned++;
