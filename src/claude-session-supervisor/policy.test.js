@@ -14,6 +14,8 @@ const {
     transitionDispatch,
     replayCapForSource,
     canReplayDispatch,
+    effectiveSilenceMs,
+    MAX_EFFECTIVE_SILENCE_MS,
     intensityBurst,
     intensityWindow,
     intensityExhausted,
@@ -105,7 +107,7 @@ test('terminal dispatch states contains completed/failed/abandoned', () => {
 });
 
 test('replayCapForSource mapping', () => {
-    assert.equal(replayCapForSource('scheduler'), 2);
+    assert.equal(replayCapForSource('scheduler'), 4);
     assert.equal(replayCapForSource('channel'), 1);
     assert.equal(replayCapForSource('user'), 1);
     assert.equal(replayCapForSource('probe'), 0);
@@ -113,7 +115,7 @@ test('replayCapForSource mapping', () => {
 });
 
 test('canReplayDispatch: cap exhausted blocks', () => {
-    const row = { source: 'scheduler', replay_count: 2, replay_cap: 2, visible_effect_count: 0 };
+    const row = { source: 'scheduler', replay_count: 4, replay_cap: 4, visible_effect_count: 0 };
     assert.deepEqual(canReplayDispatch(row), { allowed: false, reason: 'replay_cap_exceeded' });
 });
 
@@ -135,6 +137,30 @@ test('canReplayDispatch: scheduler allowed after visible effect (if cap not exce
 test('canReplayDispatch: user fresh and no effect is allowed', () => {
     const row = { source: 'user', replay_count: 0, replay_cap: 1, visible_effect_count: 0 };
     assert.deepEqual(canReplayDispatch(row), { allowed: true });
+});
+
+test('effectiveSilenceMs: doubles per replay, 30min base ladder', () => {
+    const base = 30 * 60 * 1000;
+    assert.equal(effectiveSilenceMs(base, 0), 30 * 60 * 1000);
+    assert.equal(effectiveSilenceMs(base, 1), 60 * 60 * 1000);
+    assert.equal(effectiveSilenceMs(base, 2), 120 * 60 * 1000);
+    assert.equal(effectiveSilenceMs(base, 3), 240 * 60 * 1000);
+    assert.equal(effectiveSilenceMs(base, 4), 480 * 60 * 1000);
+});
+
+test('effectiveSilenceMs: clamps at MAX_EFFECTIVE_SILENCE_MS', () => {
+    const base = 30 * 60 * 1000;
+    // replay_count 5 would be 960 min — ceiling caps at 8h
+    assert.equal(effectiveSilenceMs(base, 5), MAX_EFFECTIVE_SILENCE_MS);
+    assert.equal(effectiveSilenceMs(base, 99), MAX_EFFECTIVE_SILENCE_MS);
+});
+
+test('effectiveSilenceMs: sanitizes bad inputs', () => {
+    assert.equal(effectiveSilenceMs(0, 3), 0);
+    assert.equal(effectiveSilenceMs(-1000, 3), 0);
+    assert.equal(effectiveSilenceMs(1000, -1), 1000);
+    assert.equal(effectiveSilenceMs(1000, NaN), 1000);
+    assert.equal(effectiveSilenceMs(1000, 1.7), 2000); // floor of 1.7 → 1
 });
 
 // PR2: wedge/recovery transitions

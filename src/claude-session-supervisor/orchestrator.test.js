@@ -570,14 +570,18 @@ test('PR2: replay cap exceeded → failed + system notice on chat_id', async () 
     const { dispatchId } = supervisor.enqueue({
         source: 'scheduler', chatId: 'dev-123', payload: 'hopeless', silenceMs: 30,
     });
-    // Force replay_count to cap so canReplayDispatch returns false
+    // Force replay_count to cap so canReplayDispatch returns false.
+    // Scheduler replay_cap is 4 (exponential-backoff change). Wedge timer uses
+    // effectiveSilenceMs(base=30, count=4) = 480ms — raise wait budgets.
     store.incrementReplayCount(dispatchId);
-    store.incrementReplayCount(dispatchId); // now 2 == replay_cap for scheduler
-    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
+    store.incrementReplayCount(dispatchId);
+    store.incrementReplayCount(dispatchId);
+    store.incrementReplayCount(dispatchId); // now 4 == replay_cap for scheduler
+    await waitForCondition(() => killCalls.length > 0, { timeoutMs: 2000 });
     channelManager.simulateClaudeResurrected();
     channelManager.simulateRespawn();
     await waitForCondition(() => store.getDispatch(dispatchId).state === DISPATCH_STATES.FAILED,
-        { timeoutMs: 500 });
+        { timeoutMs: 2000 });
     const row = store.getDispatch(dispatchId);
     assert.equal(row.state, DISPATCH_STATES.FAILED);
     assert.match(row.last_error || '', /replay_not_allowed:replay_cap_exceeded/);
@@ -727,6 +731,9 @@ test('PR2: system_notice_failed incident when bridge send returns false', async 
     const { dispatchId } = supervisor.enqueue({
         source: 'scheduler', chatId: 'dev-x', payload: 'p', silenceMs: 30,
     });
+    // Scheduler replay_cap is 4; bump count to cap so next wedge → cap exceeded.
+    store.incrementReplayCount(dispatchId);
+    store.incrementReplayCount(dispatchId);
     store.incrementReplayCount(dispatchId);
     store.incrementReplayCount(dispatchId);
     await waitForCondition(() => killCalls.length > 0, { timeoutMs: 500 });
@@ -741,6 +748,109 @@ test('PR2: system_notice_failed incident when bridge send returns false', async 
         `expected system_notice_failed in ${JSON.stringify(kinds)}`);
     assert.ok(!kinds.includes('system_notice_emitted'),
         `must NOT record emitted when send returned false`);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): orphaned non-terminal dispatches are abandoned on restart', async () => {
+    const { supervisor, store } = fixture();
+    // Simulate three rows left over from a prior process — one in each
+    // non-terminal state. listOpenDispatches should surface all of them.
+    store.insertDispatch({
+        dispatchId: 'orphan-queued', source: 'scheduler', payload: 'q',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+    store.insertDispatch({
+        dispatchId: 'orphan-sending', source: 'scheduler', payload: 's',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.SENDING,
+        epoch: 0, enqueuedAt: 2,
+    });
+    store.insertDispatch({
+        dispatchId: 'orphan-active', source: 'scheduler', payload: 'a',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.ACTIVE,
+        epoch: 0, enqueuedAt: 3,
+    });
+
+    await supervisor.start();
+
+    for (const id of ['orphan-queued', 'orphan-sending', 'orphan-active']) {
+        const row = store.getDispatch(id);
+        assert.equal(row.state, DISPATCH_STATES.ABANDONED, `${id} should be abandoned`);
+        assert.match(row.last_error || '', /orphaned_by_restart/);
+    }
+    const summary = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'recovery_summary'")
+        .get();
+    assert.ok(summary, 'recovery_summary incident must be recorded');
+    const details = JSON.parse(summary.details_json);
+    assert.equal(details.abandoned_count, 3);
+
+    // Supervisor state is clean and able to accept fresh dispatches.
+    assert.equal(supervisor.state, STATES.IDLE);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): recovery ignores rows from the current epoch (no split-brain on second start)', async () => {
+    const { supervisor, store, runtime } = fixture();
+    // Row from a prior epoch: must be abandoned.
+    store.insertDispatch({
+        dispatchId: 'old', source: 'scheduler', payload: 'old',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+    // Row from the current epoch (simulating a live-process dispatch that was
+    // inserted by a concurrent enqueue path): must NOT be touched.
+    store.insertDispatch({
+        dispatchId: 'live', source: 'scheduler', payload: 'live',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: runtime.currentEpoch, enqueuedAt: 2,
+    });
+
+    await supervisor.start();
+
+    assert.equal(store.getDispatch('old').state, DISPATCH_STATES.ABANDONED);
+    assert.equal(store.getDispatch('live').state, DISPATCH_STATES.QUEUED,
+        'current-epoch rows must not be touched by recovery');
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): recovery runs at most once per supervisor instance', async () => {
+    const { supervisor, store } = fixture();
+    store.insertDispatch({
+        dispatchId: 'old', source: 'scheduler', payload: 'old',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+    await supervisor.start();
+    // Second start() (e.g. a misbehaving caller) must not re-run recovery.
+    // Insert a new orphan from a prior epoch and verify it is NOT abandoned —
+    // once _recoveryDone is set, recovery is a no-op.
+    store.insertDispatch({
+        dispatchId: 'old2', source: 'scheduler', payload: 'old2',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 3,
+    });
+    await supervisor.start();
+    assert.equal(store.getDispatch('old2').state, DISPATCH_STATES.QUEUED);
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): no recovery work when all dispatches are already terminal', async () => {
+    const { supervisor, store } = fixture();
+    store.insertDispatch({
+        dispatchId: 'done', source: 'scheduler', payload: 'd',
+        silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.COMPLETED,
+        epoch: 0, enqueuedAt: 1,
+    });
+    await supervisor.start();
+    const summary = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'recovery_summary'")
+        .get();
+    assert.equal(summary, undefined, 'no recovery_summary when nothing to abandon');
     await supervisor.shutdown();
     store.close();
 });

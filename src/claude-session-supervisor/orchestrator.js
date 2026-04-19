@@ -28,7 +28,7 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const { STATES, DISPATCH_STATES, TERMINAL_DISPATCH_STATES,
         transitionSupervisor, transitionDispatch, replayCapForSource,
-        canReplayDispatch, intensityExhausted } = require('./policy');
+        canReplayDispatch, effectiveSilenceMs, intensityExhausted } = require('./policy');
 
 const DEFAULT_SILENCE_MS = 5 * 60 * 1000; // 5 minutes
 const SAFETY_NET_MULTIPLIER = 10;          // abandon after silence_ms * 10 with no Stop
@@ -116,6 +116,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
             epoch: this.epoch,
             details: { hook_log_path: this.hookLogPath, pr3_effect_ledger: true },
         });
+
+        // Recover any dispatches left non-terminal by a prior process. Their
+        // in-memory state (timers, awaitOutcome resolvers, active context) died
+        // with the previous supervisor, so they cannot be resumed cleanly.
+        // Mark them ABANDONED with a structured reason so callers observe a
+        // terminal state instead of silent drift. Runs before the probe so
+        // the probe is the first legitimate dispatch in the new epoch.
+        this._recoverOrphanedDispatches();
 
         // PR3: fire-and-forget probe dispatch for spawn verification.
         // Non-blocking — external dispatches can proceed immediately.
@@ -366,19 +374,25 @@ class ClaudeSessionSupervisor extends EventEmitter {
             activatedAt: activateTs,
             lastProgressAt: activateTs,
         });
-        const silenceMs = row.silence_ms || DEFAULT_SILENCE_MS;
-        const safetyMs = silenceMs * SAFETY_NET_MULTIPLIER;
+        // Sanitize the caller-supplied silence budget. A negative or non-numeric
+        // value would otherwise arm an immediate safety-net kill on activation.
+        const rawBase = Number(row.silence_ms);
+        const baseSilenceMs = Number.isFinite(rawBase) && rawBase > 0 ? rawBase : DEFAULT_SILENCE_MS;
+        // Safety net is bounded to the caller's (sanitized) base silence budget
+        // so that exponential wedge backoff (effectiveSilenceMs below) cannot
+        // stretch the no-Stop abandon window. Base × 10 stays stable across replays.
+        const safetyMs = baseSilenceMs * SAFETY_NET_MULTIPLIER;
         const safetyTimer = setTimeout(() => {
             this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
         }, safetyMs);
         if (safetyTimer.unref) safetyTimer.unref();
-        // PR2: wedge timer at silenceMs (the tighter window). If no hook-log
-        // progress before this fires, the supervisor treats the dispatch as
-        // wedged and initiates kill+respawn. Safety net remains as the backstop
-        // (e.g., if kill/respawn itself misbehaves).
+        // Wedge timer uses the effective (backoff-scaled) silence. On replays
+        // this doubles per attempt so an upstream outage doesn't burn the
+        // whole replay budget inside the outage window.
+        const wedgeSilenceMs = effectiveSilenceMs(baseSilenceMs, row.replay_count || 0);
         const wedgeTimer = setTimeout(() => {
             this._handleWedge(dispatchId, 'silence_timeout');
-        }, silenceMs);
+        }, wedgeSilenceMs);
         if (wedgeTimer.unref) wedgeTimer.unref();
         this.activeDispatch = {
             dispatchId,
@@ -487,11 +501,13 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         this.store.markProgress(dispatchId, now);
         this.activeDispatch.lastProgressAt = now;
-        // Progress resets the wedge timer. Use silence_ms from the row (not
-        // DEFAULT_SILENCE_MS) so per-dispatch tuning via jobSilenceFor is respected.
+        // Progress resets the wedge timer. Recompute effective silence from
+        // the immutable base and current replay_count so post-replay timers
+        // stay on the same backoff ladder used at activation.
         const row = this.store.getDispatch(dispatchId);
         if (row && row.silence_ms) {
-            this._armWedgeTimer(dispatchId, row.silence_ms);
+            const wedgeSilenceMs = effectiveSilenceMs(row.silence_ms, row.replay_count || 0);
+            this._armWedgeTimer(dispatchId, wedgeSilenceMs);
         }
 
         // PR3: visible_effect_count is now incremented by the effect-ledger
@@ -550,7 +566,11 @@ class ClaudeSessionSupervisor extends EventEmitter {
         } else {
             // Either runtime doesn't support kill (edge case) or the process
             // was already dead. Treat both as process_already_dead — main.js's
-            // restart path will eventually bring a new Claude.
+            // restart path will eventually bring a new Claude. Record the
+            // recovery event against the intensity ring so tight crash loops
+            // through this branch still trip intensity_exhausted (prior bug:
+            // only the kill_ordered branch bumped the counter).
+            this._recordIntensityTimestamp(now);
             this._transition('process_already_dead', { occurredAt: now }); // SUSPECT -> RESPAWNING
         }
 
@@ -816,6 +836,95 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // _activateNext() can't promote it after abandon.
         this.queue = this.queue.filter(id => id !== dispatchId);
         this._completeDispatch(dispatchId, DISPATCH_STATES.ABANDONED, reason);
+    }
+
+    /**
+     * Post-start crash recovery.
+     *
+     * If the previous process died while a dispatch was queued/sending/active,
+     * the row survives in SQLite but none of the in-memory state does — no
+     * active subprocess, no wedge/safety timers, no awaitOutcome resolvers.
+     * Resuming cleanly is not possible (we would replay side-effects without
+     * knowing which hooks already fired), and leaving the row non-terminal
+     * would cause listOpenDispatches() to return ghosts forever.
+     *
+     * Policy: mark every non-terminal row from a PRIOR epoch as ABANDONED
+     * with reason 'orphaned_by_restart'. Rows with `row.epoch >= this.epoch`
+     * are live work of the current process — never touch them (prevents
+     * split-brain if start() is ever called twice, and prevents recovery
+     * from racing enqueue paths that insert before start() returns).
+     *
+     * Runs exactly once per supervisor instance (guarded by _recoveryDone).
+     */
+    _recoverOrphanedDispatches() {
+        if (this._recoveryDone) return;
+        this._recoveryDone = true;
+
+        let open;
+        try {
+            open = this.store.listOpenDispatches();
+        } catch (err) {
+            this.incidents.record({
+                kind: 'recovery_error',
+                epoch: this.epoch,
+                details: { error: err && err.message ? err.message : String(err) },
+            });
+            return;
+        }
+        if (!open || open.length === 0) return;
+
+        const currentEpoch = this.epoch;
+        const abandoned = [];
+        for (const row of open) {
+            if (!row || !row.dispatch_id) continue;
+            if (TERMINAL_DISPATCH_STATES.has(row.state)) continue;
+            // Never touch rows from the current (or a future, which shouldn't
+            // happen) epoch — those belong to the live supervisor.
+            if ((row.epoch || 0) >= currentEpoch) continue;
+            try {
+                this.store.updateDispatchState(row.dispatch_id, {
+                    state: DISPATCH_STATES.ABANDONED,
+                    terminalAt: this.clock(),
+                    lastError: 'orphaned_by_restart',
+                });
+                this.incidents.record({
+                    kind: 'dispatch_abandoned',
+                    dispatchId: row.dispatch_id,
+                    epoch: currentEpoch,
+                    stateFrom: row.state,
+                    stateTo: DISPATCH_STATES.ABANDONED,
+                    details: {
+                        error: 'orphaned_by_restart',
+                        prior_state: row.state,
+                        prior_epoch: row.epoch || 0,
+                        prior_replay_count: row.replay_count || 0,
+                    },
+                });
+                abandoned.push(row.dispatch_id);
+            } catch (err) {
+                this.incidents.record({
+                    kind: 'recovery_error',
+                    dispatchId: row.dispatch_id,
+                    epoch: currentEpoch,
+                    details: {
+                        error: err && err.message ? err.message : String(err),
+                        prior_state: row.state,
+                        prior_epoch: row.epoch || 0,
+                    },
+                });
+            }
+        }
+
+        if (abandoned.length > 0) {
+            this.incidents.record({
+                kind: 'recovery_summary',
+                epoch: currentEpoch,
+                details: {
+                    abandoned_count: abandoned.length,
+                    dispatch_ids: abandoned.slice(0, 16),
+                },
+            });
+        }
     }
 
     /**

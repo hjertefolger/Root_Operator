@@ -129,12 +129,39 @@ function transitionDispatch(current, event) {
  */
 function replayCapForSource(source) {
     switch (source) {
-        case 'scheduler': return 2;
+        case 'scheduler': return 4;
         case 'channel': return 1;
         case 'user': return 1;
         case 'probe': return 0;
         default: return 0;
     }
+}
+
+/**
+ * Exponential backoff for the wedge-detection silence timer. The caller
+ * supplies a base silence budget when enqueueing; each replay doubles it.
+ *
+ * Rationale: an upstream Anthropic outage can last hours. With a flat base
+ * silence_ms, `replay_cap` retries burn inside the outage and the dispatch
+ * is abandoned before recovery. Doubling stretches coverage across replays
+ * without increasing the steady-state attempt count.
+ *
+ * Ladder at base=30min, replayCount=0..4: 30 / 60 / 120 / 240 / 480 min.
+ * Ceiling (MAX_EFFECTIVE_SILENCE_MS) clamps runaway values if a caller
+ * passes a large base or replay_count climbs via a bug.
+ *
+ * IMPORTANT: this returns the *effective* silence for wedge detection only.
+ * The safety-net timer in `_activateNext()` must continue to use the
+ * immutable base silence_ms — it protects against broken Stop delivery,
+ * not legitimate quiet periods.
+ */
+const MAX_EFFECTIVE_SILENCE_MS = 8 * 60 * 60 * 1000; // 8h hard ceiling
+
+function effectiveSilenceMs(baseSilenceMs, replayCount = 0) {
+    const base = Number(baseSilenceMs) > 0 ? Number(baseSilenceMs) : 0;
+    const n = Number.isFinite(replayCount) && replayCount > 0 ? Math.floor(replayCount) : 0;
+    const scaled = base * Math.pow(2, n);
+    return Math.min(scaled, MAX_EFFECTIVE_SILENCE_MS);
 }
 
 /**
@@ -197,6 +224,8 @@ module.exports = {
     transitionDispatch,
     replayCapForSource,
     canReplayDispatch,
+    effectiveSilenceMs,
+    MAX_EFFECTIVE_SILENCE_MS,
     intensityBurst,
     intensityWindow,
     intensityExhausted,
