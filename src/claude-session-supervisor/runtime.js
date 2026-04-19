@@ -263,17 +263,18 @@ class Runtime {
             return { pid, certain: false, reason: 'no_signature_recorded' };
         }
         // ps-unavailable sentinel: recordPid couldn't capture the command
-        // on this host. Two options:
-        //   - default: treat as uncertain (safe, but bricks recovery on
-        //     sandboxed hosts where `ps` is permanently unavailable)
-        //   - with ROOT_OPERATOR_TRUST_UNSIGNED_PIDFILE=1: treat as
-        //     certain and trust the PID. Accepts PID-reuse risk as the
-        //     explicit tradeoff.
+        // on this host. Default is now "trust the PID" — permanent brick
+        // via orphan_unsafe on every crash recovery is worse than the
+        // bounded PID-reuse risk (narrow timing window between orphan
+        // exit and reassignment, plus the PID is our RECORD, not
+        // someone else's pidfile). Opt OUT with
+        // ROOT_OPERATOR_DISTRUST_UNSIGNED_PIDFILE=1 for hosts where
+        // PID reuse is a realistic concern.
         if (recordedSignature === PS_UNAVAILABLE_SENTINEL) {
-            if (process.env && process.env.ROOT_OPERATOR_TRUST_UNSIGNED_PIDFILE === '1') {
-                return { pid, certain: true };
+            if (process.env && process.env.ROOT_OPERATOR_DISTRUST_UNSIGNED_PIDFILE === '1') {
+                return { pid, certain: false, reason: 'ps_unavailable_at_record' };
             }
-            return { pid, certain: false, reason: 'ps_unavailable_at_record' };
+            return { pid, certain: true, reason: 'ps_unavailable_at_record_trusted' };
         }
 
         // Verify the PID still points at a Claude process.

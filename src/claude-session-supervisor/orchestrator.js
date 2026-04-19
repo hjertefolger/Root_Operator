@@ -152,26 +152,40 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._orphanStatusUnsafe = false;
         // Keep the legacy field name for any code that still reads it.
         this._orphanKillFailed = false;
-        // Evidence that THIS boot affirmatively cleared the orphan.
-        // Requires ALL of:
-        //   - a pidfile was present (we have something to prove from)
-        //   - probe was certain (no ps-lookup failure, no legacy-unsigned)
-        //   - either no orphan pid was extracted, OR the kill succeeded,
-        //     OR the orphan was benignly already_dead
-        // Pidfile-absent does NOT count as affirmative: previous boots
-        // abandoning prior-epoch rows leave the next boot looking "clean"
-        // on their own with no actual evidence the orphan is gone. Used
-        // by the orphan_unsafe_latch auto-clear logic (pass-21 + pass-22).
+        // Evidence that THIS boot cleared the orphan. Three tiers:
+        //   STRONG (_bootProbeAffirmativelyClean = true):
+        //     pidfile present + probe certain + no orphan or kill succeeded.
+        //     We have proof.
+        //   PASSIVE (_bootProbePassivelyClean = true):
+        //     no pidfile + no stale socket + no prior-epoch open rows.
+        //     Covers the "user rebooted the host after the first-upgrade
+        //     unsafe boot abandoned everything" case. Not as strong as a
+        //     certain probe, but the environment shows no signs of an
+        //     active orphan and blocking forever is worse than trusting
+        //     an honest restart.
+        //   NONE: keep the latch.
         this._bootProbeAffirmativelyClean = false;
+        this._bootProbePassivelyClean = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
                 const report = this.runtime.bootCleanup();
+                const orphanConfirmedGone = !!(report
+                    && (!report.orphan_pid
+                        || report.orphan_killed === true
+                        || report.orphan_kill_reason === 'already_dead'));
                 if (report
                     && report.pidfile_present === true
                     && report.orphan_status_certain === true
-                    && (!report.orphan_pid || report.orphan_killed === true
-                        || report.orphan_kill_reason === 'already_dead')) {
+                    && orphanConfirmedGone) {
                     this._bootProbeAffirmativelyClean = true;
+                }
+                // Passive-clean: no pidfile to probe AND no stale artifacts.
+                // Check prior-epoch rows below — a later step in this block
+                // sets the flag only once we know rows are clean too.
+                if (report
+                    && report.pidfile_present === false
+                    && report.stale_socket_removed === false) {
+                    this._bootProbePassivelyCleanPending = true;
                 }
                 if (report && (report.orphan_pid || report.stale_socket_removed
                     || (report.old_epochs_removed && report.old_epochs_removed.length > 0))) {
@@ -205,17 +219,26 @@ class ClaudeSessionSupervisor extends EventEmitter {
                 // install (no pidfile, no orphans) should still proceed.
                 const pidfileMissing = !!(report && report.pidfile_present === false);
                 const probeUncertain = !!(report && report.orphan_status_certain === false);
+                let priorEpochOpenExists = false;
+                try {
+                    const open = this.store.listOpenDispatches();
+                    priorEpochOpenExists = open.some(row =>
+                        row
+                        && (row.epoch || 0) < this.epoch
+                        && !TERMINAL_DISPATCH_STATES.has(row.state));
+                } catch (_) {
+                    priorEpochOpenExists = true; // be conservative
+                }
+                // Confirm passive-clean: passivelyCleanPending was set above
+                // (no pidfile + no stale socket). Only hold that flag if
+                // there are also no prior-epoch open rows — otherwise the
+                // recovered dispatches show we DO have recent history that
+                // demands stronger evidence.
+                if (this._bootProbePassivelyCleanPending && !priorEpochOpenExists) {
+                    this._bootProbePassivelyClean = true;
+                }
+                delete this._bootProbePassivelyCleanPending;
                 if (pidfileMissing || probeUncertain) {
-                    let priorEpochOpenExists = false;
-                    try {
-                        const open = this.store.listOpenDispatches();
-                        priorEpochOpenExists = open.some(row =>
-                            row
-                            && (row.epoch || 0) < this.epoch
-                            && !TERMINAL_DISPATCH_STATES.has(row.state));
-                    } catch (_) {
-                        priorEpochOpenExists = true; // be conservative
-                    }
                     if (priorEpochOpenExists) {
                         this._orphanStatusUnsafe = true;
                         this.incidents.record({
@@ -285,27 +308,37 @@ class ClaudeSessionSupervisor extends EventEmitter {
         try {
             const persistedUnsafe = this.store.getStateValue('orphan_unsafe_latch', '');
             if (persistedUnsafe === 'true') {
-                if (this._bootProbeAffirmativelyClean && !this._orphanStatusUnsafe) {
+                const canClear = (this._bootProbeAffirmativelyClean
+                        || this._bootProbePassivelyClean)
+                    && !this._orphanStatusUnsafe;
+                if (canClear) {
                     this.store.setStateValue('orphan_unsafe_latch', '');
                     this.incidents.record({
                         kind: 'orphan_unsafe_latch_auto_cleared',
                         epoch: this.epoch,
                         details: {
-                            note: 'current boot affirmatively clean (probe certain + no orphan); stale latch cleared',
+                            note: this._bootProbeAffirmativelyClean
+                                ? 'affirmative clean (pidfile probe certain + no orphan)'
+                                : 'passive clean (no pidfile, no stale socket, no prior-epoch rows)',
                         },
                     });
                 } else {
-                    // Current boot can't positively confirm safety → respect
-                    // the latch (re-assert the unsafe flag if we haven't
-                    // already detected it locally).
+                    // Still no evidence of safety — respect the latch and
+                    // re-assert the unsafe flag if local detection missed
+                    // it. Incident explicitly names the env-var escape
+                    // hatch so operators who confirm the orphan is gone
+                    // have a visible recovery path without needing to
+                    // reverse-engineer the SQLite state.
                     this._orphanStatusUnsafe = true;
                     this.incidents.record({
                         kind: 'orphan_unsafe_latch_carried_forward',
                         epoch: this.epoch,
                         details: {
-                            note: 'current boot did not present affirmative clean evidence',
-                            boot_probe_clean: this._bootProbeAffirmativelyClean,
+                            note: 'no affirmative/passive clean signal this boot',
+                            boot_probe_affirmative: this._bootProbeAffirmativelyClean,
+                            boot_probe_passive: this._bootProbePassivelyClean,
                             local_unsafe: this._orphanStatusUnsafe,
+                            operator_override: 'ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1 restart to clear',
                         },
                     });
                 }
