@@ -152,17 +152,22 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._orphanStatusUnsafe = false;
         // Keep the legacy field name for any code that still reads it.
         this._orphanKillFailed = false;
-        // Evidence that THIS boot affirmatively cleared the orphan: the
-        // probe was certain AND reported no live orphan. Used by the
-        // orphan_unsafe_latch auto-clear logic to distinguish "genuinely
-        // safe, clear the stale latch" from "can't tell, keep latched."
+        // Evidence that THIS boot affirmatively cleared the orphan.
+        // Requires ALL of:
+        //   - a pidfile was present (we have something to prove from)
+        //   - probe was certain (no ps-lookup failure, no legacy-unsigned)
+        //   - either no orphan pid was extracted, OR the kill succeeded,
+        //     OR the orphan was benignly already_dead
+        // Pidfile-absent does NOT count as affirmative: previous boots
+        // abandoning prior-epoch rows leave the next boot looking "clean"
+        // on their own with no actual evidence the orphan is gone. Used
+        // by the orphan_unsafe_latch auto-clear logic (pass-21 + pass-22).
         this._bootProbeAffirmativelyClean = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
                 const report = this.runtime.bootCleanup();
-                // Affirmative-clean: probe was certain AND no orphan found.
-                // (If orphan_pid was set but successfully killed, also clean.)
                 if (report
+                    && report.pidfile_present === true
                     && report.orphan_status_certain === true
                     && (!report.orphan_pid || report.orphan_killed === true
                         || report.orphan_kill_reason === 'already_dead')) {
@@ -543,6 +548,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._stopTailer();
         this._clearActiveSafetyTimer();
         this._clearActiveWedgeTimer();
+        this._clearGatedActivationTimer();
         this._unsubscribeBridgeReady();
         // Terminalize any in-flight dispatch so it doesn't look permanently active
         if (this.activeDispatch) {
@@ -600,6 +606,52 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._transition('shutdown', { occurredAt: this.clock() });
     }
 
+    /**
+     * Arms (or re-arms) a one-shot timer that terminalizes queued
+     * dispatches if the bridge stays down long enough. Without this,
+     * a scheduler fire → _fireJob → supervisor.enqueue → _activateNext
+     * hitting the bridge gate would wait forever on awaitOutcome,
+     * leaving runningAt set and blocking subsequent cron ticks.
+     *
+     * Timeout budget = 10× default silence (50 min). Matches the
+     * safety-net window that would have fired if the dispatch had
+     * activated normally and never emitted a Stop. Cleared whenever
+     * _activateNext successfully activates a dispatch.
+     */
+    _armGatedActivationTimeout() {
+        if (this._gatedActivationTimer) return;
+        const budgetMs = DEFAULT_SILENCE_MS * SAFETY_NET_MULTIPLIER;
+        this._gatedActivationTimer = setTimeout(() => {
+            this._gatedActivationTimer = null;
+            if (this._shutdown) return;
+            // Terminalize all rows still queued after the bridge-wait
+            // budget expired. This is the "bridge never came back"
+            // failure mode — scheduler needs its awaitOutcome to
+            // resolve so runningAt clears and the next cron tick can
+            // proceed.
+            try {
+                const open = this.store.listOpenDispatches();
+                for (const row of open) {
+                    if (!row || row.state !== DISPATCH_STATES.QUEUED) continue;
+                    if ((row.epoch || 0) !== this.epoch) continue;
+                    this._completeDispatch(
+                        row.dispatch_id,
+                        DISPATCH_STATES.FAILED,
+                        'bridge_never_ready',
+                    );
+                }
+            } catch (_) { /* best-effort */ }
+        }, budgetMs);
+        if (this._gatedActivationTimer.unref) this._gatedActivationTimer.unref();
+    }
+
+    _clearGatedActivationTimer() {
+        if (this._gatedActivationTimer) {
+            clearTimeout(this._gatedActivationTimer);
+            this._gatedActivationTimer = null;
+        }
+    }
+
     _activateNext() {
         if (this.activeDispatch) return;
         // Bridge-readiness gate. Two signals we care about:
@@ -613,9 +665,11 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Tests that mock channelManager without `.connected` (undefined)
         // behave as always-available once bridge_ready has fired.
         if (!this._bridgeReadyFired) {
+            this._armGatedActivationTimeout();
             return;
         }
         if (this.channelManager && this.channelManager.connected === false) {
+            this._armGatedActivationTimeout();
             return;
         }
         // Drain zombie ids: an id popped from the in-memory queue might have
@@ -644,6 +698,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
         }
 
         const now = this.clock();
+        // Activation is proceeding — the bridge-wait budget timer is no
+        // longer needed. If it was never armed, this is a no-op.
+        this._clearGatedActivationTimer();
         this.store.updateDispatchState(dispatchId, {
             state: DISPATCH_STATES.SENDING,
             sendingAt: now,
