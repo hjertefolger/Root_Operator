@@ -186,43 +186,66 @@ class Runtime {
      * pidfile AND that PID still belongs to a Claude subprocess, or null
      * otherwise. Does not kill.
      *
-     * PID reuse is a real concern: if the old Claude exited after Electron
-     * crashed, the OS can reuse that numeric PID before the next boot. A
-     * naïve kill would SIGKILL whichever unrelated process now owns it.
-     * We defend by reading the pidfile content as PID + command-name
-     * signature (recordPid writes both) and verifying the signature matches
-     * the live process's `ps -p <pid> -o command=` output before returning.
-     * Mismatch → null → bootCleanup skips the kill.
+     * For boot-time safety analysis, prefer probeOrphanStatus() — it
+     * distinguishes "definitely no orphan" from "can't tell" (corrupted
+     * pidfile, unreadable file, ps lookup failed), which matters for the
+     * abandon-vs-replay decision in bootCleanup.
      */
     detectOrphanPid() {
+        const result = this.probeOrphanStatus();
+        return result.pid;
+    }
+
+    /**
+     * Richer companion to detectOrphanPid(). Returns:
+     *   { pid: number, certain: true }   — orphan confirmed alive
+     *   { pid: null,   certain: true }   — definitively no orphan
+     *   { pid: null,   certain: false, reason: string }
+     *                                    — cannot verify (corrupted
+     *                                      pidfile, unreadable content,
+     *                                      ps lookup failure, etc.)
+     *
+     * The "certain: false" branch is important: bootCleanup treats it as
+     * UNSAFE so the supervisor doesn't re-queue orphans while an old
+     * Claude might still be alive but we can't identify it.
+     */
+    probeOrphanStatus() {
         const pf = this.pidfilePath();
-        if (!fs.existsSync(pf)) return null;
+        if (!fs.existsSync(pf)) {
+            return { pid: null, certain: true };
+        }
 
         let raw;
         try {
             raw = fs.readFileSync(pf, 'utf8').trim();
-        } catch {
-            return null;
+        } catch (err) {
+            return { pid: null, certain: false, reason: `read_error:${err.code || 'unknown'}` };
         }
-        if (!raw) return null;
+        if (!raw) {
+            return { pid: null, certain: false, reason: 'empty_pidfile' };
+        }
 
-        // File format: "<pid>" (legacy) OR "<pid>\n<command-signature>" (current).
         const lines = raw.split('\n');
         const pid = parseInt((lines[0] || '').trim(), 10);
-        if (!pid || isNaN(pid)) return null;
-        const recordedSignature = (lines[1] || '').trim(); // may be empty (legacy pidfile)
+        if (!pid || isNaN(pid)) {
+            return { pid: null, certain: false, reason: 'unparseable_pid' };
+        }
+        const recordedSignature = (lines[1] || '').trim();
 
-        // Cheap existence probe first.
+        // Existence probe. ESRCH means the process is definitively gone.
         try {
             process.kill(pid, 0);
-        } catch {
-            return null;
+        } catch (err) {
+            if (err.code === 'ESRCH') return { pid: null, certain: true };
+            // EPERM here means the process exists but we can't signal it —
+            // that's CERTAIN orphan presence, not uncertainty. Fall through
+            // to the signature check so we can at least attempt a kill.
+            if (err.code !== 'EPERM') {
+                return { pid: null, certain: false, reason: `kill0_error:${err.code || 'unknown'}` };
+            }
         }
 
-        // Verify the PID still points at a Claude process. On legacy
-        // single-line pidfiles (no signature), skip the check so we don't
-        // regress older boots — upstream callers write the signature on
-        // every spawn going forward, so the gap closes within one cycle.
+        // Verify the PID still points at a Claude process.
         if (recordedSignature) {
             let current = null;
             try {
@@ -231,19 +254,19 @@ class Runtime {
                     stdio: ['ignore', 'pipe', 'ignore'],
                 }).trim();
             } catch {
-                // ps failed (process vanished mid-check, permission, or an
-                // unexpected platform). Safer to not kill on uncertainty.
-                return null;
+                return { pid: null, certain: false, reason: 'ps_lookup_failed' };
             }
-            if (!current) return null;
-            // Signature match is a substring check — the full command line
-            // may include args/flags that weren't recorded, but the
-            // executable portion we snapshotted at spawn must still be
-            // present for this to be the same process.
-            if (!current.includes(recordedSignature)) return null;
+            if (!current) {
+                return { pid: null, certain: false, reason: 'ps_empty_output' };
+            }
+            if (!current.includes(recordedSignature)) {
+                // Signature mismatch: PID was reused by an unrelated
+                // process. Definitely not our orphan.
+                return { pid: null, certain: true };
+            }
         }
 
-        return pid;
+        return { pid, certain: true };
     }
 
     /**
@@ -342,6 +365,8 @@ class Runtime {
             orphan_killed: false,
             orphan_kill_reason: null,
             pidfile_present: false,
+            orphan_status_certain: true,
+            orphan_status_reason: null,
             stale_socket_removed: false,
             old_epochs_removed: [],
         };
@@ -349,7 +374,12 @@ class Runtime {
         const pidfilePath = this.pidfilePath();
         report.pidfile_present = fs.existsSync(pidfilePath);
 
-        const pid = this.detectOrphanPid();
+        const probe = this.probeOrphanStatus();
+        report.orphan_status_certain = probe.certain !== false;
+        if (probe.certain === false) {
+            report.orphan_status_reason = probe.reason || 'unknown';
+        }
+        const pid = probe.pid;
         if (pid) {
             report.orphan_pid = pid;
             const result = this.killOrphanPid(pid);
@@ -358,7 +388,16 @@ class Runtime {
                 ? null
                 : (result.reason || 'unknown');
         }
-        this.clearPidfile();
+        // Keep the pidfile around when a real kill failure occurred
+        // (orphan is still alive). Next boot's bootCleanup() will try
+        // again. Clearing would permanently lose the identity of the
+        // surviving orphan after a single transient EPERM/EACCES.
+        const killTrulyFailed = !!(pid
+            && report.orphan_killed === false
+            && report.orphan_kill_reason !== 'already_dead');
+        if (!killTrulyFailed) {
+            this.clearPidfile();
+        }
 
         const socketResult = this.cleanupStaleSocket();
         report.stale_socket_removed = socketResult.removed;

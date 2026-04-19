@@ -1098,6 +1098,44 @@ test('start(): pidfile kill returning already_dead is treated as safe (not unsaf
     store.close();
 });
 
+test('start(): uncertain pidfile probe + prior-epoch orphans → abandon-all', async () => {
+    const { supervisor, store, runtime } = fixture();
+    // Simulate a corrupted pidfile (present but probe can't verify).
+    // bootCleanup must report pidfile_present=true, orphan_status_certain=false.
+    const origBoot = runtime.bootCleanup.bind(runtime);
+    runtime.bootCleanup = () => ({
+        orphan_pid: null,
+        orphan_killed: false,
+        orphan_kill_reason: null,
+        pidfile_present: true,
+        orphan_status_certain: false,
+        orphan_status_reason: 'ps_lookup_failed',
+        stale_socket_removed: false,
+        old_epochs_removed: [],
+    });
+
+    store.insertDispatch({
+        dispatchId: 'uncertain-orphan', source: 'channel', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    const row = store.getDispatch('uncertain-orphan');
+    assert.equal(row.state, DISPATCH_STATES.ABANDONED,
+        'uncertain pidfile status must force abandon-all');
+    const unknownIncident = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'boot_cleanup_orphan_status_unknown'")
+        .get();
+    const details = JSON.parse(unknownIncident.details_json);
+    assert.match(details.reason, /pidfile_probe_uncertain:ps_lookup_failed/);
+
+    runtime.bootCleanup = origBoot;
+    await supervisor.shutdown();
+    store.close();
+});
+
 test('start(): pidfile kill returning EPERM triggers abandon-all (unsafe branch)', async () => {
     const { supervisor, store, runtime } = fixture();
     const origBoot = runtime.bootCleanup.bind(runtime);

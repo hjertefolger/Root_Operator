@@ -148,6 +148,75 @@ test('bootCleanup reports what happened', () => {
     runtime.store.close();
 });
 
+test('probeOrphanStatus: empty pidfile → certain:false (uncertain)', () => {
+    const { runtime } = freshFixture();
+    fs.writeFileSync(runtime.pidfilePath(), '');
+    const probe = runtime.probeOrphanStatus();
+    assert.equal(probe.pid, null);
+    assert.equal(probe.certain, false);
+    assert.equal(probe.reason, 'empty_pidfile');
+    runtime.store.close();
+});
+
+test('probeOrphanStatus: unparseable pid → certain:false (uncertain)', () => {
+    const { runtime } = freshFixture();
+    fs.writeFileSync(runtime.pidfilePath(), 'garbage-not-a-number\n');
+    const probe = runtime.probeOrphanStatus();
+    assert.equal(probe.pid, null);
+    assert.equal(probe.certain, false);
+    assert.equal(probe.reason, 'unparseable_pid');
+    runtime.store.close();
+});
+
+test('probeOrphanStatus: dead pid → certain:true (no orphan, confident)', () => {
+    const { runtime } = freshFixture();
+    fs.writeFileSync(runtime.pidfilePath(), '999999');
+    const probe = runtime.probeOrphanStatus();
+    assert.equal(probe.pid, null);
+    assert.equal(probe.certain, true);
+    runtime.store.close();
+});
+
+test('probeOrphanStatus: no pidfile → certain:true (no orphan, confident)', () => {
+    const { runtime } = freshFixture();
+    // no write; no pidfile exists
+    const probe = runtime.probeOrphanStatus();
+    assert.equal(probe.pid, null);
+    assert.equal(probe.certain, true);
+    runtime.store.close();
+});
+
+test('bootCleanup preserves pidfile on non-already_dead kill failure', () => {
+    const { runtime } = freshFixture();
+    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`); // live pid
+    // Force killOrphanPid to return a real failure.
+    const origKill = runtime.killOrphanPid.bind(runtime);
+    runtime.killOrphanPid = () => ({ killed: false, reason: 'EPERM' });
+    const report = runtime.bootCleanup();
+    assert.equal(report.orphan_killed, false);
+    assert.equal(report.orphan_kill_reason, 'EPERM');
+    // Pidfile MUST still exist so the next boot can retry.
+    assert.ok(fs.existsSync(runtime.pidfilePath()),
+        'pidfile must survive a real kill failure');
+    runtime.killOrphanPid = origKill;
+    runtime.clearPidfile(); // cleanup
+    runtime.store.close();
+});
+
+test('bootCleanup clears pidfile on already_dead (benign race)', () => {
+    const { runtime } = freshFixture();
+    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`);
+    const origKill = runtime.killOrphanPid.bind(runtime);
+    runtime.killOrphanPid = () => ({ killed: false, reason: 'already_dead' });
+    const report = runtime.bootCleanup();
+    assert.equal(report.orphan_kill_reason, 'already_dead');
+    // Pidfile should be cleared — orphan is gone, no reason to retry.
+    assert.equal(fs.existsSync(runtime.pidfilePath()), false,
+        'pidfile must be cleared when the orphan is benignly gone');
+    runtime.killOrphanPid = origKill;
+    runtime.store.close();
+});
+
 test('detectOrphanPid: PID-reuse defense — mismatched signature returns null', () => {
     const { runtime } = freshFixture();
     // Record the test-runner process (a live pid) but with a bogus command

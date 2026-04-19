@@ -153,6 +153,12 @@ class DispatchStore {
                 WHERE state IN ('queued', 'sending', 'active')
                 ORDER BY enqueued_at ASC
             `),
+            getLatestDispatchForSource: this.db.prepare(`
+                SELECT * FROM dispatches
+                WHERE source = ? AND source_id = ?
+                ORDER BY enqueued_at DESC
+                LIMIT 1
+            `),
             insertEffect: this.db.prepare(`
                 INSERT INTO effects (
                     effect_id, dispatch_id, ordinal, kind, payload_hash,
@@ -255,6 +261,16 @@ class DispatchStore {
 
     listOpenDispatches() {
         return this._stmt.listOpenDispatches.all();
+    }
+
+    /**
+     * Return the most recently enqueued dispatch matching source+source_id,
+     * regardless of state (including terminal rows). Used by the scheduler
+     * on restart to disambiguate "crash mid-run" from "completed between
+     * supervisor terminalization and scheduler _completeJob."
+     */
+    getLatestDispatchForSource(source, sourceId) {
+        return this._stmt.getLatestDispatchForSource.get(source, sourceId ?? null) || null;
     }
 
     insertPreparedEffect({ effectId, dispatchId, ordinal, kind, payloadHash = null, preparedAt, externalRef = null }) {

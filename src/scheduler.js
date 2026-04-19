@@ -145,6 +145,25 @@ class Scheduler extends EventEmitter {
             });
     }
 
+    /**
+     * Return the supervisor's most recent dispatch row for this job's
+     * source_id, or null if supervisor is unwired or the method isn't
+     * available. Used to disambiguate a genuine crash-mid-run from a
+     * completed-but-unrecorded success after a restart.
+     */
+    _getLatestSupervisorDispatch(jobId) {
+        if (!this.supervisor || !this.supervisor.store
+            || typeof this.supervisor.store.getLatestDispatchForSource !== 'function') {
+            return null;
+        }
+        try {
+            return this.supervisor.store.getLatestDispatchForSource('scheduler', jobId);
+        } catch (err) {
+            console.error(`[Scheduler] getLatestDispatchForSource failed for ${jobId}: ${err.message}`);
+            return null;
+        }
+    }
+
     _hasLiveSupervisorDispatchForJob(jobId) {
         if (!this.supervisor || !this.supervisor.store
             || typeof this.supervisor.store.listOpenDispatches !== 'function') {
@@ -219,12 +238,30 @@ class Scheduler extends EventEmitter {
             reattachQueue.push(job);
         }
 
-        // Record crash-abandoned runs as failures (bumps consecutiveErrors,
-        // writes lastError, clears runningAt). _completeJob handles all
-        // side-effects and persistence — don't double-write jobs here.
+        // Reconcile each crash-suspect job against the supervisor's record
+        // of the most recent dispatch. There's a real race between
+        // supervisor terminalization and scheduler._completeJob clearing
+        // runningAt — if main.js crashed in that window, the dispatch is
+        // already terminal (possibly COMPLETED) but scheduler still thinks
+        // the job is running. Blindly recording every such job as
+        // crash_mid_run_orphaned would rewrite a successful run as a
+        // failure, bump consecutiveErrors, and eventually auto-disable a
+        // job that actually finished. Ask the supervisor what really
+        // happened.
         for (const job of crashFailedJobs) {
             const startedAt = job.runningAt ? new Date(job.runningAt).getTime() : Date.now();
-            this._completeJob(job.id, 'error', 'crash_mid_run_orphaned', startedAt);
+            const latest = this._getLatestSupervisorDispatch(job.id);
+            if (latest && latest.state === 'completed') {
+                this._completeJob(job.id, 'success', null, startedAt);
+            } else if (latest && (latest.state === 'failed' || latest.state === 'abandoned')) {
+                const err = latest.last_error || `${latest.state}_no_error_recorded`;
+                this._completeJob(job.id, 'error', err, startedAt);
+            } else {
+                // No supervisor record, or latest row was non-terminal and
+                // should have been in reattachQueue — treat as genuine
+                // mid-run crash.
+                this._completeJob(job.id, 'error', 'crash_mid_run_orphaned', startedAt);
+            }
             cleaned++;
         }
 

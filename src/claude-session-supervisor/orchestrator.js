@@ -169,10 +169,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         },
                     });
                 }
-                // Unknown-status branch: no pidfile at all. Only elevate to
-                // UNSAFE when prior-epoch non-terminal rows exist — otherwise
-                // a clean fresh install would trip this every boot.
-                if (report && report.pidfile_present === false) {
+                // Unknown-status branch: either the pidfile is missing
+                // entirely (first-upgrade boot) or the probe couldn't verify
+                // it (corrupted content, unparseable PID, ps lookup failure,
+                // empty file, etc.). Only elevate to UNSAFE when there are
+                // prior-epoch non-terminal rows to protect — a clean fresh
+                // install (no pidfile, no orphans) should still proceed.
+                const pidfileMissing = !!(report && report.pidfile_present === false);
+                const probeUncertain = !!(report && report.orphan_status_certain === false);
+                if (pidfileMissing || probeUncertain) {
                     let priorEpochOpenExists = false;
                     try {
                         const open = this.store.listOpenDispatches();
@@ -189,7 +194,9 @@ class ClaudeSessionSupervisor extends EventEmitter {
                             kind: 'boot_cleanup_orphan_status_unknown',
                             epoch: this.epoch,
                             details: {
-                                reason: 'no_pidfile_with_prior_epoch_open_dispatches',
+                                reason: probeUncertain
+                                    ? `pidfile_probe_uncertain:${report.orphan_status_reason || 'unknown'}`
+                                    : 'no_pidfile_with_prior_epoch_open_dispatches',
                             },
                         });
                     }
