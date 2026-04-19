@@ -23,6 +23,11 @@ const { execFileSync } = require('child_process');
 const RUNTIME_DIR = path.join(process.env.HOME || '', '.root-operator', 'runtime');
 const PIDFILE_NAME = 'supervisor.pidfile';
 const SOCKET_PATH_DEFAULT = '/tmp/root-operator-channel.sock';
+// Written on the signature line of the pidfile when recordPid cannot
+// invoke `ps` (sandboxed host, missing binary, transient failure).
+// Distinct from an absent signature so probeOrphanStatus can treat
+// these hosts differently than legacy pre-signature pidfiles.
+const PS_UNAVAILABLE_SENTINEL = '__ps_unavailable_at_record__';
 
 const HOOK_BASENAME = 'claude-channel-hooks';
 const DEBUG_BASENAME = 'claude-channel-debug';
@@ -252,14 +257,23 @@ class Runtime {
             }
         }
 
-        // No recorded signature — either a legacy pidfile written before
-        // the signature field existed, or a post-upgrade write where
-        // recordPid's `ps` capture failed. Either way we cannot verify
-        // the PID still belongs to Claude. Treat as uncertain so the
-        // orchestrator flags orphan_unsafe and abandon-all rather than
-        // risking a SIGKILL on a reused PID.
+        // No recorded signature — legacy pre-signature pidfile. Treat as
+        // uncertain; orchestrator will flag orphan_unsafe.
         if (!recordedSignature) {
             return { pid, certain: false, reason: 'no_signature_recorded' };
+        }
+        // ps-unavailable sentinel: recordPid couldn't capture the command
+        // on this host. Two options:
+        //   - default: treat as uncertain (safe, but bricks recovery on
+        //     sandboxed hosts where `ps` is permanently unavailable)
+        //   - with ROOT_OPERATOR_TRUST_UNSIGNED_PIDFILE=1: treat as
+        //     certain and trust the PID. Accepts PID-reuse risk as the
+        //     explicit tradeoff.
+        if (recordedSignature === PS_UNAVAILABLE_SENTINEL) {
+            if (process.env && process.env.ROOT_OPERATOR_TRUST_UNSIGNED_PIDFILE === '1') {
+                return { pid, certain: true };
+            }
+            return { pid, certain: false, reason: 'ps_unavailable_at_record' };
         }
 
         // Verify the PID still points at a Claude process.
@@ -351,19 +365,38 @@ class Runtime {
     recordPid(pid) {
         if (!pid) return;
         let signature = '';
+        let psAvailable = true;
         try {
             signature = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
                 encoding: 'utf8',
                 stdio: ['ignore', 'pipe', 'ignore'],
             }).trim();
         } catch {
-            // ps failed (platform quirk, transient). Fall back to a bare
-            // PID line so the pidfile at least records existence; the
-            // missing signature disables the reuse check for this boot.
             signature = '';
+            psAvailable = false;
         }
-        const content = signature ? `${pid}\n${signature}\n` : `${pid}\n`;
+        // When `ps` IS available, record the captured signature normally.
+        // When NOT available (sandboxed Electron host, some container
+        // runtimes, packaged app without ps in PATH), write an explicit
+        // sentinel on the signature line so the next boot's
+        // probeOrphanStatus() can distinguish "ps was unavailable at
+        // record time" from "legacy pre-signature pidfile." This lets
+        // operators opt into trusting such pidfiles via
+        // ROOT_OPERATOR_TRUST_UNSIGNED_PIDFILE=1, accepting the
+        // PID-reuse risk on hosts where the signature layer can't work.
+        const finalSignature = signature || PS_UNAVAILABLE_SENTINEL;
+        const content = `${pid}\n${finalSignature}\n`;
         fs.writeFileSync(this.pidfilePath(), content);
+        if (!psAvailable) {
+            // Best-effort log so operators see why orphan verification
+            // will be weaker on this host.
+            try {
+                fs.appendFileSync(
+                    path.join(this.runtimeDir, 'recordPid-warnings.log'),
+                    `${new Date().toISOString()} ps_unavailable_at_record pid=${pid}\n`,
+                );
+            } catch (_) { /* ignore */ }
+        }
     }
 
     /**

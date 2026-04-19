@@ -3372,6 +3372,15 @@ function initChannelMode() {
                 setChannelRuntime('error',
                     'Previous Claude process may still be alive. Restart the app to retry.',
                     { attempt: channelStartupAttempt });
+                // Tear down the bridge so the orphan's surviving socket
+                // can't keep feeding the main process reply_request /
+                // claude_reply traffic while we refuse to spawn a fresh
+                // Claude. Without this, the orphan's replies would still
+                // land in ChatStore and trigger effect commits.
+                if (channelManager) {
+                    try { channelManager.disconnect(); } catch (_) { /* ignore */ }
+                    channelManager = null;
+                }
                 return; // Do NOT spawn.
             }
             // Healthy boot: proceed with scheduler + Claude spawn.

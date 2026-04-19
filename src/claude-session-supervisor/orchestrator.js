@@ -152,9 +152,22 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._orphanStatusUnsafe = false;
         // Keep the legacy field name for any code that still reads it.
         this._orphanKillFailed = false;
+        // Evidence that THIS boot affirmatively cleared the orphan: the
+        // probe was certain AND reported no live orphan. Used by the
+        // orphan_unsafe_latch auto-clear logic to distinguish "genuinely
+        // safe, clear the stale latch" from "can't tell, keep latched."
+        this._bootProbeAffirmativelyClean = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
                 const report = this.runtime.bootCleanup();
+                // Affirmative-clean: probe was certain AND no orphan found.
+                // (If orphan_pid was set but successfully killed, also clean.)
+                if (report
+                    && report.orphan_status_certain === true
+                    && (!report.orphan_pid || report.orphan_killed === true
+                        || report.orphan_kill_reason === 'already_dead')) {
+                    this._bootProbeAffirmativelyClean = true;
+                }
                 if (report && (report.orphan_pid || report.stale_socket_removed
                     || (report.old_epochs_removed && report.old_epochs_removed.length > 0))) {
                     this.incidents.record({
@@ -253,15 +266,44 @@ class ClaudeSessionSupervisor extends EventEmitter {
         if (process.env && process.env.ROOT_OPERATOR_CLEAR_ORPHAN_LATCH === '1') {
             this.clearOrphanUnsafeLatch();
         }
+        // Auto-clear policy: only clear a stale latch when THIS boot
+        // presents AFFIRMATIVE evidence the orphan is gone — probe was
+        // certain AND no orphan present (or orphan was killed /
+        // already_dead). A probe that simply returned "can't tell"
+        // (ps_lookup_failed, ps_empty_output, no pidfile + no records)
+        // is NOT affirmative; the latch stays until a future boot can
+        // prove clean. This avoids both:
+        //   (a) sticky-forever bricks (pass-21 concern) — once the
+        //       env heals and the next boot probes clean, we clear.
+        //   (b) false-clear restart bypass (pass-18 concern) — a single
+        //       "uncertain" boot won't erase the protection.
         try {
             const persistedUnsafe = this.store.getStateValue('orphan_unsafe_latch', '');
             if (persistedUnsafe === 'true') {
-                this._orphanStatusUnsafe = true;
-                this.incidents.record({
-                    kind: 'orphan_unsafe_latch_carried_forward',
-                    epoch: this.epoch,
-                    details: { note: 'cleared by manual reset after confirming orphan Claude is gone' },
-                });
+                if (this._bootProbeAffirmativelyClean && !this._orphanStatusUnsafe) {
+                    this.store.setStateValue('orphan_unsafe_latch', '');
+                    this.incidents.record({
+                        kind: 'orphan_unsafe_latch_auto_cleared',
+                        epoch: this.epoch,
+                        details: {
+                            note: 'current boot affirmatively clean (probe certain + no orphan); stale latch cleared',
+                        },
+                    });
+                } else {
+                    // Current boot can't positively confirm safety → respect
+                    // the latch (re-assert the unsafe flag if we haven't
+                    // already detected it locally).
+                    this._orphanStatusUnsafe = true;
+                    this.incidents.record({
+                        kind: 'orphan_unsafe_latch_carried_forward',
+                        epoch: this.epoch,
+                        details: {
+                            note: 'current boot did not present affirmative clean evidence',
+                            boot_probe_clean: this._bootProbeAffirmativelyClean,
+                            local_unsafe: this._orphanStatusUnsafe,
+                        },
+                    });
+                }
             }
         } catch (_) { /* best-effort */ }
 
