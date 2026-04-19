@@ -18,20 +18,13 @@ const EventEmitter = require('events');
 
 const MAX_JOBS = 50;
 const MAX_PROMPT_SIZE = 50_000; // 50KB
-// Upper bound on a legitimate single scheduler dispatch, used only as a
-// cross-process crash-recovery fallback. Within a live main.js process the
-// supervisor's awaitOutcome() → _completeJob() path clears runningAt when
-// the dispatch terminalizes, so this timeout should never fire during
-// healthy operation. It exists to unstick a job whose main.js died
-// mid-dispatch AND whose supervisor orphan-recovery somehow missed it.
-//
-// Sized to cover the supervisor's worst-case exponential-backoff retry
-// window: with scheduler replay_cap=4 and silenceMsForReplay doubling,
-// the Night Lab base of 30 min expands to 30 + 60 + 120 + 240 + 480 =
-// 930 min (≈15.5 h). The previous 2 h cutoff pre-dated exponential
-// backoff and would flag healthy long retries as stale, firing duplicate
-// cron runs while the original dispatch was still legitimately retrying.
-const STUCK_RUN_MS = 20 * 60 * 60 * 1000; // 20 hours (was 2h pre-backoff)
+// Time-based stale-run cutoff used ONLY on the legacy no-supervisor path.
+// When the supervisor is wired in, it's the source of truth for dispatch
+// lifecycle — the scheduler asks supervisor.store.listOpenDispatches()
+// and trusts the answer, regardless of how long runningAt has been set.
+// This keeps exponential-backoff retry windows (up to ~15.5 h for Night
+// Lab) from being misread as "stuck" and triggering duplicate cron fires.
+const STUCK_RUN_MS = 2 * 60 * 60 * 1000; // 2 hours (legacy fallback only)
 const MIN_REFIRE_GAP_MS = 5_000; // 5 seconds between same job fires
 const MAX_CONSECUTIVE_ERRORS = 10; // Disable after this many
 
@@ -94,6 +87,31 @@ class Scheduler extends EventEmitter {
     }
 
     /**
+     * Ask the supervisor whether any non-terminal dispatch currently exists
+     * for the given scheduler job id. Returns:
+     *   true  — supervisor has a live (queued/sending/active) dispatch for
+     *           this job; defer to supervisor, leave runningAt alone.
+     *   false — supervisor has NO live dispatch for this job; any persisted
+     *           runningAt is a stale cross-process artifact and can be
+     *           cleared immediately.
+     *   null  — supervisor not wired (legacy path); caller should fall back
+     *           to the time-based STUCK_RUN_MS cutoff.
+     */
+    _hasLiveSupervisorDispatchForJob(jobId) {
+        if (!this.supervisor || !this.supervisor.store
+            || typeof this.supervisor.store.listOpenDispatches !== 'function') {
+            return null;
+        }
+        try {
+            const open = this.supervisor.store.listOpenDispatches();
+            return open.some(d => d && d.source === 'scheduler' && d.source_id === jobId);
+        } catch (err) {
+            console.error(`[Scheduler] listOpenDispatches failed: ${err.message}`);
+            return null; // fall back to time-based cutoff on query error
+        }
+    }
+
+    /**
      * Load all persisted jobs, clean stale state, and start timers.
      */
     start() {
@@ -101,15 +119,27 @@ class Scheduler extends EventEmitter {
         let started = 0;
         let cleaned = 0;
 
-        // Clean stale running state from previous crashes
+        // Clean stale running state from previous crashes. Supervisor (when
+        // present) is source of truth — a job whose supervisor dispatch has
+        // already terminalized (including by _recoverOrphanedDispatches on
+        // this same boot) gets its runningAt cleared immediately, regardless
+        // of wall-clock age. Legacy no-supervisor path uses STUCK_RUN_MS.
         for (const job of jobs) {
-            if (job.runningAt) {
+            if (!job.runningAt) continue;
+            const liveDispatch = this._hasLiveSupervisorDispatchForJob(job.id);
+            if (liveDispatch === false) {
+                job.runningAt = null;
+                cleaned++;
+                continue;
+            }
+            if (liveDispatch === null) {
                 const staleMs = Date.now() - new Date(job.runningAt).getTime();
                 if (staleMs > STUCK_RUN_MS || isNaN(staleMs)) {
                     job.runningAt = null;
                     cleaned++;
                 }
             }
+            // liveDispatch === true → supervisor says dispatch is still active; leave it.
         }
 
         if (cleaned > 0) {
@@ -299,15 +329,31 @@ class Scheduler extends EventEmitter {
             return;
         }
 
-        // Check if already running (stuck run protection)
+        // Check if already running (stuck-run protection).
+        // Supervisor (when present) is the source of truth: if supervisor has
+        // a live dispatch for this job we skip regardless of wall-clock age;
+        // if supervisor says no live dispatch exists we clear runningAt and
+        // proceed. Only the legacy no-supervisor path uses the time-based
+        // STUCK_RUN_MS cutoff.
         if (job.runningAt) {
             const runningMs = Date.now() - new Date(job.runningAt).getTime();
-            if (runningMs < STUCK_RUN_MS) {
-                console.log(`[Scheduler] Skipping "${job.name}" — still running (${Math.round(runningMs / 1000)}s)`);
+            const liveDispatch = this._hasLiveSupervisorDispatchForJob(job.id);
+            if (liveDispatch === true) {
+                console.log(`[Scheduler] Skipping "${job.name}" — supervisor has live dispatch (${Math.round(runningMs / 1000)}s)`);
                 return;
             }
-            // Stale run — clear it and proceed
-            console.log(`[Scheduler] Clearing stale run for "${job.name}" (${Math.round(runningMs / 1000)}s)`);
+            if (liveDispatch === null) {
+                // Legacy path: no supervisor, use time-based cutoff.
+                if (runningMs < STUCK_RUN_MS) {
+                    console.log(`[Scheduler] Skipping "${job.name}" — still running (${Math.round(runningMs / 1000)}s)`);
+                    return;
+                }
+                console.log(`[Scheduler] Clearing stale run for "${job.name}" (${Math.round(runningMs / 1000)}s)`);
+            } else {
+                // Supervisor present and has no live dispatch → cross-process
+                // orphan. Clear and proceed.
+                console.log(`[Scheduler] Clearing orphaned runningAt for "${job.name}" (supervisor reports no live dispatch)`);
+            }
         }
 
         // Error backoff check
