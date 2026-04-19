@@ -2180,7 +2180,7 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
                 const sanitizeEnvelope = (s) => String(s).replace(/<\/(system-reminder|memory-context|channel)>/g, '<\u200B/$1>');
                 const safeContent = sanitizeEnvelope(content);
                 const safeBlock = sanitizeEnvelope(memoryBlock);
-                outboundContent = `${safeContent}\n\n<system-reminder>\n<memory-context>\n${safeBlock}\n</memory-context>\n\nReply to the user by calling the mcp__root-operator__reply tool with the chat_id from the <channel> tag above. Do not reply as plain text.\n</system-reminder>`;
+                outboundContent = `${safeContent}\n\n<system-reminder>\n<memory-context>\n${safeBlock}\n</memory-context>\n\nReply via the mcp__root-operator__reply tool using the chat_id from the <channel> tag above. A single-emoji ack is still a reply. Plain text doesn't reach the user.\n</system-reminder>`;
             }
             if (process.env.NODE_ENV === 'development' || process.env.DYNAMIC_MEMORY_PERF === '1') {
                 const wall = Date.now() - perfStart;
