@@ -322,20 +322,41 @@ class Runtime {
     /**
      * Convenience: run all boot-time cleanup steps.
      * Returns a report of what happened, for incident logging.
+     *
+     * Fields on the report:
+     *   - orphan_pid:        number|null — pid recovered from the pidfile, if any
+     *   - orphan_killed:     boolean — true only if SIGKILL succeeded
+     *   - orphan_kill_reason: string|null — 'already_dead' | 'no_pid' | error code
+     *                        for the kill attempt (lets callers distinguish a
+     *                        benign exit-before-kill race from EPERM)
+     *   - pidfile_present:   boolean — whether a pidfile existed at boot (false
+     *                        on fresh installs and on the first boot after
+     *                        upgrading from a build that never called recordPid;
+     *                        callers should treat "no pidfile AND prior-epoch
+     *                        open dispatches" as unsafe/unknown orphan status)
+     *   - stale_socket_removed, old_epochs_removed: see below
      */
     bootCleanup() {
         const report = {
             orphan_pid: null,
             orphan_killed: false,
+            orphan_kill_reason: null,
+            pidfile_present: false,
             stale_socket_removed: false,
             old_epochs_removed: [],
         };
+
+        const pidfilePath = this.pidfilePath();
+        report.pidfile_present = fs.existsSync(pidfilePath);
 
         const pid = this.detectOrphanPid();
         if (pid) {
             report.orphan_pid = pid;
             const result = this.killOrphanPid(pid);
             report.orphan_killed = result.killed;
+            report.orphan_kill_reason = result.killed
+                ? null
+                : (result.reason || 'unknown');
         }
         this.clearPidfile();
 

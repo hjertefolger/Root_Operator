@@ -753,7 +753,13 @@ test('PR2: system_notice_failed incident when bridge send returns false', async 
 });
 
 test('start(): SENDING/ACTIVE orphans are abandoned; QUEUED orphans are re-queued', async () => {
-    const { supervisor, store } = fixture();
+    const { supervisor, store, runtime } = fixture();
+    // Pre-write a pidfile with a dead PID so bootCleanup sees pidfile_present
+    // AND detects no live orphan. Without this, the "no pidfile with
+    // prior-epoch open dispatches" branch would flip recovery to UNSAFE and
+    // abandon every row — correct in production (first-upgrade-boot), but
+    // not what this test is covering.
+    fs.writeFileSync(runtime.pidfilePath(), '999999');
     // Simulate three rows left over from a prior process — one in each
     // non-terminal state. QUEUED must be re-queued (any source) because it
     // never touched Claude; SENDING/ACTIVE must be abandoned (effect
@@ -802,6 +808,7 @@ test('start(): SENDING/ACTIVE orphans are abandoned; QUEUED orphans are re-queue
 
 test('start(): recovery ignores rows from the current epoch (no split-brain on second start)', async () => {
     const { supervisor, store, runtime } = fixture();
+    fs.writeFileSync(runtime.pidfilePath(), '999999'); // dead pid → safe recovery
     // Row from a prior epoch: must be abandoned.
     store.insertDispatch({
         dispatchId: 'old', source: 'scheduler', payload: 'old',
@@ -834,7 +841,8 @@ test('start(): recovery ignores rows from the current epoch (no split-brain on s
 });
 
 test('start(): recovery runs at most once per supervisor instance', async () => {
-    const { supervisor, store } = fixture();
+    const { supervisor, store, runtime } = fixture();
+    fs.writeFileSync(runtime.pidfilePath(), '999999'); // dead pid → safe recovery
     store.insertDispatch({
         dispatchId: 'old', source: 'scheduler', payload: 'old',
         silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
@@ -859,7 +867,8 @@ test('start(): recovery runs at most once per supervisor instance', async () => 
 });
 
 test('start(): recovered QUEUED orphan activates on bridge_ready (not before)', async () => {
-    const { supervisor, store, sent } = fixture();
+    const { supervisor, store, sent, runtime } = fixture();
+    fs.writeFileSync(runtime.pidfilePath(), '999999'); // dead pid → safe recovery
     // Seed a channel QUEUED orphan from a prior epoch.
     store.insertDispatch({
         dispatchId: 'resumed-channel', source: 'channel', chatId: 'dev-x',
@@ -929,6 +938,7 @@ test('start(): calls runtime.bootCleanup() before orphan recovery', async () => 
 
 test('start(): channel/user QUEUED orphans are re-queued, not abandoned', async () => {
     const { supervisor, store, runtime } = fixture();
+    fs.writeFileSync(runtime.pidfilePath(), '999999'); // dead pid → safe recovery
     store.insertDispatch({
         dispatchId: 'orphan-channel-queued', source: 'channel', payload: 'hi',
         silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
@@ -1023,6 +1033,102 @@ test('_onHookEvent: re-arms wedge timer from sanitized base when silence_ms is b
     assert.equal(after.state, DISPATCH_STATES.ACTIVE,
         'dispatch must remain active after progress — wedge timer must not fire at 0ms');
 
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): no-pidfile with prior-epoch open dispatches triggers abandon-all (first-upgrade-boot safety)', async () => {
+    const { supervisor, store } = fixture();
+    // No pidfile written. Pre-existing prior-epoch QUEUED row from an old
+    // build that never called recordPid(). Correct behavior: treat as
+    // UNSAFE and abandon rather than replay (an old Claude could still be
+    // alive and we wouldn't know).
+    store.insertDispatch({
+        dispatchId: 'legacy-orphan', source: 'channel', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    const row = store.getDispatch('legacy-orphan');
+    assert.equal(row.state, DISPATCH_STATES.ABANDONED,
+        'no pidfile + prior-epoch orphan must be abandoned on first-upgrade boot');
+    assert.match(row.last_error || '', /orphan_status_unsafe_abandon_all/);
+    const unknownIncident = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'boot_cleanup_orphan_status_unknown'")
+        .get();
+    assert.ok(unknownIncident, 'boot_cleanup_orphan_status_unknown incident must be recorded');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): pidfile kill returning already_dead is treated as safe (not unsafe)', async () => {
+    const { supervisor, store, runtime } = fixture();
+    // Simulate the detect→kill race: the PID was live when detectOrphanPid
+    // checked, but the process exited before killOrphanPid() ran. The
+    // runtime reports orphan_killed=false with reason='already_dead'.
+    // Recovery must NOT collapse to abandon-all in that case.
+    const origBoot = runtime.bootCleanup.bind(runtime);
+    runtime.bootCleanup = () => ({
+        orphan_pid: 99999,
+        orphan_killed: false,
+        orphan_kill_reason: 'already_dead',
+        pidfile_present: true,
+        stale_socket_removed: false,
+        old_epochs_removed: [],
+    });
+
+    store.insertDispatch({
+        dispatchId: 'raced-orphan', source: 'channel', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    const row = store.getDispatch('raced-orphan');
+    assert.notEqual(row.state, DISPATCH_STATES.ABANDONED,
+        'already_dead kill result must be treated as safe, not unsafe');
+    assert.match(row.last_error || '', /^$|orphaned_by_restart/);
+
+    runtime.bootCleanup = origBoot;
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): pidfile kill returning EPERM triggers abandon-all (unsafe branch)', async () => {
+    const { supervisor, store, runtime } = fixture();
+    const origBoot = runtime.bootCleanup.bind(runtime);
+    runtime.bootCleanup = () => ({
+        orphan_pid: 99999,
+        orphan_killed: false,
+        orphan_kill_reason: 'EPERM',
+        pidfile_present: true,
+        stale_socket_removed: false,
+        old_epochs_removed: [],
+    });
+
+    store.insertDispatch({
+        dispatchId: 'uncooperative-orphan', source: 'channel', payload: 'hi',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    const row = store.getDispatch('uncooperative-orphan');
+    assert.equal(row.state, DISPATCH_STATES.ABANDONED);
+    assert.match(row.last_error || '', /orphan_status_unsafe_abandon_all/);
+    const failIncident = store.db
+        .prepare("SELECT details_json FROM incidents WHERE kind = 'boot_cleanup_kill_failed'")
+        .get();
+    assert.ok(failIncident);
+    const details = JSON.parse(failIncident.details_json);
+    assert.equal(details.kill_reason, 'EPERM');
+
+    runtime.bootCleanup = origBoot;
     await supervisor.shutdown();
     store.close();
 });

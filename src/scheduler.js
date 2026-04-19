@@ -236,15 +236,23 @@ class Scheduler extends EventEmitter {
             this._reattachDispatchCompletion(job);
         }
 
-        for (const job of jobs) {
+        // Re-read jobs from persistence AFTER the crash-failed _completeJob
+        // writes have landed. The in-memory `jobs` array we iterated above
+        // is stale — it has no bumped consecutiveErrors and no lastRun
+        // timestamps from the crash-recovery pass. Starting timers from the
+        // stale array would cause the first cron tick after restart to
+        // refire immediately instead of honoring the error-backoff schedule.
+        const latestJobs = this._getJobs();
+
+        for (const job of latestJobs) {
             if (job.enabled) {
                 this._startTimer(job);
                 started++;
             }
         }
 
-        if (jobs.length > 0) {
-            console.log(`[Scheduler] Loaded ${jobs.length} jobs, started ${started}`);
+        if (latestJobs.length > 0) {
+            console.log(`[Scheduler] Loaded ${latestJobs.length} jobs, started ${started}`);
         }
     }
 

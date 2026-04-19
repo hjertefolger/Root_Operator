@@ -127,10 +127,20 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // old Claude as wedged and kills it). bootCleanup() also removes
         // stale sockets and prunes old epochs.
         // Capture bootCleanup result so _recoverOrphanedDispatches can see
-        // whether the old Claude process was actually killed. If kill failed
-        // (EPERM, zombie, etc.) we can't safely re-queue orphans — the
-        // surviving Claude could emit hook events for the same dispatch id
-        // we're about to reactivate.
+        // whether the orphan status is safe. Four outcomes matter:
+        //   (a) orphan found and killed → safe
+        //   (b) orphan found but kill returned 'already_dead' (raced our
+        //       own detect→kill window) → safe, orphan is gone either way
+        //   (c) orphan found and kill failed for any other reason (EPERM,
+        //       EACCES, stuck in D state) → UNSAFE, Claude may still be
+        //       processing the old dispatch
+        //   (d) no pidfile at all AND prior-epoch open dispatches exist →
+        //       UNKNOWN. Happens on the first boot after upgrading from a
+        //       build that never called recordPid(): there's no way to
+        //       detect a surviving orphan. Treated the same as UNSAFE
+        //       because it has the same blast radius.
+        this._orphanStatusUnsafe = false;
+        // Keep the legacy field name for any code that still reads it.
         this._orphanKillFailed = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
@@ -143,13 +153,46 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         details: report,
                     });
                 }
-                if (report && report.orphan_pid && report.orphan_killed === false) {
+                const killFailedUnsafely = !!(report
+                    && report.orphan_pid
+                    && report.orphan_killed === false
+                    && report.orphan_kill_reason !== 'already_dead');
+                if (killFailedUnsafely) {
+                    this._orphanStatusUnsafe = true;
                     this._orphanKillFailed = true;
                     this.incidents.record({
                         kind: 'boot_cleanup_kill_failed',
                         epoch: this.epoch,
-                        details: { orphan_pid: report.orphan_pid },
+                        details: {
+                            orphan_pid: report.orphan_pid,
+                            kill_reason: report.orphan_kill_reason,
+                        },
                     });
+                }
+                // Unknown-status branch: no pidfile at all. Only elevate to
+                // UNSAFE when prior-epoch non-terminal rows exist — otherwise
+                // a clean fresh install would trip this every boot.
+                if (report && report.pidfile_present === false) {
+                    let priorEpochOpenExists = false;
+                    try {
+                        const open = this.store.listOpenDispatches();
+                        priorEpochOpenExists = open.some(row =>
+                            row
+                            && (row.epoch || 0) < this.epoch
+                            && !TERMINAL_DISPATCH_STATES.has(row.state));
+                    } catch (_) {
+                        priorEpochOpenExists = true; // be conservative
+                    }
+                    if (priorEpochOpenExists) {
+                        this._orphanStatusUnsafe = true;
+                        this.incidents.record({
+                            kind: 'boot_cleanup_orphan_status_unknown',
+                            epoch: this.epoch,
+                            details: {
+                                reason: 'no_pidfile_with_prior_epoch_open_dispatches',
+                            },
+                        });
+                    }
                 }
             } catch (err) {
                 this.incidents.record({
@@ -985,17 +1028,17 @@ class ClaudeSessionSupervisor extends EventEmitter {
         const currentEpoch = this.epoch;
         const abandoned = [];
         const requeued = [];
-        // If bootCleanup couldn't SIGKILL a surviving Claude (EPERM, zombie,
-        // transient), it would be unsafe to replay queued orphans — the old
-        // Claude could be processing them. Force every orphan (QUEUED too)
-        // into ABANDONED in that case, and record a distinct reason so
-        // operators can see why.
-        const killFailed = !!this._orphanKillFailed;
-        const REQUEUE_SOURCES = killFailed
+        // If the orphan status is unsafe (kill failed for a real reason, or
+        // we have no pidfile on a boot with prior-epoch open dispatches), we
+        // can't safely replay queued orphans — an old Claude may still be
+        // processing them. Collapse the policy to abandon-all and tag with
+        // a distinct reason so operators can see why.
+        const unsafe = !!this._orphanStatusUnsafe;
+        const REQUEUE_SOURCES = unsafe
             ? new Set()
             : new Set(['channel', 'user', 'scheduler']);
-        const abandonReason = killFailed
-            ? 'orphan_kill_failed_abandon_all'
+        const abandonReason = unsafe
+            ? 'orphan_status_unsafe_abandon_all'
             : 'orphaned_by_restart';
 
         for (const row of open) {
