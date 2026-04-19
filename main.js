@@ -3782,7 +3782,19 @@ app.on('will-quit', () => {
     // orphan Claude alive. Claude-process exits during normal operation
     // leave the pidfile in place (the next spawn overwrites it); only
     // a true app-level quit clears it.
-    if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function') {
+    //
+    // Exception: if this boot entered the HARD_FAILED state because
+    // bootCleanup flagged the orphan as still alive (EPERM, EACCES, or
+    // unverifiable pidfile + prior-epoch orphans), the kill never actually
+    // succeeded. Deleting the pidfile now would erase the only durable
+    // record of that PID + signature. Next boot would see "no pidfile +
+    // no prior-epoch orphans" (recovery already abandoned them during the
+    // failed boot), skip the unsafe branch, and accept fresh dispatches
+    // against a still-live orphan's shared hook log. Keep the pidfile so
+    // the next boot can retry the kill.
+    const hardFailedOrphanUnsafe = supervisor && supervisor.state === 'hardFailed';
+    if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function'
+        && !hardFailedOrphanUnsafe) {
         try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
     }
 });

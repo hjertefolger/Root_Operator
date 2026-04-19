@@ -566,18 +566,25 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // value would otherwise arm an immediate safety-net kill on activation
         // or re-arm a zero-ms wedge timer via _onHookEvent after progress.
         const baseSilenceMs = this._sanitizedBaseSilenceMs(row.silence_ms);
-        // Safety net is bounded to the caller's (sanitized) base silence budget
-        // so that exponential wedge backoff (effectiveSilenceMs below) cannot
-        // stretch the no-Stop abandon window. Base × 10 stays stable across replays.
-        const safetyMs = baseSilenceMs * SAFETY_NET_MULTIPLIER;
-        const safetyTimer = setTimeout(() => {
-            this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
-        }, safetyMs);
-        if (safetyTimer.unref) safetyTimer.unref();
         // Wedge timer uses the effective (backoff-scaled) silence. On replays
         // this doubles per attempt so an upstream outage doesn't burn the
         // whole replay budget inside the outage window.
         const wedgeSilenceMs = effectiveSilenceMs(baseSilenceMs, row.replay_count || 0);
+        // Safety net must ALWAYS exceed the wedge window — otherwise on the
+        // final replay (scheduler cap=4, wedge=base*16, safety=base*10) the
+        // safety-net would fire BEFORE the wedge, aborting the dispatch
+        // before it gets its intended long-outage recovery window.
+        // Policy: max(base*SAFETY_NET_MULTIPLIER, wedge*1.5). The 1.5 factor
+        // gives the wedge enough headroom to fire and be handled (kill +
+        // respawn + replay) before the safety net takes over.
+        const safetyMs = Math.max(
+            baseSilenceMs * SAFETY_NET_MULTIPLIER,
+            Math.ceil(wedgeSilenceMs * 1.5),
+        );
+        const safetyTimer = setTimeout(() => {
+            this._abandonDispatch(dispatchId, 'safety_timeout_no_stop');
+        }, safetyMs);
+        if (safetyTimer.unref) safetyTimer.unref();
         const wedgeTimer = setTimeout(() => {
             this._handleWedge(dispatchId, 'silence_timeout');
         }, wedgeSilenceMs);
