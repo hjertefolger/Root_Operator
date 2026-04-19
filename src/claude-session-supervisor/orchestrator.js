@@ -837,10 +837,22 @@ class ClaudeSessionSupervisor extends EventEmitter {
                 if (this._shutdown) return;
                 this._bridgeReadyFired = false;
             };
-            if (typeof this.channelManager.on === 'function') {
-                this.channelManager.on('disconnect', this._bridgeLostHandler);
-                this.channelManager.on('bridge_lost', this._bridgeLostHandler);
-            }
+            // ChannelManager emits 'disconnected' on socket close (see
+            // src/channel-manager.js). We subscribe to the broad set of
+            // plausible names so the gate resets correctly across any
+            // channelManager variant that emits one of them.
+            this.channelManager.on('disconnected', this._bridgeLostHandler);
+            this.channelManager.on('disconnect', this._bridgeLostHandler);
+            this.channelManager.on('bridge_lost', this._bridgeLostHandler);
+        }
+
+        // Seed from cached bridge state: ChannelManager.bridgeReady may have
+        // flipped true BEFORE the supervisor subscribed (connect() happens
+        // earlier in initChannelMode than supervisor.start()). Without this
+        // seed, a late attach to an already-ready bridge leaves the gate
+        // closed and dispatches queue indefinitely.
+        if (this.channelManager.bridgeReady === true) {
+            this._bridgeReadyFired = true;
         }
     }
 
@@ -851,6 +863,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._bridgeReadyHandler = null;
         }
         if (this._bridgeLostHandler) {
+            this.channelManager.off('disconnected', this._bridgeLostHandler);
             this.channelManager.off('disconnect', this._bridgeLostHandler);
             this.channelManager.off('bridge_lost', this._bridgeLostHandler);
             this._bridgeLostHandler = null;

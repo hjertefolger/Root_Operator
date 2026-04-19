@@ -3346,18 +3346,39 @@ function initChannelMode() {
             hookLogPath: supervisorHookLog,
             enableProbe: true,
         });
+        // Kick off start() synchronously but chain the spawn decision to
+        // its completion. In the orphan-unsafe / HARD_FAILED path we must
+        // NOT spawn a fresh Claude — that spawn's recordPid() would
+        // overwrite the pidfile the next boot needs to retry killing the
+        // original orphan, and the fresh Claude would share the orphan's
+        // hook log stream with no way to correlate.
         supervisor.start().then(() => {
-            // Latch the orphan-unsafe flag once start() has settled. It's
-            // not cleared if we later tear down the supervisor — the
-            // pidfile must survive until the NEXT boot can retry the kill.
             if (supervisor && supervisor.state === 'hardFailed') {
                 supervisorOrphanUnsafeThisBoot = true;
+                logDebug('[SUPERVISOR] HARD_FAILED on boot — refusing to spawn Claude. Restart after resolving orphan.');
+                setChannelRuntime('error',
+                    'Previous Claude process may still be alive. Restart the app to retry.',
+                    { attempt: channelStartupAttempt });
+                return; // Do NOT spawn.
             }
+            // Healthy boot: proceed with scheduler + Claude spawn.
+            if (store) {
+                scheduler = new Scheduler(store, channelManager, supervisor);
+                scheduler.start();
+            }
+            spawnClaudeCode();
         }).catch((err) => {
             logDebug(`[SUPERVISOR] start failed: ${err.message}`);
             supervisor = null;
+            // Fall back to legacy (no-supervisor) boot path.
+            if (store) {
+                scheduler = new Scheduler(store, channelManager, supervisor);
+                scheduler.start();
+            }
+            spawnClaudeCode();
         });
         logDebug('[SUPERVISOR] PR3 effect-ledger mode active');
+        return; // supervisor start chain owns scheduler + spawn
     } catch (err) {
         logDebug(`[SUPERVISOR] init failed: ${err.message} — scheduler will use legacy path`);
         supervisor = null;
@@ -3367,13 +3388,12 @@ function initChannelMode() {
         }
     }
 
-    // Start persistent scheduler (survives session rotation)
+    // Legacy path: supervisor was never constructed (init threw). Start
+    // scheduler and Claude without supervisor coordination.
     if (store) {
         scheduler = new Scheduler(store, channelManager, supervisor);
         scheduler.start();
     }
-
-    // Spawn Claude Code (auto-approves channel confirmation prompt)
     spawnClaudeCode();
 }
 
