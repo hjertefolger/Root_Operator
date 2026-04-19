@@ -3,13 +3,19 @@ import { createPortal } from 'react-dom';
 import { ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
 
 const MAX_SCALE = 6;
+const MAX_WEB_ZOOM = 8;
 const MIN_SCALE = 1;
+const WEB_ZOOM_EPSILON = 0.001;
+const SWIPE_NAV_DISTANCE = 72;
+const SWIPE_NAV_LONG_DISTANCE = 120;
+const SWIPE_NAV_VELOCITY = 0.35;
+const SWIPE_NAV_VERTICAL_DRIFT = 48;
 const EMPTY_ANNOTATIONS = { strokes: [], redo: [] };
 const ANNOTATION_COLORS = [
+  { value: '#0a84ff', label: 'Blue' },
   { value: '#ff453a', label: 'Red' },
   { value: '#ffd60a', label: 'Yellow' },
   { value: '#32d74b', label: 'Green' },
-  { value: '#0a84ff', label: 'Blue' },
   { value: '#ffffff', label: 'White' },
   { value: '#111111', label: 'Black' },
 ];
@@ -19,9 +25,76 @@ const STROKE_WIDTHS = [
   { value: 8, label: 'Thick' },
   { value: 12, label: 'Bold' },
 ];
+const EMPTY_VIEWPORT_RECT = { width: 0, height: 0, left: 0, top: 0 };
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+function getViewportFallbackRect() {
+  if (typeof window === 'undefined') {
+    return EMPTY_VIEWPORT_RECT;
+  }
+
+  const visualViewport = window.visualViewport;
+  return {
+    width: Math.max(0, visualViewport?.width || window.innerWidth || 0),
+    height: Math.max(0, visualViewport?.height || window.innerHeight || 0),
+    left: visualViewport?.offsetLeft || 0,
+    top: visualViewport?.offsetTop || 0,
+  };
+}
+
+function normalizeViewportRect(rect) {
+  const fallback = getViewportFallbackRect();
+  if (!rect) {
+    return fallback;
+  }
+
+  const width = Math.max(0, rect.width || 0);
+  const height = Math.max(0, rect.height || 0);
+  if (width > 0 && height > 0) {
+    return {
+      width,
+      height,
+      left: rect.left || 0,
+      top: rect.top || 0,
+    };
+  }
+
+  return fallback;
+}
+
+function isSameViewportRect(left, right) {
+  return left.width === right.width
+    && left.height === right.height
+    && left.left === right.left
+    && left.top === right.top;
+}
+
+function getStageMetrics({ naturalSize, viewportRect, useLayoutZoomViewer, fitScaleLimit }) {
+  const hasNaturalSize = naturalSize.width > 0 && naturalSize.height > 0;
+  const fitScale = (hasNaturalSize && viewportRect.width > 0 && viewportRect.height > 0)
+    ? Math.min(
+        viewportRect.width / naturalSize.width,
+        viewportRect.height / naturalSize.height,
+        fitScaleLimit
+      )
+    : 0;
+  const stageWidth = fitScale > 0
+    ? naturalSize.width * fitScale
+    : (useLayoutZoomViewer ? viewportRect.width : 0);
+  const stageHeight = fitScale > 0
+    ? naturalSize.height * fitScale
+    : (useLayoutZoomViewer ? viewportRect.height : 0);
+
+  return {
+    hasNaturalSize,
+    fitScale,
+    stageWidth,
+    stageHeight,
+    hasStage: stageWidth > 0 && stageHeight > 0,
+  };
 }
 
 function getAttachmentPreviewSrc(attachment) {
@@ -59,31 +132,24 @@ function getAttachmentAnnotationKey(attachment, index) {
 function getImagePointFromClient({
   clientX,
   clientY,
-  viewportRect,
-  transform,
-  stageWidth,
-  stageHeight,
+  stageRect,
   naturalWidth,
   naturalHeight,
 }) {
-  if (!viewportRect.width || !viewportRect.height || !stageWidth || !stageHeight || !naturalWidth || !naturalHeight) {
+  if (!stageRect || !stageRect.width || !stageRect.height || !naturalWidth || !naturalHeight) {
     return null;
   }
 
-  const viewportCenterX = viewportRect.left + (viewportRect.width / 2);
-  const viewportCenterY = viewportRect.top + (viewportRect.height / 2);
-  const stageLeft = viewportCenterX + transform.x - ((stageWidth * transform.scale) / 2);
-  const stageTop = viewportCenterY + transform.y - ((stageHeight * transform.scale) / 2);
-  const baseX = (clientX - stageLeft) / transform.scale;
-  const baseY = (clientY - stageTop) / transform.scale;
+  const baseX = clientX - stageRect.left;
+  const baseY = clientY - stageRect.top;
 
-  if (baseX < 0 || baseY < 0 || baseX > stageWidth || baseY > stageHeight) {
+  if (baseX < 0 || baseY < 0 || baseX > stageRect.width || baseY > stageRect.height) {
     return null;
   }
 
   return {
-    x: baseX * (naturalWidth / stageWidth),
-    y: baseY * (naturalHeight / stageHeight),
+    x: baseX * (naturalWidth / stageRect.width),
+    y: baseY * (naturalHeight / stageRect.height),
   };
 }
 
@@ -201,18 +267,24 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   onClose,
 }) {
   const viewportRef = useRef(null);
+  const viewportRectRef = useRef(getViewportFallbackRect());
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
+  const contentRef = useRef(null);
   const transformRef = useRef({ scale: 1, x: 0, y: 0 });
+  const webViewRef = useRef({ zoom: 1, x: 0, y: 0 });
+  const webViewFrameRef = useRef(0);
+  const webPendingViewRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef({ mode: 'idle' });
   const drawingPointerIdRef = useRef(null);
   const draftStrokeRef = useRef(null);
   const renderFrameRef = useRef(0);
   const [activeIndex, setActiveIndex] = useState(initialIndex);
-  const [viewportRect, setViewportRect] = useState({ width: 0, height: 0, left: 0, top: 0 });
+  const [viewportRect, setViewportRect] = useState(() => viewportRectRef.current);
   const [transform, setTransform] = useState({ scale: 1, x: 0, y: 0 });
-  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  const naturalSizeRef = useRef({ width: 0, height: 0 });
+  const [naturalSize, setNaturalSize] = useState(() => naturalSizeRef.current);
   const [imageLoadError, setImageLoadError] = useState('');
   const [annotationState, setAnnotationState] = useState({});
   const [drawEnabled, setDrawEnabled] = useState(false);
@@ -221,8 +293,10 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState('');
   const [openPicker, setOpenPicker] = useState(null);
-
+  const [webView, setWebView] = useState({ zoom: 1, x: 0, y: 0 });
   const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
+  const isDesktopSurface = typeof window !== 'undefined' && Boolean(window.electronAPI);
+  const useLayoutZoomViewer = !isDesktopSurface;
   const activeAttachment = attachmentCount > 0 ? attachments[activeIndex] : null;
   const attachmentId = activeAttachment?.id || '';
   const cachedAttachment = attachmentId ? attachmentCache?.[attachmentId] : null;
@@ -241,49 +315,99 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const redoStack = currentAnnotations.redo || EMPTY_ANNOTATIONS.redo;
   const hasAnnotations = strokes.length > 0;
   const annotatedAttachmentHandler = onQueueAnnotatedAttachment || onSendAnnotatedAttachment;
+  const hasNaturalSize = naturalSize.width > 0 && naturalSize.height > 0;
   const canSendAnnotated = Boolean(
     hasAnnotations
     && !isSending
     && typeof annotatedAttachmentHandler === 'function'
     && imageRef.current
-    && naturalSize.width > 0
-    && naturalSize.height > 0
+    && hasNaturalSize
     && !errorMessage
   );
 
-  // Clamp fit-scale so we never display the bitmap above its native pixel
-  // budget — on Retina displays the browser would otherwise upscale past
-  // 1 CSS px = (devicePixelRatio) device px and the image renders soft
-  // even though the transported bytes are clean. `1 / devicePixelRatio`
-  // keeps one source pixel on one device pixel.
-  const maxScale =
-    typeof window !== 'undefined' && window.devicePixelRatio > 0
+  const fitScaleLimit =
+    !useLayoutZoomViewer && typeof window !== 'undefined' && window.devicePixelRatio > 0
       ? 1 / window.devicePixelRatio
-      : 1;
-  const fitScale = (naturalSize.width > 0 && naturalSize.height > 0 && viewportRect.width > 0 && viewportRect.height > 0)
-    ? Math.min(
-        viewportRect.width / naturalSize.width,
-        viewportRect.height / naturalSize.height,
-        maxScale
-      )
-    : 0;
-  const stageWidth = fitScale > 0 ? naturalSize.width * fitScale : 0;
-  const stageHeight = fitScale > 0 ? naturalSize.height * fitScale : 0;
-  const hasStage = stageWidth > 0 && stageHeight > 0;
+      : Number.POSITIVE_INFINITY;
+  const {
+    fitScale,
+    stageWidth,
+    stageHeight,
+    hasStage,
+  } = getStageMetrics({
+    naturalSize,
+    viewportRect,
+    useLayoutZoomViewer,
+    fitScaleLimit,
+  });
+  const stageDisplayWidth = useLayoutZoomViewer ? stageWidth * webView.zoom : stageWidth;
+  const stageDisplayHeight = useLayoutZoomViewer ? stageHeight * webView.zoom : stageHeight;
   const hasPrev = activeIndex > 0;
   const hasNext = activeIndex < (attachmentCount - 1);
 
-  const measureViewport = useCallback(() => {
-    const nextRect = viewportRef.current?.getBoundingClientRect();
-    if (!nextRect) {
-      return;
+  const measureViewport = useCallback((node = viewportRef.current) => {
+    const nextRect = normalizeViewportRect(node?.getBoundingClientRect?.());
+    viewportRectRef.current = nextRect;
+    setViewportRect((current) => (isSameViewportRect(current, nextRect) ? current : nextRect));
+    return nextRect;
+  }, []);
+
+  const handleViewportRef = useCallback((node) => {
+    viewportRef.current = node;
+    if (node) {
+      measureViewport(node);
     }
-    setViewportRect({
-      width: nextRect.width,
-      height: nextRect.height,
-      left: nextRect.left,
-      top: nextRect.top,
-    });
+  }, [measureViewport]);
+
+  const getCurrentStageMetrics = useCallback(() => (
+    getStageMetrics({
+      naturalSize: naturalSizeRef.current,
+      viewportRect: viewportRectRef.current,
+      useLayoutZoomViewer,
+      fitScaleLimit,
+    })
+  ), [fitScaleLimit, useLayoutZoomViewer]);
+
+  const commitNaturalSize = useCallback((width, height) => {
+    if (width <= 0 || height <= 0) {
+      return false;
+    }
+
+    const nextSize = { width, height };
+    naturalSizeRef.current = nextSize;
+    setImageLoadError('');
+    setNaturalSize((current) => (
+      current.width === width && current.height === height
+        ? current
+        : nextSize
+    ));
+    measureViewport();
+    return true;
+  }, [measureViewport]);
+
+  const commitNaturalSizeFromImage = useCallback((image) => {
+    if (!image) {
+      return false;
+    }
+    return commitNaturalSize(image.naturalWidth, image.naturalHeight);
+  }, [commitNaturalSize]);
+
+  const handleImageLoad = useCallback((event) => {
+    commitNaturalSizeFromImage(event.currentTarget);
+  }, [commitNaturalSizeFromImage]);
+
+  const handleImageError = useCallback(() => {
+    setImageLoadError('Unable to render this image');
+  }, []);
+
+  const resetNaturalSize = useCallback(() => {
+    const nextSize = { width: 0, height: 0 };
+    naturalSizeRef.current = nextSize;
+    setNaturalSize((current) => (
+      current.width === 0 && current.height === 0
+        ? current
+        : nextSize
+    ));
   }, []);
 
   const resetTransform = useCallback(() => {
@@ -294,19 +418,47 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
 
   const clampTransform = useCallback((nextTransform, nextScale = nextTransform.scale) => {
     const scale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
-    if (!hasStage || viewportRect.width <= 0 || viewportRect.height <= 0) {
+    const {
+      hasStage: currentHasStage,
+      stageWidth: currentStageWidth,
+      stageHeight: currentStageHeight,
+    } = getCurrentStageMetrics();
+    const currentViewportRect = viewportRectRef.current;
+    if (!currentHasStage || currentViewportRect.width <= 0 || currentViewportRect.height <= 0) {
       return { scale, x: 0, y: 0 };
     }
 
-    const overflowX = Math.max(0, ((stageWidth * scale) - viewportRect.width) / 2);
-    const overflowY = Math.max(0, ((stageHeight * scale) - viewportRect.height) / 2);
+    const overflowX = Math.max(0, ((currentStageWidth * scale) - currentViewportRect.width) / 2);
+    const overflowY = Math.max(0, ((currentStageHeight * scale) - currentViewportRect.height) / 2);
 
     return {
       scale,
       x: clamp(nextTransform.x, -overflowX, overflowX),
       y: clamp(nextTransform.y, -overflowY, overflowY),
     };
-  }, [hasStage, stageHeight, stageWidth, viewportRect.height, viewportRect.width]);
+  }, [getCurrentStageMetrics]);
+
+  const clampWebView = useCallback((nextView, nextZoom = nextView.zoom) => {
+    const zoom = clamp(nextZoom, MIN_SCALE, MAX_WEB_ZOOM);
+    const {
+      hasStage: currentHasStage,
+      stageWidth: currentStageWidth,
+      stageHeight: currentStageHeight,
+    } = getCurrentStageMetrics();
+    const currentViewportRect = viewportRectRef.current;
+    if (!currentHasStage || currentViewportRect.width <= 0 || currentViewportRect.height <= 0) {
+      return { zoom, x: 0, y: 0 };
+    }
+
+    const overflowX = Math.max(0, ((currentStageWidth * zoom) - currentViewportRect.width) / 2);
+    const overflowY = Math.max(0, ((currentStageHeight * zoom) - currentViewportRect.height) / 2);
+
+    return {
+      zoom,
+      x: clamp(nextView.x, -overflowX, overflowX),
+      y: clamp(nextView.y, -overflowY, overflowY),
+    };
+  }, [getCurrentStageMetrics]);
 
   const commitTransform = useCallback((nextTransform) => {
     const clamped = clampTransform(nextTransform, nextTransform.scale);
@@ -315,8 +467,46 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     return clamped;
   }, [clampTransform]);
 
+  const scheduleWebViewCommit = useCallback((nextView, options = {}) => {
+    const { immediate = false } = options;
+    const clamped = clampWebView(nextView, nextView.zoom);
+    webViewRef.current = clamped;
+
+    if (immediate) {
+      if (webViewFrameRef.current) {
+        cancelAnimationFrame(webViewFrameRef.current);
+        webViewFrameRef.current = 0;
+      }
+      webPendingViewRef.current = null;
+      setWebView(clamped);
+      return clamped;
+    }
+
+    webPendingViewRef.current = clamped;
+    if (!webViewFrameRef.current) {
+      webViewFrameRef.current = requestAnimationFrame(() => {
+        webViewFrameRef.current = 0;
+        if (!webPendingViewRef.current) {
+          return;
+        }
+        setWebView(webPendingViewRef.current);
+        webPendingViewRef.current = null;
+      });
+    }
+
+    return clamped;
+  }, [clampWebView]);
+
+  const resetWebView = useCallback(() => {
+    scheduleWebViewCommit({ zoom: 1, x: 0, y: 0 }, { immediate: true });
+  }, [scheduleWebViewCommit]);
+
   const zoomAtPoint = useCallback((nextScale, anchorClientPoint) => {
-    if (!hasStage) {
+    const {
+      hasStage: currentHasStage,
+    } = getCurrentStageMetrics();
+    const currentViewportRect = viewportRectRef.current;
+    if (!currentHasStage) {
       return;
     }
 
@@ -327,12 +517,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
 
     const anchor = {
-      x: anchorClientPoint.x - viewportRect.left,
-      y: anchorClientPoint.y - viewportRect.top,
+      x: anchorClientPoint.x - currentViewportRect.left,
+      y: anchorClientPoint.y - currentViewportRect.top,
     };
     const viewportCenter = {
-      x: viewportRect.width / 2,
-      y: viewportRect.height / 2,
+      x: currentViewportRect.width / 2,
+      y: currentViewportRect.height / 2,
     };
     const anchorDx = anchor.x - viewportCenter.x;
     const anchorDy = anchor.y - viewportCenter.y;
@@ -343,7 +533,41 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       x: anchorDx - ((anchorDx - current.x) * ratio),
       y: anchorDy - ((anchorDy - current.y) * ratio),
     });
-  }, [commitTransform, hasStage, viewportRect.height, viewportRect.left, viewportRect.top, viewportRect.width]);
+  }, [commitTransform, getCurrentStageMetrics]);
+
+  const zoomWebAtPoint = useCallback((nextZoom, anchorClientPoint) => {
+    const {
+      hasStage: currentHasStage,
+    } = getCurrentStageMetrics();
+    const currentViewportRect = viewportRectRef.current;
+    if (!useLayoutZoomViewer || !currentHasStage) {
+      return webViewRef.current;
+    }
+
+    const current = webViewRef.current;
+    const zoom = clamp(nextZoom, MIN_SCALE, MAX_WEB_ZOOM);
+    if (Math.abs(zoom - current.zoom) < WEB_ZOOM_EPSILON) {
+      return current;
+    }
+
+    const anchor = {
+      x: anchorClientPoint.x - currentViewportRect.left,
+      y: anchorClientPoint.y - currentViewportRect.top,
+    };
+    const viewportCenter = {
+      x: currentViewportRect.width / 2,
+      y: currentViewportRect.height / 2,
+    };
+    const anchorDx = anchor.x - viewportCenter.x;
+    const anchorDy = anchor.y - viewportCenter.y;
+    const ratio = zoom / current.zoom;
+
+    return scheduleWebViewCommit({
+      zoom,
+      x: anchorDx - ((anchorDx - current.x) * ratio),
+      y: anchorDy - ((anchorDy - current.y) * ratio),
+    });
+  }, [getCurrentStageMetrics, scheduleWebViewCommit, useLayoutZoomViewer]);
 
   const clearPointers = useCallback(() => {
     pointersRef.current.clear();
@@ -357,6 +581,36 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const goNext = useCallback(() => {
     setActiveIndex((current) => Math.min(attachmentCount - 1, current + 1));
   }, [attachmentCount]);
+
+  const navigateBySwipe = useCallback((dx, dy, durationMs) => {
+    if (webViewRef.current.zoom > (MIN_SCALE + WEB_ZOOM_EPSILON)) {
+      return false;
+    }
+
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    const velocity = absDx / Math.max(durationMs, 1);
+    const isHorizontal = absDx > (absDy * 1.5);
+    const hasDistance = absDx >= SWIPE_NAV_DISTANCE;
+    const hasMomentum = velocity >= SWIPE_NAV_VELOCITY || absDx >= SWIPE_NAV_LONG_DISTANCE;
+    const withinVerticalDrift = absDy <= SWIPE_NAV_VERTICAL_DRIFT;
+
+    if (!isHorizontal || !hasDistance || !hasMomentum || !withinVerticalDrift) {
+      return false;
+    }
+
+    if (dx < 0 && hasNext) {
+      goNext();
+      return true;
+    }
+
+    if (dx > 0 && hasPrev) {
+      goPrev();
+      return true;
+    }
+
+    return false;
+  }, [goNext, goPrev, hasNext, hasPrev]);
 
   const retryFetch = useCallback(async () => {
     if (!canFetch || !activeAttachment) {
@@ -493,22 +747,77 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     };
   }, [measureViewport]);
 
-  useEffect(() => {
-    setNaturalSize({ width: 0, height: 0 });
+  useLayoutEffect(() => {
     setImageLoadError('');
     setSendError('');
     setIsSending(false);
     clearPointers();
+    resetNaturalSize();
+    measureViewport();
+    if (useLayoutZoomViewer) {
+      resetWebView();
+      return;
+    }
     resetTransform();
-  }, [activeAttachment?.id, clearPointers, resetTransform]);
+  }, [activeAttachment?.id, clearPointers, measureViewport, resetNaturalSize, resetTransform, resetWebView, useLayoutZoomViewer]);
 
   useEffect(() => {
+    if (!previewSrc || hasNaturalSize) {
+      return;
+    }
+
+    const image = imageRef.current;
+    if (!image) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const commitFromImage = () => {
+      if (cancelled) {
+        return false;
+      }
+      return commitNaturalSizeFromImage(image);
+    };
+
+    const handleLoad = () => {
+      commitFromImage();
+    };
+
+    image.addEventListener('load', handleLoad);
+
+    if (!commitFromImage()) {
+      if (typeof image.decode === 'function') {
+        image.decode()
+          .then(() => {
+            commitFromImage();
+          })
+          .catch(() => {
+            if (image.complete) {
+              commitFromImage();
+            }
+          });
+      } else if (image.complete) {
+        commitFromImage();
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      image.removeEventListener('load', handleLoad);
+    };
+  }, [commitNaturalSizeFromImage, hasNaturalSize, previewSrc]);
+
+  useLayoutEffect(() => {
     if (viewportRect.width <= 0 || viewportRect.height <= 0) {
       return;
     }
     clearPointers();
+    if (useLayoutZoomViewer) {
+      resetWebView();
+      return;
+    }
     resetTransform();
-  }, [clearPointers, resetTransform, viewportRect.height, viewportRect.width]);
+  }, [clearPointers, resetTransform, resetWebView, useLayoutZoomViewer, viewportRect.height, viewportRect.width]);
 
   useEffect(() => {
     if (!activeAttachment || previewSrc || !canFetch || isLoading || fetchError) {
@@ -526,16 +835,17 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       return;
     }
 
-    const displayWidth = Math.max(1, Math.round(stageWidth));
-    const displayHeight = Math.max(1, Math.round(stageHeight));
+    const renderWidth = Math.max(1, Math.round(useLayoutZoomViewer ? stageDisplayWidth : stageWidth));
+    const renderHeight = Math.max(1, Math.round(useLayoutZoomViewer ? stageDisplayHeight : stageHeight));
     const devicePixelRatio = window.devicePixelRatio || 1;
 
-    if (canvas.width !== Math.round(displayWidth * devicePixelRatio) || canvas.height !== Math.round(displayHeight * devicePixelRatio)) {
-      canvas.width = Math.round(displayWidth * devicePixelRatio);
-      canvas.height = Math.round(displayHeight * devicePixelRatio);
-      canvas.style.width = `${displayWidth}px`;
-      canvas.style.height = `${displayHeight}px`;
+    if (canvas.width !== Math.round(renderWidth * devicePixelRatio) || canvas.height !== Math.round(renderHeight * devicePixelRatio)) {
+      canvas.width = Math.round(renderWidth * devicePixelRatio);
+      canvas.height = Math.round(renderHeight * devicePixelRatio);
     }
+
+    canvas.style.width = `${renderWidth}px`;
+    canvas.style.height = `${renderHeight}px`;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) {
@@ -543,9 +853,9 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
 
     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-    ctx.clearRect(0, 0, displayWidth, displayHeight);
+    ctx.clearRect(0, 0, renderWidth, renderHeight);
 
-    const previewScale = displayWidth / naturalSize.width;
+    const previewScale = renderWidth / naturalSize.width;
     for (const stroke of strokes) {
       drawStroke(ctx, stroke, previewScale);
     }
@@ -553,7 +863,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     if (draftStrokeRef.current) {
       drawStroke(ctx, draftStrokeRef.current, previewScale);
     }
-  }, [hasStage, naturalSize.height, naturalSize.width, stageHeight, stageWidth, strokes]);
+  }, [hasStage, naturalSize.height, naturalSize.width, stageDisplayHeight, stageDisplayWidth, stageHeight, stageWidth, strokes, useLayoutZoomViewer]);
 
   const scheduleCanvasRender = useCallback(() => {
     if (renderFrameRef.current) {
@@ -576,6 +886,15 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       }
     };
   }, [renderCanvas]);
+
+  useEffect(() => {
+    return () => {
+      if (webViewFrameRef.current) {
+        cancelAnimationFrame(webViewFrameRef.current);
+        webViewFrameRef.current = 0;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     drawingPointerIdRef.current = null;
@@ -651,20 +970,19 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [scheduleCanvasRender, updateAnnotations]);
 
   const handleDrawPointerDown = useCallback((event) => {
-    if (!drawEnabled || !previewSrc || !hasStage) {
+    if (!drawEnabled || !previewSrc || !hasStage || !hasNaturalSize) {
       return;
     }
     if (event.pointerType === 'mouse' && event.button !== 0) {
       return;
     }
 
+    const stageRect = contentRef.current?.getBoundingClientRect();
+
     const point = getImagePointFromClient({
       clientX: event.clientX,
       clientY: event.clientY,
-      viewportRect,
-      transform: transformRef.current,
-      stageWidth,
-      stageHeight,
+      stageRect,
       naturalWidth: naturalSize.width,
       naturalHeight: naturalSize.height,
     });
@@ -685,20 +1003,19 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       points: [point],
     };
     scheduleCanvasRender();
-  }, [drawEnabled, hasStage, naturalSize.height, naturalSize.width, previewSrc, scheduleCanvasRender, selectedColor, selectedWidth, stageHeight, stageWidth, viewportRect]);
+  }, [drawEnabled, hasNaturalSize, hasStage, naturalSize.height, naturalSize.width, previewSrc, scheduleCanvasRender, selectedColor, selectedWidth, stageWidth]);
 
   const handleDrawPointerMove = useCallback((event) => {
     if (drawingPointerIdRef.current !== event.pointerId || !draftStrokeRef.current) {
       return;
     }
 
+    const stageRect = contentRef.current?.getBoundingClientRect();
+
     const point = getImagePointFromClient({
       clientX: event.clientX,
       clientY: event.clientY,
-      viewportRect,
-      transform: transformRef.current,
-      stageWidth,
-      stageHeight,
+      stageRect,
       naturalWidth: naturalSize.width,
       naturalHeight: naturalSize.height,
     });
@@ -715,7 +1032,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
 
     points.push(point);
     scheduleCanvasRender();
-  }, [naturalSize.height, naturalSize.width, scheduleCanvasRender, stageHeight, stageWidth, viewportRect]);
+  }, [naturalSize.height, naturalSize.width, scheduleCanvasRender]);
 
   const handleDrawPointerUp = useCallback((event) => {
     if (drawingPointerIdRef.current !== event.pointerId) {
@@ -738,7 +1055,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [scheduleCanvasRender]);
 
   const handleWheel = useCallback((event) => {
-    if (!hasStage) {
+    if (!hasStage || useLayoutZoomViewer) {
       return;
     }
 
@@ -748,7 +1065,24 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       x: event.clientX,
       y: event.clientY,
     });
-  }, [hasStage, zoomAtPoint]);
+  }, [hasStage, useLayoutZoomViewer, zoomAtPoint]);
+
+  const handleWebWheel = useCallback((event) => {
+    if (!useLayoutZoomViewer || !hasStage || drawEnabled || !previewSrc) {
+      return;
+    }
+
+    if (!event.ctrlKey && !event.metaKey) {
+      return;
+    }
+
+    event.preventDefault();
+    const scaleDelta = Math.exp(-event.deltaY * 0.0025);
+    zoomWebAtPoint(webViewRef.current.zoom * scaleDelta, {
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }, [drawEnabled, hasStage, previewSrc, useLayoutZoomViewer, zoomWebAtPoint]);
 
   const handleStagePointerDown = useCallback((event) => {
     if (drawEnabled) {
@@ -761,6 +1095,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       return;
     }
 
+    measureViewport(event.currentTarget);
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -780,7 +1115,54 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       lastX: event.clientX,
       lastY: event.clientY,
     };
-  }, [drawEnabled, previewSrc]);
+  }, [drawEnabled, measureViewport, previewSrc]);
+
+  const handleWebStagePointerDown = useCallback((event) => {
+    if (!useLayoutZoomViewer || drawEnabled || !previewSrc) {
+      return;
+    }
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      return;
+    }
+
+    measureViewport(event.currentTarget);
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pointersRef.current.size >= 2) {
+      const [pointA, pointB] = Array.from(pointersRef.current.values());
+      gestureRef.current = {
+        mode: 'web-pinch',
+        pinch: getViewportPoint(pointA, pointB),
+      };
+      return;
+    }
+
+    if (webViewRef.current.zoom > (MIN_SCALE + WEB_ZOOM_EPSILON)) {
+      gestureRef.current = {
+        mode: 'web-pan',
+        pointerId: event.pointerId,
+        lastX: event.clientX,
+        lastY: event.clientY,
+      };
+      return;
+    }
+
+    gestureRef.current = event.pointerType === 'mouse'
+      ? { mode: 'idle' }
+      : {
+          mode: 'web-swipe',
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          startX: event.clientX,
+          startY: event.clientY,
+          lastX: event.clientX,
+          lastY: event.clientY,
+          startTime: event.timeStamp,
+          lastTime: event.timeStamp,
+        };
+  }, [drawEnabled, measureViewport, previewSrc, useLayoutZoomViewer]);
 
   const handleStagePointerMove = useCallback((event) => {
     if (drawEnabled) {
@@ -840,8 +1222,98 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     };
   }, [commitTransform, drawEnabled, zoomAtPoint]);
 
+  const handleWebStagePointerMove = useCallback((event) => {
+    if (!useLayoutZoomViewer || drawEnabled || !pointersRef.current.has(event.pointerId)) {
+      return;
+    }
+
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointersRef.current.size >= 2) {
+      event.preventDefault();
+      const [pointA, pointB] = Array.from(pointersRef.current.values());
+      const nextPinch = getViewportPoint(pointA, pointB);
+      const previousPinch = gestureRef.current.mode === 'web-pinch' ? gestureRef.current.pinch : nextPinch;
+      const currentView = webViewRef.current;
+      const nextZoom = currentView.zoom * (nextPinch.distance / Math.max(previousPinch.distance, 1));
+      const zoomedView = zoomWebAtPoint(nextZoom, nextPinch.center);
+
+      scheduleWebViewCommit({
+        zoom: zoomedView.zoom,
+        x: zoomedView.x + (nextPinch.center.x - previousPinch.center.x),
+        y: zoomedView.y + (nextPinch.center.y - previousPinch.center.y),
+      });
+
+      gestureRef.current = {
+        mode: 'web-pinch',
+        pinch: nextPinch,
+      };
+      return;
+    }
+
+    if (gestureRef.current.mode === 'web-pan' && gestureRef.current.pointerId === event.pointerId) {
+      event.preventDefault();
+      scheduleWebViewCommit({
+        zoom: webViewRef.current.zoom,
+        x: webViewRef.current.x + (event.clientX - gestureRef.current.lastX),
+        y: webViewRef.current.y + (event.clientY - gestureRef.current.lastY),
+      });
+
+      gestureRef.current = {
+        ...gestureRef.current,
+        lastX: event.clientX,
+        lastY: event.clientY,
+      };
+      return;
+    }
+
+    if (gestureRef.current.mode === 'web-swipe' && gestureRef.current.pointerId === event.pointerId) {
+      gestureRef.current = {
+        ...gestureRef.current,
+        lastX: event.clientX,
+        lastY: event.clientY,
+        lastTime: event.timeStamp,
+      };
+    }
+  }, [drawEnabled, scheduleWebViewCommit, useLayoutZoomViewer, zoomWebAtPoint]);
+
   const releasePointer = useCallback((event) => {
+    if (gestureRef.current.mode === 'web-swipe' && gestureRef.current.pointerId === event.pointerId && event.type !== 'pointercancel') {
+      navigateBySwipe(
+        event.clientX - gestureRef.current.startX,
+        event.clientY - gestureRef.current.startY,
+        event.timeStamp - gestureRef.current.startTime
+      );
+    }
+
     pointersRef.current.delete(event.pointerId);
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+
+    if (useLayoutZoomViewer) {
+      if (pointersRef.current.size >= 2) {
+        const [pointA, pointB] = Array.from(pointersRef.current.values());
+        gestureRef.current = {
+          mode: 'web-pinch',
+          pinch: getViewportPoint(pointA, pointB),
+        };
+        return;
+      }
+
+      if (pointersRef.current.size === 1) {
+        const [[pointerId, point]] = Array.from(pointersRef.current.entries());
+        if (webViewRef.current.zoom > (MIN_SCALE + WEB_ZOOM_EPSILON)) {
+          gestureRef.current = {
+            mode: 'web-pan',
+            pointerId,
+            lastX: point.x,
+            lastY: point.y,
+          };
+          return;
+        }
+      }
+
+      gestureRef.current = { mode: 'idle' };
+      return;
+    }
 
     if (pointersRef.current.size >= 2) {
       const [pointA, pointB] = Array.from(pointersRef.current.values());
@@ -864,7 +1336,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
 
     gestureRef.current = { mode: 'idle' };
-  }, []);
+  }, [navigateBySwipe, useLayoutZoomViewer]);
 
   if (typeof document === 'undefined' || attachmentCount === 0 || !activeAttachment) {
     return null;
@@ -949,8 +1421,11 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
         </div>
 
         <div
-          ref={viewportRef}
-          onWheel={handleWheel}
+          ref={handleViewportRef}
+          onWheel={(event) => {
+            handleWheel(event);
+            handleWebWheel(event);
+          }}
           onMouseDown={(event) => {
             if (event.target === event.currentTarget) {
               onClose?.();
@@ -962,7 +1437,8 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             minHeight: 0,
             background: 'transparent',
             overflow: 'hidden',
-            touchAction: 'pinch-zoom',
+            overscrollBehavior: useLayoutZoomViewer ? 'none' : 'auto',
+            touchAction: useLayoutZoomViewer ? 'none' : 'pinch-zoom',
           }}
         >
           {(isLoading || (previewSrc && naturalSize.width === 0 && !errorMessage) || (!previewSrc && !errorMessage)) && (
@@ -1020,65 +1496,128 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           )}
 
           {previewSrc && (
-            <div
-              onPointerDown={handleStagePointerDown}
-              onPointerMove={handleStagePointerMove}
-              onPointerUp={releasePointer}
-              onPointerCancel={releasePointer}
-              style={{
-                position: 'absolute',
-                left: '50%',
-                top: '50%',
-                width: stageWidth,
-                height: stageHeight,
-                transform: `translate(calc(-50% + ${transform.x}px), calc(-50% + ${transform.y}px)) scale(${transform.scale})`,
-                transformOrigin: 'center center',
-                touchAction: 'none',
-                cursor: drawEnabled ? 'crosshair' : (transform.scale > 1 ? 'grab' : 'default'),
-              }}
-            >
-              <img
-                ref={imageRef}
-                src={previewSrc}
-                alt={activeAttachment.name}
-                onLoad={(event) => {
-                  setImageLoadError('');
-                  setNaturalSize({
-                    width: event.currentTarget.naturalWidth,
-                    height: event.currentTarget.naturalHeight,
-                  });
-                  measureViewport();
+            useLayoutZoomViewer ? (
+              <div
+                onPointerDown={handleWebStagePointerDown}
+                onPointerMove={handleWebStagePointerMove}
+                onPointerUp={releasePointer}
+                onPointerCancel={releasePointer}
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) {
+                    onClose?.();
+                  }
                 }}
-                onError={() => {
-                  setImageLoadError('Unable to render this image');
-                }}
-                style={{
-                  display: 'block',
-                  width: '100%',
-                  height: '100%',
-                  objectFit: 'contain',
-                  userSelect: 'none',
-                  WebkitUserSelect: 'none',
-                  WebkitTouchCallout: 'none',
-                }}
-                draggable={false}
-              />
-              <canvas
-                ref={canvasRef}
-                onPointerDown={handleDrawPointerDown}
-                onPointerMove={handleDrawPointerMove}
-                onPointerUp={handleDrawPointerUp}
-                onPointerCancel={handleDrawPointerCancel}
                 style={{
                   position: 'absolute',
                   inset: 0,
-                  width: '100%',
-                  height: '100%',
-                  pointerEvents: drawEnabled ? 'auto' : 'none',
                   touchAction: 'none',
                 }}
-              />
-            </div>
+              >
+                <div
+                  ref={contentRef}
+                  style={{
+                    position: 'absolute',
+                    left: '50%',
+                    top: '50%',
+                    width: hasStage ? stageDisplayWidth : '100%',
+                    height: hasStage ? stageDisplayHeight : '100%',
+                    transform: `translate(-50%, -50%) translate3d(${webView.x}px, ${webView.y}px, 0)`,
+                    willChange: 'transform,width,height',
+                    touchAction: 'none',
+                    cursor: drawEnabled ? 'crosshair' : (webView.zoom > 1 ? 'grab' : 'default'),
+                  }}
+                >
+                  <img
+                    ref={imageRef}
+                    src={previewSrc}
+                    alt={activeAttachment.name}
+                    onLoad={handleImageLoad}
+                    onError={handleImageError}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      userSelect: 'none',
+                      WebkitUserSelect: 'none',
+                      WebkitTouchCallout: 'none',
+                      pointerEvents: 'none',
+                      touchAction: 'none',
+                    }}
+                    draggable={false}
+                  />
+                  {hasNaturalSize && (
+                    <canvas
+                      ref={canvasRef}
+                      onPointerDown={handleDrawPointerDown}
+                      onPointerMove={handleDrawPointerMove}
+                      onPointerUp={handleDrawPointerUp}
+                      onPointerCancel={handleDrawPointerCancel}
+                      style={{
+                        position: 'absolute',
+                        inset: 0,
+                        width: '100%',
+                        height: '100%',
+                        pointerEvents: drawEnabled ? 'auto' : 'none',
+                        touchAction: 'none',
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div
+                ref={contentRef}
+                onPointerDown={handleStagePointerDown}
+                onPointerMove={handleStagePointerMove}
+                onPointerUp={releasePointer}
+                onPointerCancel={releasePointer}
+                style={{
+                  position: 'absolute',
+                  left: '50%',
+                  top: '50%',
+                  width: stageWidth,
+                  height: stageHeight,
+                  transform: `translate(calc(-50% + ${transform.x}px), calc(-50% + ${transform.y}px)) scale(${transform.scale})`,
+                  transformOrigin: 'center center',
+                  touchAction: 'none',
+                  cursor: drawEnabled ? 'crosshair' : (transform.scale > 1 ? 'grab' : 'default'),
+                }}
+              >
+                <img
+                  ref={imageRef}
+                  src={previewSrc}
+                  alt={activeAttachment.name}
+                  onLoad={handleImageLoad}
+                  onError={handleImageError}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'contain',
+                    userSelect: 'none',
+                    WebkitUserSelect: 'none',
+                    WebkitTouchCallout: 'none',
+                  }}
+                  draggable={false}
+                />
+                <canvas
+                  ref={canvasRef}
+                  onPointerDown={handleDrawPointerDown}
+                  onPointerMove={handleDrawPointerMove}
+                  onPointerUp={handleDrawPointerUp}
+                  onPointerCancel={handleDrawPointerCancel}
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    width: '100%',
+                    height: '100%',
+                    pointerEvents: drawEnabled ? 'auto' : 'none',
+                    touchAction: 'none',
+                  }}
+                />
+              </div>
+            )
           )}
 
           {attachmentCount > 1 && (

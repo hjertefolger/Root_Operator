@@ -66,9 +66,24 @@ export function useWebSocket() {
     }
   }, []);
 
+  const armHeartbeatTimeout = useCallback((ws, reason = 'Heartbeat timeout') => {
+    if (heartbeatTimeoutRef.current) {
+      clearTimeout(heartbeatTimeoutRef.current);
+    }
+
+    heartbeatTimeoutRef.current = setTimeout(() => {
+      if (socketRef.current !== ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      console.log(`[WS] ${reason}`);
+      ws.close(4000, reason);
+    }, HEARTBEAT_CONFIG.timeout);
+  }, []);
+
   // Send a single heartbeat ping. Carries the current visibility state so
   // the server can update clientVisible and lastHeartbeat atomically.
-  const sendPing = useCallback((ws) => {
+  const sendPing = useCallback((ws, options = {}) => {
+    const { expectPong = false, reason = 'Heartbeat timeout' } = options;
     if (ws.readyState !== WebSocket.OPEN) {
       return;
     }
@@ -78,12 +93,16 @@ export function useWebSocket() {
         timestamp: Date.now(),
         visible: isPageVisible(),
       }));
+      if (expectPong) {
+        armHeartbeatTimeout(ws, reason);
+      }
     } catch {
       // Socket may be closing
     }
-  }, []);
+  }, [armHeartbeatTimeout]);
 
-  const startHeartbeat = useCallback((ws) => {
+  const startHeartbeat = useCallback((ws, options = {}) => {
+    const { probeImmediately = true, reason = 'Heartbeat timeout' } = options;
     clearHeartbeat();
 
     // Fire an immediate ping so lastHeartbeat is fresh right now — don't
@@ -91,15 +110,11 @@ export function useWebSocket() {
     // resuming from background: the visibility change sends client_visible
     // immediately, but without a fresh heartbeat the server sees the pair
     // (visible=true, lastHeartbeat=stale) and sends push anyway.
-    sendPing(ws);
+    sendPing(ws, { expectPong: probeImmediately, reason });
 
     heartbeatIntervalRef.current = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN && isPageVisible()) {
-        sendPing(ws);
-        heartbeatTimeoutRef.current = setTimeout(() => {
-          console.log('[WS] Heartbeat timeout');
-          ws.close(4000, 'Heartbeat timeout');
-        }, HEARTBEAT_CONFIG.timeout);
+        sendPing(ws, { expectPong: true, reason: 'Heartbeat timeout' });
       }
     }, HEARTBEAT_CONFIG.interval);
   }, [clearHeartbeat, sendPing]);
@@ -148,7 +163,7 @@ export function useWebSocket() {
       syncReconnectAttempt(0);
 
       if (isPageVisible()) {
-        startHeartbeat(ws);
+        startHeartbeat(ws, { probeImmediately: true, reason: 'Initial heartbeat timeout' });
       }
     };
 
@@ -275,14 +290,35 @@ export function useWebSocket() {
     connect();
   }, [clearHeartbeat, clearReconnectTimeout, connect, syncReconnectAttempt]);
 
+  const recoverConnection = useCallback((reason) => {
+    if (!isPageVisible() || serverStoppedRef.current || intentionalCloseRef.current) {
+      return;
+    }
+
+    const currentSocket = socketRef.current;
+    if (currentSocket?.readyState === WebSocket.OPEN) {
+      console.log(`[WS] ${reason}, probing existing socket`);
+      startHeartbeat(currentSocket, { probeImmediately: true, reason: 'Resume heartbeat timeout' });
+      return;
+    }
+
+    if (currentSocket?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+
+    if (pendingReconnectOnVisibleRef.current || !currentSocket) {
+      console.log(`[WS] ${reason}, reconnecting immediately`);
+      pendingReconnectOnVisibleRef.current = false;
+      connect();
+    }
+  }, [connect, startHeartbeat]);
+
   useEffect(() => {
-    if (typeof document === 'undefined') {
+    if (typeof document === 'undefined' || typeof window === 'undefined') {
       return undefined;
     }
 
     const handleVisibilityChange = () => {
-      const currentSocket = socketRef.current;
-
       if (!isPageVisible()) {
         clearHeartbeat();
 
@@ -294,29 +330,26 @@ export function useWebSocket() {
         return;
       }
 
-      if (serverStoppedRef.current || intentionalCloseRef.current) {
-        return;
-      }
+      recoverConnection('Page visible');
+    };
 
-      if (currentSocket?.readyState === WebSocket.OPEN) {
-        startHeartbeat(currentSocket);
-        return;
-      }
+    const handlePageShow = () => {
+      recoverConnection('pageshow');
+    };
 
-      if (currentSocket?.readyState === WebSocket.CONNECTING) {
-        return;
-      }
-
-      if (pendingReconnectOnVisibleRef.current || !currentSocket) {
-        console.log('[WS] Page visible, reconnecting immediately');
-        pendingReconnectOnVisibleRef.current = false;
-        connect();
-      }
+    const handleWindowFocus = () => {
+      recoverConnection('window focus');
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [clearHeartbeat, clearReconnectTimeout, connect, startHeartbeat]);
+    window.addEventListener('pageshow', handlePageShow);
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pageshow', handlePageShow);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [clearHeartbeat, clearReconnectTimeout, recoverConnection]);
 
   useEffect(() => {
     connect();

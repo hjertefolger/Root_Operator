@@ -21,7 +21,7 @@ function formatTime(ts) {
 function Row({ label, value }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
-      <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
+      <span className="font-sans text-xs font-normal text-muted-foreground">
         {label}
       </span>
       <span className="font-mono text-xs font-normal tracking-wider text-foreground text-right">
@@ -137,7 +137,7 @@ function SecurityPanel({
         <span className="font-mono text-xs font-normal tracking-wider">
           {fingerprintNodes || placeholder}
         </span>
-        <span className="font-mono text-xs font-normal tracking-wider text-muted-foreground">
+        <span className="font-sans text-xs font-normal text-muted-foreground">
           Verify with desktop app
         </span>
       </div>

@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
+const RETURNING_DEVICE_HANDSHAKE_TIMEOUT_MS = 12000;
+
 // RSA-PSS algorithm parameters
 const RSA_PSS_PARAMS = {
   name: "RSA-PSS",
@@ -134,7 +136,7 @@ async function migrateFromLocalStorage() {
   }
 }
 
-export function useAuth(socket) {
+export function useAuth(socket, forceReconnect) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [pairingCode, setPairingCode] = useState(null);
@@ -396,6 +398,54 @@ export function useAuth(socket) {
       // Note: Do NOT reset keysReady - keys persist across connections
     }
   }, [socket]);
+
+  useEffect(() => {
+    if (
+      typeof forceReconnect !== 'function'
+      || !socket
+      || socket.readyState !== WebSocket.OPEN
+      || !serverReady
+      || !keysReady
+      || !isReturningDevice
+      || isAuthenticated
+      || pairingError
+      || pairingStatus === 'waiting'
+      || pairingStatus === 'paired'
+      || fatalSecurityErrorRef.current
+    ) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (
+        fatalSecurityErrorRef.current
+        || isAuthenticated
+        || pairingError
+        || pairingStatus === 'waiting'
+        || pairingStatus === 'paired'
+      ) {
+        return;
+      }
+
+      console.warn('[AUTH] Returning-device handshake stalled, forcing reconnect');
+      pairingInitiatedRef.current = false;
+      setServerReady(false);
+      setPairingStatus('connecting');
+      setPairingError(null);
+      forceReconnect();
+    }, RETURNING_DEVICE_HANDSHAKE_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [
+    forceReconnect,
+    isAuthenticated,
+    isReturningDevice,
+    keysReady,
+    pairingError,
+    pairingStatus,
+    serverReady,
+    socket,
+  ]);
 
   // Listen for WebSocket messages
   useEffect(() => {

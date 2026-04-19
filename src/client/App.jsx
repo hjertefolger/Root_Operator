@@ -82,7 +82,7 @@ function App() {
   const [channelActivities, setChannelActivities] = useState([]);
 
   // Initialize WebSocket connection
-  const { socket, connectionState, disconnect } = useWebSocket();
+  const { socket, connectionState, disconnect, forceReconnect } = useWebSocket();
 
   // Initialize authentication with pairing flow
   const {
@@ -96,7 +96,7 @@ function App() {
     signPayload,
     handleSecurityFailure,
     wasAuthenticatedThisSession
-  } = useAuth(socket);
+  } = useAuth(socket, forceReconnect);
   const notifications = useNotifications(socket, isAuthenticated);
 
   // Initialize E2E encryption
@@ -115,7 +115,8 @@ function App() {
     serverIdentityJwk,
     signPayload,
     onSecurityFailure: handleSecurityFailure,
-    disconnect
+    disconnect,
+    forceReconnect,
   });
 
   // File attachment support

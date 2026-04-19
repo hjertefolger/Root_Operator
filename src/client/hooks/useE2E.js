@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 
 const E2E_INFO = new TextEncoder().encode('root-operator-e2e-v2');
+const E2E_HANDSHAKE_TIMEOUT_MS = 12000;
 
 function base64ToArrayBuffer(base64) {
   const binary = atob(base64);
@@ -85,7 +86,7 @@ async function computeJwkKidHex(jwk) {
   return bytesToHex(new Uint8Array(hash));
 }
 
-export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload, onSecurityFailure, disconnect }) {
+export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload, onSecurityFailure, disconnect, forceReconnect }) {
   const [e2eReady, setE2eReady] = useState(false);
   const [sessionFingerprintHex, setSessionFingerprintHex] = useState(null);
   const [sessionStartedAt, setSessionStartedAt] = useState(null);
@@ -155,6 +156,31 @@ export function useE2E({ socket, isAuthenticated, serverIdentityJwk, signPayload
       securityFailureHandledRef.current = false;
     }
   }, [isAuthenticated, resetE2EState, socket]);
+
+  useEffect(() => {
+    if (
+      typeof forceReconnect !== 'function'
+      || !socket
+      || socket.readyState !== WebSocket.OPEN
+      || !isAuthenticated
+      || e2eReady
+      || securityFailureHandledRef.current
+    ) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (e2eReadyRef.current || securityFailureHandledRef.current) {
+        return;
+      }
+
+      console.warn('[E2E] Handshake stalled, forcing reconnect');
+      resetE2EState();
+      forceReconnect();
+    }, E2E_HANDSHAKE_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [e2eReady, forceReconnect, isAuthenticated, resetE2EState, socket]);
 
   useEffect(() => {
     if (!socket) {

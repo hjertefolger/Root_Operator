@@ -259,6 +259,66 @@ function getAttachmentPreviewSrc(attachment) {
   return `data:${attachment.mime};base64,${attachment.bytesBase64}`;
 }
 
+function AttachmentPill({ name, size, icon, onClick, disabled }) {
+  const { stem, ext } = splitFileNameExt(name);
+  const isButton = typeof onClick === 'function';
+  const sharedInner = (
+    <>
+      <span style={{ display: 'inline-flex', flexShrink: 0, color: '#4B5AFF' }}>{icon}</span>
+      <span style={{
+        fontSize: 13,
+        color: 'rgba(255,255,255,0.55)',
+        fontFamily: MONO,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        minWidth: 0,
+        flex: 1,
+      }}>
+        {stem}
+      </span>
+      {ext && (
+        <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
+          {ext}
+        </span>
+      )}
+      {size != null && (
+        <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
+          {formatFileSize(size)}
+        </span>
+      )}
+    </>
+  );
+
+  const sharedStyle = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 7,
+    padding: '6px 12px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.12)',
+    background: 'transparent',
+    textAlign: 'left',
+    width: '100%',
+    minWidth: 0,
+  };
+
+  if (isButton) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        style={{ ...sharedStyle, color: 'inherit', cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.72 : 1 }}
+      >
+        {sharedInner}
+      </button>
+    );
+  }
+
+  return <div style={sharedStyle}>{sharedInner}</div>;
+}
+
 const AssistantAttachmentList = memo(function AssistantAttachmentList({
   attachments,
   externalRef,
@@ -281,52 +341,18 @@ const AssistantAttachmentList = memo(function AssistantAttachmentList({
           : attachment);
         const isLoading = fetchState?.loading === true;
         const canOpen = Boolean(onOpenAttachmentViewer && (previewSrc || (attachment.id && externalRef)));
+        const icon = isLoading
+          ? <Loader size={13} strokeWidth={2.2} className="animate-spin" />
+          : <Eye size={13} strokeWidth={2.3} />;
         return (
-          <div
+          <AttachmentPill
             key={`assistant-attachment-${attachmentKey}`}
-            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
-          >
-            <button
-              type="button"
-              onClick={() => onOpenAttachmentViewer?.({ attachments, externalRef, initialIndex: index })}
-              disabled={!canOpen}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                width: '100%',
-                padding: '8px 12px',
-                borderRadius: 999,
-                border: '1px solid rgba(255,255,255,0.12)',
-                background: 'transparent',
-                color: 'inherit',
-                cursor: canOpen ? 'pointer' : 'default',
-                textAlign: 'left',
-                opacity: canOpen ? 1 : 0.72,
-              }}
-            >
-              {isLoading ? (
-                <Loader size={13} strokeWidth={2.2} className="animate-spin" style={{ color: '#4B5AFF', flexShrink: 0 }} />
-              ) : (
-                <Eye size={13} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
-              )}
-              <span style={{
-                fontSize: 13,
-                color: 'rgba(255,255,255,0.72)',
-                fontFamily: MONO,
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                minWidth: 0,
-                flex: 1,
-              }}>
-                {attachment.name}
-              </span>
-              <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', fontFamily: MONO, flexShrink: 0 }}>
-                {formatFileSize(attachment.size || 0)}
-              </span>
-            </button>
-          </div>
+            name={attachment.name}
+            size={attachment.size || 0}
+            icon={icon}
+            onClick={canOpen ? () => onOpenAttachmentViewer?.({ attachments, externalRef, initialIndex: index }) : undefined}
+            disabled={!canOpen}
+          />
         );
       })}
     </div>
@@ -366,40 +392,14 @@ const ChatMessageItem = memo(function ChatMessageItem({
       )}
       {files.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxWidth: '85%' }}>
-          {files.map((f, i) => {
-            const { stem, ext } = splitFileNameExt(f.name);
-            return (
-              <div key={`file-${i}-${f.name}`} style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 7,
-                padding: '6px 12px',
-                borderRadius: 999,
-                border: '1px solid rgba(255,255,255,0.12)',
-                background: 'transparent',
-              }}>
-                <Plus size={12} strokeWidth={2.5} style={{ color: '#4B5AFF', flexShrink: 0 }} />
-                <span style={{
-                  fontSize: 13,
-                  color: 'rgba(255,255,255,0.55)',
-                  fontFamily: MONO,
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  maxWidth: 120,
-                  minWidth: 0,
-                }}>
-                  {stem}
-                </span>
-                {ext && <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
-                  {ext}
-                </span>}
-                {f.size != null && <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
-                  {formatFileSize(f.size)}
-                </span>}
-              </div>
-            );
-          })}
+          {files.map((f, i) => (
+            <AttachmentPill
+              key={`file-${i}-${f.name}`}
+              name={f.name}
+              size={f.size}
+              icon={<Plus size={12} strokeWidth={2.5} />}
+            />
+          ))}
         </div>
       )}
       {!isUser && assistantAttachments.length > 0 && (
