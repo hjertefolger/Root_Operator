@@ -3576,6 +3576,17 @@ function teardownChannelMode() {
         scheduler.stopAll();
         scheduler = null;
     }
+    // Shut down supervisor BEFORE killing Claude so awaitOutcome waiters
+    // settle cleanly, wedge/safety timers clear, and the instance can't
+    // keep mutating dispatch rows after a subsequent initChannelMode
+    // spins up a fresh supervisor. Without this, toggling channel mode
+    // off/on while a dispatch was active created two supervisors on the
+    // same store — the new one treated the old one's live rows as
+    // prior-epoch orphans.
+    if (supervisor) {
+        supervisor.shutdown().catch(() => { /* best-effort during teardown */ });
+        supervisor = null;
+    }
     // Only kill Claude if we spawned it
     if (claudeProcess) killClaudeCode();
     if (channelManager) {

@@ -182,19 +182,33 @@ class Scheduler extends EventEmitter {
         // in Claude while the scheduler record stays stuck in the running
         // state forever.
         const reattachQueue = [];
+        const crashFailedJobs = [];
         for (const job of jobs) {
             if (!job.runningAt) continue;
             const liveDispatch = this._hasLiveSupervisorDispatchForJob(job.id);
             if (liveDispatch === false) {
-                job.runningAt = null;
-                cleaned++;
+                // Supervisor sees no live dispatch for this job, yet the
+                // job's runningAt is still set. That means either:
+                //   (a) supervisor terminalized the dispatch via
+                //       _recoverOrphanedDispatches on this same boot
+                //       (SENDING/ACTIVE → ABANDONED), or
+                //   (b) main.js crashed mid-run and no supervisor dispatch
+                //       ever existed.
+                // Either way, the previous run did not complete normally.
+                // Record it as a failure so the user/UI sees something went
+                // wrong and the error-backoff schedule applies to the next
+                // cron tick — otherwise a crash-looping job would fire
+                // again immediately with no visible error history.
+                crashFailedJobs.push(job);
                 continue;
             }
             if (liveDispatch === null) {
                 const staleMs = Date.now() - new Date(job.runningAt).getTime();
                 if (staleMs > STUCK_RUN_MS || isNaN(staleMs)) {
-                    job.runningAt = null;
-                    cleaned++;
+                    // Legacy path: same crash-failed reasoning, but with a
+                    // wall-clock threshold because there's no supervisor to
+                    // ask. Record as failure rather than silently clearing.
+                    crashFailedJobs.push(job);
                 }
                 continue;
             }
@@ -205,8 +219,16 @@ class Scheduler extends EventEmitter {
             reattachQueue.push(job);
         }
 
+        // Record crash-abandoned runs as failures (bumps consecutiveErrors,
+        // writes lastError, clears runningAt). _completeJob handles all
+        // side-effects and persistence — don't double-write jobs here.
+        for (const job of crashFailedJobs) {
+            const startedAt = job.runningAt ? new Date(job.runningAt).getTime() : Date.now();
+            this._completeJob(job.id, 'error', 'crash_mid_run_orphaned', startedAt);
+            cleaned++;
+        }
+
         if (cleaned > 0) {
-            this._saveJobs(jobs);
             console.log(`[Scheduler] Cleaned ${cleaned} stale running states`);
         }
 

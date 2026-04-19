@@ -126,6 +126,12 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // flip a successful run to abandoned (fresh supervisor sees the
         // old Claude as wedged and kills it). bootCleanup() also removes
         // stale sockets and prunes old epochs.
+        // Capture bootCleanup result so _recoverOrphanedDispatches can see
+        // whether the old Claude process was actually killed. If kill failed
+        // (EPERM, zombie, etc.) we can't safely re-queue orphans — the
+        // surviving Claude could emit hook events for the same dispatch id
+        // we're about to reactivate.
+        this._orphanKillFailed = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
                 const report = this.runtime.bootCleanup();
@@ -135,6 +141,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         kind: 'boot_cleanup',
                         epoch: this.epoch,
                         details: report,
+                    });
+                }
+                if (report && report.orphan_pid && report.orphan_killed === false) {
+                    this._orphanKillFailed = true;
+                    this.incidents.record({
+                        kind: 'boot_cleanup_kill_failed',
+                        epoch: this.epoch,
+                        details: { orphan_pid: report.orphan_pid },
                     });
                 }
             } catch (err) {
@@ -971,7 +985,18 @@ class ClaudeSessionSupervisor extends EventEmitter {
         const currentEpoch = this.epoch;
         const abandoned = [];
         const requeued = [];
-        const REQUEUE_SOURCES = new Set(['channel', 'user', 'scheduler']);
+        // If bootCleanup couldn't SIGKILL a surviving Claude (EPERM, zombie,
+        // transient), it would be unsafe to replay queued orphans — the old
+        // Claude could be processing them. Force every orphan (QUEUED too)
+        // into ABANDONED in that case, and record a distinct reason so
+        // operators can see why.
+        const killFailed = !!this._orphanKillFailed;
+        const REQUEUE_SOURCES = killFailed
+            ? new Set()
+            : new Set(['channel', 'user', 'scheduler']);
+        const abandonReason = killFailed
+            ? 'orphan_kill_failed_abandon_all'
+            : 'orphaned_by_restart';
 
         for (const row of open) {
             if (!row || !row.dispatch_id) continue;
@@ -1003,7 +1028,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
                     this.store.updateDispatchState(row.dispatch_id, {
                         state: DISPATCH_STATES.ABANDONED,
                         terminalAt: this.clock(),
-                        lastError: 'orphaned_by_restart',
+                        lastError: abandonReason,
                     });
                     this.incidents.record({
                         kind: 'dispatch_abandoned',
@@ -1012,7 +1037,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         stateFrom: row.state,
                         stateTo: DISPATCH_STATES.ABANDONED,
                         details: {
-                            error: 'orphaned_by_restart',
+                            error: abandonReason,
                             prior_state: row.state,
                             prior_source: row.source,
                             prior_epoch: row.epoch || 0,
