@@ -226,8 +226,10 @@ test('orchestrator emits activate_dispatch via sendStructuredMessage', async () 
     });
 
     await sup.start();
-    // start() goes to IDLE and enqueues a probe (enableProbe=true).
-    // The probe activates immediately and sends activate_dispatch.
+    // Probe firing is now deferred to the first bridge_ready so that on
+    // real cold boots it doesn't drain recovered orphans through a
+    // disconnected bridge (pass-7 fix). Simulate bridge coming up.
+    sup._onBridgeReady();
     await new Promise(r => setTimeout(r, 50));
 
     const activateMsg = structuredMessages.find(m => m.type === 'activate_dispatch');

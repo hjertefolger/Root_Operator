@@ -161,28 +161,40 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // exact failure recovery is trying to prevent. _onBridgeReady()
         // drains the queue once the bridge is live (see its drain block).
 
-        // PR3: fire-and-forget probe dispatch for spawn verification.
-        // Non-blocking — external dispatches can proceed immediately.
-        // The probe proves the bridge can mediate a full turn to Stop.
-        // Gated by enableProbe (off in tests, on in production).
-        if (this._enableProbe) {
-            try {
-                const { dispatchId } = this.enqueue({
-                    source: 'probe',
-                    payload: '[system] Verify spawn by calling _ping tool now.',
-                    silenceMs: 15000,
+        // Probe is deferred to _onBridgeReady — see _fireStartupProbe().
+        // Firing it here would enqueue while the channel bridge is still
+        // down on cold boot, which triggers _activateNext and drains any
+        // recovered orphans through a disconnected bridge (pass-7 P1).
+    }
+
+    /**
+     * Fire the PR3 startup probe, but at most once per supervisor instance.
+     * Purpose: verify the spawn by driving a full turn from enqueue → Stop
+     * through the bridge. Must NOT fire during supervisor.start(), because
+     * on cold boot the bridge isn't live yet and the probe's enqueue would
+     * drain recovered orphans into a disconnected channel. Instead, called
+     * from _onBridgeReady() the first time the bridge is actually up.
+     */
+    _fireStartupProbe() {
+        if (!this._enableProbe) return;
+        if (this._probeFired) return;
+        this._probeFired = true;
+        try {
+            const { dispatchId } = this.enqueue({
+                source: 'probe',
+                payload: '[system] Verify spawn by calling _ping tool now.',
+                silenceMs: 15000,
+            });
+            this.awaitOutcome(dispatchId).then((outcome) => {
+                if (this._shutdown) return;
+                this.incidents.record({
+                    kind: outcome.state === 'completed' ? 'verify_ok' : 'verify_probe_failed',
+                    epoch: this.epoch,
+                    details: { outcome },
                 });
-                this.awaitOutcome(dispatchId).then((outcome) => {
-                    if (this._shutdown) return;
-                    this.incidents.record({
-                        kind: outcome.state === 'completed' ? 'verify_ok' : 'verify_probe_failed',
-                        epoch: this.epoch,
-                        details: { outcome },
-                    });
-                }).catch(() => { /* shutdown race — ignore */ });
-            } catch (_) {
-                // enqueue may fail if hardFailed/shutdown. Non-fatal.
-            }
+            }).catch(() => { /* shutdown race — ignore */ });
+        } catch (_) {
+            // enqueue may fail if hardFailed/shutdown. Non-fatal.
         }
     }
 
@@ -702,6 +714,11 @@ class ClaudeSessionSupervisor extends EventEmitter {
         if (this.state === STATES.IDLE && !this.activeDispatch && this.queue.length > 0) {
             this._activateNext();
         }
+
+        // 4. First-bridge-ready: fire the startup probe. Deferred from
+        // supervisor.start() so the probe's enqueue doesn't drain any
+        // recovered orphan queue through a disconnected bridge on cold boot.
+        this._fireStartupProbe();
     }
 
     _retryActiveDispatch(dispatchId, reason) {

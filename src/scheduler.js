@@ -97,6 +97,54 @@ class Scheduler extends EventEmitter {
      *   null  — supervisor not wired (legacy path); caller should fall back
      *           to the time-based STUCK_RUN_MS cutoff.
      */
+    /**
+     * Post-restart re-attach path. Given a scheduled job whose supervisor
+     * dispatch is still non-terminal after boot, find that dispatch by
+     * source_id and wire an awaitOutcome → _completeJob chain so the
+     * terminalization updates scheduler bookkeeping (runningAt, lastRun,
+     * lastResult). Without this, recovered dispatches that complete in
+     * Claude would finish with no side-effect on the scheduler record,
+     * leaving runNow() triggers and infrequent jobs permanently in-flight.
+     *
+     * Best-effort: a missing dispatch, a dead supervisor, or a thrown
+     * awaitOutcome resolves to a lenient error path — we clear runningAt
+     * so the next tick can re-fire rather than suppressing the job forever.
+     */
+    _reattachDispatchCompletion(job) {
+        if (!this.supervisor || !this.supervisor.store) return;
+        let dispatchId = null;
+        try {
+            const open = this.supervisor.store.listOpenDispatches();
+            const match = open.find(d =>
+                d && d.source === 'scheduler' && d.source_id === job.id);
+            if (match) dispatchId = match.dispatch_id;
+        } catch (err) {
+            console.error(`[Scheduler] reattach lookup failed for "${job.name}": ${err.message}`);
+            return;
+        }
+        if (!dispatchId) return;
+
+        // Use runningAt (persisted across the crash) as our "started" marker
+        // so lastDurationMs reflects the full in-flight time rather than
+        // just post-restart elapsed. If runningAt is malformed, fall back
+        // to Date.now() — a modest underestimate beats NaN.
+        const startedAt = job.runningAt ? new Date(job.runningAt).getTime() : Date.now();
+
+        console.log(`[Scheduler] Re-attached completion handler for "${job.name}" → ${dispatchId}`);
+        this.supervisor.awaitOutcome(dispatchId)
+            .then((outcome) => {
+                if (outcome && outcome.state === 'completed') {
+                    this._completeJob(job.id, 'success', null, startedAt);
+                } else {
+                    const err = outcome ? `${outcome.state}: ${outcome.error || 'unknown'}` : 'unknown_outcome';
+                    this._completeJob(job.id, 'error', err, startedAt);
+                }
+            })
+            .catch((err) => {
+                this._completeJob(job.id, 'error', `supervisor_reattach: ${err.message}`, startedAt);
+            });
+    }
+
     _hasLiveSupervisorDispatchForJob(jobId) {
         if (!this.supervisor || !this.supervisor.store
             || typeof this.supervisor.store.listOpenDispatches !== 'function') {
@@ -124,6 +172,16 @@ class Scheduler extends EventEmitter {
         // already terminalized (including by _recoverOrphanedDispatches on
         // this same boot) gets its runningAt cleared immediately, regardless
         // of wall-clock age. Legacy no-supervisor path uses STUCK_RUN_MS.
+        //
+        // For jobs whose supervisor dispatch is still LIVE (either because
+        // _recoverOrphanedDispatches re-queued it, or because it was mid-
+        // flight when we booted), we re-attach an awaitOutcome so the
+        // eventual terminalization flows back into _completeJob — clearing
+        // runningAt, writing lastRun/lastResult, and emitting 'completed'.
+        // Without this re-attach, a recovered scheduler dispatch can finish
+        // in Claude while the scheduler record stays stuck in the running
+        // state forever.
+        const reattachQueue = [];
         for (const job of jobs) {
             if (!job.runningAt) continue;
             const liveDispatch = this._hasLiveSupervisorDispatchForJob(job.id);
@@ -138,13 +196,22 @@ class Scheduler extends EventEmitter {
                     job.runningAt = null;
                     cleaned++;
                 }
+                continue;
             }
-            // liveDispatch === true → supervisor says dispatch is still active; leave it.
+            // liveDispatch === true → supervisor has a non-terminal dispatch
+            // for this job. Stash for awaitOutcome re-attach after we finish
+            // iterating jobs (avoid async work while the jobs array is in
+            // the middle of being mutated / saved).
+            reattachQueue.push(job);
         }
 
         if (cleaned > 0) {
             this._saveJobs(jobs);
             console.log(`[Scheduler] Cleaned ${cleaned} stale running states`);
+        }
+
+        for (const job of reattachQueue) {
+            this._reattachDispatchCompletion(job);
         }
 
         for (const job of jobs) {
