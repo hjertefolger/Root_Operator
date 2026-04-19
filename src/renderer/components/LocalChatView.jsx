@@ -10,6 +10,7 @@ const STATUS_COLORS = {
   orange: '#f59e0b',
   red: '#d44d69',
 };
+const DESKTOP_LOCAL_CHAT_ID = 'desktop-local';
 
 function mergeMessages(prev, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) {
@@ -17,10 +18,18 @@ function mergeMessages(prev, incoming) {
   }
 
   const next = [...prev];
-  const seen = new Set(prev.map((item) => `${item.role}:${item.ts || ''}:${item.content}`));
+  const seen = new Set(prev.map((item) => {
+    const attachmentKey = Array.isArray(item.attachments)
+      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+      : '';
+    return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
+  }));
 
   for (const item of incoming) {
-    const key = `${item.role}:${item.ts || ''}:${item.content}`;
+    const attachmentKey = Array.isArray(item.attachments)
+      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+      : '';
+    const key = `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
     if (!seen.has(key)) {
       seen.add(key);
       next.push(item);
@@ -38,6 +47,7 @@ function LocalChatView({ tunnelState }) {
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [forceScrollToBottomKey, setForceScrollToBottomKey] = useState(0);
   const [focusInputKey, setFocusInputKey] = useState(0);
+  const [viewerReturnedAttachments, setViewerReturnedAttachments] = useState([]);
 
   useEffect(() => {
     let mounted = true;
@@ -47,12 +57,32 @@ function LocalChatView({ tunnelState }) {
         return;
       }
 
+      if (payload.type === 'viewer_annotated' || payload.type === 'viewer_send_back') {
+        if (payload.parentChatId && payload.parentChatId !== DESKTOP_LOCAL_CHAT_ID) {
+          return;
+        }
+        if (!Array.isArray(payload.data) || payload.data.length === 0) {
+          return;
+        }
+
+        setViewerReturnedAttachments((prev) => [...prev, {
+          id: globalThis.crypto?.randomUUID?.() || `viewer-return-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          type: payload.type,
+          filename: typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename.trim() : 'attachment.png',
+          mimeType: typeof payload.mimeType === 'string' && payload.mimeType.trim() ? payload.mimeType.trim() : 'application/octet-stream',
+          data: payload.data,
+        }]);
+        return;
+      }
+
       if (payload.type === 'channel_message') {
         setWaiting(false);
         setMessages((prev) => mergeMessages(prev, [{
           role: payload.role || 'assistant',
           content: payload.content,
           ts: payload.ts || new Date().toISOString(),
+          attachments: payload.attachments,
+          external_ref: payload.external_ref,
         }]));
         setActivities((prev) => prev.map((item) => (
           item.active
@@ -116,6 +146,23 @@ function LocalChatView({ tunnelState }) {
     }
   }, [invoke]);
 
+  const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
+    const result = await invoke('FETCH_LOCAL_CHAT_ATTACHMENT_BYTES', {
+      attachmentId,
+      externalRef,
+    });
+
+    if (!result?.success) {
+      throw new Error(result?.error || 'Image unavailable');
+    }
+
+    return {
+      attachmentId: result.attachmentId,
+      bytesBase64: result.bytesBase64,
+      mime: result.mime,
+    };
+  }, [invoke]);
+
   const handleToggleAlwaysOnTop = useCallback(async () => {
     try {
       const result = await invoke('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP');
@@ -126,6 +173,29 @@ function LocalChatView({ tunnelState }) {
       console.error('Failed to toggle always-on-top:', error);
     }
   }, [invoke]);
+
+  const handleOpenDesktopAttachmentViewer = useCallback(async ({ attachments, externalRef, initialIndex = 0 }) => {
+    const openViewer = window.electronAPI?.viewer?.open;
+    if (typeof openViewer !== 'function') {
+      return { success: false, error: 'Attachment viewer unavailable' };
+    }
+
+    return await openViewer({
+      attachments,
+      externalRef,
+      initialIndex,
+      parentChatId: DESKTOP_LOCAL_CHAT_ID,
+    });
+  }, []);
+
+  const handleConsumeViewerReturnedAttachments = useCallback((consumedIds) => {
+    if (!Array.isArray(consumedIds) || consumedIds.length === 0) {
+      return;
+    }
+
+    const consumedSet = new Set(consumedIds);
+    setViewerReturnedAttachments((prev) => prev.filter((item) => !consumedSet.has(item.id)));
+  }, []);
 
   const channelStatus = tunnelState?.health?.channel || {
     level: 'orange',
@@ -210,7 +280,11 @@ function LocalChatView({ tunnelState }) {
         setWaiting={setWaiting}
         onSubmitMessage={handleSubmitMessage}
         onSendFile={handleSendFile}
+        onRequestAttachmentBytes={handleRequestAttachmentBytes}
         canSendOverride={canSend}
+        onOpenDesktopAttachmentViewer={handleOpenDesktopAttachmentViewer}
+        viewerReturnedAttachments={viewerReturnedAttachments}
+        onConsumeViewerReturnedAttachments={handleConsumeViewerReturnedAttachments}
       />
     </div>
   );

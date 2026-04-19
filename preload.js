@@ -32,11 +32,17 @@ const VALID_INVOKE_CHANNELS = [
     'GET_OPERATING_MODE',
     'OPEN_LOCAL_CHAT_WINDOW',
     'GET_LOCAL_CHAT_STATE',
+    'FETCH_LOCAL_CHAT_ATTACHMENT_BYTES',
     'SEND_LOCAL_CHAT_MESSAGE',
     'SEND_LOCAL_CHAT_FILE',
     'TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP',
     'GET_DYNAMIC_MEMORY_ENABLED',
-    'SET_DYNAMIC_MEMORY_ENABLED'
+    'SET_DYNAMIC_MEMORY_ENABLED',
+    'viewer:open',
+    'viewer:get-state',
+    'viewer:annotated',
+    'viewer:send-back',
+    'viewer:close'
 ];
 
 const VALID_SEND_CHANNELS = [
@@ -54,41 +60,47 @@ const VALID_RECEIVE_CHANNELS = [
 ];
 
 // Expose protected methods that only allow specific channels
+function invokeAllowed(channel, ...args) {
+    if (VALID_INVOKE_CHANNELS.includes(channel)) {
+        return ipcRenderer.invoke(channel, ...args);
+    }
+    console.error(`[SECURITY] Blocked invoke to invalid channel: ${channel}`);
+    return Promise.reject(new Error('Invalid IPC channel'));
+}
+
+function sendAllowed(channel, ...args) {
+    if (VALID_SEND_CHANNELS.includes(channel)) {
+        ipcRenderer.send(channel, ...args);
+    } else {
+        console.error(`[SECURITY] Blocked send to invalid channel: ${channel}`);
+    }
+}
+
+function subscribeAllowed(channel, callback) {
+    if (VALID_RECEIVE_CHANNELS.includes(channel)) {
+        // Wrap callback to remove event object (prevents access to sender)
+        const wrappedCallback = (event, ...args) => callback(...args);
+        ipcRenderer.on(channel, wrappedCallback);
+
+        // Return cleanup function
+        return () => {
+            ipcRenderer.removeListener(channel, wrappedCallback);
+        };
+    }
+
+    console.error(`[SECURITY] Blocked listener on invalid channel: ${channel}`);
+    return () => {};
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
     // Invoke (request/response pattern)
-    invoke: (channel, ...args) => {
-        if (VALID_INVOKE_CHANNELS.includes(channel)) {
-            return ipcRenderer.invoke(channel, ...args);
-        }
-        console.error(`[SECURITY] Blocked invoke to invalid channel: ${channel}`);
-        return Promise.reject(new Error('Invalid IPC channel'));
-    },
+    invoke: invokeAllowed,
 
     // Send (fire and forget)
-    send: (channel, ...args) => {
-        if (VALID_SEND_CHANNELS.includes(channel)) {
-            ipcRenderer.send(channel, ...args);
-        } else {
-            console.error(`[SECURITY] Blocked send to invalid channel: ${channel}`);
-        }
-    },
+    send: sendAllowed,
 
     // Receive (main -> renderer)
-    on: (channel, callback) => {
-        if (VALID_RECEIVE_CHANNELS.includes(channel)) {
-            // Wrap callback to remove event object (prevents access to sender)
-            const wrappedCallback = (event, ...args) => callback(...args);
-            ipcRenderer.on(channel, wrappedCallback);
-
-            // Return cleanup function
-            return () => {
-                ipcRenderer.removeListener(channel, wrappedCallback);
-            };
-        } else {
-            console.error(`[SECURITY] Blocked listener on invalid channel: ${channel}`);
-            return () => {};
-        }
-    },
+    on: subscribeAllowed,
 
     // One-time receive
     once: (channel, callback) => {
@@ -97,5 +109,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
         } else {
             console.error(`[SECURITY] Blocked once listener on invalid channel: ${channel}`);
         }
-    }
+    },
+
+    viewer: {
+        open: (payload) => invokeAllowed('viewer:open', payload),
+        getState: () => invokeAllowed('viewer:get-state'),
+        annotated: (payload) => invokeAllowed('viewer:annotated', payload),
+        sendBack: (payload) => invokeAllowed('viewer:send-back', payload),
+        close: () => invokeAllowed('viewer:close'),
+    },
 });

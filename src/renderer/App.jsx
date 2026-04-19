@@ -3,11 +3,14 @@ import { useElectron } from './hooks/useElectron';
 import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
 import LocalChatView from './components/LocalChatView';
+import ViewerWindow from './components/ViewerWindow';
 
 const RENDERER_VIEW = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('view')
   : null;
 const IS_LOCAL_CHAT_VIEW = RENDERER_VIEW === 'chat';
+const IS_VIEWER_WINDOW = RENDERER_VIEW === 'viewer';
+const IS_AUXILIARY_VIEW = IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW;
 
 function App() {
   const { invoke, on } = useElectron();
@@ -29,7 +32,7 @@ function App() {
 
   // Auto-resize window to fit content
   useEffect(() => {
-    if (IS_LOCAL_CHAT_VIEW) return undefined;
+    if (IS_AUXILIARY_VIEW) return undefined;
     if (!containerRef.current) return;
 
     const resizeWindow = () => {
@@ -72,6 +75,10 @@ function App() {
 
   // Load initial settings and sync tunnel state
   useEffect(() => {
+    if (IS_VIEWER_WINDOW) {
+      return undefined;
+    }
+
     async function loadInitialState() {
       try {
         // Request authoritative tunnel state from main process
@@ -106,6 +113,10 @@ function App() {
 
   // Listen for tunnel events
   useEffect(() => {
+    if (IS_VIEWER_WINDOW) {
+      return undefined;
+    }
+
     const cleanup = [
       on('TUNNEL_LIVE', (url) => {
         setTunnelState(prev => ({
@@ -187,7 +198,9 @@ function App() {
 
   return (
     <div ref={containerRef} className="flex flex-col">
-      {IS_LOCAL_CHAT_VIEW ? (
+      {IS_VIEWER_WINDOW ? (
+        <ViewerWindow />
+      ) : IS_LOCAL_CHAT_VIEW ? (
         <LocalChatView tunnelState={tunnelState} />
       ) : view === 'main' ? (
         <MainView

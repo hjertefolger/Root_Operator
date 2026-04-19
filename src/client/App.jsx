@@ -12,7 +12,10 @@ import { useFileAttachment } from './hooks/useFileAttachment';
 import { mergeChannelActivity } from './lib/channelActivity';
 
 function getMessageKey(item) {
-  return `${item.role}:${item.ts || ''}:${item.content}`;
+  const attachmentKey = Array.isArray(item.attachments)
+    ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
+    : '';
+  return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
 }
 
 function mergeMessages(prev, incoming) {
@@ -143,6 +146,16 @@ function App() {
 
   // Handle ALL WebSocket messages at App level — always mounted, never misses
   const messageChainRef = useRef(Promise.resolve());
+  const pendingAttachmentRequestsRef = useRef(new Map());
+
+  useEffect(() => () => {
+    for (const pending of pendingAttachmentRequestsRef.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Connection closed'));
+    }
+    pendingAttachmentRequestsRef.current.clear();
+  }, [socket]);
+
   useEffect(() => {
     if (!socket) return;
 
@@ -196,12 +209,31 @@ function App() {
             role: parsed.role || 'assistant',
             content: parsed.content,
             ts: parsed.ts || new Date().toISOString(),
+            attachments: parsed.attachments,
+            external_ref: parsed.external_ref,
           }]));
           setChannelActivities(prev => prev.map((item) => (
             item.active
               ? { ...item, active: false, done: true, completedAt: parsed.ts || new Date().toISOString() }
               : item
           )));
+        } else if (parsed.type === 'attachment_bytes_response') {
+          const pending = pendingAttachmentRequestsRef.current.get(parsed.request_id);
+          if (!pending) {
+            return;
+          }
+
+          pendingAttachmentRequestsRef.current.delete(parsed.request_id);
+          if (parsed.isError) {
+            pending.reject(new Error(parsed.error || 'Image unavailable'));
+            return;
+          }
+
+          pending.resolve({
+            attachmentId: parsed.attachment_id,
+            bytesBase64: parsed.bytesBase64,
+            mime: parsed.mime,
+          });
         } else if (parsed.type === 'channel_activity' && parsed.activity) {
           setChannelActivities(prev => mergeChannelActivity(prev, parsed.activity));
         }
@@ -219,6 +251,51 @@ function App() {
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, handleServerKeyMessage, decryptOutput]);
+
+  const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
+      throw new Error('Secure session unavailable');
+    }
+    if (!attachmentId || !externalRef) {
+      throw new Error('Attachment reference missing');
+    }
+
+    const requestId = globalThis.crypto?.randomUUID?.() || `att-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const encrypted = await encryptInput(JSON.stringify({
+      type: 'fetch_attachment_bytes',
+      request_id: requestId,
+      attachment_id: attachmentId,
+      external_ref: externalRef,
+    }));
+
+    if (!encrypted) {
+      throw new Error('Secure session unavailable');
+    }
+
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const pending = pendingAttachmentRequestsRef.current.get(requestId);
+        if (!pending) {
+          return;
+        }
+        pendingAttachmentRequestsRef.current.delete(requestId);
+        pending.reject(new Error('Image unavailable'));
+      }, 15000);
+
+      pendingAttachmentRequestsRef.current.set(requestId, {
+        timer,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
+    });
+  }, [e2eReady, encryptInput, socket]);
 
   // Safe area wrapper for overlay screens
   const SafeAreaWrapper = ({ children }) => (
@@ -295,6 +372,7 @@ function App() {
           waiting={channelWaiting}
           setWaiting={setChannelWaiting}
           onSendFile={handleSendFile}
+          onRequestAttachmentBytes={handleRequestAttachmentBytes}
           uploadProgress={uploadProgress}
           onAbortUpload={abortUpload}
         />

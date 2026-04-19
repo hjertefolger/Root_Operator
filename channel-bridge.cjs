@@ -74,6 +74,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Reply text to send to the device',
           },
+          attachments: {
+            type: 'array',
+            description: 'Optional absolute paths to local image files on the Mac',
+            items: {
+              type: 'string',
+            },
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -153,7 +160,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const ordinal = ++dispatchOrdinal;
 
   if (toolName === 'reply') {
-    const { chat_id, text } = request.params.arguments;
+    const { chat_id, text, attachments } = request.params.arguments;
 
     // PR3: reply is now request/response through the effect ledger.
     // Forward to Electron, await commit confirmation.
@@ -166,7 +173,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       ts: new Date().toISOString(),
     });
 
-    return handleReplyRequest(chat_id, text, ordinal);
+    return handleReplyRequest(chat_id, text, ordinal, attachments);
   }
 
   // --- Scheduler tools: forward to Electron and await response ---
@@ -207,7 +214,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 let replyCallbacks = new Map();
 let replyCallId = 0;
 
-function handleReplyRequest(chatId, text, ordinal) {
+function handleReplyRequest(chatId, text, ordinal, attachments) {
   return new Promise((resolve) => {
     if (!electronSocket || electronSocket.destroyed) {
       resolve({
@@ -227,6 +234,7 @@ function handleReplyRequest(chatId, text, ordinal) {
       ordinal,
       chat_id: chatId,
       text,
+      attachments: Array.isArray(attachments) ? attachments : undefined,
       ts: new Date().toISOString(),
     });
   });

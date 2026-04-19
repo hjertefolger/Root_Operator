@@ -21,7 +21,26 @@ const { ChannelManager } = require('./src/channel-manager');
 const { ChatStore } = require('./src/chat-store');
 const { Scheduler } = require('./src/scheduler');
 const { AppUpdater, defaultUpdateState } = require('./src/updater');
-const { ensureWorkspace, writeSystemPromptFile, writeProjectMcpConfig, ensureWorkspaceChatHistory, ensureAttachmentsDir, ATTACHMENTS_DIR, WORKSPACE_DIR } = require('./src/workspace');
+const {
+    ensureWorkspace,
+    writeSystemPromptFile,
+    writeProjectMcpConfig,
+    ensureWorkspaceChatHistory,
+    ensureAttachmentsDir,
+    ensureOutboundAttachmentsDir,
+    ATTACHMENTS_DIR,
+    OUTBOUND_ATTACHMENTS_DIR,
+    WORKSPACE_DIR,
+} = require('./src/workspace');
+const {
+    OUTBOUND_ATTACHMENT_GC_GRACE_MS,
+    OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
+    getStagedAttachmentPath,
+    loadStagedAttachmentBytes,
+    stageOutboundAttachments,
+    stripAttachmentBytes,
+    touchAttachmentForGc,
+} = require('./src/outbound-attachments');
 const { DynamicMemory } = require('./src/dynamic-memory');
 const {
     DispatchStore: SupervisorDispatchStore,
@@ -100,6 +119,7 @@ if (!WORKER_BASE_URL || !WORKER_DOMAIN) {
 // GLOBAL STATE
 let mainWindow;
 let localChatWindow;
+const viewerWindowStateByWebContentsId = new Map();
 let tray;
 let server;
 let wss;
@@ -138,6 +158,7 @@ let channelReplyPending = false;
 let latestChannelActivity = null;
 let lastChannelActivityKey = '';
 let lastChannelActivityAt = 0;
+let outboundAttachmentSweepTimer = null;
 let claudeDebugFilePath = '';
 let claudeDebugPollTimer = null;
 let claudeDebugReadOffset = 0;
@@ -1199,6 +1220,116 @@ function createLocalChatWindow() {
     return localChatWindow;
 }
 
+function normalizeViewerInitState(payload = {}) {
+    const attachments = Array.isArray(payload.attachments)
+        ? payload.attachments.filter((attachment) => attachment && typeof attachment === 'object')
+        : [];
+    const resolvedInitialIndex = Number.isInteger(payload.initialIndex)
+        ? payload.initialIndex
+        : Number.parseInt(payload.initialIndex, 10);
+    const initialIndex = attachments.length > 0
+        ? Math.max(0, Math.min(Number.isNaN(resolvedInitialIndex) ? 0 : resolvedInitialIndex, attachments.length - 1))
+        : 0;
+
+    return {
+        attachments,
+        externalRef: typeof payload.externalRef === 'string' && payload.externalRef.trim()
+            ? payload.externalRef.trim()
+            : null,
+        initialIndex,
+        parentChatId: typeof payload.parentChatId === 'string' && payload.parentChatId.trim()
+            ? payload.parentChatId.trim()
+            : null,
+    };
+}
+
+function createAttachmentViewerWindow({ attachments, externalRef, initialIndex, parentChatId, parentWindow }) {
+    const viewerWindow = new BrowserWindow({
+        width: 1180,
+        height: 860,
+        minWidth: 720,
+        minHeight: 520,
+        show: false,
+        parent: parentWindow,
+        titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+        backgroundColor: '#0a0b10',
+        title: 'Attachment Viewer',
+        autoHideMenuBar: true,
+        resizable: true,
+        maximizable: true,
+        minimizable: true,
+        fullscreenable: true,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js'),
+            sandbox: true
+        }
+    });
+
+    viewerWindowStateByWebContentsId.set(viewerWindow.webContents.id, {
+        attachments,
+        externalRef,
+        initialIndex,
+        parentChatId,
+        parentWindowId: parentWindow && !parentWindow.isDestroyed() ? parentWindow.id : null,
+    });
+
+    if (isDev) {
+        viewerWindow.loadURL(`http://localhost:${VITE_RENDERER_PORT}/renderer.html?view=viewer`);
+    } else {
+        viewerWindow.loadFile('ui/dist/renderer.html', { search: '?view=viewer' });
+    }
+
+    viewerWindow.once('ready-to-show', () => {
+        if (!viewerWindow.isDestroyed()) {
+            viewerWindow.center();
+            viewerWindow.show();
+            viewerWindow.focus();
+        }
+    });
+
+    viewerWindow.on('closed', () => {
+        viewerWindowStateByWebContentsId.delete(viewerWindow.webContents.id);
+    });
+
+    return viewerWindow;
+}
+
+function getAttachmentViewerContext(event) {
+    const viewerWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!viewerWindow || viewerWindow.isDestroyed()) {
+        throw new Error('Viewer window unavailable');
+    }
+
+    const state = viewerWindowStateByWebContentsId.get(event.sender.id);
+    if (!state) {
+        throw new Error('Viewer state unavailable');
+    }
+
+    const parentWindow = state.parentWindowId ? BrowserWindow.fromId(state.parentWindowId) : null;
+
+    return { viewerWindow, state, parentWindow };
+}
+
+function normalizeViewerResultPayload(payload = {}) {
+    if (typeof payload.filename !== 'string' || !payload.filename.trim()) {
+        throw new Error('Viewer filename missing');
+    }
+    if (typeof payload.mimeType !== 'string' || !payload.mimeType.trim()) {
+        throw new Error('Viewer mime type missing');
+    }
+    if (!Array.isArray(payload.data) || payload.data.length === 0) {
+        throw new Error('Viewer image data missing');
+    }
+
+    return {
+        filename: path.basename(payload.filename.trim()),
+        mimeType: payload.mimeType.trim(),
+        data: payload.data.map((value) => Number(value) & 0xff),
+    };
+}
+
 function registerGlobalShortcuts() {
     const startTunnelRegistered = globalShortcut.register('CommandOrControl+Shift+J', async () => {
         if (isConnecting || server || tunnelProcess) {
@@ -2100,10 +2231,204 @@ function scheduleChannelIdle(detail = `${getActivityAssistantName()} is ready fo
     }, CHANNEL_ACTIVITY_IDLE_MS);
 }
 
-function sendLocalChatEvent(payload) {
-    if (localChatWindow && !localChatWindow.isDestroyed()) {
-        localChatWindow.webContents.send('LOCAL_CHAT_EVENT', payload);
+function sendLocalChatEventToWindow(targetWindow, payload) {
+    if (targetWindow && !targetWindow.isDestroyed()) {
+        targetWindow.webContents.send('LOCAL_CHAT_EVENT', payload);
+        return true;
     }
+    return false;
+}
+
+function sendLocalChatEvent(payload) {
+    sendLocalChatEventToWindow(localChatWindow, payload);
+}
+
+function hasStructuredAttachments(message) {
+    return Array.isArray(message?.attachments) && message.attachments.length > 0;
+}
+
+function buildAttachmentFallbackText(content, attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+        return content || '';
+    }
+
+    const fallbackLines = attachments.map((attachment) => `[Attachment: ${attachment.name} — open in a newer client]`);
+    return content ? `${content}\n\n${fallbackLines.join('\n')}` : fallbackLines.join('\n');
+}
+
+function collectReferencedOutboundAttachmentPaths(messages) {
+    const referenced = new Set();
+    const items = Array.isArray(messages) ? messages : [];
+    for (const message of items) {
+        if (!hasStructuredAttachments(message) || !message.external_ref) {
+            continue;
+        }
+        message.attachments.forEach((attachment, index) => {
+            referenced.add(getStagedAttachmentPath(OUTBOUND_ATTACHMENTS_DIR, message.external_ref, index, attachment.name));
+        });
+    }
+    return referenced;
+}
+
+function markOutboundAttachmentsForGc(messages) {
+    const paths = collectReferencedOutboundAttachmentPaths(messages);
+    if (paths.size === 0) {
+        return;
+    }
+
+    const now = new Date();
+    for (const filePath of paths) {
+        touchAttachmentForGc(filePath, now);
+    }
+}
+
+function sweepOutboundAttachments() {
+    try {
+        ensureOutboundAttachmentsDir();
+        const referenced = collectReferencedOutboundAttachmentPaths(chatStore ? chatStore.loadMessages() : []);
+        const entries = fs.readdirSync(OUTBOUND_ATTACHMENTS_DIR, { withFileTypes: true });
+        const now = Date.now();
+
+        for (const entry of entries) {
+            if (!entry.isFile()) {
+                continue;
+            }
+
+            const filePath = path.join(OUTBOUND_ATTACHMENTS_DIR, entry.name);
+            if (referenced.has(filePath)) {
+                continue;
+            }
+
+            const stat = fs.statSync(filePath);
+            if ((now - stat.mtimeMs) < OUTBOUND_ATTACHMENT_GC_GRACE_MS) {
+                continue;
+            }
+
+            fs.unlinkSync(filePath);
+            logDebug(`[ATTACH] Swept outbound attachment ${entry.name}`);
+        }
+    } catch (error) {
+        logDebug(`[ATTACH] Sweep failed: ${error.message}`);
+    }
+}
+
+function startOutboundAttachmentSweep() {
+    clearInterval(outboundAttachmentSweepTimer);
+    sweepOutboundAttachments();
+    outboundAttachmentSweepTimer = setInterval(() => {
+        sweepOutboundAttachments();
+    }, OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS);
+}
+
+function findMessageAttachmentById(message, attachmentId) {
+    const attachments = stripAttachmentBytes(message?.attachments);
+    if (!attachments || !attachmentId) {
+        return null;
+    }
+
+    const attachmentIndex = attachments.findIndex((attachment) => attachment.id === attachmentId);
+    if (attachmentIndex === -1) {
+        return null;
+    }
+
+    return {
+        attachment: attachments[attachmentIndex],
+        attachmentIndex,
+    };
+}
+
+function buildAttachmentBytesResponsePayload({ requestId, attachmentId, externalRef }) {
+    const response = {
+        type: 'attachment_bytes_response',
+        request_id: requestId,
+        attachment_id: attachmentId,
+    };
+
+    try {
+        if (typeof requestId !== 'string' || !requestId.trim()) {
+            throw new Error('Attachment request id missing');
+        }
+        if (typeof attachmentId !== 'string' || !attachmentId.trim()) {
+            throw new Error('Attachment id missing');
+        }
+        if (typeof externalRef !== 'string' || !externalRef.trim()) {
+            throw new Error('Attachment reference missing');
+        }
+        if (!chatStore) {
+            throw new Error('Chat history unavailable');
+        }
+
+        const message = chatStore.findByExternalRef(externalRef);
+        if (!message) {
+            throw new Error('Attachment message not found');
+        }
+
+        const resolvedAttachment = findMessageAttachmentById(message, attachmentId);
+        if (!resolvedAttachment) {
+            throw new Error('Attachment metadata not found');
+        }
+
+        const attachmentBytes = loadStagedAttachmentBytes({
+            outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+            effectId: externalRef,
+            attachment: resolvedAttachment.attachment,
+            attachmentIndex: resolvedAttachment.attachmentIndex,
+        });
+
+        return {
+            ...response,
+            ...attachmentBytes,
+        };
+    } catch (error) {
+        return {
+            ...response,
+            isError: true,
+            error: error.message || 'Attachment unavailable',
+        };
+    }
+}
+
+function parseStructuredChannelInput(inputData) {
+    if (typeof inputData !== 'string') {
+        return null;
+    }
+
+    const trimmed = inputData.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(trimmed);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function buildTransportChannelMessage(message, { supportsAttachments = true } = {}) {
+    const normalized = {
+        type: 'channel_message',
+        role: message.role || 'assistant',
+        content: message.content || '',
+        ts: message.ts || new Date().toISOString(),
+    };
+
+    if (!hasStructuredAttachments(message)) {
+        return normalized;
+    }
+
+    const attachments = stripAttachmentBytes(message.attachments);
+    if (!supportsAttachments) {
+        normalized.content = buildAttachmentFallbackText(normalized.content, attachments);
+        return normalized;
+    }
+
+    if (message.external_ref) {
+        normalized.external_ref = message.external_ref;
+    }
+    normalized.attachments = attachments;
+    return normalized;
 }
 
 function createChatTimelineItem(activity) {
@@ -2126,7 +2451,7 @@ function createChatTimelineItem(activity) {
 }
 
 function getLocalChatState() {
-    const messages = chatStore ? chatStore.loadMessages() : [];
+    const messages = chatStore ? chatStore.loadMessages().map((message) => buildTransportChannelMessage(message)) : [];
     const activities = latestChannelActivity ? [createChatTimelineItem(latestChannelActivity)] : [];
 
     return {
@@ -2214,7 +2539,8 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
         detail: `Waiting for the ${assistantName} chat bridge to reconnect.`,
     }, { force: true });
 
-    chatStore.addMessage({ role: 'user', content, ts });
+    const userWrite = chatStore.addMessage({ role: 'user', content, ts });
+    markOutboundAttachmentsForGc(userWrite.evicted);
 
     if (echoToLocalChat) {
         sendLocalChatEvent({
@@ -3196,7 +3522,8 @@ function initChannelMode() {
             content: reply.text,
             ts: reply.ts || new Date().toISOString(),
         };
-        chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+        const legacyWrite = chatStore.addMessage({ role: msg.role, content: msg.content, ts: msg.ts });
+        markOutboundAttachmentsForGc(legacyWrite.evicted);
         if (dynamicMemory && dynamicMemory.isEnabled()) {
             const replyChatId = reply.chat_id || reply.chatId || null;
             dynamicMemory.indexMessage('assistant', msg.content, replyChatId).catch((err) => {
@@ -3433,9 +3760,20 @@ function initChannelMode() {
 async function handleReplyRequest(req) {
     const { callId, dispatch_id, ordinal, chat_id, text, ts } = req;
     const effectId = dispatch_id ? `reply:${dispatch_id}:${ordinal}` : null;
+    const stagingEffectId = effectId || `reply-${callId || 'manual'}-${Date.now()}`;
+    const messageExternalRef = effectId || stagingEffectId;
     const replyTs = ts || new Date().toISOString();
+    let stagedAttachments = [];
 
     try {
+        if (Array.isArray(req.attachments) && req.attachments.length > 0) {
+            stagedAttachments = stageOutboundAttachments({
+                outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+                effectId: stagingEffectId,
+                attachments: req.attachments,
+            });
+        }
+
         // Step 1: prepare effect row (if supervisor store is available)
         if (supervisorStore && effectId) {
             try {
@@ -3460,11 +3798,14 @@ async function handleReplyRequest(req) {
             role: 'assistant',
             content: text,
             ts: replyTs,
+            external_ref: messageExternalRef,
+            attachments: stripAttachmentBytes(stagedAttachments),
         };
-        chatStore.addMessage(
-            { role: msg.role, content: msg.content, ts: msg.ts },
-            { externalRef: effectId },
+        const assistantWrite = chatStore.addMessage(
+            { role: msg.role, content: msg.content, ts: msg.ts, attachments: msg.attachments },
+            { externalRef: messageExternalRef },
         );
+        markOutboundAttachmentsForGc(assistantWrite.evicted);
 
         // Step 3: dynamic-memory index with external_ref.
         // MUST be awaited before markEffectCommitted (Codex critical finding):
@@ -3473,7 +3814,7 @@ async function handleReplyRequest(req) {
         if (dynamicMemory && dynamicMemory.isEnabled()) {
             try {
                 await dynamicMemory.indexMessage('assistant', text, chat_id || null, {
-                    externalRef: effectId,
+                    externalRef: messageExternalRef,
                 });
             } catch (err) {
                 logDebug(`[MEMORY] Index (assistant) error: ${err.message}`);
@@ -3486,10 +3827,12 @@ async function handleReplyRequest(req) {
         // Step 4: WebSocket fan-out + notifications
         for (const client of activeClients) {
             if (client.readyState === WebSocket.OPEN) {
-                sendEncryptedOutput(client, JSON.stringify(msg));
+                sendEncryptedOutput(client, JSON.stringify(buildTransportChannelMessage(msg, {
+                    supportsAttachments: client.supportsAttachments === true,
+                })));
             }
         }
-        sendLocalChatEvent(msg);
+        sendLocalChatEvent(buildTransportChannelMessage(msg));
         notifyAssistantReply(msg);
         scheduleChannelIdle();
 
@@ -3519,6 +3862,15 @@ async function handleReplyRequest(req) {
             isError: false,
         });
     } catch (err) {
+        for (const attachment of stagedAttachments) {
+            if (attachment.created && attachment.stagedPath && fs.existsSync(attachment.stagedPath)) {
+                try {
+                    fs.unlinkSync(attachment.stagedPath);
+                } catch {
+                    // Ignore cleanup errors after the original failure.
+                }
+            }
+        }
         logDebug(`[REPLY] handleReplyRequest failed: ${err.message}`);
         channelManager?.sendStructuredMessage({
             type: 'reply_response',
@@ -3797,6 +4149,7 @@ app.whenReady().then(async () => {
     } catch (error) {
         logDebug(`[CHAT] Failed to read history store: ${error.message}`);
     }
+    startOutboundAttachmentSweep();
 
     try {
         dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
@@ -3840,6 +4193,7 @@ app.on('will-quit', () => {
     cachedPushVapidKeys = null;
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
+    clearInterval(outboundAttachmentSweepTimer);
     // NOTE: we deliberately do NOT clear the pidfile on will-quit.
     // killClaudeCode() above asks node-pty to terminate the child but
     // doesn't synchronously wait for exit. If the PTY child lingers
@@ -3896,6 +4250,72 @@ ipcMain.handle('OPEN_LOCAL_CHAT_WINDOW', () => {
     return { success: true };
 });
 ipcMain.handle('GET_LOCAL_CHAT_STATE', () => getLocalChatState());
+ipcMain.handle('viewer:open', async (event, payload = {}) => {
+    try {
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        if (!parentWindow || parentWindow.isDestroyed()) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        const {
+            attachments,
+            externalRef,
+            initialIndex,
+            parentChatId,
+        } = normalizeViewerInitState(payload);
+
+        if (attachments.length === 0) {
+            throw new Error('Viewer attachments missing');
+        }
+        if (!parentChatId) {
+            throw new Error('Viewer parent chat missing');
+        }
+
+        const viewerWindow = createAttachmentViewerWindow({
+            attachments,
+            externalRef,
+            initialIndex,
+            parentChatId,
+            parentWindow,
+        });
+
+        return { success: true, windowId: viewerWindow.id };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to open attachment viewer' };
+    }
+});
+ipcMain.handle('viewer:get-state', async (event) => {
+    try {
+        const { state } = getAttachmentViewerContext(event);
+        return {
+            success: true,
+            attachments: state.attachments,
+            externalRef: state.externalRef,
+            initialIndex: state.initialIndex,
+            parentChatId: state.parentChatId,
+        };
+    } catch (error) {
+        return { success: false, error: error.message || 'Viewer state unavailable' };
+    }
+});
+ipcMain.handle('FETCH_LOCAL_CHAT_ATTACHMENT_BYTES', async (event, { attachmentId, externalRef } = {}) => {
+    const response = buildAttachmentBytesResponsePayload({
+        requestId: `desktop-local:${Date.now()}`,
+        attachmentId,
+        externalRef,
+    });
+
+    if (response.isError) {
+        return { success: false, error: response.error || 'Attachment unavailable' };
+    }
+
+    return {
+        success: true,
+        attachmentId: response.attachment_id,
+        bytesBase64: response.bytesBase64,
+        mime: response.mime,
+    };
+});
 ipcMain.handle('SEND_LOCAL_CHAT_MESSAGE', async (event, text) => {
     if (typeof text !== 'string' || !text.trim()) {
         return { success: false, error: 'Message is empty' };
@@ -3963,6 +4383,57 @@ ipcMain.handle('SEND_LOCAL_CHAT_FILE', async (event, { data, filename, mimeType,
     }
     parts.push(`[File attached: ${filename}]\nSaved to: ${destPath}`);
     return await submitChannelUserMessage('desktop-local', parts.join('\n\n'), 'desktop-local');
+});
+ipcMain.handle('viewer:annotated', async (event, payload = {}) => {
+    try {
+        const { state, parentWindow } = getAttachmentViewerContext(event);
+        const file = normalizeViewerResultPayload(payload);
+        const delivered = sendLocalChatEventToWindow(parentWindow, {
+            type: 'viewer_annotated',
+            parentChatId: state.parentChatId,
+            filename: file.filename,
+            mimeType: file.mimeType,
+            data: file.data,
+        });
+
+        if (!delivered) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to return annotated attachment' };
+    }
+});
+ipcMain.handle('viewer:send-back', async (event, payload = {}) => {
+    try {
+        const { state, parentWindow } = getAttachmentViewerContext(event);
+        const file = normalizeViewerResultPayload(payload);
+        const delivered = sendLocalChatEventToWindow(parentWindow, {
+            type: 'viewer_send_back',
+            parentChatId: state.parentChatId,
+            filename: file.filename,
+            mimeType: file.mimeType,
+            data: file.data,
+        });
+
+        if (!delivered) {
+            throw new Error('Parent chat window unavailable');
+        }
+
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to send attachment back to chat' };
+    }
+});
+ipcMain.handle('viewer:close', async (event) => {
+    try {
+        const { viewerWindow } = getAttachmentViewerContext(event);
+        viewerWindow.close();
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error.message || 'Failed to close attachment viewer' };
+    }
 });
 ipcMain.handle('TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP', () => {
     if (!localChatWindow || localChatWindow.isDestroyed()) {
@@ -4755,6 +5226,7 @@ function handleConnection(ws, req) {
 
     ws.lastActivity = Date.now();
     ws.lastHeartbeat = Date.now();
+    ws.supportsAttachments = false;
     // Start as not-visible — the client will send client_visible:true once it
     // confirms foreground state. Prevents a 35-second race window on reconnect
     // where the server assumes the client is visible and suppresses push.
@@ -4803,6 +5275,12 @@ function handleConnection(ws, req) {
                 ws.lastHeartbeat = Date.now();
             }
             logDebug(`[NOTIFICATIONS] client_visible kid=${(ws.kid || '?').substring(0, 8)} visible=${nowVisible} hb=${ws.lastHeartbeat}`);
+            return;
+        }
+
+        if (m.type === 'client_capabilities') {
+            ws.supportsAttachments = m.supportsAttachments === true;
+            logDebug(`[WS] Client capabilities kid=${(ws.kid || '?').substring(0, 8)} attachments=${ws.supportsAttachments}`);
             return;
         }
 
@@ -5078,6 +5556,20 @@ function handleConnection(ws, req) {
                 inputData = inputData.substring(0, MAX_INPUT_SIZE);
             }
 
+            const structuredInput = parseStructuredChannelInput(inputData);
+            if (structuredInput?.type === 'fetch_attachment_bytes') {
+                const response = buildAttachmentBytesResponsePayload({
+                    requestId: structuredInput.request_id,
+                    attachmentId: structuredInput.attachment_id,
+                    externalRef: structuredInput.external_ref,
+                });
+                if (response.isError) {
+                    logDebug(`[ATTACH] On-demand fetch failed for ${structuredInput.attachment_id || 'unknown'}: ${response.error}`);
+                }
+                sendEncryptedOutput(ws, JSON.stringify(response));
+                return;
+            }
+
             if (operatingMode === 'channel') {
                 // Channel mode: forward to Claude Code via channel bridge
                 const deviceId = ws.kid || 'unknown';
@@ -5350,7 +5842,9 @@ function startPty(ws) {
     if (operatingMode === 'channel') {
         logDebug('[CHANNEL] Client attached in channel mode, skipping PTY');
         // Send chat history from disk (buffered by sendEncryptedOutput until E2E ready)
-        const history = chatStore.loadMessages();
+        const history = chatStore.loadMessages().map((message) => buildTransportChannelMessage(message, {
+            supportsAttachments: ws.supportsAttachments === true,
+        }));
         if (history.length > 0) {
             sendEncryptedOutput(ws, JSON.stringify({
                 type: 'channel_history',

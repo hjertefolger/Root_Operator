@@ -67,6 +67,7 @@ if [ ${#ARGS[@]} -eq 0 ]; then
         src/claude-session-supervisor/incidents.test.js
         src/claude-session-supervisor/dispatch-store.test.js
         src/claude-session-supervisor/schema-migration.test.js
+        src/claude-session-supervisor/pr3-effect-ledger.test.js
         src/claude-session-supervisor/orchestrator.test.js
         src/claude-session-supervisor/scheduler-integration.test.js
         src/claude-session-supervisor/channel-manager-integration.test.js

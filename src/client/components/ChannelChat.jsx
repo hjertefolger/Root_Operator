@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
-import { Check, ArrowUp, ChevronDown, Loader, Plus, X } from 'lucide-react';
+import { Check, ArrowUp, ChevronDown, Eye, Loader, Plus, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import AttachmentViewerOverlay from './AttachmentViewerOverlay';
 
 const isMobileChatInput = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 const AUTO_SCROLL_BOTTOM_THRESHOLD = 24;
@@ -251,9 +252,100 @@ function parseFileAttachments(content) {
   return { text: textLines.join('\n').trim(), files };
 }
 
-const ChatMessageItem = memo(function ChatMessageItem({ role, content }) {
+function getAttachmentPreviewSrc(attachment) {
+  if (!attachment?.bytesBase64 || !attachment?.mime) {
+    return '';
+  }
+  return `data:${attachment.mime};base64,${attachment.bytesBase64}`;
+}
+
+const AssistantAttachmentList = memo(function AssistantAttachmentList({
+  attachments,
+  externalRef,
+  attachmentCache,
+  attachmentFetchState,
+  onOpenAttachmentViewer,
+}) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return null;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: '85%' }}>
+      {attachments.map((attachment, index) => {
+        const attachmentKey = attachment.id || `${attachment.name}-${index}`;
+        const cachedAttachment = attachment.id ? attachmentCache?.[attachment.id] : null;
+        const fetchState = attachment.id ? attachmentFetchState?.[attachment.id] : null;
+        const previewSrc = getAttachmentPreviewSrc(cachedAttachment
+          ? { ...attachment, ...cachedAttachment }
+          : attachment);
+        const isLoading = fetchState?.loading === true;
+        const canOpen = Boolean(onOpenAttachmentViewer && (previewSrc || (attachment.id && externalRef)));
+        return (
+          <div
+            key={`assistant-attachment-${attachmentKey}`}
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            <button
+              type="button"
+              onClick={() => onOpenAttachmentViewer?.({ attachments, externalRef, initialIndex: index })}
+              disabled={!canOpen}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                width: '100%',
+                padding: '8px 12px',
+                borderRadius: 999,
+                border: '1px solid rgba(255,255,255,0.12)',
+                background: 'transparent',
+                color: 'inherit',
+                cursor: canOpen ? 'pointer' : 'default',
+                textAlign: 'left',
+                opacity: canOpen ? 1 : 0.72,
+              }}
+            >
+              {isLoading ? (
+                <Loader size={13} strokeWidth={2.2} className="animate-spin" style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              ) : (
+                <Eye size={13} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+              )}
+              <span style={{
+                fontSize: 13,
+                color: 'rgba(255,255,255,0.72)',
+                fontFamily: MONO,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                minWidth: 0,
+                flex: 1,
+              }}>
+                {attachment.name}
+              </span>
+              <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', fontFamily: MONO, flexShrink: 0 }}>
+                {formatFileSize(attachment.size || 0)}
+              </span>
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+const ChatMessageItem = memo(function ChatMessageItem({
+  role,
+  content,
+  attachments,
+  externalRef,
+  attachmentCache,
+  attachmentFetchState,
+  onRequestAttachment,
+  onOpenAttachmentViewer,
+}) {
   const isUser = role === 'user';
   const { text, files } = isUser ? parseFileAttachments(content) : { text: content, files: [] };
+  const assistantAttachments = isUser ? [] : (Array.isArray(attachments) ? attachments : []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start', gap: 4 }}>
@@ -310,6 +402,15 @@ const ChatMessageItem = memo(function ChatMessageItem({ role, content }) {
           })}
         </div>
       )}
+      {!isUser && assistantAttachments.length > 0 && (
+        <AssistantAttachmentList
+          attachments={assistantAttachments}
+          externalRef={externalRef}
+          attachmentCache={attachmentCache}
+          attachmentFetchState={attachmentFetchState}
+          onOpenAttachmentViewer={onOpenAttachmentViewer}
+        />
+      )}
     </div>
   );
 });
@@ -321,6 +422,10 @@ const ChatMessages = memo(function ChatMessages({
   assistantName,
   scrollContainerRef,
   messagesEndRef,
+  attachmentCache,
+  attachmentFetchState,
+  onRequestAttachment,
+  onOpenAttachmentViewer,
 }) {
   return (
     <div
@@ -379,7 +484,7 @@ const ChatMessages = memo(function ChatMessages({
 
       {messages.map((msg, i) => {
         const messageKey = msg.ts
-          ? `${msg.role}:${msg.ts}`
+          ? `${msg.role}:${msg.ts}:${Array.isArray(msg.attachments) ? msg.attachments.map((attachment) => attachment.id || attachment.name).join('|') : ''}`
           : `${msg.role}:${i}:${msg.content}`;
 
         return (
@@ -387,6 +492,12 @@ const ChatMessages = memo(function ChatMessages({
             key={messageKey}
             role={msg.role}
             content={msg.content}
+            attachments={msg.attachments}
+            externalRef={msg.external_ref}
+            attachmentCache={attachmentCache}
+            attachmentFetchState={attachmentFetchState}
+            onRequestAttachment={onRequestAttachment}
+            onOpenAttachmentViewer={onOpenAttachmentViewer}
           />
         );
       })}
@@ -408,12 +519,25 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, uploadProgress, onAbortUpload, draftStorageKey, focusInputKey = 0 }) {
+const ChatComposer = memo(function ChatComposer({
+  canSend,
+  onSend,
+  onSendFile,
+  uploadProgress,
+  onAbortUpload,
+  draftStorageKey,
+  focusInputKey = 0,
+  pendingFiles = [],
+  onAddPendingFiles,
+  onRemovePendingFile,
+  onClearPendingFiles,
+  onPreviewPendingFile,
+}) {
   const [input, setInput] = useState(() => loadStoredDraft(draftStorageKey));
   const [isSending, setIsSending] = useState(false);
-  const [pendingFiles, setPendingFiles] = useState([]);
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
+  const previousPendingCountRef = useRef(pendingFiles.length);
 
   useEffect(() => {
     if (!draftStorageKey || typeof window === 'undefined') {
@@ -446,6 +570,13 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
   }, [focusInputKey]);
 
   useEffect(() => {
+    if (pendingFiles.length > previousPendingCountRef.current) {
+      textareaRef.current?.focus();
+    }
+    previousPendingCountRef.current = pendingFiles.length;
+  }, [pendingFiles.length]);
+
+  useEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = '0px';
@@ -463,7 +594,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
 
     setIsSending(true);
     setInput('');
-    setPendingFiles([]);
+    onClearPendingFiles?.();
     if (textareaRef.current) textareaRef.current.style.height = '0px';
 
     try {
@@ -480,7 +611,7 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
       setIsSending(false);
       textareaRef.current?.focus();
     }
-  }, [input, pendingFiles, canSend, isSending, onSend, onSendFile]);
+  }, [canSend, input, isSending, onClearPendingFiles, onSend, onSendFile, pendingFiles]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key !== 'Enter' || e.nativeEvent?.isComposing) {
@@ -508,16 +639,12 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
   const handleFileChange = useCallback((e) => {
     const files = e.target.files;
     if (files?.length) {
-      setPendingFiles(prev => [...prev, ...Array.from(files)]);
+      onAddPendingFiles?.(Array.from(files));
       textareaRef.current?.focus();
     }
     // Reset input so same file can be re-selected
     e.target.value = '';
-  }, []);
-
-  const removePendingFile = useCallback((index) => {
-    setPendingFiles(prev => prev.filter((_, i) => i !== index));
-  }, []);
+  }, [onAddPendingFiles]);
 
   const hasContent = input.trim().length > 0 || pendingFiles.length > 0;
   const isUploading = uploadProgress !== null;
@@ -537,29 +664,53 @@ const ChatComposer = memo(function ChatComposer({ canSend, onSend, onSendFile, u
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
           {pendingFiles.map((file, i) => {
             const { stem, ext } = splitFileNameExt(file.name);
+            const canPreview = Boolean(
+              onPreviewPendingFile && typeof file.type === 'string' && file.type.startsWith('image/'),
+            );
             return (
-              <div key={`${file.name}-${i}`} style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 7,
-                padding: '6px 12px',
-                background: 'transparent',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 999,
-                maxWidth: 'fit-content',
-              }}>
-                <Plus size={12} strokeWidth={2.5} style={{ color: '#4B5AFF', flexShrink: 0 }} />
-                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.55)', fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120, minWidth: 0 }}>
-                  {stem}
-                </span>
-                {ext && <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
-                  {ext}
-                </span>}
-                <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
-                  {formatFileSize(file.size)}
-                </span>
+              <div
+                key={`${file.name}-${i}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 7,
+                  padding: '6px 12px',
+                  background: 'transparent',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 999,
+                  maxWidth: 'fit-content',
+                }}
+              >
                 <button
-                  onClick={() => removePendingFile(i)}
+                  type="button"
+                  onClick={() => canPreview && onPreviewPendingFile?.(file, i)}
+                  disabled={!canPreview}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 7,
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    margin: 0,
+                    cursor: canPreview ? 'pointer' : 'default',
+                    color: 'inherit',
+                    minWidth: 0,
+                  }}
+                >
+                  <Eye size={12} strokeWidth={2.3} style={{ color: '#4B5AFF', flexShrink: 0 }} />
+                  <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.55)', fontFamily: MONO, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 120, minWidth: 0 }}>
+                    {stem}
+                  </span>
+                  {ext && <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
+                    {ext}
+                  </span>}
+                  <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
+                    {formatFileSize(file.size)}
+                  </span>
+                </button>
+                <button
+                  onClick={() => onRemovePendingFile?.(i)}
                   style={{
                     background: 'none', border: 'none', padding: 2, cursor: 'pointer',
                     display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
@@ -717,6 +868,10 @@ function ChannelChat({
   draftStorageKey = '',
   forceScrollToBottomKey = 0,
   focusInputKey = 0,
+  onRequestAttachmentBytes,
+  onOpenDesktopAttachmentViewer,
+  viewerReturnedAttachments = [],
+  onConsumeViewerReturnedAttachments,
 }) {
   const scrollContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -728,10 +883,251 @@ function ChannelChat({
   const lastScrollTopRef = useRef(0);
   const shouldAutoScrollRef = useRef(true);
   const nextScrollBehaviorRef = useRef('auto');
+  const attachmentRequestPromisesRef = useRef(new Map());
+  const processedViewerAttachmentIdsRef = useRef(new Set());
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [attachmentCache, setAttachmentCache] = useState({});
+  const [attachmentFetchState, setAttachmentFetchState] = useState({});
+  const [viewerState, setViewerState] = useState(null);
+  const [pendingFiles, setPendingFiles] = useState([]);
   const canSend = typeof canSendOverride === 'boolean'
     ? canSendOverride
     : Boolean(socket && e2eReady);
+
+  useEffect(() => {
+    const seededAttachments = [];
+
+    for (const message of messages) {
+      if (!Array.isArray(message.attachments)) {
+        continue;
+      }
+      for (const attachment of message.attachments) {
+        if (attachment?.id && attachment?.bytesBase64 && attachment?.mime) {
+          seededAttachments.push({
+            id: attachment.id,
+            bytesBase64: attachment.bytesBase64,
+            mime: attachment.mime,
+          });
+        }
+      }
+    }
+
+    if (seededAttachments.length === 0) {
+      return;
+    }
+
+    setAttachmentCache((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const attachment of seededAttachments) {
+        const existing = next[attachment.id];
+        if (!existing || existing.bytesBase64 !== attachment.bytesBase64 || existing.mime !== attachment.mime) {
+          next[attachment.id] = {
+            bytesBase64: attachment.bytesBase64,
+            mime: attachment.mime,
+          };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [messages]);
+
+  const requestAttachmentBytes = useCallback(async ({ attachment, externalRef }) => {
+    const attachmentId = attachment?.id;
+    if (!attachmentId) {
+      throw new Error('Attachment id missing');
+    }
+
+    if (attachment.bytesBase64 && attachment.mime) {
+      return {
+        bytesBase64: attachment.bytesBase64,
+        mime: attachment.mime,
+      };
+    }
+
+    if (attachmentCache[attachmentId]?.bytesBase64) {
+      return attachmentCache[attachmentId];
+    }
+
+    const existingRequest = attachmentRequestPromisesRef.current.get(attachmentId);
+    if (existingRequest) {
+      return existingRequest;
+    }
+
+    if (typeof onRequestAttachmentBytes !== 'function') {
+      throw new Error('Attachment fetch unavailable');
+    }
+
+    setAttachmentFetchState((prev) => ({
+      ...prev,
+      [attachmentId]: { loading: true, error: '' },
+    }));
+
+    const request = onRequestAttachmentBytes({ attachmentId, externalRef })
+      .then((response) => {
+        if (!response?.bytesBase64) {
+          throw new Error('Image unavailable');
+        }
+
+        const resolvedAttachment = {
+          bytesBase64: response.bytesBase64,
+          mime: response.mime || attachment.mime || '',
+        };
+
+        setAttachmentCache((prev) => ({
+          ...prev,
+          [attachmentId]: resolvedAttachment,
+        }));
+        setAttachmentFetchState((prev) => ({
+          ...prev,
+          [attachmentId]: { loading: false, error: '' },
+        }));
+        return resolvedAttachment;
+      })
+      .catch((error) => {
+        setAttachmentFetchState((prev) => ({
+          ...prev,
+          [attachmentId]: { loading: false, error: error.message || 'Image unavailable' },
+        }));
+        throw error;
+      })
+      .finally(() => {
+        attachmentRequestPromisesRef.current.delete(attachmentId);
+      });
+
+    attachmentRequestPromisesRef.current.set(attachmentId, request);
+    return request;
+  }, [attachmentCache, onRequestAttachmentBytes]);
+
+  const openInlineAttachmentViewer = useCallback(({ attachments, externalRef, initialIndex = 0 }) => {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return;
+    }
+
+    setViewerState({
+      attachments,
+      externalRef,
+      initialIndex,
+      key: globalThis.crypto?.randomUUID?.() || `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    });
+  }, []);
+
+  const openAssistantAttachmentViewer = useCallback(async ({ attachments, externalRef, initialIndex = 0 }) => {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return;
+    }
+
+    if (typeof onOpenDesktopAttachmentViewer === 'function') {
+      try {
+        const result = await onOpenDesktopAttachmentViewer({ attachments, externalRef, initialIndex });
+        if (result?.success) {
+          return;
+        }
+
+        console.warn('[CHAT] Failed to open desktop attachment viewer:', result?.error || 'Unknown error');
+      } catch (error) {
+        console.warn('[CHAT] Failed to open desktop attachment viewer:', error?.message || error);
+      }
+    }
+
+    openInlineAttachmentViewer({ attachments, externalRef, initialIndex });
+  }, [onOpenDesktopAttachmentViewer, openInlineAttachmentViewer]);
+
+  const closeAttachmentViewer = useCallback(() => {
+    setViewerState(null);
+  }, []);
+
+  const previewPendingFile = useCallback(async (file, index) => {
+    if (!(file instanceof File) || !file.type?.startsWith('image/')) {
+      return;
+    }
+
+    const bytesBase64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        const commaIndex = result.indexOf(',');
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : '');
+      };
+      reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+      reader.readAsDataURL(file);
+    }).catch((error) => {
+      console.warn('[CHAT] Failed to preview pending file:', error.message);
+      return '';
+    });
+
+    if (!bytesBase64) {
+      return;
+    }
+
+    openInlineAttachmentViewer({
+      attachments: [{
+        id: `pending-${index}-${file.name}`,
+        name: file.name,
+        mime: file.type,
+        size: file.size,
+        bytesBase64,
+      }],
+      externalRef: null,
+      initialIndex: 0,
+    });
+  }, [openInlineAttachmentViewer]);
+
+  const addPendingFiles = useCallback((files) => {
+    const nextFiles = (Array.isArray(files) ? files : [files]).filter((file) => file instanceof File);
+    if (nextFiles.length === 0) {
+      return;
+    }
+    setPendingFiles((prev) => [...prev, ...nextFiles]);
+  }, []);
+
+  const removePendingFile = useCallback((index) => {
+    setPendingFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
+  }, []);
+
+  const clearPendingFiles = useCallback(() => {
+    setPendingFiles([]);
+  }, []);
+
+  useEffect(() => {
+    if (!Array.isArray(viewerReturnedAttachments) || viewerReturnedAttachments.length === 0) {
+      return;
+    }
+
+    const consumedIds = [];
+
+    for (const item of viewerReturnedAttachments) {
+      if (!item?.id || processedViewerAttachmentIdsRef.current.has(item.id)) {
+        continue;
+      }
+
+      processedViewerAttachmentIdsRef.current.add(item.id);
+      consumedIds.push(item.id);
+
+      if (!Array.isArray(item.data) || item.data.length === 0) {
+        continue;
+      }
+
+      try {
+        const file = new File(
+          [new Uint8Array(item.data)],
+          item.filename || 'attachment.png',
+          {
+            type: item.mimeType || 'application/octet-stream',
+            lastModified: Date.now(),
+          },
+        );
+        addPendingFiles(file);
+      } catch (error) {
+        console.warn('[CHAT] Failed to restore viewer attachment:', error?.message || error);
+      }
+    }
+
+    if (consumedIds.length > 0) {
+      onConsumeViewerReturnedAttachments?.(consumedIds);
+    }
+  }, [addPendingFiles, onConsumeViewerReturnedAttachments, viewerReturnedAttachments]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -913,6 +1309,14 @@ function ChannelChat({
     }
   }, [canSend, onSendFile, setActivities, setMessages, setWaiting]);
 
+  const handleSendAnnotatedAttachment = useCallback(async (file) => {
+    await handleSendFile(file, '');
+  }, [handleSendFile]);
+
+  const handleQueueAnnotatedAttachment = useCallback(async (file) => {
+    addPendingFiles(file);
+  }, [addPendingFiles]);
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, background: '#000', position: 'relative' }}>
       <ChatMessages
@@ -922,6 +1326,10 @@ function ChannelChat({
         assistantName={assistantName}
         scrollContainerRef={scrollContainerRef}
         messagesEndRef={messagesEndRef}
+        attachmentCache={attachmentCache}
+        attachmentFetchState={attachmentFetchState}
+        onRequestAttachment={requestAttachmentBytes}
+        onOpenAttachmentViewer={openAssistantAttachmentViewer}
       />
       <div
         style={{
@@ -981,7 +1389,26 @@ function ChannelChat({
         onAbortUpload={onAbortUpload}
         draftStorageKey={draftStorageKey}
         focusInputKey={focusInputKey}
+        pendingFiles={pendingFiles}
+        onAddPendingFiles={addPendingFiles}
+        onRemovePendingFile={removePendingFile}
+        onClearPendingFiles={clearPendingFiles}
+        onPreviewPendingFile={previewPendingFile}
       />
+      {viewerState && (
+        <AttachmentViewerOverlay
+          key={viewerState.key}
+          attachments={viewerState.attachments}
+          externalRef={viewerState.externalRef}
+          initialIndex={viewerState.initialIndex}
+          attachmentCache={attachmentCache}
+          attachmentFetchState={attachmentFetchState}
+          onRequestAttachment={requestAttachmentBytes}
+          onQueueAnnotatedAttachment={onSendFile ? handleQueueAnnotatedAttachment : undefined}
+          onSendAnnotatedAttachment={onSendFile ? handleSendAnnotatedAttachment : undefined}
+          onClose={closeAttachmentViewer}
+        />
+      )}
     </div>
   );
 }

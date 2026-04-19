@@ -16,6 +16,13 @@ const path = require('node:path');
 
 const { DispatchStore } = require('./dispatch-store');
 const { ChatStore } = require('../chat-store');
+const {
+    computeAttachmentId,
+    getStagedAttachmentPath,
+    loadStagedAttachmentBytes,
+} = require('../outbound-attachments');
+
+const ONE_BY_ONE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlH0dQAAAAASUVORK5CYII=';
 
 function tempDbPath() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pr3-test-'));
@@ -24,6 +31,10 @@ function tempDbPath() {
 
 function tempChatDir() {
     return fs.mkdtempSync(path.join(os.tmpdir(), 'pr3-chatstore-'));
+}
+
+function tempOutboundDir() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'pr3-outbound-'));
 }
 
 // ==========================================================================
@@ -185,6 +196,90 @@ test('ChatStore findByExternalRef returns matching message', () => {
 
     const nullRef = cs.findByExternalRef(null);
     assert.equal(nullRef, null);
+});
+
+test('ChatStore strips attachment bytes but preserves metadata', () => {
+    const dir = tempChatDir();
+    const cs = new ChatStore(dir);
+
+    cs.addMessage(
+        {
+            role: 'assistant',
+            content: 'image reply',
+            ts: '2026-04-16T12:05:00Z',
+            attachments: [{
+                id: 'att-1',
+                name: 'diagram.png',
+                mime: 'image/png',
+                size: 128,
+                sha256: 'abc123',
+                kind: 'image',
+                bytesBase64: 'ZmFrZQ==',
+            }],
+        },
+        { externalRef: 'reply:d1:3' },
+    );
+
+    const [message] = cs.loadMessages();
+    assert.deepEqual(message.attachments, [{
+        id: 'att-1',
+        name: 'diagram.png',
+        mime: 'image/png',
+        size: 128,
+        sha256: 'abc123',
+        kind: 'image',
+    }]);
+    assert.equal(message.attachments[0].bytesBase64, undefined);
+});
+
+test('ChatStore truncateIfNeeded returns evicted messages', () => {
+    const dir = tempChatDir();
+    const cs = new ChatStore(dir);
+
+    for (let index = 0; index < 201; index += 1) {
+        cs.appendMessage({
+            role: 'assistant',
+            content: `message-${index}`,
+            ts: `2026-04-16T12:${String(index).padStart(2, '0')}:00Z`,
+        });
+    }
+
+    const evicted = cs.truncateIfNeeded();
+    assert.equal(evicted.length, 1);
+    assert.equal(evicted[0].content, 'message-0');
+    assert.equal(cs.loadMessages().length, 200);
+    assert.equal(cs.loadMessages()[0].content, 'message-1');
+});
+
+test('computeAttachmentId uses effect id plus ordinal index', () => {
+    assert.equal(computeAttachmentId('reply:d1:2', 0), 'reply:d1:2-0');
+    assert.equal(computeAttachmentId('reply:d1:2', 3), 'reply:d1:2-3');
+});
+
+test('loadStagedAttachmentBytes reads staged outbound bytes on demand', () => {
+    const outboundDir = tempOutboundDir();
+    const effectId = 'reply:d1:4';
+    const attachment = {
+        id: 'reply:d1:4-0',
+        name: 'diagram.png',
+        mime: 'image/png',
+        size: 0,
+        sha256: 'unused',
+        kind: 'image',
+    };
+    const stagedPath = getStagedAttachmentPath(outboundDir, effectId, 0, attachment.name);
+
+    fs.writeFileSync(stagedPath, Buffer.from(ONE_BY_ONE_PNG_BASE64, 'base64'));
+
+    const hydrated = loadStagedAttachmentBytes({
+        outboundDir,
+        effectId,
+        attachment,
+        attachmentIndex: 0,
+    });
+
+    assert.equal(hydrated.mime, 'image/png');
+    assert.equal(hydrated.bytesBase64, ONE_BY_ONE_PNG_BASE64);
 });
 
 // ==========================================================================
