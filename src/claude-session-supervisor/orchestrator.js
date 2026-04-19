@@ -825,13 +825,36 @@ class ClaudeSessionSupervisor extends EventEmitter {
         if (this._bridgeReadyHandler) return;
         this._bridgeReadyHandler = () => this._onBridgeReady();
         this.channelManager.on('bridge_ready', this._bridgeReadyHandler);
+        // Also listen for disconnect so every reconnect cycle has to
+        // re-confirm bridge_ready. Without this, a socket drop + reconnect
+        // leaves _bridgeReadyFired stuck true and a dispatch enqueued
+        // between socket-accept and mcp-ready would land in a half-init
+        // bridge. Only applies when the channelManager exposes a
+        // `.connected` flag (production-shaped); mock helpers with
+        // connected===undefined stay always-ready.
+        if (this.channelManager.connected !== undefined) {
+            this._bridgeLostHandler = () => {
+                if (this._shutdown) return;
+                this._bridgeReadyFired = false;
+            };
+            if (typeof this.channelManager.on === 'function') {
+                this.channelManager.on('disconnect', this._bridgeLostHandler);
+                this.channelManager.on('bridge_lost', this._bridgeLostHandler);
+            }
+        }
     }
 
     _unsubscribeBridgeReady() {
         if (!this.channelManager || typeof this.channelManager.off !== 'function') return;
-        if (!this._bridgeReadyHandler) return;
-        this.channelManager.off('bridge_ready', this._bridgeReadyHandler);
-        this._bridgeReadyHandler = null;
+        if (this._bridgeReadyHandler) {
+            this.channelManager.off('bridge_ready', this._bridgeReadyHandler);
+            this._bridgeReadyHandler = null;
+        }
+        if (this._bridgeLostHandler) {
+            this.channelManager.off('disconnect', this._bridgeLostHandler);
+            this.channelManager.off('bridge_lost', this._bridgeLostHandler);
+            this._bridgeLostHandler = null;
+        }
     }
 
     /**
@@ -843,9 +866,12 @@ class ClaudeSessionSupervisor extends EventEmitter {
      */
     _onBridgeReady() {
         if (this._shutdown) return;
-        // Clear the pre-first-bridge-ready gate so _activateNext can send.
-        // Stays true for the lifetime of this supervisor instance; a
-        // subsequent socket drop relies on the connected-flag gate instead.
+        // Clear the bridge-ready gate so _activateNext can send. This flag
+        // is reset to false whenever the socket drops (see _onBridgeLost)
+        // so each reconnect cycle has to wait for bridge_ready again before
+        // draining the queue — during that window ChannelManager.connected
+        // can flip true from the socket accept while mcp.connect() is still
+        // running, and sending then would land in a half-initialized bridge.
         this._bridgeReadyFired = true;
 
         // 1. Replay decision (if any) while still in RESPAWNING state.

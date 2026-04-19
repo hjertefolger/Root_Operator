@@ -35,6 +35,11 @@ let dynamicMemory = null;
 let supervisor = null;
 let supervisorStore = null;
 let supervisorRuntime = null;
+// Sticky marker: true if ANY supervisor instance this boot entered the
+// orphan_unsafe HARD_FAILED path. Survives teardownChannelMode() nulling
+// `supervisor`, so the will-quit pidfile cleanup still knows to preserve
+// the file even when mode was toggled off before quitting.
+let supervisorOrphanUnsafeThisBoot = false;
 const isDev = !app.isPackaged;
 
 if (isDev) {
@@ -3341,7 +3346,14 @@ function initChannelMode() {
             hookLogPath: supervisorHookLog,
             enableProbe: true,
         });
-        supervisor.start().catch((err) => {
+        supervisor.start().then(() => {
+            // Latch the orphan-unsafe flag once start() has settled. It's
+            // not cleared if we later tear down the supervisor — the
+            // pidfile must survive until the NEXT boot can retry the kill.
+            if (supervisor && supervisor.state === 'hardFailed') {
+                supervisorOrphanUnsafeThisBoot = true;
+            }
+        }).catch((err) => {
             logDebug(`[SUPERVISOR] start failed: ${err.message}`);
             supervisor = null;
         });
@@ -3588,6 +3600,12 @@ function teardownChannelMode() {
     // same store — the new one treated the old one's live rows as
     // prior-epoch orphans.
     if (supervisor) {
+        // Latch orphan-unsafe BEFORE nulling the reference, so will-quit
+        // (which may run later after mode has toggled) still knows to
+        // preserve the pidfile for next-boot retry.
+        if (supervisor.state === 'hardFailed') {
+            supervisorOrphanUnsafeThisBoot = true;
+        }
         supervisor.shutdown().catch(() => { /* best-effort during teardown */ });
         supervisor = null;
     }
@@ -3792,7 +3810,11 @@ app.on('will-quit', () => {
     // failed boot), skip the unsafe branch, and accept fresh dispatches
     // against a still-live orphan's shared hook log. Keep the pidfile so
     // the next boot can retry the kill.
-    const hardFailedOrphanUnsafe = supervisor && supervisor.state === 'hardFailed';
+    // Check both the live supervisor (if present) AND the sticky flag that
+    // survives teardownChannelMode() nulling the supervisor object — either
+    // signal means "orphan may still be alive, don't erase the PID marker."
+    const hardFailedOrphanUnsafe = supervisorOrphanUnsafeThisBoot
+        || (supervisor && supervisor.state === 'hardFailed');
     if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function'
         && !hardFailedOrphanUnsafe) {
         try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }

@@ -254,10 +254,17 @@ class Runtime {
                     stdio: ['ignore', 'pipe', 'ignore'],
                 }).trim();
             } catch {
-                return { pid: null, certain: false, reason: 'ps_lookup_failed' };
+                // ps probe failed but kill(pid,0) already proved the PID
+                // exists. Preserve the PID so bootCleanup can KEEP the
+                // pidfile (the PID is still actionable for next boot) while
+                // also flagging certain=false so the orchestrator forces
+                // orphan_unsafe → abandon-all + HARD_FAILED. Trying to
+                // SIGKILL this PID now would risk killing an unrelated
+                // reused process since we can't confirm the signature.
+                return { pid, certain: false, reason: 'ps_lookup_failed' };
             }
             if (!current) {
-                return { pid: null, certain: false, reason: 'ps_empty_output' };
+                return { pid, certain: false, reason: 'ps_empty_output' };
             }
             if (!current.includes(recordedSignature)) {
                 // Signature mismatch: PID was reused by an unrelated
@@ -382,11 +389,25 @@ class Runtime {
         const pid = probe.pid;
         if (pid) {
             report.orphan_pid = pid;
-            const result = this.killOrphanPid(pid);
-            report.orphan_killed = result.killed;
-            report.orphan_kill_reason = result.killed
-                ? null
-                : (result.reason || 'unknown');
+            // Only actually SIGKILL when we're CERTAIN this PID is our
+            // orphan Claude (kill + ps signature match). Uncertain probes
+            // (ps_lookup_failed, ps_empty_output) carry a PID that kill(0)
+            // verified exists, but we can't confirm identity — killing
+            // would risk SIGKILL'ing an unrelated reused PID. Let the
+            // orchestrator's orphan_unsafe path handle these via
+            // abandon-all and keep the pidfile for next-boot retry.
+            if (probe.certain) {
+                const result = this.killOrphanPid(pid);
+                report.orphan_killed = result.killed;
+                report.orphan_kill_reason = result.killed
+                    ? null
+                    : (result.reason || 'unknown');
+            } else {
+                // Explicit marker: we held off because identity was uncertain.
+                // bootCleanup() keeps the pidfile; orchestrator treats this as
+                // unsafe (same path as kill failure).
+                report.orphan_kill_reason = 'skipped_uncertain_identity';
+            }
         }
         // Keep the pidfile around when it's still ACTIONABLE:
         //   (a) a real kill failure occurred (orphan still alive, real error) — next boot retries
