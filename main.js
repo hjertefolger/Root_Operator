@@ -2144,6 +2144,18 @@ async function submitChannelUserMessage(chatId, content, userId, options = {}) {
     if (operatingMode !== 'channel' || !channelManager || !channelManager.connected) {
         return { success: false, error: 'Chat bridge unavailable' };
     }
+    // Quarantine: if the supervisor hard-failed on boot because a prior
+    // Claude may still be alive (orphan_unsafe), do NOT forward user
+    // messages through the bridge either — they would land in the
+    // surviving orphan's hook stream. Surface a clear error; operator
+    // must restart the host after terminating the orphan.
+    if ((supervisor && supervisor.state === 'hardFailed')
+        || supervisorOrphanUnsafeThisBoot) {
+        return {
+            success: false,
+            error: 'Supervisor is quarantined (orphan_unsafe). Restart the host after confirming the previous Claude process has been terminated.',
+        };
+    }
 
     const ts = new Date().toISOString();
 

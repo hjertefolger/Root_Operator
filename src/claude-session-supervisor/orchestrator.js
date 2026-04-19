@@ -244,6 +244,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // during the failed boot — the next launch would otherwise see
         // neither a pidfile nor open orphans and spawn a fresh Claude
         // into a still-live orphan's hook log.
+        //
+        // Emergency override: launching with ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1
+        // clears the latch before the check runs. Use this after manually
+        // confirming the orphan Claude is gone (e.g. `pkill claude` and
+        // verifying with `ps`) and the supervisor has been unfairly
+        // quarantined by a transient bootCleanup uncertainty.
+        if (process.env && process.env.ROOT_OPERATOR_CLEAR_ORPHAN_LATCH === '1') {
+            this.clearOrphanUnsafeLatch();
+        }
         try {
             const persistedUnsafe = this.store.getStateValue('orphan_unsafe_latch', '');
             if (persistedUnsafe === 'true') {
@@ -284,6 +293,51 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Firing it here would enqueue while the channel bridge is still
         // down on cold boot, which triggers _activateNext and drains any
         // recovered orphans through a disconnected bridge (pass-7 P1).
+
+        // Late-attach drain: ONLY when the channelManager had truly cached
+        // a bridge_ready before subscribe (_bridgeReadyCached === true).
+        // The auto-ready path for mocks without `.on` sets
+        // _bridgeReadyFired but shouldn't trigger an immediate drain —
+        // those tests expect activation to happen only on explicit
+        // enqueue/bridge_ready calls. _bridgeReadyCached distinguishes
+        // "production saw a real bridge_ready before we attached" from
+        // "test mock has no bridge lifecycle."
+        if (this._bridgeReadyCached
+            && this.state === STATES.IDLE
+            && !this.activeDispatch) {
+            this._activateNext();
+            this._fireStartupProbe();
+        }
+    }
+
+    /**
+     * Clear the persisted orphan_unsafe_latch. Public API so an operator
+     * (via CLI, IPC, or restart with ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1)
+     * can acknowledge they've confirmed the orphan Claude is gone and
+     * allow the next supervisor.start() to proceed normally. The supervisor
+     * remains HARD_FAILED for THIS instance — a fresh start() after a
+     * full process restart is required to pick up the cleared latch.
+     *
+     * Returns { cleared: boolean, wasSet: boolean }.
+     */
+    clearOrphanUnsafeLatch() {
+        let wasSet = false;
+        try {
+            wasSet = this.store.getStateValue('orphan_unsafe_latch', '') === 'true';
+            this.store.setStateValue('orphan_unsafe_latch', '');
+            this.incidents.record({
+                kind: 'orphan_unsafe_latch_cleared',
+                epoch: this.epoch,
+                details: { was_set: wasSet, note: 'requires restart to take effect' },
+            });
+            return { cleared: true, wasSet };
+        } catch (err) {
+            return {
+                cleared: false,
+                wasSet,
+                error: err && err.message ? err.message : String(err),
+            };
+        }
     }
 
     /**
@@ -877,6 +931,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // closed and dispatches queue indefinitely.
         if (this.channelManager.bridgeReady === true) {
             this._bridgeReadyFired = true;
+            this._bridgeReadyCached = true; // signals late-attach drain
         }
     }
 
