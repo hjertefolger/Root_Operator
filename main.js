@@ -3294,14 +3294,15 @@ function initChannelMode() {
             },
             getClaudePid: () => (claudeProcess && claudeProcess.pid) || null,
         });
-        // PR1 does NOT bump epoch: the Runtime module has full epoch +
-        // orphan-cleanup machinery available, but nothing in the PR1 live
-        // path actually consumes epoch-scoped files yet (main.js still
-        // writes the stable-named hook log). Wiring spawnClaudeCode() to
-        // use epoch-scoped paths is deferred to PR4, when respawn needs
-        // per-spawn isolation. Using a fixed epoch=0 here avoids bumping
-        // the counter every boot without any consumer.
-        supervisorRuntime.currentEpoch = 0;
+        // Bump the supervisor epoch on each boot. The orphan-recovery path
+        // in _recoverOrphanedDispatches() terminalizes rows whose
+        // row.epoch < this.epoch — without a bump, every boot runs at
+        // epoch 0 and the filter becomes a no-op, leaving crashed-process
+        // dispatches permanently non-terminal. Hook-log paths remain
+        // stable-named (not yet epoch-scoped); this bump exists solely
+        // so the recovery filter actually distinguishes prior-process
+        // rows from live ones.
+        supervisorRuntime.incrementEpoch();
         const supervisorIncidents = new SupervisorIncidentLogger({
             store: supervisorStore,
             jsonlPath: path.join(supervisorRuntimeDir, 'supervisor-incidents.jsonl'),

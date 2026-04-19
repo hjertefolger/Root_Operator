@@ -18,7 +18,20 @@ const EventEmitter = require('events');
 
 const MAX_JOBS = 50;
 const MAX_PROMPT_SIZE = 50_000; // 50KB
-const STUCK_RUN_MS = 2 * 60 * 60 * 1000; // 2 hours
+// Upper bound on a legitimate single scheduler dispatch, used only as a
+// cross-process crash-recovery fallback. Within a live main.js process the
+// supervisor's awaitOutcome() → _completeJob() path clears runningAt when
+// the dispatch terminalizes, so this timeout should never fire during
+// healthy operation. It exists to unstick a job whose main.js died
+// mid-dispatch AND whose supervisor orphan-recovery somehow missed it.
+//
+// Sized to cover the supervisor's worst-case exponential-backoff retry
+// window: with scheduler replay_cap=4 and silenceMsForReplay doubling,
+// the Night Lab base of 30 min expands to 30 + 60 + 120 + 240 + 480 =
+// 930 min (≈15.5 h). The previous 2 h cutoff pre-dated exponential
+// backoff and would flag healthy long retries as stale, firing duplicate
+// cron runs while the original dispatch was still legitimately retrying.
+const STUCK_RUN_MS = 20 * 60 * 60 * 1000; // 20 hours (was 2h pre-backoff)
 const MIN_REFIRE_GAP_MS = 5_000; // 5 seconds between same job fires
 const MAX_CONSECUTIVE_ERRORS = 10; // Disable after this many
 
