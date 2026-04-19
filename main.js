@@ -34,6 +34,7 @@ let store;
 let dynamicMemory = null;
 let supervisor = null;
 let supervisorStore = null;
+let supervisorRuntime = null;
 const isDev = !app.isPackaged;
 
 if (isDev) {
@@ -2999,6 +3000,19 @@ async function spawnClaudeCode() {
             },
         });
 
+        // Record Claude's PID so supervisor.bootCleanup() on the next boot
+        // can detect and kill a surviving orphan (e.g. if this Electron
+        // process crashes while the pty child lives on). Without this the
+        // pidfile is always absent and detectOrphanPid() returns null,
+        // which makes orphan-recovery unsafe in the crash-restart case.
+        if (supervisorRuntime && claudeProcess && typeof claudeProcess.pid === 'number') {
+            try {
+                supervisorRuntime.recordPid(claudeProcess.pid);
+            } catch (err) {
+                logDebug(`[CLAUDE] recordPid failed: ${err.message}`);
+            }
+        }
+
         setChannelRuntime('waiting_confirm', `Waiting for ${assistantName} to confirm local development access.`, {
             attempt: channelStartupAttempt,
         });
@@ -3077,6 +3091,13 @@ async function spawnClaudeCode() {
             stopClaudeDebugWatcher();
             stopClaudeHookWatcher();
             claudeProcess = null;
+            // Clear the recorded PID on clean exit so the next boot's
+            // detectOrphanPid() sees an empty pidfile. If this Electron
+            // crashes before reaching here, the pidfile remains and
+            // bootCleanup() on the next boot will SIGKILL the orphan.
+            if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function') {
+                try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
+            }
             removeChannelSocket();
 
             if (operatingMode === 'channel' && !isAppQuitting) {
@@ -3279,7 +3300,7 @@ function initChannelMode() {
         fs.mkdirSync(supervisorRuntimeDir, { recursive: true });
 
         supervisorStore = new SupervisorDispatchStore(path.join(brainDir, 'claude-supervisor.db'));
-        const supervisorRuntime = new SupervisorRuntime({
+        supervisorRuntime = new SupervisorRuntime({
             store: supervisorStore,
             runtimeDir: supervisorRuntimeDir,
             // PR2: wire the kill trigger + PID probe so the supervisor can
