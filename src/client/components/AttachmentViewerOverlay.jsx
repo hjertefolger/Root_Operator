@@ -1095,7 +1095,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       return;
     }
 
-    measureViewport(event.currentTarget);
+    measureViewport();
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
