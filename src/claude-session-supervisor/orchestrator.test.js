@@ -752,10 +752,12 @@ test('PR2: system_notice_failed incident when bridge send returns false', async 
     store.close();
 });
 
-test('start(): orphaned non-terminal dispatches are abandoned on restart', async () => {
+test('start(): SENDING/ACTIVE orphans are abandoned; QUEUED orphans are re-queued', async () => {
     const { supervisor, store } = fixture();
     // Simulate three rows left over from a prior process — one in each
-    // non-terminal state. listOpenDispatches should surface all of them.
+    // non-terminal state. QUEUED must be re-queued (any source) because it
+    // never touched Claude; SENDING/ACTIVE must be abandoned (effect
+    // ambiguity). Replay_cap bounds subsequent retries in the new epoch.
     store.insertDispatch({
         dispatchId: 'orphan-queued', source: 'scheduler', payload: 'q',
         silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
@@ -774,19 +776,25 @@ test('start(): orphaned non-terminal dispatches are abandoned on restart', async
 
     await supervisor.start();
 
-    for (const id of ['orphan-queued', 'orphan-sending', 'orphan-active']) {
+    for (const id of ['orphan-sending', 'orphan-active']) {
         const row = store.getDispatch(id);
-        assert.equal(row.state, DISPATCH_STATES.ABANDONED, `${id} should be abandoned`);
+        assert.equal(row.state, DISPATCH_STATES.ABANDONED,
+            `${id} (SENDING/ACTIVE) must be abandoned`);
         assert.match(row.last_error || '', /orphaned_by_restart/);
     }
+    const queuedRow = store.getDispatch('orphan-queued');
+    assert.notEqual(queuedRow.state, DISPATCH_STATES.ABANDONED,
+        'scheduler QUEUED orphan must be re-queued, not abandoned');
+
     const summary = store.db
         .prepare("SELECT details_json FROM incidents WHERE kind = 'recovery_summary'")
         .get();
     assert.ok(summary, 'recovery_summary incident must be recorded');
     const details = JSON.parse(summary.details_json);
-    assert.equal(details.abandoned_count, 3);
+    assert.equal(details.abandoned_count, 2);
+    assert.equal(details.requeued_count, 1);
 
-    // Supervisor state is clean and able to accept fresh dispatches.
+    // Supervisor state is clean and ready for the bridge.
     assert.equal(supervisor.state, STATES.IDLE);
     await supervisor.shutdown();
     store.close();
@@ -810,9 +818,17 @@ test('start(): recovery ignores rows from the current epoch (no split-brain on s
 
     await supervisor.start();
 
-    assert.equal(store.getDispatch('old').state, DISPATCH_STATES.ABANDONED);
-    assert.equal(store.getDispatch('live').state, DISPATCH_STATES.QUEUED,
+    // Scheduler QUEUED orphans are now re-queued, not abandoned — but the
+    // prior-epoch row MUST have been touched (its epoch advanced to current).
+    const oldRow = store.getDispatch('old');
+    assert.notEqual(oldRow.state, DISPATCH_STATES.ABANDONED);
+    assert.equal(oldRow.epoch, runtime.currentEpoch,
+        'prior-epoch row must be re-adopted into the current epoch');
+    // Current-epoch row must be completely untouched.
+    const liveRow = store.getDispatch('live');
+    assert.equal(liveRow.state, DISPATCH_STATES.QUEUED,
         'current-epoch rows must not be touched by recovery');
+    assert.equal(liveRow.epoch, runtime.currentEpoch);
     await supervisor.shutdown();
     store.close();
 });
@@ -826,20 +842,23 @@ test('start(): recovery runs at most once per supervisor instance', async () => 
     });
     await supervisor.start();
     // Second start() (e.g. a misbehaving caller) must not re-run recovery.
-    // Insert a new orphan from a prior epoch and verify it is NOT abandoned —
-    // once _recoveryDone is set, recovery is a no-op.
+    // Insert a new orphan from a prior epoch (epoch=0) and verify its epoch
+    // is NOT advanced by a second pass — once _recoveryDone is set, the
+    // whole recovery body is a no-op, so the row stays at epoch 0.
     store.insertDispatch({
         dispatchId: 'old2', source: 'scheduler', payload: 'old2',
         silenceMs: 30_000, replayCap: 4, state: DISPATCH_STATES.QUEUED,
         epoch: 0, enqueuedAt: 3,
     });
     await supervisor.start();
-    assert.equal(store.getDispatch('old2').state, DISPATCH_STATES.QUEUED);
+    const row = store.getDispatch('old2');
+    assert.equal(row.state, DISPATCH_STATES.QUEUED);
+    assert.equal(row.epoch, 0, 'second start() must not re-adopt prior-epoch rows');
     await supervisor.shutdown();
     store.close();
 });
 
-test('start(): recovered channel/user QUEUED orphan is activated during startup', async () => {
+test('start(): recovered QUEUED orphan activates on bridge_ready (not before)', async () => {
     const { supervisor, store, sent } = fixture();
     // Seed a channel QUEUED orphan from a prior epoch.
     store.insertDispatch({
@@ -850,8 +869,18 @@ test('start(): recovered channel/user QUEUED orphan is activated during startup'
 
     await supervisor.start();
 
-    // Recovery must have flipped it to SENDING/ACTIVE (via _activateNext),
-    // not left it sitting queued waiting for unrelated traffic.
+    // Before bridge_ready, the re-queued dispatch must still be queued.
+    // Activating immediately during start() would fire against a
+    // disconnected bridge and mark the dispatch bridge_unavailable,
+    // defeating the whole purpose of recovery.
+    const beforeBridge = store.getDispatch('resumed-channel');
+    assert.equal(beforeBridge.state, DISPATCH_STATES.QUEUED,
+        'recovered QUEUED must stay queued until bridge_ready');
+    assert.equal(sent.length, 0, 'nothing should be sent before bridge is up');
+
+    // Simulate bridge coming up. _onBridgeReady must drain the queue.
+    supervisor._onBridgeReady();
+
     await waitForCondition(
         () => {
             const r = store.getDispatch('resumed-channel');
@@ -859,14 +888,11 @@ test('start(): recovered channel/user QUEUED orphan is activated during startup'
         },
         { timeoutMs: 500 },
     );
-    const row = store.getDispatch('resumed-channel');
-    assert.notEqual(row.state, DISPATCH_STATES.QUEUED,
-        'recovered channel QUEUED must be activated during start(), not parked');
-    // Payload must have been sent through channelManager.sendToChannel or
-    // similar — minimum check: at least one message dispatched.
-    assert.ok(sent.length > 0 || store.getDispatch('resumed-channel').state === DISPATCH_STATES.SENDING
-        || store.getDispatch('resumed-channel').state === DISPATCH_STATES.ACTIVE,
-        'activation path should have been taken');
+    const afterBridge = store.getDispatch('resumed-channel');
+    assert.notEqual(afterBridge.state, DISPATCH_STATES.QUEUED,
+        'recovered QUEUED must activate once bridge_ready fires');
+    assert.ok([DISPATCH_STATES.SENDING, DISPATCH_STATES.ACTIVE].includes(afterBridge.state),
+        `activation path should have been taken, got ${afterBridge.state}`);
 
     await supervisor.shutdown();
     store.close();
@@ -946,20 +972,25 @@ test('start(): channel/user QUEUED orphans are re-queued, not abandoned', async 
     assert.ok([DISPATCH_STATES.QUEUED, DISPATCH_STATES.SENDING, DISPATCH_STATES.ACTIVE].includes(userRow.state));
     assert.equal(userRow.epoch, runtime.currentEpoch);
 
+    // Scheduler QUEUED is now also re-adopted (pass-7 fix — preserves
+    // runNow() manual triggers that cron wouldn't replay). SENDING/ACTIVE
+    // stays abandoned regardless of source because of effect ambiguity.
     const schedRow = store.getDispatch('orphan-scheduler-queued');
-    assert.equal(schedRow.state, DISPATCH_STATES.ABANDONED);
-    assert.match(schedRow.last_error || '', /orphaned_by_restart/);
+    assert.notEqual(schedRow.state, DISPATCH_STATES.ABANDONED,
+        'scheduler QUEUED must be re-queued (runNow preservation)');
+    assert.equal(schedRow.epoch, runtime.currentEpoch);
 
     const activeRow = store.getDispatch('orphan-channel-active');
     assert.equal(activeRow.state, DISPATCH_STATES.ABANDONED);
 
-    // Summary should count 2 requeued + 2 abandoned.
+    // Summary should count 3 requeued (channel + user + scheduler QUEUED)
+    // and 1 abandoned (the channel ACTIVE row — effect ambiguity).
     const summary = store.db
         .prepare("SELECT details_json FROM incidents WHERE kind = 'recovery_summary'")
         .get();
     const details = JSON.parse(summary.details_json);
-    assert.equal(details.requeued_count, 2);
-    assert.equal(details.abandoned_count, 2);
+    assert.equal(details.requeued_count, 3);
+    assert.equal(details.abandoned_count, 1);
 
     await supervisor.shutdown();
     store.close();

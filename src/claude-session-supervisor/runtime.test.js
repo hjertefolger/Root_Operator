@@ -116,10 +116,20 @@ test('cleanupStaleSocket removes existing file', () => {
     runtime.store.close();
 });
 
-test('recordPid writes pidfile, clearPidfile removes it', () => {
+test('recordPid writes pidfile (pid + optional command signature), clearPidfile removes it', () => {
     const { runtime } = freshFixture();
-    runtime.recordPid(12345);
-    assert.equal(fs.readFileSync(runtime.pidfilePath(), 'utf8'), '12345');
+    // recordPid now snapshots `ps -p <pid> -o command=` for the current
+    // process (the test runner itself) so the pidfile has two lines:
+    //   line 1: pid
+    //   line 2: command signature (non-empty for the live node process)
+    runtime.recordPid(process.pid);
+    const raw = fs.readFileSync(runtime.pidfilePath(), 'utf8');
+    const lines = raw.split('\n').filter(Boolean);
+    assert.equal(parseInt(lines[0], 10), process.pid);
+    assert.ok(lines.length >= 1, 'pidfile must at least record the pid');
+    // Signature is best-effort; on any platform where ps output is empty
+    // we fall back to a single-line pidfile. Both shapes are accepted.
+
     runtime.clearPidfile();
     assert.equal(fs.existsSync(runtime.pidfilePath()), false);
     // Idempotent: clearing when absent is fine
@@ -135,5 +145,26 @@ test('bootCleanup reports what happened', () => {
     assert.equal(report.orphan_pid, null); // 999999 wasn't detected as alive
     assert.equal(report.stale_socket_removed, true);
     assert.ok(Array.isArray(report.old_epochs_removed));
+    runtime.store.close();
+});
+
+test('detectOrphanPid: PID-reuse defense — mismatched signature returns null', () => {
+    const { runtime } = freshFixture();
+    // Record the test-runner process (a live pid) but with a bogus command
+    // signature that cannot possibly match `ps -p <pid> -o command=`.
+    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}\n/definitely-not-a-real-binary-xyz\n`);
+    assert.equal(runtime.detectOrphanPid(), null,
+        'live PID with mismatched signature must NOT be returned (PID reuse defense)');
+    runtime.store.close();
+});
+
+test('detectOrphanPid: legacy single-line pidfile (no signature) still works', () => {
+    const { runtime } = freshFixture();
+    // Old-format pidfile without the signature line. This can exist on the
+    // first boot after the signature upgrade lands. detectOrphanPid must
+    // still return the pid (skip signature check) rather than reject.
+    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`);
+    assert.equal(runtime.detectOrphanPid(), process.pid,
+        'legacy pidfile without signature must still surface the pid');
     runtime.store.close();
 });

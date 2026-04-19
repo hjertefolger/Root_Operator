@@ -149,20 +149,17 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Recover any dispatches left non-terminal by a prior process. Their
         // in-memory state (timers, awaitOutcome resolvers, active context) died
         // with the previous supervisor, so they cannot be resumed cleanly.
-        // Per-source/per-state policy (see _recoverOrphanedDispatches docs):
-        // channel/user QUEUED rows are re-adopted; everything else abandoned.
+        // Per-source/per-state policy (see _recoverOrphanedDispatches docs).
         // Runs AFTER bootCleanup so any surviving orphan Claude is already
         // dead, and BEFORE the probe so the probe is the first new dispatch.
         this._recoverOrphanedDispatches();
-        // If recovery re-adopted queued rows, they need an explicit
-        // _activateNext() to start draining — probe (when enabled) would do
-        // this via its enqueue, but the probe is off by default in tests and
-        // may be off in other configurations. Without this call a recovered
-        // channel/user message would sit in the queue until some unrelated
-        // enqueue arrived.
-        if (this.queue.length > 0 && !this.activeDispatch && this.state === STATES.IDLE) {
-            this._activateNext();
-        }
+        // NOTE: we deliberately do NOT drain re-queued dispatches here. On a
+        // real boot main.js starts the supervisor BEFORE spawnClaudeCode, so
+        // the channel bridge is still disconnected — calling _activateNext
+        // would immediately fail each re-queued dispatch via
+        // sendToChannelUnbuffered→false→'bridge_unavailable', which is the
+        // exact failure recovery is trying to prevent. _onBridgeReady()
+        // drains the queue once the bridge is live (see its drain block).
 
         // PR3: fire-and-forget probe dispatch for spawn verification.
         // Non-blocking — external dispatches can proceed immediately.
@@ -696,6 +693,15 @@ class ClaudeSessionSupervisor extends EventEmitter {
         if (this.state === STATES.VERIFYING) {
             this._transition('verify_skipped', { occurredAt: this.clock() });
         }
+
+        // 3. Drain any dispatches queued while the bridge was offline. Covers
+        // the post-boot case where _recoverOrphanedDispatches() re-adopted
+        // channel/user/scheduler QUEUED orphans before the bridge came up.
+        // Activation is gated on IDLE + no active dispatch; _activateNext()
+        // also self-guards, so calling it unconditionally here is safe.
+        if (this.state === STATES.IDLE && !this.activeDispatch && this.queue.length > 0) {
+            this._activateNext();
+        }
     }
 
     _retryActiveDispatch(dispatchId, reason) {
@@ -905,28 +911,28 @@ class ClaudeSessionSupervisor extends EventEmitter {
      * Per-state policy:
      *
      *   SENDING / ACTIVE (any source)
-     *     → ABANDONED with reason 'orphaned_by_restart'.
-     *       These rows either hit the bridge or were in the middle of it.
-     *       Side-effect state is ambiguous — replay could double-commit.
+     *     → ABANDONED with reason 'orphaned_by_restart'. These rows either
+     *       hit the bridge or were in the middle of it. Side-effect state
+     *       is ambiguous — replay could double-commit.
      *
-     *   QUEUED, source = 'channel' or 'user'
+     *   QUEUED, source = 'channel' | 'user' | 'scheduler'
      *     → re-adopted into the current epoch (via resetDispatchToQueued)
-     *       and pushed onto this.queue for normal activation. These payloads
-     *       never touched Claude, so there's no side-effect ambiguity. The
-     *       original caller's awaitOutcome() died with the old process, but
-     *       the message itself was a one-shot with no alternate retry path —
-     *       dropping it would silently lose user-visible work.
+     *       and pushed onto this.queue. Actual activation is deferred to
+     *       _onBridgeReady so we don't fire-and-fail against a disconnected
+     *       bridge on cold boot. Queued rows never touched Claude, so there
+     *       is no side-effect ambiguity. Source matters for retry policy
+     *       *elsewhere* (replay_cap, scheduler stuck-run guard), not here.
+     *       Scheduler runNow() payloads go through this path too — they
+     *       have no cron retry, so dropping them would silently lose a
+     *       user-triggered one-off.
      *
-     *   QUEUED, source = 'scheduler'
-     *     → ABANDONED. The scheduler has its own cron-based retry cadence;
-     *       re-activating here would also decouple the dispatch from the
-     *       scheduler's awaitOutcome/_completeJob path, leaving runningAt
-     *       unreconciled until the next tick. Abandon lets the scheduler's
-     *       supervisor-aware stuck-run check (pass-3 fix) clear runningAt
-     *       on the next fire.
+     *   QUEUED, probe
+     *     → ABANDONED. Probes are liveness tests; re-arming the OLD probe
+     *       is meaningless when supervisor.start() already issues a fresh
+     *       probe for this epoch.
      *
-     *   QUEUED, any other source (probe, unknown)
-     *     → ABANDONED (same as today; no caller semantics to preserve).
+     *   QUEUED, unknown source
+     *     → ABANDONED (no semantics to preserve).
      */
     _recoverOrphanedDispatches() {
         if (this._recoveryDone) return;
@@ -948,7 +954,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
         const currentEpoch = this.epoch;
         const abandoned = [];
         const requeued = [];
-        const REQUEUE_SOURCES = new Set(['channel', 'user']);
+        const REQUEUE_SOURCES = new Set(['channel', 'user', 'scheduler']);
 
         for (const row of open) {
             if (!row || !row.dispatch_id) continue;

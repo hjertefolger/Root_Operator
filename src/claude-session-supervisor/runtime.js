@@ -18,6 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const RUNTIME_DIR = path.join(process.env.HOME || '', '.root-operator', 'runtime');
 const PIDFILE_NAME = 'supervisor.pidfile';
@@ -181,8 +182,17 @@ class Runtime {
     }
 
     /**
-     * Returns the orphan PID (number) if a live process is recorded in the pidfile,
-     * or null otherwise. Does not kill.
+     * Returns the orphan PID (number) if a live process is recorded in the
+     * pidfile AND that PID still belongs to a Claude subprocess, or null
+     * otherwise. Does not kill.
+     *
+     * PID reuse is a real concern: if the old Claude exited after Electron
+     * crashed, the OS can reuse that numeric PID before the next boot. A
+     * naïve kill would SIGKILL whichever unrelated process now owns it.
+     * We defend by reading the pidfile content as PID + command-name
+     * signature (recordPid writes both) and verifying the signature matches
+     * the live process's `ps -p <pid> -o command=` output before returning.
+     * Mismatch → null → bootCleanup skips the kill.
      */
     detectOrphanPid() {
         const pf = this.pidfilePath();
@@ -194,16 +204,46 @@ class Runtime {
         } catch {
             return null;
         }
-        const pid = parseInt(raw, 10);
-        if (!pid || isNaN(pid)) return null;
+        if (!raw) return null;
 
+        // File format: "<pid>" (legacy) OR "<pid>\n<command-signature>" (current).
+        const lines = raw.split('\n');
+        const pid = parseInt((lines[0] || '').trim(), 10);
+        if (!pid || isNaN(pid)) return null;
+        const recordedSignature = (lines[1] || '').trim(); // may be empty (legacy pidfile)
+
+        // Cheap existence probe first.
         try {
-            // kill(pid, 0) probes existence without signalling
             process.kill(pid, 0);
-            return pid;
         } catch {
             return null;
         }
+
+        // Verify the PID still points at a Claude process. On legacy
+        // single-line pidfiles (no signature), skip the check so we don't
+        // regress older boots — upstream callers write the signature on
+        // every spawn going forward, so the gap closes within one cycle.
+        if (recordedSignature) {
+            let current = null;
+            try {
+                current = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+                    encoding: 'utf8',
+                    stdio: ['ignore', 'pipe', 'ignore'],
+                }).trim();
+            } catch {
+                // ps failed (process vanished mid-check, permission, or an
+                // unexpected platform). Safer to not kill on uncertainty.
+                return null;
+            }
+            if (!current) return null;
+            // Signature match is a substring check — the full command line
+            // may include args/flags that weren't recorded, but the
+            // executable portion we snapshotted at spawn must still be
+            // present for this to be the same process.
+            if (!current.includes(recordedSignature)) return null;
+        }
+
+        return pid;
     }
 
     /**
@@ -247,11 +287,36 @@ class Runtime {
     }
 
     /**
-     * Write the current Claude PID to the pidfile. Called by main.js after spawn.
+     * Write the current Claude PID + command-name signature to the pidfile.
+     * Called by main.js after spawnClaudeCode().
+     *
+     * The signature is used by detectOrphanPid() to defend against PID
+     * reuse: if the recorded PID is reassigned to an unrelated process
+     * between boots, the `ps -p <pid> -o command=` output won't contain
+     * our signature and bootCleanup() will skip the kill. The signature
+     * is snapshotted at spawn time from `ps` itself (not from arguments
+     * we pass), so a later rename or symlink doesn't desync it.
+     *
+     * File format: "<pid>\n<signature>\n". Legacy one-line pidfiles from
+     * earlier boots are still parseable (detectOrphanPid skips the
+     * signature check when the second line is absent).
      */
     recordPid(pid) {
         if (!pid) return;
-        fs.writeFileSync(this.pidfilePath(), String(pid));
+        let signature = '';
+        try {
+            signature = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+            }).trim();
+        } catch {
+            // ps failed (platform quirk, transient). Fall back to a bare
+            // PID line so the pidfile at least records existence; the
+            // missing signature disables the reuse check for this boot.
+            signature = '';
+        }
+        const content = signature ? `${pid}\n${signature}\n` : `${pid}\n`;
+        fs.writeFileSync(this.pidfilePath(), content);
     }
 
     /**
