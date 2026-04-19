@@ -82,18 +82,26 @@ test('cleanupOldEpochs keeps last N', () => {
     runtime.store.close();
 });
 
-test('detectOrphanPid returns pid if live, null if absent or dead', () => {
+test('detectOrphanPid returns pid if live+certain, null if absent/dead/uncertain', () => {
     const { runtime } = freshFixture();
     // No pidfile -> null
     assert.equal(runtime.detectOrphanPid(), null);
 
-    // Pidfile with our own live PID -> returns it
-    fs.writeFileSync(runtime.pidfilePath(), String(process.pid));
+    // Pidfile with a live PID + valid signature → returns it.
+    // Use recordPid so the current command's signature gets captured
+    // correctly and probeOrphanStatus returns certain:true.
+    runtime.recordPid(process.pid);
     assert.equal(runtime.detectOrphanPid(), process.pid);
 
     // Pidfile with a very unlikely-to-exist PID -> null
     fs.writeFileSync(runtime.pidfilePath(), '999999');
     assert.equal(runtime.detectOrphanPid(), null);
+
+    // Legacy single-line pidfile (no signature) → UNCERTAIN → null
+    // (post-pass-18: caller must use probeOrphanStatus to see the PID).
+    fs.writeFileSync(runtime.pidfilePath(), String(process.pid));
+    assert.equal(runtime.detectOrphanPid(), null,
+        'unsigned legacy pidfile must not be trusted as confirmed orphan');
     runtime.store.close();
 });
 
@@ -188,8 +196,11 @@ test('probeOrphanStatus: no pidfile → certain:true (no orphan, confident)', ()
 
 test('bootCleanup preserves pidfile on non-already_dead kill failure', () => {
     const { runtime } = freshFixture();
-    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`); // live pid
-    // Force killOrphanPid to return a real failure.
+    // recordPid writes pid + signature so probe returns certain:true and
+    // bootCleanup actually attempts the kill (the code path this test
+    // covers). A raw single-line write would be treated as uncertain
+    // under the new signature-required policy.
+    runtime.recordPid(process.pid);
     const origKill = runtime.killOrphanPid.bind(runtime);
     runtime.killOrphanPid = () => ({ killed: false, reason: 'EPERM' });
     const report = runtime.bootCleanup();
@@ -205,7 +216,7 @@ test('bootCleanup preserves pidfile on non-already_dead kill failure', () => {
 
 test('bootCleanup clears pidfile on already_dead (benign race)', () => {
     const { runtime } = freshFixture();
-    fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`);
+    runtime.recordPid(process.pid);
     const origKill = runtime.killOrphanPid.bind(runtime);
     runtime.killOrphanPid = () => ({ killed: false, reason: 'already_dead' });
     const report = runtime.bootCleanup();
@@ -227,13 +238,20 @@ test('detectOrphanPid: PID-reuse defense — mismatched signature returns null',
     runtime.store.close();
 });
 
-test('detectOrphanPid: legacy single-line pidfile (no signature) still works', () => {
+test('detectOrphanPid: legacy single-line pidfile (no signature) is treated as uncertain', () => {
     const { runtime } = freshFixture();
-    // Old-format pidfile without the signature line. This can exist on the
-    // first boot after the signature upgrade lands. detectOrphanPid must
-    // still return the pid (skip signature check) rather than reject.
+    // Old-format pidfile without the signature line can exist on the
+    // first boot after the signature upgrade. Post-pass-18 policy:
+    // treat as uncertain rather than trusting the bare PID, because we
+    // can't confirm identity and SIGKILLing a reused PID would be worse
+    // than a false-positive orphan_unsafe path. detectOrphanPid returns
+    // null; the richer probeOrphanStatus surfaces the PID + certain:false.
     fs.writeFileSync(runtime.pidfilePath(), `${process.pid}`);
-    assert.equal(runtime.detectOrphanPid(), process.pid,
-        'legacy pidfile without signature must still surface the pid');
+    assert.equal(runtime.detectOrphanPid(), null,
+        'legacy pidfile without signature must NOT be trusted as confirmed orphan');
+    const probe = runtime.probeOrphanStatus();
+    assert.equal(probe.pid, process.pid);
+    assert.equal(probe.certain, false);
+    assert.equal(probe.reason, 'no_signature_recorded');
     runtime.store.close();
 });

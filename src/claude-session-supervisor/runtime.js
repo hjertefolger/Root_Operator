@@ -193,6 +193,13 @@ class Runtime {
      */
     detectOrphanPid() {
         const result = this.probeOrphanStatus();
+        // Only surface a PID when identity is confirmed. Uncertain probes
+        // (ps_lookup_failed, ps_empty_output, no-signature legacy pidfile)
+        // could otherwise be treated by callers as confirmed orphans and
+        // SIGKILL'd — exactly the PID-reuse risk signature checks exist
+        // to prevent. Use probeOrphanStatus() directly when you need the
+        // PID AND the certainty flag.
+        if (!result.certain) return null;
         return result.pid;
     }
 
@@ -243,6 +250,16 @@ class Runtime {
             if (err.code !== 'EPERM') {
                 return { pid: null, certain: false, reason: `kill0_error:${err.code || 'unknown'}` };
             }
+        }
+
+        // No recorded signature — either a legacy pidfile written before
+        // the signature field existed, or a post-upgrade write where
+        // recordPid's `ps` capture failed. Either way we cannot verify
+        // the PID still belongs to Claude. Treat as uncertain so the
+        // orchestrator flags orphan_unsafe and abandon-all rather than
+        // risking a SIGKILL on a reused PID.
+        if (!recordedSignature) {
+            return { pid, certain: false, reason: 'no_signature_recorded' };
         }
 
         // Verify the PID still points at a Claude process.

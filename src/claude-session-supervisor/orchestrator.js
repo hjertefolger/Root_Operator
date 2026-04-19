@@ -237,7 +237,31 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // further enqueues throw rather than run under this ambiguity.
         // Operators must restart the host after resolving the orphan to
         // return the supervisor to service.
+        // Durable marker: if ANY prior boot (this process or a previous one)
+        // ended in orphan_unsafe and the operator hasn't manually cleared
+        // the marker, stay in HARD_FAILED. Covers the "no-actionable-PID"
+        // variant where recovery already abandoned all prior-epoch rows
+        // during the failed boot — the next launch would otherwise see
+        // neither a pidfile nor open orphans and spawn a fresh Claude
+        // into a still-live orphan's hook log.
+        try {
+            const persistedUnsafe = this.store.getStateValue('orphan_unsafe_latch', '');
+            if (persistedUnsafe === 'true') {
+                this._orphanStatusUnsafe = true;
+                this.incidents.record({
+                    kind: 'orphan_unsafe_latch_carried_forward',
+                    epoch: this.epoch,
+                    details: { note: 'cleared by manual reset after confirming orphan Claude is gone' },
+                });
+            }
+        } catch (_) { /* best-effort */ }
+
         if (this._orphanStatusUnsafe) {
+            // Persist the latch so a subsequent re-init or boot (even one
+            // with an intact empty DB) won't bypass the hard-fail by
+            // finding nothing to recover. Cleared only on explicit manual
+            // reset (store key: orphan_unsafe_latch).
+            try { this.store.setStateValue('orphan_unsafe_latch', 'true'); } catch (_) { /* best-effort */ }
             this._transition('orphan_unsafe', { occurredAt: this.clock() });
             this.incidents.record({
                 kind: 'supervisor_hard_failed_orphan_unsafe',
