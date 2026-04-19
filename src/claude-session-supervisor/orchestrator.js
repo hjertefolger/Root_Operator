@@ -152,20 +152,17 @@ class ClaudeSessionSupervisor extends EventEmitter {
         this._orphanStatusUnsafe = false;
         // Keep the legacy field name for any code that still reads it.
         this._orphanKillFailed = false;
-        // Evidence that THIS boot cleared the orphan. Three tiers:
-        //   STRONG (_bootProbeAffirmativelyClean = true):
-        //     pidfile present + probe certain + no orphan or kill succeeded.
-        //     We have proof.
-        //   PASSIVE (_bootProbePassivelyClean = true):
-        //     no pidfile + no stale socket + no prior-epoch open rows.
-        //     Covers the "user rebooted the host after the first-upgrade
-        //     unsafe boot abandoned everything" case. Not as strong as a
-        //     certain probe, but the environment shows no signs of an
-        //     active orphan and blocking forever is worse than trusting
-        //     an honest restart.
-        //   NONE: keep the latch.
+        // Evidence that THIS boot cleared the orphan. Only STRONG
+        // affirmative-clean signals (pidfile present + probe certain +
+        // no orphan or kill succeeded) can auto-clear the latch.
+        // Passive signals (no pidfile + no rows) are too weak:
+        // a previous unsafe boot may have abandoned everything while
+        // the real orphan is still running — the "environment looks
+        // clean" signal would bypass the quarantine without proof.
+        // Operators needing to recover from a stuck latch use the
+        // ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1 env override (logged
+        // prominently on every latched boot).
         this._bootProbeAffirmativelyClean = false;
-        this._bootProbePassivelyClean = false;
         if (typeof this.runtime.bootCleanup === 'function') {
             try {
                 const report = this.runtime.bootCleanup();
@@ -179,14 +176,13 @@ class ClaudeSessionSupervisor extends EventEmitter {
                     && orphanConfirmedGone) {
                     this._bootProbeAffirmativelyClean = true;
                 }
-                // Passive-clean: no pidfile to probe AND no stale artifacts.
-                // Check prior-epoch rows below — a later step in this block
-                // sets the flag only once we know rows are clean too.
-                if (report
-                    && report.pidfile_present === false
-                    && report.stale_socket_removed === false) {
-                    this._bootProbePassivelyCleanPending = true;
-                }
+                // NOTE: pass-23 added a "passive clean" tier
+                // (no pidfile + no stale socket + no rows). Pass-25
+                // found that too weak — previous unsafe boot abandoning
+                // rows leaves that exact state even when the orphan is
+                // still alive. Reverted; only strong affirmative signals
+                // auto-clear. Operators use ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1
+                // to unstick hosts where affirmative proof isn't possible.
                 if (report && (report.orphan_pid || report.stale_socket_removed
                     || (report.old_epochs_removed && report.old_epochs_removed.length > 0))) {
                     this.incidents.record({
@@ -229,15 +225,6 @@ class ClaudeSessionSupervisor extends EventEmitter {
                 } catch (_) {
                     priorEpochOpenExists = true; // be conservative
                 }
-                // Confirm passive-clean: passivelyCleanPending was set above
-                // (no pidfile + no stale socket). Only hold that flag if
-                // there are also no prior-epoch open rows — otherwise the
-                // recovered dispatches show we DO have recent history that
-                // demands stronger evidence.
-                if (this._bootProbePassivelyCleanPending && !priorEpochOpenExists) {
-                    this._bootProbePassivelyClean = true;
-                }
-                delete this._bootProbePassivelyCleanPending;
                 if (pidfileMissing || probeUncertain) {
                     if (priorEpochOpenExists) {
                         this._orphanStatusUnsafe = true;
@@ -308,8 +295,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
         try {
             const persistedUnsafe = this.store.getStateValue('orphan_unsafe_latch', '');
             if (persistedUnsafe === 'true') {
-                const canClear = (this._bootProbeAffirmativelyClean
-                        || this._bootProbePassivelyClean)
+                const canClear = this._bootProbeAffirmativelyClean
                     && !this._orphanStatusUnsafe;
                 if (canClear) {
                     this.store.setStateValue('orphan_unsafe_latch', '');
@@ -317,9 +303,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         kind: 'orphan_unsafe_latch_auto_cleared',
                         epoch: this.epoch,
                         details: {
-                            note: this._bootProbeAffirmativelyClean
-                                ? 'affirmative clean (pidfile probe certain + no orphan)'
-                                : 'passive clean (no pidfile, no stale socket, no prior-epoch rows)',
+                            note: 'affirmative clean (pidfile probe certain + no orphan)',
                         },
                     });
                 } else {
@@ -334,11 +318,10 @@ class ClaudeSessionSupervisor extends EventEmitter {
                         kind: 'orphan_unsafe_latch_carried_forward',
                         epoch: this.epoch,
                         details: {
-                            note: 'no affirmative/passive clean signal this boot',
+                            note: 'no affirmative clean signal this boot',
                             boot_probe_affirmative: this._bootProbeAffirmativelyClean,
-                            boot_probe_passive: this._bootProbePassivelyClean,
                             local_unsafe: this._orphanStatusUnsafe,
-                            operator_override: 'ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1 restart to clear',
+                            operator_override: 'Restart with ROOT_OPERATOR_CLEAR_ORPHAN_LATCH=1 after confirming prior Claude process is terminated (e.g. `pkill claude; ps aux | grep -i claude`).',
                         },
                     });
                 }
@@ -519,6 +502,12 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._activateNext();
         } else {
             this.queue.push(dispatchId);
+            // If a bridge-wait timer is armed, re-arm in case this new row
+            // has a larger silence budget — otherwise the original timer's
+            // shorter window would expire the long-tolerance job early.
+            if (this._gatedActivationTimer) {
+                this._armGatedActivationTimeout();
+            }
         }
 
         return { dispatchId };
@@ -658,7 +647,12 @@ class ClaudeSessionSupervisor extends EventEmitter {
      * cold boot still get a bounded wait.
      */
     _armGatedActivationTimeout() {
-        if (this._gatedActivationTimer) return;
+        // Compute the current target budget from ALL queued rows. If the
+        // existing armed timer is already at or above that budget, we're
+        // fine. If a newly-queued row has a larger silence budget than
+        // what the current timer was sized for, re-arm with the larger
+        // value — otherwise Night-Lab-scale work queued after a
+        // short-budget row would get prematurely failed.
         let maxSilence = DEFAULT_SILENCE_MS;
         try {
             const open = this.store.listOpenDispatches();
@@ -670,6 +664,14 @@ class ClaudeSessionSupervisor extends EventEmitter {
             }
         } catch (_) { /* best-effort, fall back to default */ }
         const budgetMs = maxSilence * SAFETY_NET_MULTIPLIER;
+        // If an armed timer exists, only extend it — never shrink.
+        // Shrinking would expire a long-budget row early.
+        if (this._gatedActivationTimer) {
+            if (budgetMs <= this._gatedActivationBudgetMs) return;
+            clearTimeout(this._gatedActivationTimer);
+            this._gatedActivationTimer = null;
+        }
+        this._gatedActivationBudgetMs = budgetMs;
         this._gatedActivationTimer = setTimeout(() => {
             this._gatedActivationTimer = null;
             if (this._shutdown) return;
@@ -699,6 +701,7 @@ class ClaudeSessionSupervisor extends EventEmitter {
             clearTimeout(this._gatedActivationTimer);
             this._gatedActivationTimer = null;
         }
+        this._gatedActivationBudgetMs = 0;
     }
 
     _activateNext() {
