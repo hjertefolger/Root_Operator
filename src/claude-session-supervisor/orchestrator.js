@@ -117,13 +117,52 @@ class ClaudeSessionSupervisor extends EventEmitter {
             details: { hook_log_path: this.hookLogPath, pr3_effect_ledger: true },
         });
 
+        // Kill any surviving orphan Claude subprocess BEFORE reconciling
+        // dispatch rows. If the previous main.js crashed but its pty-spawned
+        // Claude child survived, that process could still be executing the
+        // old dispatch. Terminalizing the DB row here while a live Claude
+        // writes hook events for the same dispatch_id would either duplicate
+        // scheduler side-effects (orphan completes + new replay runs) or
+        // flip a successful run to abandoned (fresh supervisor sees the
+        // old Claude as wedged and kills it). bootCleanup() also removes
+        // stale sockets and prunes old epochs.
+        if (typeof this.runtime.bootCleanup === 'function') {
+            try {
+                const report = this.runtime.bootCleanup();
+                if (report && (report.orphan_pid || report.stale_socket_removed
+                    || (report.old_epochs_removed && report.old_epochs_removed.length > 0))) {
+                    this.incidents.record({
+                        kind: 'boot_cleanup',
+                        epoch: this.epoch,
+                        details: report,
+                    });
+                }
+            } catch (err) {
+                this.incidents.record({
+                    kind: 'boot_cleanup_error',
+                    epoch: this.epoch,
+                    details: { error: err && err.message ? err.message : String(err) },
+                });
+            }
+        }
+
         // Recover any dispatches left non-terminal by a prior process. Their
         // in-memory state (timers, awaitOutcome resolvers, active context) died
         // with the previous supervisor, so they cannot be resumed cleanly.
-        // Mark them ABANDONED with a structured reason so callers observe a
-        // terminal state instead of silent drift. Runs before the probe so
-        // the probe is the first legitimate dispatch in the new epoch.
+        // Per-source/per-state policy (see _recoverOrphanedDispatches docs):
+        // channel/user QUEUED rows are re-adopted; everything else abandoned.
+        // Runs AFTER bootCleanup so any surviving orphan Claude is already
+        // dead, and BEFORE the probe so the probe is the first new dispatch.
         this._recoverOrphanedDispatches();
+        // If recovery re-adopted queued rows, they need an explicit
+        // _activateNext() to start draining — probe (when enabled) would do
+        // this via its enqueue, but the probe is off by default in tests and
+        // may be off in other configurations. Without this call a recovered
+        // channel/user message would sit in the queue until some unrelated
+        // enqueue arrived.
+        if (this.queue.length > 0 && !this.activeDispatch && this.state === STATES.IDLE) {
+            this._activateNext();
+        }
 
         // PR3: fire-and-forget probe dispatch for spawn verification.
         // Non-blocking — external dispatches can proceed immediately.

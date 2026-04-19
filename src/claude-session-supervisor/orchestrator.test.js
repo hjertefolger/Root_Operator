@@ -839,6 +839,68 @@ test('start(): recovery runs at most once per supervisor instance', async () => 
     store.close();
 });
 
+test('start(): recovered channel/user QUEUED orphan is activated during startup', async () => {
+    const { supervisor, store, sent } = fixture();
+    // Seed a channel QUEUED orphan from a prior epoch.
+    store.insertDispatch({
+        dispatchId: 'resumed-channel', source: 'channel', chatId: 'dev-x',
+        payload: 'resume me', silenceMs: 30_000, replayCap: 1,
+        state: DISPATCH_STATES.QUEUED, epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    // Recovery must have flipped it to SENDING/ACTIVE (via _activateNext),
+    // not left it sitting queued waiting for unrelated traffic.
+    await waitForCondition(
+        () => {
+            const r = store.getDispatch('resumed-channel');
+            return r && r.state !== DISPATCH_STATES.QUEUED;
+        },
+        { timeoutMs: 500 },
+    );
+    const row = store.getDispatch('resumed-channel');
+    assert.notEqual(row.state, DISPATCH_STATES.QUEUED,
+        'recovered channel QUEUED must be activated during start(), not parked');
+    // Payload must have been sent through channelManager.sendToChannel or
+    // similar — minimum check: at least one message dispatched.
+    assert.ok(sent.length > 0 || store.getDispatch('resumed-channel').state === DISPATCH_STATES.SENDING
+        || store.getDispatch('resumed-channel').state === DISPATCH_STATES.ACTIVE,
+        'activation path should have been taken');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
+test('start(): calls runtime.bootCleanup() before orphan recovery', async () => {
+    const { supervisor, store, runtime } = fixture();
+    let cleanupCalled = false;
+    let cleanupCalledBeforeRecovery = null;
+    const origBoot = runtime.bootCleanup.bind(runtime);
+    runtime.bootCleanup = () => {
+        cleanupCalled = true;
+        // At this moment recovery must not have run yet — orphan row still
+        // non-terminal if one existed.
+        const orphan = store.getDispatch('orphan-for-ordering');
+        cleanupCalledBeforeRecovery = orphan && orphan.state === DISPATCH_STATES.QUEUED;
+        return origBoot();
+    };
+    store.insertDispatch({
+        dispatchId: 'orphan-for-ordering', source: 'channel', payload: 'x',
+        silenceMs: 30_000, replayCap: 1, state: DISPATCH_STATES.QUEUED,
+        epoch: 0, enqueuedAt: 1,
+    });
+
+    await supervisor.start();
+
+    assert.equal(cleanupCalled, true, 'bootCleanup must be invoked during start()');
+    assert.equal(cleanupCalledBeforeRecovery, true,
+        'bootCleanup must run BEFORE _recoverOrphanedDispatches');
+
+    await supervisor.shutdown();
+    store.close();
+});
+
 test('start(): channel/user QUEUED orphans are re-queued, not abandoned', async () => {
     const { supervisor, store, runtime } = fixture();
     store.insertDispatch({
@@ -864,18 +926,24 @@ test('start(): channel/user QUEUED orphans are re-queued, not abandoned', async 
 
     await supervisor.start();
 
-    // Channel + user QUEUED were re-adopted into current epoch (still queued,
-    // waiting for _activateNext; they'll be picked up when supervisor has a
-    // chance). Scheduler QUEUED stays abandoned (scheduler owns retry cadence).
-    // Any SENDING/ACTIVE regardless of source is abandoned (effect ambiguity).
+    // Channel + user QUEUED were re-adopted into current epoch. With the
+    // pass-5 fix, start() also calls _activateNext() so the FIRST one
+    // transitions to SENDING/ACTIVE and subsequent ones stay QUEUED until
+    // the head completes. The invariant we care about here is:
+    //   - not ABANDONED (i.e. the row is still in the live lifecycle)
+    //   - epoch advanced to current
+    // Scheduler QUEUED and any SENDING/ACTIVE get abandoned (effect ambiguity).
     const channelRow = store.getDispatch('orphan-channel-queued');
-    assert.equal(channelRow.state, DISPATCH_STATES.QUEUED,
-        'channel QUEUED must stay queued (re-adopted)');
+    assert.notEqual(channelRow.state, DISPATCH_STATES.ABANDONED,
+        'channel QUEUED must not be abandoned (re-adopted)');
+    assert.ok([DISPATCH_STATES.QUEUED, DISPATCH_STATES.SENDING, DISPATCH_STATES.ACTIVE].includes(channelRow.state),
+        `channel row should be in the live lifecycle, got ${channelRow.state}`);
     assert.equal(channelRow.epoch, runtime.currentEpoch,
         'channel QUEUED epoch must advance to current');
 
     const userRow = store.getDispatch('orphan-user-queued');
-    assert.equal(userRow.state, DISPATCH_STATES.QUEUED);
+    assert.notEqual(userRow.state, DISPATCH_STATES.ABANDONED);
+    assert.ok([DISPATCH_STATES.QUEUED, DISPATCH_STATES.SENDING, DISPATCH_STATES.ACTIVE].includes(userRow.state));
     assert.equal(userRow.epoch, runtime.currentEpoch);
 
     const schedRow = store.getDispatch('orphan-scheduler-queued');
