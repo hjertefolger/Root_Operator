@@ -3091,13 +3091,17 @@ async function spawnClaudeCode() {
             stopClaudeDebugWatcher();
             stopClaudeHookWatcher();
             claudeProcess = null;
-            // Clear the recorded PID on clean exit so the next boot's
-            // detectOrphanPid() sees an empty pidfile. If this Electron
-            // crashes before reaching here, the pidfile remains and
-            // bootCleanup() on the next boot will SIGKILL the orphan.
-            if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function') {
-                try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
-            }
+            // NOTE: we deliberately do NOT clear the pidfile here. Claude
+            // exits frequently during normal operation (scheduled respawn,
+            // replay-triggered kill, crash followed by auto-restart). Every
+            // new spawn calls recordPid() which overwrites the file with
+            // the fresh PID, so the file always reflects the MOST RECENT
+            // spawn. Clearing it on every Claude exit would open a race:
+            // Claude crashes → we clear the pidfile → Electron crashes
+            // before the next spawn records a new PID → next boot sees
+            // no pidfile + prior-epoch open dispatches → orphan_unsafe
+            // hard-fail even though the old Claude is definitively gone.
+            // Clean-quit clearing happens in the app's 'will-quit' handler.
             removeChannelSocket();
 
             if (operatingMode === 'channel' && !isAppQuitting) {
@@ -3773,6 +3777,14 @@ app.on('will-quit', () => {
     cachedPushVapidKeys = null;
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
+    // Clean-quit marker: remove the supervisor pidfile so the next boot
+    // does not mistake this orderly shutdown for a crash that left an
+    // orphan Claude alive. Claude-process exits during normal operation
+    // leave the pidfile in place (the next spawn overwrites it); only
+    // a true app-level quit clears it.
+    if (supervisorRuntime && typeof supervisorRuntime.clearPidfile === 'function') {
+        try { supervisorRuntime.clearPidfile(); } catch (_) { /* ignore */ }
+    }
 });
 
 app.on('will-quit', () => {

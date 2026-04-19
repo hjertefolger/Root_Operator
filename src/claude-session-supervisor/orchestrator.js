@@ -72,6 +72,16 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
         this.state = STATES.STOPPED;
         this.epoch = runtime.currentEpoch;
+        // Tracks whether bridge_ready has fired at least once since start().
+        // The ChannelManager.connected flag flips true the instant the Unix
+        // socket accepts, but mcp.connect() runs AFTER that; only
+        // bridge_ready confirms the MCP side is up and can forward to
+        // Claude. Activating dispatches on socket-connected alone would
+        // send into a half-initialized bridge. Pre-first-bridge-ready,
+        // _activateNext refuses to send even when connected is true.
+        // Post-first-bridge-ready, the cheaper connected-flag gate takes
+        // over (covers mid-session socket drops).
+        this._bridgeReadyFired = false;
         // activeDispatch carries its own safety timer (armed at activation, not
         // at awaitOutcome — queued dispatches that never activate cannot be
         // auto-abandoned). PR2 adds wedgeTimer and inRecovery flag.
@@ -460,20 +470,19 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     _activateNext() {
         if (this.activeDispatch) return;
-        // Bridge-connectivity gate. If the ChannelManager exposes a
-        // `.connected` flag and it's false, leave the queue alone —
-        // _onBridgeReady() will call _activateNext() again once the bridge
-        // is live. This prevents three distinct footguns:
-        //   (1) cold-boot: supervisor.start() runs before spawnClaudeCode,
-        //       so anything recovered into this.queue would be sent through
-        //       a disconnected bridge and marked bridge_unavailable.
-        //   (2) cron fires during startup: a scheduled job that triggers
-        //       enqueue() before bridge_ready would drain the recovered
-        //       queue ahead of itself.
-        //   (3) bridge drops mid-session: new enqueues wait for reconnect
-        //       instead of firing and failing.
-        // Mocks/tests without a `.connected` property (undefined) behave as
-        // before — always-available — and are not affected.
+        // Bridge-readiness gate. Two signals we care about:
+        //   (a) pre-first-bridge-ready: NEVER send, even if connected has
+        //       flipped true — ChannelManager.connected == Unix socket
+        //       accepted, but mcp.connect() runs AFTER that. Only
+        //       bridge_ready confirms the MCP side can forward to Claude.
+        //       Sending into that half-initialized window would drop work.
+        //   (b) post-first-bridge-ready: use the cheap connected flag.
+        //       If the socket drops mid-session, hold sends until reconnect.
+        // Tests that mock channelManager without `.connected` (undefined)
+        // behave as always-available once bridge_ready has fired.
+        if (!this._bridgeReadyFired) {
+            return;
+        }
         if (this.channelManager && this.channelManager.connected === false) {
             return;
         }
@@ -791,7 +800,21 @@ class ClaudeSessionSupervisor extends EventEmitter {
     }
 
     _subscribeBridgeReady() {
-        if (!this.channelManager || typeof this.channelManager.on !== 'function') return;
+        if (!this.channelManager || typeof this.channelManager.on !== 'function') {
+            // No event emitter — can't listen for bridge_ready, so we can't
+            // gate activation on it. Treat as always-ready (typical in
+            // send-only channelManager mocks).
+            this._bridgeReadyFired = true;
+            return;
+        }
+        // If the channelManager doesn't expose a `.connected` flag, it's not
+        // a production-shaped bridge — it's a test mock or a stub that has
+        // no separate "socket-accepted vs mcp-ready" window to worry about.
+        // Skip the pre-first-bridge-ready gate for those; subscription still
+        // happens so later emitted bridge_ready events drive replay logic.
+        if (this.channelManager.connected === undefined) {
+            this._bridgeReadyFired = true;
+        }
         if (this._bridgeReadyHandler) return;
         this._bridgeReadyHandler = () => this._onBridgeReady();
         this.channelManager.on('bridge_ready', this._bridgeReadyHandler);
@@ -813,6 +836,10 @@ class ClaudeSessionSupervisor extends EventEmitter {
      */
     _onBridgeReady() {
         if (this._shutdown) return;
+        // Clear the pre-first-bridge-ready gate so _activateNext can send.
+        // Stays true for the lifetime of this supervisor instance; a
+        // subsequent socket drop relies on the connected-flag gate instead.
+        this._bridgeReadyFired = true;
 
         // 1. Replay decision (if any) while still in RESPAWNING state.
         if (this._dispatchAwaitingReplay) {
