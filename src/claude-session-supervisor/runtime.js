@@ -388,19 +388,20 @@ class Runtime {
                 ? null
                 : (result.reason || 'unknown');
         }
-        // Keep the pidfile around when:
-        //   (a) a real kill failure occurred (orphan still alive, real error)
-        //   (b) the probe was inconclusive (certain=false) — kill(pid,0) may
-        //       have already shown a live PID; losing the pidfile now means
-        //       later boots can't retry identifying/killing the orphan.
-        // Clearing only runs for definitive-safe outcomes: no pidfile,
-        // probe was certain AND orphan was absent, or orphan was
-        // benignly gone ('already_dead').
+        // Keep the pidfile around when it's still ACTIONABLE:
+        //   (a) a real kill failure occurred (orphan still alive, real error) — next boot retries
+        //   (b) the probe was inconclusive AND produced a PID we can retry later
+        // Clear in every other case, including inconclusive probes that
+        // couldn't recover any PID at all (empty file, unparseable PID,
+        // ps_lookup_failed with no prior kill(pid,0) match). Keeping those
+        // makes the pidfile sticky: a one-off truncated write would force
+        // every subsequent boot down the orphan_status_unsafe_abandon_all
+        // path until someone manually deleted supervisor.pidfile.
         const killTrulyFailed = !!(pid
             && report.orphan_killed === false
             && report.orphan_kill_reason !== 'already_dead');
-        const probeInconclusive = !report.orphan_status_certain;
-        if (!killTrulyFailed && !probeInconclusive) {
+        const probeInconclusiveWithPid = !report.orphan_status_certain && !!pid;
+        if (!killTrulyFailed && !probeInconclusiveWithPid) {
             this.clearPidfile();
         }
 

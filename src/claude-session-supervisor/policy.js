@@ -69,6 +69,7 @@ function transitionSupervisor(current, event) {
             break;
         case T.IDLE:
             if (event === 'dispatch_activated') return { ok: true, next: T.DISPATCHING };
+            if (event === 'orphan_unsafe') return { ok: true, next: T.HARD_FAILED };
             if (event === 'shutdown') return { ok: true, next: T.STOPPED };
             break;
         case T.DISPATCHING:

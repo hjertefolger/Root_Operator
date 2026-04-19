@@ -313,54 +313,71 @@ test('multiple awaitOutcome callers on same dispatch all settle', async () => {
     store.close();
 });
 
-test('disconnected ChannelManager: supervisor uses unbuffered send, nothing enters buffer', async () => {
-    // Real-shaped ChannelManager stand-in with the current interface:
-    // connected flag + buffered sendToChannel (legacy) + unbuffered variant
-    // (PR1 addition). Verifies the supervisor routes through the unbuffered
-    // variant so no payload ever reaches the internal buffer.
+test('disconnected ChannelManager: supervisor holds dispatch, never hits buffered path', async () => {
+    // Post-pass-13 semantics: if channelManager.connected === false,
+    // _activateNext() leaves the dispatch queued and waits for
+    // _onBridgeReady(). Nothing is sent on either path — which is the
+    // important invariant (no buffered leak). Previous loud-fail behavior
+    // was replaced because it was burning scheduled jobs on transient
+    // disconnects.
     const { supervisor, store } = fixture();
     const bufferedPayloads = [];
     const unbufferedAttempts = [];
     supervisor.channelManager = {
         connected: false,
         sendToChannel(chatId, content, userId) {
-            // legacy buffered path — if this is ever called, the test fails
             bufferedPayloads.push({ chatId, content, userId });
             return false;
         },
         sendToChannelUnbuffered(chatId, content, userId) {
             unbufferedAttempts.push({ chatId, content, userId });
-            return false; // disconnected → no buffer, just false
+            return false;
         },
+        on: () => {},
+        off: () => {},
     };
     await supervisor.start();
     const { dispatchId } = supervisor.enqueue({ source: 'scheduler', payload: 'sensitive' });
-    const outcome = await supervisor.awaitOutcome(dispatchId);
-    assert.equal(outcome.state, DISPATCH_STATES.FAILED);
-    assert.equal(outcome.error, 'bridge_unavailable');
-    // Supervisor must use unbuffered, never the buffered legacy method.
-    assert.equal(bufferedPayloads.length, 0,
-        `supervisor called buffered sendToChannel: ${JSON.stringify(bufferedPayloads)}`);
-    assert.equal(unbufferedAttempts.length, 1);
+
+    // Let any async machinery settle without firing a bridge_ready.
+    await new Promise(r => setTimeout(r, 50));
+
+    // Dispatch must still be QUEUED, not sent on either path.
     const row = store.getDispatch(dispatchId);
-    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.equal(row.state, DISPATCH_STATES.QUEUED,
+        'dispatch must wait while channel is disconnected');
+    assert.equal(bufferedPayloads.length, 0,
+        `buffered path must never be used: ${JSON.stringify(bufferedPayloads)}`);
+    assert.equal(unbufferedAttempts.length, 0,
+        'unbuffered send must not fire until bridge is up');
+
+    // Flip the bridge on and verify drain works through the unbuffered path.
+    supervisor.channelManager.connected = true;
+    supervisor._onBridgeReady();
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(unbufferedAttempts.length, 1,
+        'dispatch must drain via unbuffered send once bridge is ready');
+    assert.equal(bufferedPayloads.length, 0,
+        'buffered path must still be untouched after drain');
+
     await supervisor.shutdown();
     store.close();
 });
 
-test('queue does not stall when pre-activation dispatch fails', async () => {
-    // Regression for the Codex round-5 finding: when a dispatch fails
-    // before becoming active (bridge_unavailable), _completeDispatch must
-    // still call _activateNext() so later queued dispatches can proceed
-    // once the bridge recovers.
+test('queue drains in order when bridge reconnects (not drop-on-fail)', async () => {
+    // Post-pass-13 semantics: dispatches enqueued while the bridge is
+    // disconnected sit in the queue until bridge_ready, rather than being
+    // drop-failed with bridge_unavailable. The test verifies:
+    //   (1) queued dispatches don't fail while disconnected (they wait)
+    //   (2) once connected + bridge_ready, they drain in FIFO order
+    //   (3) no buffered-send leakage during the wait
     const { supervisor, store, hookLog } = fixture();
     let connected = false;
     const cm = {
         get connected() { return connected; },
-        sendToChannel(chatId, content, userId) {
-            if (!connected) return false;
-            return true; // would normally also call supervisor-side handlers
-        },
+        sendToChannelUnbuffered() { return connected; },
+        on: () => {},
+        off: () => {},
     };
     supervisor.channelManager = cm;
     await supervisor.start();
@@ -368,26 +385,32 @@ test('queue does not stall when pre-activation dispatch fails', async () => {
     const first = supervisor.enqueue({ source: 'scheduler', payload: 'one' });
     const second = supervisor.enqueue({ source: 'scheduler', payload: 'two' });
 
-    const outcome1 = supervisor.awaitOutcome(first.dispatchId);
-    const outcome2 = supervisor.awaitOutcome(second.dispatchId);
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(store.getDispatch(first.dispatchId).state, DISPATCH_STATES.QUEUED);
+    assert.equal(store.getDispatch(second.dispatchId).state, DISPATCH_STATES.QUEUED);
 
-    // Both should fail with bridge_unavailable (connected === false)
-    const r1 = await outcome1;
-    assert.equal(r1.state, DISPATCH_STATES.FAILED);
-    assert.equal(r1.error, 'bridge_unavailable');
-
-    const r2 = await outcome2;
-    assert.equal(r2.state, DISPATCH_STATES.FAILED,
-        `queue stalled after pre-activation failure (second state=${r2.state})`);
-    assert.equal(r2.error, 'bridge_unavailable');
-
-    // Now "reconnect" and fire a fresh dispatch — it should activate normally.
+    // Reconnect + drive bridge_ready → drain begins.
     connected = true;
-    const third = supervisor.enqueue({ source: 'scheduler', payload: 'three' });
-    await waitForCondition(() => store.getDispatch(third.dispatchId).state === DISPATCH_STATES.ACTIVE);
+    supervisor._onBridgeReady();
+
+    await waitForCondition(
+        () => store.getDispatch(first.dispatchId).state === DISPATCH_STATES.ACTIVE,
+        { timeoutMs: 500 },
+    );
+    // Complete the first with a Stop hook; _activateNext should promote
+    // the second one next.
     fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
-    const r3 = await supervisor.awaitOutcome(third.dispatchId);
-    assert.equal(r3.state, DISPATCH_STATES.COMPLETED);
+    const r1 = await supervisor.awaitOutcome(first.dispatchId);
+    assert.equal(r1.state, DISPATCH_STATES.COMPLETED);
+
+    await waitForCondition(
+        () => store.getDispatch(second.dispatchId).state === DISPATCH_STATES.ACTIVE,
+        { timeoutMs: 500 },
+    );
+    fs.appendFileSync(hookLog, JSON.stringify({ hookEventName: 'Stop' }) + '\n');
+    const r2 = await supervisor.awaitOutcome(second.dispatchId);
+    assert.equal(r2.state, DISPATCH_STATES.COMPLETED,
+        'second dispatch must activate after first completes');
 
     await supervisor.shutdown();
     store.close();

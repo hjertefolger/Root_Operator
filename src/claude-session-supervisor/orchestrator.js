@@ -217,6 +217,27 @@ class ClaudeSessionSupervisor extends EventEmitter {
         // Runs AFTER bootCleanup so any surviving orphan Claude is already
         // dead, and BEFORE the probe so the probe is the first new dispatch.
         this._recoverOrphanedDispatches();
+
+        // If orphan status is UNSAFE (kill failure, missing pidfile with
+        // prior-epoch orphans, or uncertain probe) the old Claude may still
+        // be alive and writing to the stable hook log. Any new dispatch we
+        // accept would share that hook stream and could pick up stray
+        // Stop/StopFailure events from the orphan, completing/failing fresh
+        // work on hooks it never emitted. Transition to HARD_FAILED so
+        // further enqueues throw rather than run under this ambiguity.
+        // Operators must restart the host after resolving the orphan to
+        // return the supervisor to service.
+        if (this._orphanStatusUnsafe) {
+            this._transition('orphan_unsafe', { occurredAt: this.clock() });
+            this.incidents.record({
+                kind: 'supervisor_hard_failed_orphan_unsafe',
+                epoch: this.epoch,
+                details: {
+                    reason: 'orphan_status_unsafe',
+                    note: 'restart required after confirming orphan Claude is terminated',
+                },
+            });
+        }
         // NOTE: we deliberately do NOT drain re-queued dispatches here. On a
         // real boot main.js starts the supervisor BEFORE spawnClaudeCode, so
         // the channel bridge is still disconnected — calling _activateNext
@@ -400,18 +421,20 @@ class ClaudeSessionSupervisor extends EventEmitter {
             } catch (_) { /* best-effort during shutdown */ }
             this.activeDispatch = null;
         }
-        // Also terminalize ANY queued dispatches in the current epoch. Without
-        // this, a channel-mode toggle with queued scheduler work would reject
-        // the scheduler's awaitOutcome (clearing runningAt), leave the row
+        // Also terminalize ANY remaining non-terminal dispatches. Channel-mode
+        // toggles with queued scheduler work would otherwise reject the
+        // scheduler's awaitOutcome (clearing runningAt), leave the row
         // non-terminal in SQLite, and then next-boot recovery would re-queue
-        // an orphan with no scheduler waiter to reconcile its outcome. The
-        // activeDispatch branch above covers the in-flight one; this loop
-        // covers everything queued behind it.
+        // an orphan with no scheduler waiter to reconcile its outcome. We
+        // deliberately do NOT filter by epoch here — the only supervisor
+        // instance that could touch these rows is this one (teardownChannelMode
+        // shuts the prior instance down before creating a new one), so sweeping
+        // all open rows is safe and simpler than reasoning about epoch equality
+        // when epoch is sometimes null.
         try {
             const open = this.store.listOpenDispatches();
             for (const row of open) {
                 if (!row || !row.dispatch_id) continue;
-                if ((row.epoch || 0) !== this.epoch) continue;
                 if (TERMINAL_DISPATCH_STATES.has(row.state)) continue;
                 this.store.updateDispatchState(row.dispatch_id, {
                     state: DISPATCH_STATES.ABANDONED,
@@ -437,6 +460,23 @@ class ClaudeSessionSupervisor extends EventEmitter {
 
     _activateNext() {
         if (this.activeDispatch) return;
+        // Bridge-connectivity gate. If the ChannelManager exposes a
+        // `.connected` flag and it's false, leave the queue alone —
+        // _onBridgeReady() will call _activateNext() again once the bridge
+        // is live. This prevents three distinct footguns:
+        //   (1) cold-boot: supervisor.start() runs before spawnClaudeCode,
+        //       so anything recovered into this.queue would be sent through
+        //       a disconnected bridge and marked bridge_unavailable.
+        //   (2) cron fires during startup: a scheduled job that triggers
+        //       enqueue() before bridge_ready would drain the recovered
+        //       queue ahead of itself.
+        //   (3) bridge drops mid-session: new enqueues wait for reconnect
+        //       instead of firing and failing.
+        // Mocks/tests without a `.connected` property (undefined) behave as
+        // before — always-available — and are not affected.
+        if (this.channelManager && this.channelManager.connected === false) {
+            return;
+        }
         // Drain zombie ids: an id popped from the in-memory queue might have
         // been abandoned/shutdown before activation. Skip any that aren't
         // still in 'queued' state in the DB.
@@ -797,12 +837,16 @@ class ClaudeSessionSupervisor extends EventEmitter {
             this._transition('verify_skipped', { occurredAt: this.clock() });
         }
 
-        // 3. Drain any dispatches queued while the bridge was offline. Covers
-        // the post-boot case where _recoverOrphanedDispatches() re-adopted
-        // channel/user/scheduler QUEUED orphans before the bridge came up.
-        // Activation is gated on IDLE + no active dispatch; _activateNext()
-        // also self-guards, so calling it unconditionally here is safe.
-        if (this.state === STATES.IDLE && !this.activeDispatch && this.queue.length > 0) {
+        // 3. Drain any dispatches that waited while the bridge was offline.
+        // Includes two populations:
+        //   (a) recovery-adopted prior-epoch orphans pushed onto this.queue
+        //   (b) fresh enqueues made while channelManager.connected===false
+        //       that took the IDLE branch in enqueue() but were blocked by
+        //       _activateNext's connectivity gate — those rows are in the
+        //       DB as QUEUED but not on this.queue, so we can't rely on
+        //       this.queue.length here. _activateNext()'s empty-queue
+        //       fallback scans the DB for queued rows and handles this case.
+        if (this.state === STATES.IDLE && !this.activeDispatch) {
             this._activateNext();
         }
 

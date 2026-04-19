@@ -49,7 +49,7 @@ function fixture() {
     return { dir, store, runtime, channelManager, supervisor, hookLog };
 }
 
-test('supervisor + real ChannelManager: disconnected send does NOT populate pendingMessages', async () => {
+test('supervisor + real ChannelManager: disconnected dispatch waits, never populates pendingMessages', async () => {
     const { store, channelManager, supervisor } = fixture();
 
     // Sanity: real ChannelManager starts disconnected
@@ -61,26 +61,31 @@ test('supervisor + real ChannelManager: disconnected send does NOT populate pend
     const { dispatchId } = supervisor.enqueue({
         source: 'scheduler', payload: 'sensitive payload',
     });
-    const outcome = await supervisor.awaitOutcome(dispatchId);
 
-    // Dispatch must fail with bridge_unavailable
-    assert.equal(outcome.state, DISPATCH_STATES.FAILED);
-    assert.equal(outcome.error, 'bridge_unavailable');
+    // Post-pass-13 semantics: _activateNext gates on
+    // channelManager.connected, so the dispatch sits QUEUED rather than
+    // firing through a dead socket. Let the event loop settle to confirm
+    // nothing fires asynchronously.
+    await new Promise(r => setTimeout(r, 80));
     const row = store.getDispatch(dispatchId);
-    assert.equal(row.state, DISPATCH_STATES.FAILED);
+    assert.equal(row.state, DISPATCH_STATES.QUEUED,
+        'dispatch must wait while bridge is disconnected');
 
-    // CRITICAL: the real ChannelManager's internal buffer must still be
-    // empty. If supervisor had used the legacy sendToChannel(), the payload
-    // would now be sitting in pendingMessages ready to flush on reconnect.
+    // CRITICAL invariant: the real ChannelManager's buffer stays empty
+    // regardless. If the supervisor had used the legacy sendToChannel path,
+    // the payload would now be in pendingMessages ready to flush on reconnect.
     assert.equal(channelManager.pendingMessages.length, 0,
         `real ChannelManager.pendingMessages leaked: ${JSON.stringify(channelManager.pendingMessages)}`);
 
+    // shutdown() terminalizes the queued dispatch with shutdown_while_queued.
     await supervisor.shutdown();
+    const finalRow = store.getDispatch(dispatchId);
+    assert.equal(finalRow.state, DISPATCH_STATES.ABANDONED);
     channelManager.disconnect();
     store.close();
 });
 
-test('supervisor + real ChannelManager: multiple disconnected dispatches all fail, buffer stays empty', async () => {
+test('supervisor + real ChannelManager: multiple disconnected dispatches stay queued, buffer stays empty', async () => {
     const { store, channelManager, supervisor } = fixture();
 
     await supervisor.start();
@@ -93,16 +98,20 @@ test('supervisor + real ChannelManager: multiple disconnected dispatches all fai
         ids.push(dispatchId);
     }
 
-    const outcomes = await Promise.all(ids.map(id => supervisor.awaitOutcome(id)));
-    for (const o of outcomes) {
-        assert.equal(o.state, DISPATCH_STATES.FAILED);
-        assert.equal(o.error, 'bridge_unavailable');
+    // No activation on a disconnected bridge — all three sit in queue.
+    await new Promise(r => setTimeout(r, 80));
+    for (const id of ids) {
+        assert.equal(store.getDispatch(id).state, DISPATCH_STATES.QUEUED);
     }
 
     // Buffer remains empty — no risk of post-reconnect flush
     assert.equal(channelManager.pendingMessages.length, 0);
 
+    // Shutdown abandons them cleanly.
     await supervisor.shutdown();
+    for (const id of ids) {
+        assert.equal(store.getDispatch(id).state, DISPATCH_STATES.ABANDONED);
+    }
     channelManager.disconnect();
     store.close();
 });
