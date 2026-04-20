@@ -1,4 +1,6 @@
-# Root Operator
+<div align="center">
+
+# Root_Operator
 
 [![Version](https://img.shields.io/badge/version-2.4.1-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -8,6 +10,8 @@
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
 ✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
+
+</div>
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
@@ -27,8 +31,6 @@
 > - Keep secrets and credentials out of the agent's reachable filesystem
 > - Use device pairing and E2E encryption -- never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
-
----
 
 ## Why Root Operator?
 
@@ -224,8 +226,6 @@ Set a custom URL (e.g., `yourname.rootoperator.dev`) for easy access:
 1. Open Settings from the tray menu
 2. Enter your desired subdomain
 3. Your tunnel will be accessible at `yourname.rootoperator.dev`
-
-Requires the optional Cloudflare Worker -- see `worker/` directory and `.env.example`.
 
 ### Environment Variables
 
