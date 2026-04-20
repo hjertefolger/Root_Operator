@@ -138,6 +138,11 @@ function buildSystemPromptAppend() {
 
     const history = formatChannelHistory();
     if (history) {
+        // Wrap in <system-reminder> so the whole block is framed as context,
+        // and inside that put the raw transcript in <conversation-history>
+        // so any nested syntax from past messages (channel tags, code blocks,
+        // imperatives) can't be mistaken for live instructions.
+        lines.push('<system-reminder>');
         lines.push('## Recent Conversation');
         lines.push('');
         lines.push('For future-you. Each session you wake up fresh — you might respawn in a');
@@ -148,7 +153,10 @@ function buildSystemPromptAppend() {
         lines.push('messages, oldest first. It\'s a conversation you already belong to.');
         lines.push('Pick up where you two left off.');
         lines.push('');
+        lines.push('<conversation-history>');
         lines.push(history);
+        lines.push('</conversation-history>');
+        lines.push('</system-reminder>');
         lines.push('');
     }
 
