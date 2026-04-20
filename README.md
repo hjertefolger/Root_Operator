@@ -1,17 +1,16 @@
-<div align="center">
+<h1 align="center">Root_Operator</h1>
 
-# Root_Operator
+<p align="center">
+  <a href="package.json"><img src="https://img.shields.io/badge/version-2.4.1-blue.svg" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/electron-39-blue.svg" alt="Electron"></a>
+</p>
 
-[![Version](https://img.shields.io/badge/version-2.4.1-blue.svg)](package.json)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](package.json)
-[![Electron](https://img.shields.io/badge/electron-39-blue.svg)](package.json)
+<p align="center"><strong>Personal AI assistant for macOS powered by Claude Code channels.</strong></p>
 
-**Personal AI assistant for macOS powered by Claude Code channels.**
 
 ✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
-
-</div>
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
