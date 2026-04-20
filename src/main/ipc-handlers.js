@@ -336,6 +336,26 @@ function init(deps = {}) {
 
     ipcMain.handle('GET_OPERATING_MODE', () => getOperatingMode());
 
+    ipcMain.handle('GET_DYNAMIC_INDEXING_ENABLED', () => {
+        const dm = getDynamicMemory();
+        if (!dm || typeof dm.isIndexingEnabled !== 'function') return false;
+        return Boolean(dm.isIndexingEnabled());
+    });
+
+    ipcMain.handle('SET_DYNAMIC_INDEXING_ENABLED', (event, nextValue) => {
+        const dm = getDynamicMemory();
+        if (!dm || typeof dm.setIndexingEnabled !== 'function') {
+            return { success: false, enabled: false, reason: 'memory not available' };
+        }
+        try {
+            const enabled = dm.setIndexingEnabled(Boolean(nextValue));
+            return { success: true, enabled };
+        } catch (error) {
+            logDebug(`[MEMORY] SET_DYNAMIC_INDEXING_ENABLED failed: ${error.message}`);
+            return { success: false, enabled: Boolean(dm.isIndexingEnabled()), reason: error.message };
+        }
+    });
+
     ipcMain.handle('STOP', () => {
         stopBridge();
         return { success: true };

@@ -3,8 +3,9 @@
  *
  * Lifecycle:
  *   - constructor(workspaceDir, resourcesPath) - no heavy work.
- *   - init(store) - open DB. Ready as soon as DB is open; no user-visible toggle.
- *   - indexMessage(role, content, chatId) - chunk, dedup, embed, insert (always on when DB is open).
+ *   - init(store) - open DB, restore indexing flag from store.
+ *   - indexMessage(role, content, chatId) - chunk, dedup, embed, insert.
+ *     Gated by isIndexingEnabled() — toggle OFF skips silently.
  *   - searchMemory(query, opts) - hybrid search, returns array of {id, content, timestamp, score}.
  *   - saveMemory(content, chatId) - intentional write, bypasses chunker.
  *   - updateMemoryById(id, content) - re-embed + update.
@@ -12,7 +13,13 @@
  *   - buildContextForSpawn(query, chatId, limit, beforeTimestamp) - hybrid search -> markdown block.
  *   - close() - close DB on app quit.
  *
- * The embedder is lazy: first operation after init triggers model load.
+ * Two layers of "on":
+ *   - isReady()            - DB is open. Tool methods (search/save/update/delete)
+ *                             are available whenever this is true.
+ *   - isIndexingEnabled()  - user-controlled toggle. Gates only the PASSIVE
+ *                             indexMessage() path and the eager embedder
+ *                             warmup. Deliberate tool writes are unaffected.
+ *
  * Long-term / multi-modal memory is delegated to UMIO (future); this layer
  * handles agent-facing recall of prior channel messages older than the
  * channel-history tail that is already in the system prompt.
@@ -48,6 +55,8 @@ class DynamicMemory {
         this._embedderReady = false;
         this._embedderInitPromise = null;
         this._logger = null;
+        this._store = null;
+        this._indexingEnabled = false;
     }
 
     setLogger(fn) {
@@ -60,10 +69,21 @@ class DynamicMemory {
         }
     }
 
-    async init(_store) {
-        // store arg kept for backwards-compatibility with main-process wiring;
-        // the feature used to persist an enabled flag here, but dynamic memory
-        // is now always on whenever the DB is open.
+    async init(store) {
+        // `store` backs the user-facing "Dynamic Indexing" toggle. The DB itself
+        // always opens when init runs — tool methods (search/save/update/delete)
+        // work regardless of the toggle. Only the passive indexMessage() path
+        // and the eager embedder warmup are gated.
+        this._store = store || null;
+        if (this._store && typeof this._store.get === 'function') {
+            try {
+                this._indexingEnabled = Boolean(this._store.get('dynamicIndexing.enabled', false));
+            } catch (err) {
+                this._log(`[MEMORY] Failed to read dynamicIndexing.enabled: ${err.message}`);
+                this._indexingEnabled = false;
+            }
+        }
+
         const brainDir = path.join(this.workspaceDir, 'brain');
         const backupsDir = path.join(brainDir, 'backups');
         const dbPath = path.join(brainDir, 'memory.db');
@@ -259,10 +279,44 @@ class DynamicMemory {
 
     /**
      * Ready means the DB is open and dynamic memory can accept reads/writes.
-     * Dynamic memory is always on when ready — there is no user-visible toggle.
+     * Independent of the user-facing indexing toggle.
      */
     isReady() {
         return Boolean(this.db);
+    }
+
+    /**
+     * User-controlled toggle for the PASSIVE indexMessage() path and the
+     * eager embedder warmup. Tool methods (search/save/update/delete) are
+     * NOT gated by this — they always work when isReady() is true.
+     */
+    isIndexingEnabled() {
+        return Boolean(this._indexingEnabled);
+    }
+
+    /**
+     * Flip the indexing toggle at runtime. Persists to the backing store so
+     * the choice survives restarts. Returns the new effective value.
+     *
+     * OFF → ON: if the DB is already open and the embedder hasn't warmed
+     * yet, kick off a background warmup so the next indexed message doesn't
+     * pay the cold-load penalty mid-flight.
+     */
+    setIndexingEnabled(next) {
+        const value = Boolean(next);
+        this._indexingEnabled = value;
+        if (this._store && typeof this._store.set === 'function') {
+            try {
+                this._store.set('dynamicIndexing.enabled', value);
+            } catch (err) {
+                this._log(`[MEMORY] Failed to persist dynamicIndexing.enabled: ${err.message}`);
+            }
+        }
+        if (value && this.isReady() && !this._embedderReady && !this._embedderInitPromise) {
+            // Fire-and-forget. Errors are logged inside warmup().
+            this.warmup();
+        }
+        return value;
     }
 
     _modelBaseDir() {
@@ -323,6 +377,7 @@ class DynamicMemory {
      */
     async indexMessage(role, content, chatId, { externalRef } = {}) {
         if (!this.isReady()) return;
+        if (!this.isIndexingEnabled()) return;
         if (typeof content !== 'string' || !content.trim()) return;
 
         const effectiveRole = role === 'user' ? 'user' : 'assistant';

@@ -30,6 +30,9 @@ function SettingsView({ onBack, tunnelState }) {
   const [assistantName, setAssistantName] = useState(DEFAULT_ASSISTANT_NAME);
   const [pairedDevices, setPairedDevices] = useState([]);
   const [updateActionPending, setUpdateActionPending] = useState(false);
+  const [dynamicIndexingEnabled, setDynamicIndexingEnabled] = useState(false);
+  const [dynamicIndexingBusy, setDynamicIndexingBusy] = useState(false);
+
   // Initial values for dirty checking
   const initialValues = useRef({});
 
@@ -44,10 +47,11 @@ function SettingsView({ onBack, tunnelState }) {
   useEffect(() => {
     async function loadSettings() {
       try {
-        const [settings, currentSubdomain, devices] = await Promise.all([
+        const [settings, currentSubdomain, devices, indexingEnabled] = await Promise.all([
           invoke('GET_STORE', 'cfSettings'),
           invoke('GET_SUBDOMAIN'),
           invoke('GET_PAIRED_DEVICES'),
+          invoke('GET_DYNAMIC_INDEXING_ENABLED').catch(() => false),
         ]);
 
         const loadedDebug = (settings && settings.debugLogging) || false;
@@ -58,6 +62,7 @@ function SettingsView({ onBack, tunnelState }) {
         setSubdomain(loadedSubdomain);
         setAssistantName(loadedAssistantName);
         setPairedDevices(devices || []);
+        setDynamicIndexingEnabled(Boolean(indexingEnabled));
 
         // Store initial values for dirty checking
         initialValues.current = {
@@ -90,6 +95,26 @@ function SettingsView({ onBack, tunnelState }) {
       setPairedDevices(prev => prev.filter(d => d.kid !== kid));
     } catch (e) {
       console.error('Failed to remove device:', e);
+    }
+  };
+
+  const handleDynamicIndexingToggle = async (nextValue) => {
+    const next = Boolean(nextValue);
+    const previous = dynamicIndexingEnabled;
+    setDynamicIndexingEnabled(next); // optimistic
+    setDynamicIndexingBusy(true);
+    try {
+      const result = await invoke('SET_DYNAMIC_INDEXING_ENABLED', next);
+      if (!result || result.success === false) {
+        setDynamicIndexingEnabled(previous);
+      } else if (typeof result.enabled === 'boolean') {
+        setDynamicIndexingEnabled(result.enabled);
+      }
+    } catch (e) {
+      console.error('Failed to toggle dynamic indexing:', e);
+      setDynamicIndexingEnabled(previous);
+    } finally {
+      setDynamicIndexingBusy(false);
     }
   };
 
@@ -344,7 +369,27 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Section 4: App Updates */}
+          {/* Section 4: Dynamic Indexing */}
+          <AccordionItem value="dynamic-indexing" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Dynamic Indexing
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex justify-between items-center gap-3">
+                <span className="text-xs text-muted-foreground">
+                  Create local chat embeddings for searchable memory as you chat.
+                </span>
+                <Switch
+                  id="dynamic-indexing"
+                  checked={dynamicIndexingEnabled}
+                  disabled={dynamicIndexingBusy}
+                  onCheckedChange={handleDynamicIndexingToggle}
+                />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Section 5: App Updates */}
           <AccordionItem value="app-updates" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
               App Updates

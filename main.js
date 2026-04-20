@@ -600,11 +600,13 @@ app.whenReady().then(async () => {
         dynamicMemory = new DynamicMemory(WORKSPACE_DIR, process.resourcesPath);
         dynamicMemory.setLogger(logDebug);
         await dynamicMemory.init(store);
-        // Non-blocking embedder warmup: on Intel Macs the cold load can eat
-        // the entire enrichment timeout budget, so first-turn enrichment
-        // would silently miss. Running it in the background during app init
-        // makes the first real user turn hit a hot embedder.
-        dynamicMemory.warmup();
+        // Only warm the embedder eagerly when indexing is ON. With the toggle
+        // OFF the user has opted into "quiet mode" — no background CPU, no
+        // ~300MB model in RAM. The first tool call pays the one-time cold
+        // load; subsequent calls are fast.
+        if (dynamicMemory.isIndexingEnabled()) {
+            dynamicMemory.warmup();
+        }
     } catch (error) {
         logDebug(`[MEMORY] Failed to initialize: ${error.message}`);
         dynamicMemory = null;
