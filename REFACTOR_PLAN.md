@@ -1,8 +1,26 @@
-# Root Operator — Scheduler + Supervisor Strip + main.js Split
+# Root Operator — Restore Scheduler + Remove Supervisor + Split main.js
 
 **Branch:** `refactor/scheduler-strip`
-**Worktree:** `~/Documents/Dev/55-Root_Operator.wt/scheduler-strip`
-**Target executor:** Codex
+**Target executor:** Codex (manual dispatch, phase-at-a-time)
+**Reference archive (pre-refactor state + historical scheduler):** `~/.root-operator/workspace/memory/scheduled-jobs-archive/`
+
+---
+
+## 0. Reference archive — what's there and when Codex should read it
+
+Before touching any code, Codex should read `~/.root-operator/workspace/memory/scheduled-jobs-archive/README.md` to orient. The directory contains:
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Index + diff summary between 5598ac1 scheduler and current (aa1b96a). Read first. |
+| `scheduler_5598ac1.js` | **Canonical file to restore.** Full 394-line `src/scheduler.js` as it existed at commit `5598ac1` (2026-03-22), the version that ran nightly builds 019–021 reliably. This is the target for Phase 2 — either copy this file into place or run `git show 5598ac1:src/scheduler.js > src/scheduler.js` to get the same bytes. |
+| `main_wiring_5598ac1.js` | Reference-only snippet of `main.js` lines ~1645–1725 at commit 5598ac1, showing how the scheduler was wired at that time (2-arg constructor, IPC request handler). Use this to guide the Phase 2 main.js edits. |
+| `all-jobs-2026-04-20.json` | Raw electron-store dump of Tom's three scheduled jobs right before this refactor (Night Lab, Signal, Sleep Cycle). Preserved so the jobs can be re-added after the refactor lands. |
+| `night-lab-nightly-build.md` | Night Lab job — name, id, cron `22 3 * * *`, chatId, full 5295-char prompt. |
+| `signal-nightly-scan.md` | Signal scan — name, id, cron `0 4 * * *`, full 3430-char prompt. |
+| `sleep-cycle.md` | Sleep cycle — name, id, cron `0 5 * * *`, full 2824-char prompt. |
+
+None of these files need to be added to the repository. They are reference material under `~/.root-operator/workspace/memory/` (outside the repo) and stay there.
 
 ---
 
@@ -10,36 +28,38 @@
 
 Root Operator runs exactly ONE Claude CLI (April 4 2026 Anthropic enforcement forbids programmatic `claude -p` spawns). The current scheduler + supervisor were designed as if we could manage a fleet of processes: dispatch state machine (queued → sending → active → completed/failed/abandoned), silence/wedge detection with exponential backoff, kill-and-replay with cap, intensity ring for respawn budget, effect ledger.
 
-All of that is machinery to CONTROL isolated workers we don't have. With a single-process model the correct primitive is: **cron fires → post a channel message → Claude drains the channel in order**. The channel queue IS the job queue. No state machine, no replay, no wedge detection.
+All of that is machinery to control isolated workers we don't have. With a single-process model the correct primitive is: **cron fires → post a channel message → Claude drains the channel in order**. The channel queue IS the job queue. No state machine, no replay, no wedge detection.
 
-Yesterday's hardening (exponential silence 30→60→120 min, replay_cap 2→4, stuck_run_ms bumped to 15.5 h, scheduler supervisor-aware liveness) compounded the wrong abstraction: a single wedged Night Lab now starves the entire serial queue for 3+ hours, producing four orphan half-builds while Signal + Sleep Cycle wait behind it and get abandoned on shutdown. The fixes made the wrong abstraction harder to escape.
+The scheduler at commit **`5598ac1` (2026-03-22)** — "Harden scheduler to production grade" — ran nightly builds 019 (Mar 25), 020 (Mar 26), 021 (Mar 27) reliably. It predates the `claude-session-supervisor/` folder entirely. It takes `(store, channelManager)` and calls `channelManager.sendToChannel()` to fire jobs. 394 lines. That's the target. The file is already extracted to `~/.root-operator/workspace/memory/scheduled-jobs-archive/scheduler_5598ac1.js`.
 
-This refactor removes the wrong abstraction.
+Yesterday's hardening layer (exponential silence 30→60→120 min, replay_cap 2→4, stuck_run_ms 15.5 h, supervisor-aware liveness check) compounded the wrong abstraction. A single wedged Night Lab now starves the serial queue for 3+ hours and produces four orphan half-builds while Signal + Sleep Cycle wait behind it and get abandoned on shutdown. The fixes made the wrong abstraction harder to escape.
+
+This refactor reverts the architectural mistake.
 
 ---
 
 ## 2. Goals
 
-1. **Delete** `src/scheduler.js` (665 lines) and replace with a minimal cron→channel-message injector (~120 lines).
-2. **Shrink** `src/claude-session-supervisor/` to a thin "is Claude alive?" probe + boot orphan cleanup + epoch mgmt. Remove all dispatch-state machinery.
+1. **Restore** `src/scheduler.js` to its state at commit `5598ac1` (394 lines, 2-arg constructor, no supervisor coupling). Canonical copy: `~/.root-operator/workspace/memory/scheduled-jobs-archive/scheduler_5598ac1.js`.
+2. **Delete** `src/claude-session-supervisor/` in its entirety. Extract the one piece of genuine value — boot-time orphan Claude kill — into a small standalone utility.
 3. **Split** `main.js` (6231 lines) into a small entry point + focused modules under `src/main/`.
-4. Keep the app functionally equivalent for the user: scheduled jobs still fire, Claude still spawns, pairing/tunnel/notifications still work.
+4. Keep the app functionally equivalent for the user: scheduled jobs still fire as they did at 5598ac1, Claude still spawns, pairing/tunnel/notifications still work.
 
 ---
 
 ## 3. Non-goals
 
 - No new features.
-- No UI changes to scheduled-jobs CRUD (IPC surface stays the same).
+- No UI changes to scheduled-jobs CRUD. IPC surface (`ro_schedule`, `ro_list_schedules`, `ro_delete_schedule`, `ro_toggle_schedule`, `ro_run_now`) stays identical.
 - No change to pairing / tunnel / notifications / crypto logic (moved, not rewritten).
-- No new storage backend. electron-store + existing SQLite schema stay; SQLite tables can be pruned but not replaced.
-- No resumable / checkpointed jobs. Non-idempotent jobs (Night Lab, creative builds) become the caller's problem: one shot per scheduled fire, no retry.
+- No new storage backend. electron-store stays; SQLite DB for supervisor goes away with the supervisor.
+- No resumable / checkpointed jobs. Non-idempotent jobs (Night Lab, creative builds) become the caller's problem: one shot per scheduled fire, auto-disable after 10 consecutive errors (5598ac1's existing safety).
 
 ---
 
 ## 4. Target architecture
 
-### Before (what we have today)
+### Before (master `aa1b96a`)
 
 ```
 cron → Scheduler._fireJob
@@ -53,24 +73,22 @@ cron → Scheduler._fireJob
          └── await outcome ─→ mark lastRun/lastResult/consecutiveErrors
 ```
 
-### After (what we're building)
+### After (restored 5598ac1 form)
 
 ```
-cron → ScheduledJobs._fire(job)
-         └── channelManager.sendToChannel(chatId, `[Scheduled: ${job.name}]\n\n${job.prompt}`, userId)
-              └── record { jobId, firedAt, bridgeReady: bool } in observability log
+cron → Scheduler._fireJob (5598ac1 form)
+         ├── runningAt lock check (wall-clock 2h cutoff only)
+         ├── consecutive-errors backoff gate (unchanged)
+         ├── channelManager.sendToChannel(payload)
+         └── mark lastRun/lastResult  (boolean return)
 ```
 
-Supervisor shrinks to:
-- `start()` / `shutdown()` / `getStatus()` → `{ isAlive, epoch, orphanUnsafe }`
-- Boot orphan-kill + pidfile tracking (unchanged)
-- Epoch-scoped log path resolution (unchanged)
-- **Removed:** enqueue, awaitOutcome, dispatching/suspect/respawning states, wedge/silence timers, hook-log progress tailing for dispatch state, replay logic, intensity ring, effect ledger.
+Supervisor folder is gone. A new `src/orphan-kill.js` (~80 lines) is called once on boot by `main.js` to kill any zombie Claude process from a prior session.
 
 If Claude is busy / hung when a cron fires:
-- `channelManager.sendToChannel` buffers up to 100 messages on disconnect and flushes on reconnect. Cron firings queue naturally.
+- `channelManager.sendToChannel` buffers up to 100 messages on disconnect and flushes on reconnect. Cron firings queue naturally in the channel layer.
 - If Claude is alive but mid-tool-call, the message sits in the channel and Claude picks it up when its current turn finishes.
-- If Claude is hard-wedged, the message sits in the channel until user restarts. No attempt to recover automatically.
+- If Claude is hard-wedged, the message sits in the channel until user restarts. No automatic recovery. No kill-and-replay.
 
 ---
 
@@ -78,141 +96,112 @@ If Claude is busy / hung when a cron fires:
 
 ### Files (full deletion)
 
-- `src/scheduler.js`
-- `src/claude-session-supervisor/orchestrator.js`
-- `src/claude-session-supervisor/orchestrator.test.js`
-- `src/claude-session-supervisor/pr3-effect-ledger.test.js`
-- `src/claude-session-supervisor/channel-manager-integration.test.js`
-- `src/claude-session-supervisor/scheduler-integration.test.js`
+Entire directory `src/claude-session-supervisor/`:
+- `orchestrator.js` + `orchestrator.test.js`
+- `policy.js` + `policy.test.js`
+- `runtime.js` + `runtime.test.js` (but see §6 — orphan-kill extracted to new file first)
+- `incidents.js` + `incidents.test.js`
+- `dispatch-store.js` + `dispatch-store.test.js`
+- `index.js`
+- `pr3-effect-ledger.test.js`
+- `schema-migration.test.js`
+- `channel-manager-integration.test.js`
+- `scheduler-integration.test.js`
 
-### Code removed from within retained files
+### SQLite database
 
-**`src/claude-session-supervisor/policy.js`** — remove:
-- `DISPATCH_STATES`, `TERMINAL_DISPATCH_STATES`, `transitionDispatch`
-- `replayCapForSource`, `canReplayDispatch`, `effectiveSilenceMs`
-- `intensityExhausted`
-- `SAFETY_NET_MULTIPLIER`, `DEFAULT_SILENCE_MS`
-- From `STATES`: keep only `STOPPED, STARTING, VERIFYING, IDLE, HARD_FAILED`. Remove `DISPATCHING, SUSPECT, PROBING, RESPAWNING`.
-- `transitionSupervisor` table reduced accordingly.
+- The supervisor's SQLite file (`~/.root-operator/runtime/<epoch>/supervisor.db` or similar — verify path at runtime). Delete on first boot of the new version. No migration needed.
+- `~/.root-operator/runtime/supervisor-incidents.jsonl` — stop writing to it. Leave existing file on disk as historical artifact. User can delete manually.
 
-**`src/claude-session-supervisor/runtime.js`** — retain core (epoch, paths, pidfile, orphan probe), but:
-- Remove `onKillRequest` concept — supervisor no longer kills the active Claude mid-flight. On boot, if an orphan is found, we kill it (that's fine). During normal operation, no kills.
-- `bootCleanup` stays.
-- `findAndKillOrphans` becomes boot-only, not runtime-callable.
+### electron-store keys / persisted fields
 
-**`src/claude-session-supervisor/incidents.js`** — retain, but prune event kinds:
-- KEEP: `supervisor_started`, `boot_cleanup`, `boot_cleanup_kill_failed`, `supervisor_hard_failed_orphan_unsafe`, `orphan_unsafe_latch_carried_forward`, `orphan_unsafe_latch_cleared`, `process_exit`
-- DELETE: `dispatch_enqueued`, `dispatch_activated`, `dispatch_completed`, `dispatch_abandoned`, `wedge_detected`, `silence_timeout`, `kill_ordered`, `dispatch_replay_started`, `verify_ok`, `verify_probe_failed`, `supervisor_await_*`, any dispatch-lifecycle kind.
+No keys removed from the top level. Within each `scheduler-jobs` record:
+- Keep all fields present in 5598ac1 form: `id, name, cron, prompt, chatId, enabled, lastRun, lastResult, lastError, consecutiveErrors, runningAt, lastDurationMs`.
+- Today's job records already have exactly these fields. No migration needed — 5598ac1 scheduler reads today's records without modification.
 
-**`src/claude-session-supervisor/dispatch-store.js`** — simplify schema:
-- KEEP table: `incidents` (id, epoch, kind, details_json, occurred_at) — minus `state_from/state_to/dispatch_id` columns since they're no longer used
-- KEEP table: `supervisor_state` (key, value)
-- DELETE tables: `dispatches`, `effects`
-- Write a schema migration that drops them (or marks unused). File itself rename to something like `supervisor-store.js` since "dispatch" is now gone, or leave the filename and note the vestigial name.
+### main.js code removed
 
-**`src/claude-session-supervisor/index.js`** — public API reduced to:
+- Supervisor imports (lines ~45–50)
+- Supervisor initialization block in `initChannelMode` (lines ~3640–3760: `supervisorStore = new ...`, `supervisorRuntime = ...`, `supervisor = createSupervisor(...)`, `supervisor.start().then(...)`)
+- Supervisor teardown in `teardownChannelMode` (lines ~3979–4025)
+- Any supervisor-status polling / IPC exposure
+- Any UI code that displays supervisor state or dispatch state (verify in renderer and strip if present)
+
+---
+
+## 6. What REPLACES the supervisor's orphan-kill
+
+The only genuinely useful piece in the supervisor today is boot-time orphan Claude cleanup: on app launch, if a stale Claude process from a prior crashed session is still running, kill it before spawning a new one. Without this, you can end up with two Claudes fighting over the same hook log.
+
+**New file: `src/orphan-kill.js` (~80 lines, target)**
+
+Responsibilities:
+- On boot, before spawning Claude:
+  - Read `~/.root-operator/runtime/supervisor.pidfile` (keep same filename for continuity with existing installs).
+  - `ps -p <pid>`; if the process exists AND its command line matches a Claude signature, SIGTERM it; after 2s SIGKILL if still alive.
+  - Delete the pidfile.
+- Expose `recordPid(pid)` to write the new Claude's PID after spawn.
+- Expose `clearPid()` to wipe on clean exit.
+
+Public API:
 ```js
 module.exports = {
-  SupervisorStore,     // renamed from DispatchStore
-  Runtime,
-  IncidentLogger,
-  ClaudeSessionSupervisor,
-  createSupervisor,
-  STATES,              // only 5 values
-  transitionSupervisor,
-  HOOK_BASENAME, DEBUG_BASENAME, MAX_EPOCHS_KEPT,
-}
+  killOrphanClaudeIfAny,   // async, called once on boot
+  recordPid,               // sync, called right after claudeProcess spawn
+  clearPid,                // sync, called on clean exit
+};
 ```
 
-### electron-store keys / persisted fields removed
+Wire into `main.js`:
+- Top of `initChannelMode`, before `spawnClaudeCode`: `await killOrphanClaudeIfAny();`
+- Inside `spawnClaudeCode` after PTY spawn: `recordPid(claudeProcess.pid);`
+- Inside `teardownChannelMode` after Claude exit: `clearPid();`
+- Inside `app.on('will-quit')` handler: `clearPid();` (best-effort)
 
-From each scheduled job record, remove runtime fields:
-- `runningAt`, `consecutiveErrors`, `lastError`, `lastDurationMs`
-
-Keep: `id, name, cron, prompt, chatId, enabled, lastFiredAt` (renamed from `lastRun`).
-
-Write one migration step on first boot after this refactor: for each job, strip removed fields. Don't delete user-authored fields (name, cron, prompt).
+Source to crib from: `src/claude-session-supervisor/runtime.js` — functions `recordPid`, `probeOrphanStatus`, `findAndKillOrphans`. Strip out epoch logic, pidfile-signature verification, and the `_orphanStatusUnsafe` latch. Keep only basic ps-match-and-kill.
 
 ---
 
-## 6. What REPLACES the scheduler
+## 7. What REPLACES the scheduler
 
-**New file: `src/scheduled-jobs.js` (~120 lines)**
+**Action: restore `src/scheduler.js` to its state at commit `5598ac1`.**
 
-```js
-const cron = require('node-cron');
-const crypto = require('crypto');
-const EventEmitter = require('events');
+Canonical file already archived — use either of:
 
-const MAX_JOBS = 50;
-const MAX_PROMPT_SIZE = 50_000;
-const MIN_REFIRE_GAP_MS = 5_000;
+```bash
+# Option A: copy from archive
+cp ~/.root-operator/workspace/memory/scheduled-jobs-archive/scheduler_5598ac1.js src/scheduler.js
 
-class ScheduledJobs extends EventEmitter {
-  constructor(store, channelManager) {
-    super();
-    this.store = store;
-    this.channelManager = channelManager;
-    this.timers = new Map();     // jobId → cron task
-    this._lastFire = new Map();  // jobId → ts (refire gap)
-  }
-
-  start() { /* load jobs, register timers */ }
-  stopAll() { /* cancel all cron tasks */ }
-
-  addJob({ name, cronExpr, prompt, chatId }) { /* validate + persist + register timer */ }
-  removeJob(id) { /* unregister + delete */ }
-  toggleJob(id, enabled) { /* (un)register timer, persist */ }
-  listJobs() { /* return sanitized list */ }
-
-  async runNow(id) {
-    const job = this._getJobs().find(j => j.id === id);
-    if (!job) throw new Error('job not found');
-    this._fire(job);
-  }
-
-  _fire(job) {
-    const now = Date.now();
-    const last = this._lastFire.get(job.id) || 0;
-    if (now - last < MIN_REFIRE_GAP_MS) return;
-    this._lastFire.set(job.id, now);
-
-    const payload = `[Scheduled: ${job.name}]\n\n${job.prompt}`;
-    const chatId = job.chatId || '__scheduler__';
-    const userId = '__scheduler__';
-
-    const ok = this.channelManager.sendToChannel(chatId, payload, userId);
-    this._updateJobField(job.id, { lastFiredAt: new Date().toISOString() });
-    this.emit('job', { action: 'fired', jobId: job.id, name: job.name, bridgeReady: ok, ts: new Date().toISOString() });
-  }
-
-  // ... _getJobs / _saveJobs / _updateJobField / _startTimer / _stopTimer helpers
-}
-
-module.exports = { ScheduledJobs };
+# Option B: check out from git history
+git show 5598ac1:src/scheduler.js > src/scheduler.js
 ```
 
-**What's gone vs. `Scheduler`:**
-- No `supervisor` param.
-- No `runningAt` / stuck-run detection — `sendToChannel` is synchronous (writes to socket or buffers).
-- No `consecutiveErrors` / backoff — if a job fires into a dead Claude, the message queues. Next scheduled fire does the same. If Claude never recovers, user notices.
-- No `awaitOutcome` — we don't observe Claude's reply; the reply goes through the normal channel read path and the user sees it like any other Claude message.
-- No `_completeJob` with error classification.
+Both produce the same 394 bytes-for-bytes file.
 
-`channelManager.sendToChannel` returns `false` only if the pending-messages buffer (max 100) overflows. That's the only "dropped" case, and it's the channel layer's concern, not ours.
+**Characteristics of the restored file:**
+- Constructor: `new Scheduler(store, channelManager)` — 2 args, no supervisor.
+- Exports: `{ Scheduler }` only (no `jobSilenceFor` — that was added for supervisor coupling).
+- `_fireJob`: calls `channelManager.sendToChannel('__scheduler__', payload, '__scheduler__')`; success on boolean `true`, error on `false` or throw.
+- Stuck-run: wall-clock 2h cutoff on boot (no supervisor consultation).
+- Backoff: `BACKOFF_SCHEDULE_MS` 30s → 60s → 5m → 15m → 60m on consecutive errors.
+- Auto-disable after 10 consecutive errors.
+- `MAX_JOBS=50`, `MAX_PROMPT_SIZE=50_000`, refire gap 5s.
 
-**Observability:** each fire emits a `job` event + writes `lastFiredAt`. The main process can log to `runtime/scheduled-jobs.jsonl` if Tom wants a history trail. Not required for v1.
+**No modifications to the restored file** beyond what's required for it to run on the current codebase. Verify that `channelManager.sendToChannel` signature is unchanged since 5598ac1 (it should be — that method has been stable). If any modernization is needed (e.g. a renamed export, an `await` missing on a newly-async method), keep the diff surgical and note it in the commit message.
+
+**main.js wiring changes in `initChannelMode`:**
+Replace `scheduler = new Scheduler(store, channelManager, supervisor);` with `scheduler = new Scheduler(store, channelManager);`. Reference snippet for how this was wired at 5598ac1: `~/.root-operator/workspace/memory/scheduled-jobs-archive/main_wiring_5598ac1.js`.
 
 ---
 
-## 7. main.js split
+## 8. main.js split
 
 Target: `main.js` from 6231 lines → ~500 lines of entry-point wiring.
 
 Create `src/main/` directory with modules below. Each exports an `init(deps)` function; `main.js` wires them together in `app.whenReady()`.
 
-| Module | Source lines | Role |
-|--------|--------------|------|
+| Module | Source lines (approx) | Role |
+|--------|-----------------------|------|
 | `src/main/crypto-pairing.js` | 100–810 | E2E handshake, JWK, worker keys, RSA/ECDH |
 | `src/main/tunnel.js` | 853–1044 | Cloudflare tunnel setup, subdomain mgmt |
 | `src/main/window-manager.js` | 1045–1325 | BrowserWindow lifecycle, viewer windows, dock icon |
@@ -221,63 +210,65 @@ Create `src/main/` directory with modules below. Each exports an `init(deps)` fu
 | `src/main/activity-tracker.js` | 2022–2200 | Hook/debug watchers, activity formatting |
 | `src/main/local-chat.js` | 2242–2500 | Local chat window + attachments |
 | `src/main/claude-lifecycle.js` | 3153–3500 | PTY spawn/kill, exit handler, hook/debug polling |
-| `src/main/channel-mode.js` | 3500–4025 | Wires supervisor + ScheduledJobs + channelManager, teardown |
+| `src/main/channel-mode.js` | 3500–4025 | Wires scheduler + channelManager + orphan-kill |
 | `src/main/ipc-handlers.js` | 4220–4600 | All `ipcMain.handle` registrations |
 | `src/main/websocket-server.js` | 5000–5700+ | Pairing handshake, device auth, notification endpoints |
 | `src/main/logging.js` | 4585–4700 | Debug log rotation, file size limits |
 
 After extraction, `main.js` holds only:
-- `require` statements (for the new modules)
-- Global singletons (store, dynamicMemory, channelManager, supervisor, scheduledJobs)
+- `require` statements for the new modules
+- Global singletons (`store`, `dynamicMemory`, `channelManager`, `scheduler`, `claudeProcess`)
 - `app.whenReady()` wiring: call `init(deps)` on each module in the right order
 - `app.on('before-quit')` / `will-quit` teardown coordination
 - Platform-specific glue (single-instance lock, `app.setName`, default protocol)
 
 ---
 
-## 8. Execution sequence
+## 9. Execution sequence
 
-**Phase 0 — baseline.** Confirm current test suite passes on `refactor/scheduler-strip` branch at HEAD (aa1b96a + this plan). Note any pre-existing failures so we can tell what's new.
+**Phase 0 — baseline.** On `refactor/scheduler-strip` at HEAD `d5339b5` (the plan commit), confirm current test suite passes. Note any pre-existing failures so we can tell what's new from the refactor.
 
-**Phase 1 — supervisor shrink.**
-1. Rename `DispatchStore` → `SupervisorStore`, drop `dispatches` + `effects` tables, prune `incidents` columns. Migration on open.
-2. Delete `orchestrator.js`. Delete `orchestrator.test.js`, `pr3-effect-ledger.test.js`, `channel-manager-integration.test.js`.
-3. Prune `policy.js`: remove dispatch FSM, replay helpers, intensity helpers, shrink STATES.
-4. Prune `runtime.js`: drop `onKillRequest`, make `findAndKillOrphans` boot-only.
-5. Prune `incidents.js` event-kind set.
-6. New orchestrator.js-free `ClaudeSessionSupervisor` class (thin wrapper): `start/shutdown/getStatus` only. No `enqueue/awaitOutcome`.
-7. Update `index.js` exports.
-8. Commit: `Supervisor: strip dispatch state machine; reduce to alive-probe + orphan cleanup`
+**Phase 1 — orphan-kill extraction.**
+1. Create `src/orphan-kill.js` by cribbing `recordPid` + `probeOrphanStatus` + `findAndKillOrphans` from `src/claude-session-supervisor/runtime.js`. Strip epoch logic, signature verification, and the `_orphanStatusUnsafe` latch.
+2. Add `src/orphan-kill.test.js` with a handful of unit tests: pidfile write/read/clear, ps-match detection, orphan kill happy path, pid-not-running cleanup.
+3. **Do not wire into main.js yet.** Pure addition. Supervisor folder still present and wired as before — nothing should regress.
+4. Commit: `Extract boot-time orphan Claude kill into src/orphan-kill.js`
 
-**Phase 2 — scheduler replacement.**
-1. Add `src/scheduled-jobs.js` per spec in §6.
-2. Update `main.js` `initChannelMode()` (lines ~3500–3890): replace `new Scheduler(store, channelManager, supervisor)` with `new ScheduledJobs(store, channelManager)`. Remove supervisor injection.
-3. Update scheduler IPC handlers (lines ~3885–3975): `ro_add_schedule`, `ro_list_schedules`, `ro_delete_schedule`, `ro_toggle_schedule`, `ro_run_now` — point at `scheduledJobs` instead of `scheduler`. MCP-tool-visible names stay identical.
-4. One-shot migration on first boot: iterate `store.get('scheduler-jobs', [])`, strip `runningAt, consecutiveErrors, lastError, lastDurationMs`; rename `lastRun`→`lastFiredAt`.
-5. Delete `src/scheduler.js` and `scheduler-integration.test.js`.
-6. Commit: `Scheduler: replace Scheduler with ScheduledJobs (cron→channel, no state machine)`
+**Phase 2 — scheduler restore + supervisor removal.**
+1. Restore `src/scheduler.js` from `~/.root-operator/workspace/memory/scheduled-jobs-archive/scheduler_5598ac1.js` (see §7 for both copy methods).
+2. Update `main.js`:
+   - Delete supervisor imports.
+   - Delete supervisor init block in `initChannelMode`.
+   - Delete supervisor teardown in `teardownChannelMode`.
+   - Change `new Scheduler(store, channelManager, supervisor)` → `new Scheduler(store, channelManager)`.
+   - Add `await killOrphanClaudeIfAny();` before `spawnClaudeCode()` call in `initChannelMode`.
+   - Inside `spawnClaudeCode`, call `recordPid(claudeProcess.pid)` after PTY spawn.
+   - Inside `teardownChannelMode` and `will-quit` handler, call `clearPid()`.
+3. Delete entire `src/claude-session-supervisor/` directory.
+4. Check if any other module requires `better-sqlite3` — if not, remove from `package.json` dependencies and `npm uninstall`. If it's still used by dynamic-memory or elsewhere, keep it.
+5. On first boot of the new build, delete any leftover supervisor SQLite database file (`rm -f ~/.root-operator/runtime/*/supervisor.db` style cleanup — Codex should pick the right path by inspecting runtime dir).
+6. Boot the app, exercise channel mode, spawn Claude, trigger `ro_run_now` on a test job. Verify Claude receives `[Scheduled: ...]` message and responds.
+7. Commit: `Restore scheduler to 5598ac1 form; remove claude-session-supervisor`
 
-**Phase 3 — tests.**
-1. Reduce `policy.test.js` to supervisor FSM tests only.
-2. Reduce `incidents.test.js` to retained event kinds.
-3. Reduce or delete `runtime.test.js` (keep epoch/pidfile tests, drop kill tests).
-4. Adjust `dispatch-store.test.js` to match simplified schema (rename file to `supervisor-store.test.js`).
-5. Add `scheduled-jobs.test.js` covering: CRUD, cron parsing, runNow fires `sendToChannel`, refire-gap protection, `lastFiredAt` updates.
-6. Run full suite. Fix regressions.
-7. Commit: `Tests: prune dispatch FSM tests; add ScheduledJobs tests`
+**Phase 3 — test cleanup.**
+1. All supervisor-folder tests were deleted in Phase 2 (with the folder). Verify with `ls src/claude-session-supervisor/ 2>/dev/null` returning empty.
+2. Check if a scheduler.test.js exists at root or under src/ on master today. If yes, verify it still passes against the restored 5598ac1 scheduler. If it references supervisor-aware paths (`listOpenDispatches`, `jobSilenceFor`, etc.), adjust or remove those test cases.
+3. If no scheduler test existed on master today, check `git show 5598ac1 -- '*.test.js'` to see if one existed at 5598ac1. If so, restore that test file.
+4. Run the full test suite. All passes.
+5. Commit: `Tests: align with restored scheduler; remove supervisor tests`
 
-**Phase 4 — main.js split.** One module per commit. For each of the 12 modules in §7:
+**Phase 4 — main.js split.** One module per commit. For each of the 12 modules in §8:
 1. Create `src/main/<module>.js` with the extracted code.
 2. Define `init(deps)` signature.
 3. Replace in-place code in `main.js` with `require` + `init(deps)` call.
-4. Smoke: launch app, exercise the feature belonging to that module (e.g. for tunnel — enter channel mode and verify tunnel comes up; for notifications — send a test notification).
+4. Smoke: launch app, exercise the feature belonging to that module.
 5. Commit: `main.js: extract <module>`
 
-Order (low-risk → high-risk, so if we have to stop midway, the critical paths are last):
-1. `logging` (easy, isolated)
+Order (low-risk → high-risk, so critical paths are last):
+1. `logging`
 2. `tray`
 3. `window-manager`
-4. `crypto-pairing` (large, mostly pure)
+4. `crypto-pairing`
 5. `tunnel`
 6. `notifications`
 7. `websocket-server`
@@ -285,68 +276,73 @@ Order (low-risk → high-risk, so if we have to stop midway, the critical paths 
 9. `local-chat`
 10. `ipc-handlers`
 11. `claude-lifecycle`
-12. `channel-mode` (touches supervisor + scheduledJobs — do last)
+12. `channel-mode` (touches scheduler + orphan-kill — do last)
 
-**Phase 5 — verification (acceptance criteria in §10).**
+**Phase 5 — verification (acceptance criteria in §11).**
 
 ---
 
-## 9. Tests — deletion / reduction summary
+## 10. Tests — deletion / reduction summary
 
 | Test file | Fate |
 |-----------|------|
-| `orchestrator.test.js` | DELETE |
-| `pr3-effect-ledger.test.js` | DELETE |
-| `channel-manager-integration.test.js` | DELETE |
-| `scheduler-integration.test.js` | DELETE |
-| `policy.test.js` | REDUCE — keep supervisor FSM only |
-| `incidents.test.js` | REDUCE — retained event kinds only |
-| `runtime.test.js` | REDUCE — epoch + pidfile only |
-| `dispatch-store.test.js` | RENAME → `supervisor-store.test.js`; simplify schema tests |
-| `schema-migration.test.js` | UPDATE — new migration drops dispatch/effect tables |
-| `scheduled-jobs.test.js` | NEW |
+| `src/claude-session-supervisor/orchestrator.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/policy.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/runtime.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/incidents.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/dispatch-store.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/pr3-effect-ledger.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/schema-migration.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/channel-manager-integration.test.js` | DELETE (with folder) |
+| `src/claude-session-supervisor/scheduler-integration.test.js` | DELETE (with folder) |
+| `src/orphan-kill.test.js` | NEW in Phase 1 |
+| Root-level `scheduler.test.js` (if exists on master) | Update to match restored scheduler; strip supervisor-aware tests |
 
 ---
 
-## 10. Acceptance criteria
+## 11. Acceptance criteria
 
-1. Full test suite passes on `refactor/scheduler-strip` (minus explicitly deleted tests).
+1. Test suite passes on `refactor/scheduler-strip` at HEAD of Phase 5. No supervisor tests remain. `src/orphan-kill.test.js` passes.
 2. App launches clean in channel mode. Claude spawns. Bridge connects. Tunnel comes up.
-3. Scheduled-job `runNow` via MCP tool delivers the prompt into Claude's channel immediately; Claude responds; `lastFiredAt` updates.
-4. `supervisor.getStatus()` returns exactly `{ state, epoch, orphanUnsafe }` — no dispatch/queue/activeDispatch fields.
-5. `runtime/supervisor-incidents.jsonl` shows zero dispatch-lifecycle events during a run (no `dispatch_enqueued`, `_activated`, `_completed`, `wedge_detected`, `silence_timeout`, `kill_ordered`, `dispatch_replay_started`).
-6. **Overnight smoke:** schedule three jobs 30 min apart, one intentionally heavy (research + multi-step). Expected: all three messages appear in the channel as scheduled; Claude processes them in order when free; if one wedges, the others queue behind it in the channel (NOT in a supervisor queue), and whenever Claude recovers the queued ones drain. No orphan half-builds. No "shutdown_while_queued" abandonment.
+3. No file under `src/claude-session-supervisor/` exists on disk.
+4. No import of `claude-session-supervisor` anywhere in the codebase: `grep -rn "claude-session-supervisor" src/ main.js` returns nothing.
+5. Scheduled-job `runNow` via MCP tool delivers the prompt into Claude's channel immediately; Claude responds; `lastRun` updates with `lastResult: 'success'`.
+6. **Overnight smoke:** re-add the three archived jobs from `~/.root-operator/workspace/memory/scheduled-jobs-archive/` (Night Lab 03:22, Signal 04:00, Sleep Cycle 05:00 CET). Expected behavior: all three messages appear in the channel as scheduled; Claude processes them in order. If Claude hangs on one, the other two queue behind it in channelManager's 100-message buffer; when Claude recovers, queued ones drain. No `supervisor-incidents.jsonl` updates during the run (file frozen). No orphan half-builds (each job fires exactly once per scheduled tick).
 7. `main.js` ≤ 700 lines. `src/main/` has ≤ 12 module files, each < 800 lines.
-8. `grep -r "dispatch_" src/` returns nothing in production code (tests may still mention for migration reasons).
+8. `grep -rn "dispatch" src/ main.js` returns nothing in production code.
 
 ---
 
-## 11. Rollback
+## 12. Rollback
 
-Branch is fully isolated at `refactor/scheduler-strip` in worktree `~/Documents/Dev/55-Root_Operator.wt/scheduler-strip`. To abort:
+Branch `refactor/scheduler-strip` is isolated from master. To abort at any phase:
 
 ```bash
-git worktree remove ~/Documents/Dev/55-Root_Operator.wt/scheduler-strip
+cd ~/Documents/Dev/55-Root_Operator
+git checkout master
 git branch -D refactor/scheduler-strip
 ```
-
-Master is never touched until we explicitly merge.
 
 Intermediate rollback: each phase is its own commit. `git reset --hard HEAD~N` to back out N phases.
 
 ---
 
-## 12. Open questions — decide before Codex starts
+## 13. Decisions already made (so Codex doesn't re-ask)
 
-1. **Scheduled-jobs feature: keep or delete entirely?** Plan assumes keep-with-thin-replacement. If Tom wants to delete the feature outright (forcing users to external cron or a2n), skip Phase 2's new file and delete IPC tool handlers instead.
+- **Restore scheduler to 5598ac1 form** — full 394-line file with `consecutiveErrors` tracking + auto-disable-after-10. Tom: "Keep it as it was and we will go from there."
+- **Delete the whole `claude-session-supervisor/` folder** — only genuine value (boot orphan-kill) extracted into `src/orphan-kill.js`. Dispatch state machine, replay logic, effect ledger, incidents SQLite, dispatch tables — all gone.
+- **Scheduler job-record migration**: no migration needed. The 5598ac1 scheduler reads today's job records without modification (today's fields are a superset of what 5598ac1 used; runtime-state fields get overwritten on next tick).
+- **Existing supervisor SQLite database**: delete on first boot. No historical forensic data needs to migrate.
+- **`supervisor-incidents.jsonl`**: leave existing file on disk as historical artifact; stop writing to it. User can manually delete.
+- **Codex dispatch cadence**: phase-at-a-time. Tom submits each phase to Codex manually after reviewing the previous phase's commit.
+- **Archived state** for re-adding scheduled jobs and for the canonical scheduler file: `~/.root-operator/workspace/memory/scheduled-jobs-archive/` (see §0 table).
 
-2. **Backward compat for scheduler-jobs persisted records:** plan proposes in-place migration on first boot (strip runtime fields). Alternative: wipe all jobs on first boot and have Tom re-create them (3 jobs — Night Lab, Signal, Sleep Cycle). Clean-slate is simpler. Migrate is user-friendly. Pick one.
+---
 
-3. **DispatchStore → SupervisorStore rename + table drop:** could also just delete the SQLite DB entirely and let supervisor re-create a smaller schema on first boot. Easier than writing a migration. Acceptable if we don't need historical incident data. Codex should delete DB on first boot unless Tom wants the history preserved.
+## 14. Still-open questions for Codex to surface
 
-4. **Codex should NOT push this branch.** Plan stays local until Tom reviews each phase's commit.
-
-5. **Does Codex get all 5 phases in one dispatch, or one phase at a time?** Recommend phase-at-a-time: feed Phase 1 first, let Codex complete, Tom reviews, then Phase 2, etc. Prevents "Codex completed Phase 4 but broke Phase 2" kind of cascade.
+- **`better-sqlite3` dependency:** Phase 2 says remove from `package.json` if no other module uses it. Codex should verify with `grep -rn "better-sqlite3" src/ main.js` after supervisor deletion. If any other module uses it (e.g. dynamic-memory embeddings), keep the dependency.
+- **Root-level `scheduler.test.js`:** verify whether this file exists on master today. If yes, it may have been updated for supervisor-aware paths and will need adjustment. If no, check if one existed at 5598ac1 that should be restored.
 
 ---
 
