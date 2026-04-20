@@ -39,13 +39,13 @@ const MMR_LAMBDA = 0.7;
  *   limit?: number (default 5)
  */
 async function hybridSearch(db, query, opts = {}) {
-    const { chatId, limit = 5 } = opts;
+    const { chatId, limit = 5, beforeTimestamp = null } = opts;
 
     const queryEmbedding = await embedQuery(query);
 
     const [vectorResultsRaw, keywordResults] = await Promise.all([
-        Promise.resolve(searchByVector(db, queryEmbedding, chatId, limit * 2)),
-        Promise.resolve(searchByKeyword(db, query, chatId, limit * 2)),
+        Promise.resolve(searchByVector(db, queryEmbedding, chatId, limit * 2, beforeTimestamp)),
+        Promise.resolve(searchByKeyword(db, query, chatId, limit * 2, beforeTimestamp)),
     ]);
 
     // Drop weakly-relevant vector hits before fusion.

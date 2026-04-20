@@ -212,17 +212,19 @@ function cosineSimilarity(a, b) {
  * chatId: string => match exactly, null => only rows with NULL chat_id,
  * undefined => no filter.
  */
-function searchByVector(db, queryEmbedding, chatId, limit = 10) {
+function searchByVector(db, queryEmbedding, chatId, limit = 10, beforeTimestamp = null) {
     let sql = `SELECT id, content, embedding, chat_id, source_role, timestamp FROM memories`;
     const params = [];
+    const where = [];
     if (chatId !== undefined) {
-        if (chatId === null) {
-            sql += ` WHERE chat_id IS NULL`;
-        } else {
-            sql += ` WHERE chat_id = ?`;
-            params.push(chatId);
-        }
+        where.push(chatId === null ? `chat_id IS NULL` : `chat_id = ?`);
+        if (chatId !== null) params.push(chatId);
     }
+    if (beforeTimestamp) {
+        where.push(`timestamp < ?`);
+        params.push(beforeTimestamp instanceof Date ? beforeTimestamp.toISOString() : String(beforeTimestamp));
+    }
+    if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
 
     const rows = db.prepare(sql).all(...params);
     if (!rows.length) return [];
@@ -248,18 +250,18 @@ function searchByVector(db, queryEmbedding, chatId, limit = 10) {
 // Keyword search (FTS5 preferred, LIKE fallback)
 // ============================================================================
 
-function searchByKeyword(db, query, chatId, limit = 10) {
+function searchByKeyword(db, query, chatId, limit = 10, beforeTimestamp = null) {
     const cleanQuery = String(query).replace(/['"]/g, '').trim();
     if (!cleanQuery) return [];
 
     try {
-        return searchByFts5(db, cleanQuery, chatId, limit);
+        return searchByFts5(db, cleanQuery, chatId, limit, beforeTimestamp);
     } catch {
-        return searchByLike(db, cleanQuery, chatId, limit);
+        return searchByLike(db, cleanQuery, chatId, limit, beforeTimestamp);
     }
 }
 
-function searchByFts5(db, query, chatId, limit) {
+function searchByFts5(db, query, chatId, limit, beforeTimestamp = null) {
     // Sanitize FTS5 query: tokenize, drop symbols, OR the tokens.
     const tokens = query
         .split(/\s+/)
@@ -286,6 +288,11 @@ function searchByFts5(db, query, chatId, limit) {
         }
     }
 
+    if (beforeTimestamp) {
+        sql += ` AND m.timestamp < ?`;
+        params.push(beforeTimestamp instanceof Date ? beforeTimestamp.toISOString() : String(beforeTimestamp));
+    }
+
     sql += ` ORDER BY rank LIMIT ?`;
     params.push(limit);
 
@@ -300,7 +307,7 @@ function searchByFts5(db, query, chatId, limit) {
     }));
 }
 
-function searchByLike(db, query, chatId, limit) {
+function searchByLike(db, query, chatId, limit, beforeTimestamp = null) {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (!words.length) return [];
 
@@ -320,6 +327,11 @@ function searchByLike(db, query, chatId, limit) {
             sql += ` AND chat_id = ?`;
             params.push(chatId);
         }
+    }
+
+    if (beforeTimestamp) {
+        sql += ` AND timestamp < ?`;
+        params.push(beforeTimestamp instanceof Date ? beforeTimestamp.toISOString() : String(beforeTimestamp));
     }
 
     sql += ` ORDER BY timestamp DESC LIMIT ?`;

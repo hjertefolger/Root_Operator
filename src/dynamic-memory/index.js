@@ -5,7 +5,7 @@
  *   - constructor(userDataPath, resourcesPath) - no heavy work.
  *   - init(store) - open DB, set enabled flag from electron-store.
  *   - indexMessage(role, content, chatId) - chunk, dedup, embed, insert.
- *   - buildContextForSpawn(query, chatId, limit) - hybrid search -> markdown block.
+ *   - buildContextForSpawn(query, chatId, limit, beforeTimestamp) - hybrid search -> markdown block.
  *   - close() - close DB on app quit.
  *
  * The embedder is lazy: first indexMessage() after enable triggers model load.
@@ -409,7 +409,7 @@ class DynamicMemory {
      * Search for relevant past chunks and format them as a markdown block.
      * Returns a string or null if nothing relevant found / feature disabled.
      */
-    async buildContextForSpawn(query, chatId, limit = 5) {
+    async buildContextForSpawn(query, chatId, limit = 5, beforeTimestamp = null) {
         if (!this.isEnabled()) return null;
         if (typeof query !== 'string' || query.trim().length < 3) return null;
 
@@ -426,7 +426,7 @@ class DynamicMemory {
         let results = [];
         const _perfSearchStart = Date.now();
         try {
-            results = await hybridSearch(this.db, query, { chatId, limit });
+            results = await hybridSearch(this.db, query, { chatId, limit, beforeTimestamp });
         } catch (err) {
             this._log(`[MEMORY] hybridSearch failed: ${err.message}`);
             return null;

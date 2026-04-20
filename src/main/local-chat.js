@@ -539,8 +539,18 @@ function init(deps = {}) {
         if (isDynamicMemoryEnabled(dynamicMemory)) {
             const perfStart = Date.now();
             try {
+                // Channel history tail (first ~200 messages) is already in the
+                // appended system prompt. Only surface memories OLDER than the
+                // oldest message in that tail — otherwise dynamic memory just
+                // re-injects what's already loaded.
+                let beforeTimestamp = null;
+                try {
+                    const firstMessage = chatStore && chatStore.loadMessages()[0];
+                    if (firstMessage && firstMessage.ts) beforeTimestamp = firstMessage.ts;
+                } catch {}
+
                 const memoryBlock = await Promise.race([
-                    dynamicMemory.buildContextForSpawn(content, chatId, 5),
+                    dynamicMemory.buildContextForSpawn(content, chatId, 5, beforeTimestamp),
                     new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
                 ]);
 
