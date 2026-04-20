@@ -33,6 +33,8 @@
 > - Use device pairing and E2E encryption -- never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
 
+<br>
+
 ## Why Root Operator?
 
 | Problem | Root Operator |
