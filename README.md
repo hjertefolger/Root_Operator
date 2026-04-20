@@ -109,25 +109,13 @@ Two complementary layers give Claude memory without a cloud round-trip.
 ## Requirements
 
 - **macOS** 11+ (Big Sur or later) -- Apple Silicon and Intel
-- **Node.js** 18+ (for building from source)
 - **Claude Code** (latest, with channels support)
 
 ## Installation
 
-### From Release
-
 Download the latest `.dmg` from the [Releases](https://github.com/hjertefolger/Root_Operator/releases) page.
 
 The app is signed and notarized -- macOS will allow it to run without extra steps.
-
-### From Source
-
-```bash
-git clone https://github.com/hjertefolger/Root_Operator.git
-cd Root_Operator
-npm install        # Installs deps + rebuilds native modules
-npm run dev:app    # Start with hot reload
-```
 
 ## Quick Start
 
