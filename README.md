@@ -14,6 +14,7 @@
 <br>
 ✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
 <br>
+
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
