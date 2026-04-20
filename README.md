@@ -9,6 +9,7 @@
 
 <p align="center"><strong>Personal AI assistant for macOS powered by Claude Code channels.</strong></p>
 
+<br>
 
 ✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
 
