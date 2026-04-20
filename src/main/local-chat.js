@@ -515,11 +515,11 @@ function init(deps = {}) {
         });
     }
 
-    function isDynamicMemoryEnabled(dynamicMemory) {
+    function isDynamicMemoryReady(dynamicMemory) {
         return Boolean(
             dynamicMemory
-            && typeof dynamicMemory.isEnabled === 'function'
-            && dynamicMemory.isEnabled()
+            && typeof dynamicMemory.isReady === 'function'
+            && dynamicMemory.isReady()
         );
     }
 
@@ -534,52 +534,16 @@ function init(deps = {}) {
 
         const ts = getNowDate().toISOString();
         const dynamicMemory = getDynamicMemory();
-        let outboundContent = content;
 
-        if (isDynamicMemoryEnabled(dynamicMemory)) {
-            const perfStart = Date.now();
-            try {
-                // Channel history tail (first ~200 messages) is already in the
-                // appended system prompt. Only surface memories OLDER than the
-                // oldest message in that tail — otherwise dynamic memory just
-                // re-injects what's already loaded.
-                let beforeTimestamp = null;
-                try {
-                    const firstMessage = chatStore && chatStore.loadMessages()[0];
-                    if (firstMessage && firstMessage.ts) beforeTimestamp = firstMessage.ts;
-                } catch {}
+        // Per-turn enrichment is gone. Channel-history tail lives in the
+        // appended system prompt, and agent-facing recall of older memories
+        // is exposed as MCP tools (ro_memory_search). Indexing still runs
+        // below so those tools have data.
 
-                const memoryBlock = await Promise.race([
-                    dynamicMemory.buildContextForSpawn(content, chatId, 5, beforeTimestamp),
-                    new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
-                ]);
 
-                if (memoryBlock && typeof memoryBlock === 'string' && memoryBlock.length) {
-                    const sanitizeEnvelope = (value) => String(value).replace(
-                        /<\/(system-reminder|memory-context|channel)>/g,
-                        '<\u200B/$1>',
-                    );
-                    const safeContent = sanitizeEnvelope(content);
-                    const safeBlock = sanitizeEnvelope(memoryBlock);
-                    outboundContent = `${safeContent}\n\n<system-reminder>\n<memory-context>\n${safeBlock}\n</memory-context>\n\nReply via the mcp__root-operator__reply tool using the chat_id from the <channel> tag above. A single-emoji ack is still a reply. Plain text doesn't reach the user.\n</system-reminder>`;
-                }
+        const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
 
-                if (env.NODE_ENV === 'development' || env.DYNAMIC_MEMORY_PERF === '1') {
-                    const wall = Date.now() - perfStart;
-                    const hit = outboundContent !== content;
-                    const perfLine = `[MEMORY-PERF] enrichment wall=${wall}ms hit=${hit} original_len=${content.length} enriched_len=${outboundContent.length}`;
-                    consoleObject.error(perfLine);
-                    logDebug(perfLine);
-                }
-            } catch (error) {
-                logDebug(`[MEMORY] Enrichment failed: ${error.message}`);
-                outboundContent = content;
-            }
-        }
-
-        const sentToBridge = channelManager.sendToChannel(chatId, outboundContent, userId || chatId);
-
-        if (isDynamicMemoryEnabled(dynamicMemory)) {
+        if (isDynamicMemoryReady(dynamicMemory)) {
             dynamicMemory.indexMessage('user', content, chatId).catch((error) => {
                 logDebug(`[MEMORY] Index (user) error: ${error.message}`);
             });

@@ -2,27 +2,30 @@
  * Dynamic Memory - Facade class consumed by main.js.
  *
  * Lifecycle:
- *   - constructor(userDataPath, resourcesPath) - no heavy work.
- *   - init(store) - open DB, set enabled flag from electron-store.
- *   - indexMessage(role, content, chatId) - chunk, dedup, embed, insert.
+ *   - constructor(workspaceDir, resourcesPath) - no heavy work.
+ *   - init(store) - open DB. Ready as soon as DB is open; no user-visible toggle.
+ *   - indexMessage(role, content, chatId) - chunk, dedup, embed, insert (always on when DB is open).
+ *   - searchMemory(query, opts) - hybrid search, returns array of {id, content, timestamp, score}.
+ *   - saveMemory(content, chatId) - intentional write, bypasses chunker.
+ *   - updateMemoryById(id, content) - re-embed + update.
+ *   - deleteMemoryById(id) - hard remove.
  *   - buildContextForSpawn(query, chatId, limit, beforeTimestamp) - hybrid search -> markdown block.
  *   - close() - close DB on app quit.
  *
- * The embedder is lazy: first indexMessage() after enable triggers model load.
- * Every public async method re-checks `this._enabled` to cheaply abort work
- * after a mid-operation toggle off.
+ * The embedder is lazy: first operation after init triggers model load.
+ * Long-term / multi-modal memory is delegated to UMIO (future); this layer
+ * handles agent-facing recall of prior channel messages older than the
+ * channel-history tail that is already in the system prompt.
  */
 
 const path = require('path');
 const fs = require('fs');
 
-const { initDb, closeDb, contentExists, insertMemory, backupDb, validateDb, validateDbFile, attemptRecovery } = require('./db');
+const { initDb, closeDb, contentExists, insertMemory, getMemory, deleteMemory, updateMemory, backupDb, validateDb, validateDbFile, attemptRecovery } = require('./db');
 const embeddings = require('./embeddings');
 const { extractChunks, shouldExclude, getContentValue } = require('./chunker');
 const { hybridSearch } = require('./search');
 const { buildMemoryBlock } = require('./prompt');
-
-const STORE_KEY = 'dynamicMemory.enabled';
 
 const PERF_ENABLED = process.env.NODE_ENV === 'development' || process.env.DYNAMIC_MEMORY_PERF === '1';
 function perfLog(msg) {
@@ -42,8 +45,6 @@ class DynamicMemory {
         this.resourcesPath = resourcesPath;
         this.db = null;
         this.dbPath = null;
-        this.store = null;
-        this._enabled = false;
         this._embedderReady = false;
         this._embedderInitPromise = null;
         this._logger = null;
@@ -59,14 +60,10 @@ class DynamicMemory {
         }
     }
 
-    async init(store) {
-        this.store = store;
-        try {
-            this._enabled = Boolean(store && store.get(STORE_KEY, false));
-        } catch (_) {
-            this._enabled = false;
-        }
-
+    async init(_store) {
+        // store arg kept for backwards-compatibility with main-process wiring;
+        // the feature used to persist an enabled flag here, but dynamic memory
+        // is now always on whenever the DB is open.
         const brainDir = path.join(this.workspaceDir, 'brain');
         const backupsDir = path.join(brainDir, 'backups');
         const dbPath = path.join(brainDir, 'memory.db');
@@ -171,7 +168,7 @@ class DynamicMemory {
                         this.db = null;
                     } else {
                         const warn = post.warnings.length ? ` (warnings: ${post.warnings.join('; ')})` : '';
-                        this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
+                        this._log(`[MEMORY] DB ready at ${dbPath} ${warn}`);
                     }
                 } catch (err2) {
                     this.db = null;
@@ -193,7 +190,7 @@ class DynamicMemory {
                         closeDb(this.db);
                         this.db = null;
                     } else {
-                        this._log(`[MEMORY] DB ready at ${dbPath} (fresh schema, enabled=${this._enabled})`);
+                        this._log(`[MEMORY] DB ready at ${dbPath} (fresh schema)`);
                     }
                 } catch (err3) {
                     this.db = null;
@@ -230,7 +227,7 @@ class DynamicMemory {
                 }
             }
             const warn = postValidation.warnings.length ? ` (warnings: ${postValidation.warnings.join('; ')})` : '';
-            this._log(`[MEMORY] DB ready at ${dbPath} (enabled=${this._enabled})${warn}`);
+            this._log(`[MEMORY] DB ready at ${dbPath} ${warn}`);
         }
 
         // Backup rotation — only when the DB existed and was structurally
@@ -260,17 +257,12 @@ class DynamicMemory {
         }
     }
 
-    isEnabled() {
-        return Boolean(this._enabled && this.db);
-    }
-
-    setEnabled(value) {
-        const next = Boolean(value);
-        this._enabled = next;
-        if (this.store) {
-            try { this.store.set(STORE_KEY, next); } catch (_) { /* ignore */ }
-        }
-        this._log(`[MEMORY] setEnabled(${next})`);
+    /**
+     * Ready means the DB is open and dynamic memory can accept reads/writes.
+     * Dynamic memory is always on when ready — there is no user-visible toggle.
+     */
+    isReady() {
+        return Boolean(this.db);
     }
 
     _modelBaseDir() {
@@ -299,7 +291,7 @@ class DynamicMemory {
      * the already-hot model.
      */
     warmup() {
-        if (!this.isEnabled()) return Promise.resolve();
+        if (!this.isReady()) return Promise.resolve();
         return this._ensureEmbedder().catch((err) => {
             this._log(`[MEMORY] warmup failed: ${err && err.message ? err.message : err}`);
         });
@@ -326,11 +318,11 @@ class DynamicMemory {
 
     /**
      * Index a message (user or assistant). Chunks -> dedup -> embed -> insert.
-     * Re-checks this._enabled after each async step so mid-operation disable
+     * Re-checks isReady() after each async step so a mid-operation DB close
      * wastes minimal work.
      */
     async indexMessage(role, content, chatId, { externalRef } = {}) {
-        if (!this.isEnabled()) return;
+        if (!this.isReady()) return;
         if (typeof content !== 'string' || !content.trim()) return;
 
         const effectiveRole = role === 'user' ? 'user' : 'assistant';
@@ -355,11 +347,11 @@ class DynamicMemory {
             this._log(`[MEMORY] Embedder init failed: ${err.message}`);
             return;
         }
-        if (!this.isEnabled()) return;
+        if (!this.isReady()) return;
 
         const ts = new Date();
         for (const chunk of chunks) {
-            if (!this.isEnabled()) return;
+            if (!this.isReady()) return;
 
             // Dedup cheap first.
             try {
@@ -382,7 +374,7 @@ class DynamicMemory {
             }
             _perfEmbedTotal += Date.now() - _perfEmbedStart;
             _perfEmbedCount += 1;
-            if (!this.isEnabled()) return;
+            if (!this.isReady()) return;
 
             const _perfInsertStart = Date.now();
             try {
@@ -410,7 +402,7 @@ class DynamicMemory {
      * Returns a string or null if nothing relevant found / feature disabled.
      */
     async buildContextForSpawn(query, chatId, limit = 5, beforeTimestamp = null) {
-        if (!this.isEnabled()) return null;
+        if (!this.isReady()) return null;
         if (typeof query !== 'string' || query.trim().length < 3) return null;
 
         const _perfT0 = Date.now();
@@ -421,7 +413,7 @@ class DynamicMemory {
             this._log(`[MEMORY] Embedder init failed (buildContext): ${err.message}`);
             return null;
         }
-        if (!this.isEnabled()) return null;
+        if (!this.isReady()) return null;
 
         let results = [];
         const _perfSearchStart = Date.now();
@@ -440,6 +432,89 @@ class DynamicMemory {
         const block = buildMemoryBlock(results);
         perfLog(`buildContextForSpawn total=${Date.now() - _perfT0}ms search=${_perfSearchMs}ms results=${results.length} query_len=${query.length} block_len=${block ? block.length : 0}`);
         return block;
+    }
+
+    /**
+     * Agent-facing search. Returns raw result rows (not formatted as a
+     * markdown block) so tool callers can render ids alongside content.
+     *
+     * @returns {Promise<Array<{id:number, content:string, timestamp:Date, score:number, chatId:string|null, sourceRole:string}>>}
+     */
+    async searchMemory(query, { chatId = undefined, limit = 5, beforeTimestamp = null } = {}) {
+        if (!this.isReady()) return [];
+        if (typeof query !== 'string' || query.trim().length < 3) return [];
+
+        try {
+            await this._ensureEmbedder();
+        } catch (err) {
+            this._log(`[MEMORY] Embedder init failed (searchMemory): ${err.message}`);
+            return [];
+        }
+        if (!this.isReady()) return [];
+
+        try {
+            return await hybridSearch(this.db, query, { chatId, limit, beforeTimestamp });
+        } catch (err) {
+            this._log(`[MEMORY] searchMemory failed: ${err.message}`);
+            return [];
+        }
+    }
+
+    /**
+     * Intentional write. Bypasses the chunker — the full content is stored
+     * as-is. Dedups on content-hash (returns the existing id if already
+     * stored).
+     */
+    async saveMemory(content, { chatId = null } = {}) {
+        if (!this.isReady()) throw new Error('dynamic memory not ready');
+        if (typeof content !== 'string' || !content.trim()) {
+            throw new Error('content must be a non-empty string');
+        }
+
+        await this._ensureEmbedder();
+        if (!this.isReady()) throw new Error('dynamic memory not ready');
+
+        const embedding = await embeddings.embedPassage(content);
+        const { id, isDuplicate } = insertMemory(this.db, {
+            content,
+            embedding,
+            chatId,
+            sourceRole: 'manual',
+            timestamp: new Date(),
+        });
+        return { id, isDuplicate };
+    }
+
+    /**
+     * Update a memory's content. Re-embeds. Returns true if a row was updated.
+     */
+    async updateMemoryById(id, newContent) {
+        if (!this.isReady()) throw new Error('dynamic memory not ready');
+        if (typeof newContent !== 'string' || !newContent.trim()) {
+            throw new Error('newContent must be a non-empty string');
+        }
+
+        await this._ensureEmbedder();
+        if (!this.isReady()) throw new Error('dynamic memory not ready');
+
+        const embedding = await embeddings.embedPassage(newContent);
+        return updateMemory(this.db, id, newContent, embedding);
+    }
+
+    /**
+     * Hard delete. Returns true if a row was removed.
+     */
+    deleteMemoryById(id) {
+        if (!this.isReady()) throw new Error('dynamic memory not ready');
+        return deleteMemory(this.db, id);
+    }
+
+    /**
+     * Fetch a single memory row by id (no embedding payload).
+     */
+    getMemoryById(id) {
+        if (!this.isReady()) return null;
+        return getMemory(this.db, id);
     }
 
     /**

@@ -188,6 +188,47 @@ function insertMemory(db, memory) {
     return { id: Number(info.lastInsertRowid), isDuplicate: false };
 }
 
+/**
+ * Fetch a single memory row by id.
+ */
+function getMemory(db, id) {
+    const row = db.prepare(
+        `SELECT id, content, chat_id, source_role, timestamp, external_ref
+         FROM memories WHERE id = ?`
+    ).get(id);
+    if (!row) return null;
+    return {
+        id: row.id,
+        content: row.content,
+        chatId: row.chat_id,
+        sourceRole: row.source_role,
+        timestamp: new Date(row.timestamp),
+        externalRef: row.external_ref || null,
+    };
+}
+
+/**
+ * Delete a memory by id. FTS triggers handle the keyword index.
+ * Returns true if a row was removed.
+ */
+function deleteMemory(db, id) {
+    const info = db.prepare(`DELETE FROM memories WHERE id = ?`).run(id);
+    return info.changes > 0;
+}
+
+/**
+ * Update memory content + embedding. Re-hashes. FTS triggers update
+ * the keyword index automatically.
+ * Returns true if a row was updated.
+ */
+function updateMemory(db, id, newContent, newEmbedding) {
+    const hash = hashContent(newContent);
+    const info = db.prepare(
+        `UPDATE memories SET content = ?, content_hash = ?, embedding = ? WHERE id = ?`
+    ).run(newContent, hash, embeddingToBuffer(newEmbedding), id);
+    return info.changes > 0;
+}
+
 // ============================================================================
 // Vector similarity
 // ============================================================================
@@ -590,6 +631,9 @@ module.exports = {
     hashContent,
     contentExists,
     insertMemory,
+    getMemory,
+    deleteMemory,
+    updateMemory,
     searchByVector,
     searchByKeyword,
     cosineSimilarity,

@@ -326,20 +326,6 @@ function init(deps = {}) {
     });
     ipcMain.handle('DISMISS_UPDATE_BANNER', (event, version) => dismissUpdateBanner(version));
 
-    ipcMain.handle('GET_DYNAMIC_MEMORY_ENABLED', () => {
-        const dynamicMemory = getDynamicMemory();
-        return dynamicMemory ? dynamicMemory.isEnabled() : false;
-    });
-
-    ipcMain.handle('SET_DYNAMIC_MEMORY_ENABLED', (event, enabled) => {
-        const dynamicMemory = getDynamicMemory();
-        if (!dynamicMemory) {
-            return { success: false, error: 'Dynamic memory not initialized' };
-        }
-        dynamicMemory.setEnabled(Boolean(enabled));
-        return { success: true, enabled: dynamicMemory.isEnabled() };
-    });
-
     ipcMain.handle('SET_OPERATING_MODE', (event, mode) => {
         if (mode !== 'terminal' && mode !== 'channel') {
             return { success: false, error: 'Invalid mode' };

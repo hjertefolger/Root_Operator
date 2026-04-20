@@ -117,6 +117,16 @@ class ChannelManager extends EventEmitter {
             return;
         }
 
+        if (msg.type === 'memory_request') {
+            this.emit('memory_request', {
+                callId: msg.callId,
+                tool: msg.tool,
+                args: msg.args,
+                ts: msg.ts,
+            });
+            return;
+        }
+
         if (msg.type === 'bridge_ready') {
             this.bridgeReady = true;
             this.lastBridgeReadyTs = Date.now();
@@ -184,6 +194,22 @@ class ChannelManager extends EventEmitter {
     sendSchedulerResponse(callId, result, isError = false) {
         const payload = JSON.stringify({
             type: 'scheduler_response',
+            callId,
+            result,
+            isError,
+        }) + '\n';
+
+        if (!this.socket || !this.connected) {
+            return false;
+        }
+
+        this.socket.write(payload);
+        return true;
+    }
+
+    sendMemoryResponse(callId, result, isError = false) {
+        const payload = JSON.stringify({
+            type: 'memory_response',
             callId,
             result,
             isError,

@@ -129,6 +129,54 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'ro_memory_search',
+      description: 'Search Root Operator dynamic memory for messages older than the channel-history tail already in your system prompt. Use when you need to recall context from earlier conversations not present in recent history. Returns matching fragments with ids, timestamps, and content.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Natural-language search query.' },
+          limit: { type: 'number', description: 'Maximum number of results (default: 5).' },
+          chat_id: { type: 'string', description: 'Optional chat_id to scope the search. Omit to search across all.' },
+        },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'ro_memory_save',
+      description: 'Save an intentional note to Root Operator dynamic memory. Use for insights, decisions, or context worth preserving beyond the rolling channel history. Bypasses automatic chunking — the full text is stored as a single entry.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'The text to remember.' },
+          chat_id: { type: 'string', description: 'Optional chat_id to associate with this memory.' },
+        },
+        required: ['content'],
+      },
+    },
+    {
+      name: 'ro_memory_update',
+      description: 'Update the content of an existing memory entry by id. Re-embeds after the change.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'number', description: 'Memory id (from ro_memory_search results).' },
+          content: { type: 'string', description: 'New content to replace the old entry.' },
+        },
+        required: ['id', 'content'],
+      },
+    },
+    {
+      name: 'ro_memory_delete',
+      description: 'Delete a memory entry by id. Hard delete — no undo.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'number', description: 'Memory id to delete.' },
+        },
+        required: ['id'],
+      },
+    },
+    {
       name: '_ping',
       description: 'Internal health check. Call this when asked to verify spawn.',
       inputSchema: { type: 'object', properties: {} },
@@ -189,6 +237,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     return handleSchedulerTool(toolName, request.params.arguments || {});
   }
 
+  const memoryTools = ['ro_memory_search', 'ro_memory_save', 'ro_memory_update', 'ro_memory_delete'];
+  if (memoryTools.includes(toolName)) {
+    return handleMemoryTool(toolName, request.params.arguments || {});
+  }
+
   return {
     content: [
       {
@@ -226,6 +279,42 @@ function handleSchedulerTool(toolName, args) {
 
     emitToElectron({
       type: 'scheduler_request',
+      callId,
+      tool: toolName,
+      args,
+      ts: new Date().toISOString(),
+    });
+  });
+}
+
+let memoryCallbacks = new Map();
+let memoryCallId = 0;
+
+function handleMemoryTool(toolName, args) {
+  return new Promise((resolve) => {
+    if (!electronSocket || electronSocket.destroyed) {
+      resolve({
+        content: [{ type: 'text', text: 'Error: No Electron connection available' }],
+        isError: true,
+      });
+      return;
+    }
+
+    const callId = ++memoryCallId;
+    // Memory tools may call into the embedder (first-call warmup can take up
+    // to a few seconds); give them more headroom than scheduler tools.
+    const timeout = setTimeout(() => {
+      memoryCallbacks.delete(callId);
+      resolve({
+        content: [{ type: 'text', text: 'Error: Memory request timed out' }],
+        isError: true,
+      });
+    }, 15000);
+
+    memoryCallbacks.set(callId, { resolve, timeout });
+
+    emitToElectron({
+      type: 'memory_request',
       callId,
       tool: toolName,
       args,
@@ -331,6 +420,19 @@ async function handleElectronMessage(msg) {
     if (cb) {
       clearTimeout(cb.timeout);
       schedulerCallbacks.delete(msg.callId);
+      cb.resolve({
+        content: [{ type: 'text', text: msg.result }],
+        isError: msg.isError || false,
+      });
+    }
+    return;
+  }
+
+  if (msg.type === 'memory_response') {
+    const cb = memoryCallbacks.get(msg.callId);
+    if (cb) {
+      clearTimeout(cb.timeout);
+      memoryCallbacks.delete(msg.callId);
       cb.resolve({
         content: [{ type: 'text', text: msg.result }],
         isError: msg.isError || false,

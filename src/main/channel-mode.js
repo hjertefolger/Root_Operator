@@ -307,7 +307,7 @@ function init(deps = {}) {
             markOutboundAttachmentsForGc(assistantWrite && assistantWrite.evicted);
 
             const dynamicMemory = getDynamicMemory();
-            if (dynamicMemory && dynamicMemory.isEnabled()) {
+            if (dynamicMemory && dynamicMemory.isReady()) {
                 dynamicMemory.indexMessage(
                     'assistant',
                     message.content,
@@ -444,6 +444,9 @@ function init(deps = {}) {
         manager.on('scheduler_request', (req) => {
             handleSchedulerRequest(req);
         });
+        manager.on('memory_request', (req) => {
+            handleMemoryRequest(req);
+        });
         return manager;
     }
 
@@ -567,6 +570,102 @@ function init(deps = {}) {
             channelManager?.sendSchedulerResponse(req.callId, result, false);
         } catch (error) {
             channelManager?.sendSchedulerResponse(req.callId, `Error: ${error.message}`, true);
+        }
+    }
+
+    async function handleMemoryRequest(req) {
+        const channelManager = getChannelManager();
+        const dynamicMemory = getDynamicMemory();
+
+        if (!dynamicMemory || !dynamicMemory.isReady()) {
+            channelManager?.sendMemoryResponse(
+                req.callId,
+                'Dynamic memory is not ready. Try again once the app has finished initializing.',
+                true
+            );
+            return;
+        }
+
+        try {
+            let result;
+            switch (req.tool) {
+                case 'ro_memory_search': {
+                    const query = String(req.args?.query || '').trim();
+                    if (!query) {
+                        channelManager?.sendMemoryResponse(req.callId, 'Query is required.', true);
+                        return;
+                    }
+                    const limit = Math.max(1, Math.min(25, Number(req.args?.limit) || 5));
+                    const chatId = req.args?.chat_id !== undefined ? req.args.chat_id : undefined;
+                    const results = await dynamicMemory.searchMemory(query, { chatId, limit });
+
+                    if (!results.length) {
+                        result = `No matches for "${query}".`;
+                    } else {
+                        result = results.map((r) => {
+                            const ts = r.timestamp instanceof Date
+                                ? r.timestamp.toISOString()
+                                : String(r.timestamp);
+                            const score = typeof r.score === 'number' ? r.score.toFixed(3) : '?';
+                            return `[id=${r.id} score=${score} ts=${ts} role=${r.sourceRole || '?'}]\n${r.content}`;
+                        }).join('\n\n---\n\n');
+                    }
+                    break;
+                }
+
+                case 'ro_memory_save': {
+                    const content = String(req.args?.content || '').trim();
+                    if (!content) {
+                        channelManager?.sendMemoryResponse(req.callId, 'Content is required.', true);
+                        return;
+                    }
+                    const chatId = req.args?.chat_id !== undefined ? req.args.chat_id : null;
+                    const { id, isDuplicate } = await dynamicMemory.saveMemory(content, { chatId });
+                    result = isDuplicate
+                        ? `Memory already existed as id=${id} (content-hash match, not re-saved).`
+                        : `Saved as id=${id}.`;
+                    break;
+                }
+
+                case 'ro_memory_update': {
+                    const id = Number(req.args?.id);
+                    const content = String(req.args?.content || '').trim();
+                    if (!Number.isFinite(id) || id <= 0) {
+                        channelManager?.sendMemoryResponse(req.callId, 'A positive numeric id is required.', true);
+                        return;
+                    }
+                    if (!content) {
+                        channelManager?.sendMemoryResponse(req.callId, 'Content is required.', true);
+                        return;
+                    }
+                    const updated = await dynamicMemory.updateMemoryById(id, content);
+                    result = updated
+                        ? `Memory id=${id} updated.`
+                        : `No memory with id=${id} — nothing updated.`;
+                    break;
+                }
+
+                case 'ro_memory_delete': {
+                    const id = Number(req.args?.id);
+                    if (!Number.isFinite(id) || id <= 0) {
+                        channelManager?.sendMemoryResponse(req.callId, 'A positive numeric id is required.', true);
+                        return;
+                    }
+                    const deleted = dynamicMemory.deleteMemoryById(id);
+                    result = deleted
+                        ? `Memory id=${id} deleted.`
+                        : `No memory with id=${id} — nothing deleted.`;
+                    break;
+                }
+
+                default:
+                    result = `Unknown memory tool: ${req.tool}`;
+                    break;
+            }
+
+            channelManager?.sendMemoryResponse(req.callId, result, false);
+        } catch (error) {
+            channelManager?.sendMemoryResponse(req.callId, `Error: ${error.message}`, true);
         }
     }
 
