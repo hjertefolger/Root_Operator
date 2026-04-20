@@ -10,15 +10,15 @@
 <p align="center"><strong>Personal AI assistant for macOS powered by Claude Code channels.</strong></p>
 
 <br>
-
+<img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
+<br>
 ✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
 - 🧠 **Continuity & recall** — selected channel history injected into every session; optional local-embedder index for deeper semantic search
-
-<img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
+<br>
 
 > **Security notice**
 >
