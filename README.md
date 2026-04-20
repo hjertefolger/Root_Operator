@@ -7,12 +7,12 @@
 
 **Personal AI assistant for macOS powered by Claude Code channels.**
 
-✨ Persistent cron scheduler, identity system, and dynamic recall memory — all in-harness
+✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
 
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
-- 🧠 **Dynamic recall memory** — local SQLite + ONNX embedder, ~21ms semantic enrichment per turn
+- 🧠 **Continuity & recall** — selected channel history injected into every session; optional local-embedder index for deeper semantic search
 
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 
@@ -91,16 +91,20 @@ Give Claude a persistent persona across sessions.
 - **First-run onboarding** -- `BOOTSTRAP.md` guides initial setup, then self-deletes
 - **Fully customizable** -- edit workspace files at `~/.root-operator/workspace/`
 
-### Dynamic Memory
+### Continuity & Recall
 
-Offline semantic memory layer that gives Claude continuity across sessions, restarts, and even chip architectures. Every turn is embedded, stored, and retrieved on the next inbound — no cloud round-trip.
+Two complementary layers give Claude memory without a cloud round-trip.
 
-- **Local-first** -- everything runs on-device: SQLite (FTS5 + `vec0`) for storage, `nomic-embed-text-v1.5` (768d) bundled in the app for embeddings
-- **Hybrid retrieval** -- BM25 keyword + vector cosine combined with reciprocal rank fusion; relevance gate filters before injection
-- **Fast** -- ~21ms enrichment per turn after a one-time ~100–800ms embedder warmup at boot
-- **Resilient** -- pre-open integrity validation, auto-recovery from rolling backups, WAL checkpoint before snapshot, in-place FTS rebuild for partial corruption
-- **Opt-in** -- disabled by default; toggle in Settings → Dynamic Memory. Database lives at `~/.root-operator/workspace/brain/memory.db`
-- **Backed up** -- snapshot-on-boot rotation in `brain/backups/`, gated to never archive a freshly-healed empty schema
+**Channel history** — a selected rolling tail of your conversation (~200 messages) is written into the appended system prompt on every session, wrapped in a `<conversation-history>` envelope. Claude wakes up already inside the thread. No retrieval step, no relevance guessing — just the context you already produced together.
+
+**Dynamic indexing + recall tools** — an optional local semantic index over the full conversation archive. When indexing is on, each turn is chunked, embedded with `nomic-embed-text-v1.5` (768d, bundled), and stored in SQLite (FTS5 + `vec0`). Claude calls `ro_memory_{search,save,update,delete}` as MCP tools when it needs to recall something older than the tail — explicit, not ambient.
+
+- **Local-first** -- everything runs on-device
+- **Hybrid retrieval** -- BM25 keyword + vector cosine with reciprocal rank fusion
+- **Opt-in indexing** -- disabled by default; toggle in Settings → Dynamic Indexing
+- **Tools always available** -- save/search/update/delete work regardless of toggle; the toggle only gates passive capture
+- **Resilient** -- pre-open integrity validation, rolling backups, WAL checkpoint before snapshot
+- **Paths** -- database at `~/.root-operator/workspace/brain/memory.db`, history at `channel-history.jsonl` (bounded to 200 messages)
 
 ## Requirements
 
@@ -169,7 +173,7 @@ npm run dev:app    # Start with hot reload
 |  +---------------+  +---------------+  +----------------------+  |
 |                                                                  |
 |  +------------------------------------------------------------+  |
-|  |  Dynamic Memory  -  SQLite (FTS5+vec0) + ONNX Embedder     |  |
+|  |  Memory — Channel History (JSONL) + SQLite + Embedder      |  |
 |  +------------------------------------------------------------+  |
 +-----------------------------------------------------------------+
 ```
