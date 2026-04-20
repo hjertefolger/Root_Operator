@@ -18,11 +18,6 @@ class ChannelManager extends EventEmitter {
         this._destroyed = false;
         this.pendingMessages = [];
         this.maxPendingMessages = 100;
-        // PR2 bridge-ready handshake. `connected` above flips true when the
-        // Unix socket accepts, but the MCP stdio transport inside the bridge
-        // is not ready until `mcp.connect(transport)` resolves. The bridge
-        // emits a `bridge_ready` envelope at that point. Track it separately
-        // so the supervisor can gate replay on the real readiness.
         this.bridgeReady = false;
         this.lastBridgeReadyTs = null;
     }
@@ -60,12 +55,9 @@ class ChannelManager extends EventEmitter {
             }
         });
 
-        // Only schedule retry from close — error always precedes close
         this.socket.on('close', () => {
             const wasConnected = this.connected;
             this.connected = false;
-            // bridge_ready must be re-asserted on every reconnect. A stale
-            // flag here would let the supervisor replay into a half-up bridge.
             this.bridgeReady = false;
             if (wasConnected) {
                 console.log('[ChannelManager] Disconnected from bridge');
@@ -76,7 +68,6 @@ class ChannelManager extends EventEmitter {
 
         this.socket.on('error', (error) => {
             this.emit('socket_error', error);
-            // Swallow — close fires after error and handles retry
         });
     }
 
@@ -99,6 +90,7 @@ class ChannelManager extends EventEmitter {
             this.emit('claude_reply', {
                 chat_id: msg.chat_id,
                 text: msg.text,
+                attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
                 ts: msg.ts,
             });
             return;
@@ -122,11 +114,6 @@ class ChannelManager extends EventEmitter {
                 args: msg.args,
                 ts: msg.ts,
             });
-            return;
-        }
-
-        if (msg.type === 'reply_request') {
-            this.emit('reply_request', msg);
             return;
         }
 
@@ -173,21 +160,6 @@ class ChannelManager extends EventEmitter {
         return true;
     }
 
-    /**
-     * Unbuffered variant used by ClaudeSessionSupervisor. Same semantics as
-     * sendToChannel() except it NEVER queues on disconnect — it just returns
-     * false so the caller can make its own reliability decision. This closes
-     * the PR1 race where the supervisor marks a dispatch failed but the
-     * default sendToChannel() had already pushed the payload into
-     * pendingMessages, causing a later flush to deliver the "failed"
-     * dispatch to Claude after the fact.
-     *
-     * Legacy sendToChannel() callers keep their buffering behavior so
-     * scheduled tool responses etc. still survive brief reconnects.
-     *
-     * PR2 will remove the buffer entirely and make the supervisor the only
-     * queue authority; until then this method is the clean opt-out.
-     */
     sendToChannelUnbuffered(chatId, content, userId) {
         const payload = JSON.stringify({
             type: 'client_message',
@@ -203,21 +175,6 @@ class ChannelManager extends EventEmitter {
 
         try {
             this.socket.write(payload);
-        } catch {
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * PR3: Send an arbitrary structured JSON message to the bridge.
-     * Used for activate_dispatch and future protocol messages.
-     * Returns true on success, false if bridge is unavailable.
-     */
-    sendStructuredMessage(msg) {
-        if (!this.socket || !this.connected) return false;
-        try {
-            this.socket.write(JSON.stringify(msg) + '\n');
         } catch {
             return false;
         }

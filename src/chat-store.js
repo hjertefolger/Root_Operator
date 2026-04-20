@@ -15,7 +15,7 @@ class ChatStore {
         this.filePath = path.join(userDataPath, filename);
         this.tmpPath = this.filePath + '.tmp';
         this._appendCount = 0;
-        // PR3: in-memory index for O(1) reconcile lookups by external_ref.
+        // In-memory index for O(1) lookups by external_ref.
         // Built lazily on first findByExternalRef() call.
         this._externalRefIndex = null;
     }
@@ -86,7 +86,7 @@ class ChatStore {
      * Append + truncate every 50 writes.
      * @param {object} msg - message with role, content, ts
      * @param {object} [opts]
-     * @param {string} [opts.externalRef] - PR3: supervisor effect_id for reconcile
+     * @param {string} [opts.externalRef] - stable attachment/reference token
      */
     addMessage(msg, { externalRef } = {}) {
         const sanitizedAttachments = stripAttachmentBytes(msg?.attachments);
@@ -106,8 +106,8 @@ class ChatStore {
     }
 
     /**
-     * PR3: Find a message by its external_ref (supervisor effect_id).
-     * Returns the message object or null. Used by boot-time reconcile (PR4).
+     * Find a message by its external_ref.
+     * Returns the message object or null.
      */
     findByExternalRef(ref) {
         if (!ref) return null;

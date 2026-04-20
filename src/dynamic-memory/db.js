@@ -92,16 +92,10 @@ function createSchema(db) {
 /**
  * Idempotent migration: add `external_ref` column if absent, then ensure the
  * index exists regardless of whether we added the column this run.
- * Supervisor PR1 schema prep for PR3's effect-ledger writes. PR1 itself
- * does not populate this column — but later PRs stamp it with the
- * committing effect_id so the reconcile-on-recovery pass can match
- * supervisor effects to dynamic-memory rows by direct lookup.
  *
  * Safe against concurrent opens: wraps the check-and-ALTER in an IMMEDIATE
- * transaction so two processes serialise. Also tolerates the "duplicate
+ * transaction so two processes serialize. Also tolerates the "duplicate
  * column" error defensively in case SQLite surfaces it through a race.
- *
- * Design doc: ~/.root-operator/workspace/design/claude-session-supervisor-v4.md §N-v4.2
  */
 function ensureExternalRefColumn(db) {
     const addColumnIfMissing = db.transaction(() => {
