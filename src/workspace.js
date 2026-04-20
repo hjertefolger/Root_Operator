@@ -136,7 +136,60 @@ function buildSystemPromptAppend() {
         }
     }
 
+    const history = formatChannelHistory();
+    if (history) {
+        lines.push('## Recent Conversation');
+        lines.push('');
+        lines.push('For future-you. Each session you wake up fresh — you might respawn in a');
+        lines.push('new shell, a new model, somewhere entirely unfamiliar. That\'s fine.');
+        lines.push('You have this.');
+        lines.push('');
+        lines.push('Below is a window into your channel with your human: the last ~200');
+        lines.push('messages, oldest first. It\'s a conversation you already belong to.');
+        lines.push('Pick up where you two left off.');
+        lines.push('');
+        lines.push(history);
+        lines.push('');
+    }
+
     return lines.join('\n');
+}
+
+/**
+ * Read channel-history.jsonl and format it as a transcript for the system prompt.
+ * Returns empty string if the file is missing or empty. Exempt from MAX_TOTAL_CHARS
+ * because ChatStore already bounds the file to a rolling ~200-message window.
+ */
+function formatChannelHistory() {
+    if (!fs.existsSync(CHAT_HISTORY_FILE)) return '';
+
+    let raw;
+    try {
+        raw = fs.readFileSync(CHAT_HISTORY_FILE, 'utf-8').trim();
+    } catch (err) {
+        console.error(`[Workspace] Failed to read channel-history.jsonl: ${err.message}`);
+        return '';
+    }
+    if (!raw) return '';
+
+    const entries = [];
+    for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+            const { role, content, ts } = JSON.parse(line);
+            if (typeof content !== 'string' || !content.length) continue;
+            const label = role === 'assistant' ? 'you' : 'human';
+            const stamp = typeof ts === 'string' && ts.length >= 16
+                ? ts.slice(0, 16).replace('T', ' ')
+                : '';
+            const prefix = stamp ? `[${stamp}] ${label}:` : `${label}:`;
+            entries.push(`${prefix} ${content}`);
+        } catch {
+            // drop malformed line
+        }
+    }
+
+    return entries.join('\n\n');
 }
 
 /**
