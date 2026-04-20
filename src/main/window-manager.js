@@ -707,8 +707,8 @@ function init(deps = {}) {
             }
             .email:hover { text-decoration: underline; }
             .copyright {
-                font-size: 11px;
-                color: rgba(255,255,255,0.4);
+                font-size: 13px;
+                color: rgba(255,255,255,0.5);
             }
         </style>
     </head>
@@ -716,7 +716,7 @@ function init(deps = {}) {
         <img class="icon" src="data:image/png;base64,${iconBase64}" alt="Icon">
         <div class="name">Root_Operator</div>
         <div class="version">Version ${version}</div>
-        <div class="tagline">Personal AI assistant for macOS powered by Claude Code channels</div>
+        <div class="tagline">Personal AI assistant for macOS<br>powered by Claude Code channels</div>
         <a class="email" href="mailto:support@rootoperator.dev">support@rootoperator.dev</a>
         <div class="copyright">© 2026 Root Operator</div>
     </body>
