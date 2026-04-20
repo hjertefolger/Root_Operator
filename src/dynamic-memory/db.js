@@ -165,9 +165,13 @@ function contentExists(db, content) {
 function insertMemory(db, memory) {
     const hash = hashContent(memory.content);
 
-    const existing = db.prepare(`SELECT id FROM memories WHERE content_hash = ?`).get(hash);
+    const existing = db.prepare(`SELECT id, chat_id FROM memories WHERE content_hash = ?`).get(hash);
     if (existing) {
-        return { id: existing.id, isDuplicate: true };
+        return {
+            id: existing.id,
+            isDuplicate: true,
+            existingChatId: existing.chat_id || null,
+        };
     }
 
     const info = db
@@ -223,10 +227,20 @@ function deleteMemory(db, id) {
  */
 function updateMemory(db, id, newContent, newEmbedding) {
     const hash = hashContent(newContent);
+
+    // If another row already owns this content-hash, surface a clean
+    // conflict instead of letting SQLite throw a raw UNIQUE error.
+    const collision = db.prepare(
+        `SELECT id FROM memories WHERE content_hash = ? AND id != ?`
+    ).get(hash, id);
+    if (collision) {
+        return { ok: false, conflictId: collision.id };
+    }
+
     const info = db.prepare(
         `UPDATE memories SET content = ?, content_hash = ?, embedding = ? WHERE id = ?`
     ).run(newContent, hash, embeddingToBuffer(newEmbedding), id);
-    return info.changes > 0;
+    return { ok: info.changes > 0 };
 }
 
 // ============================================================================

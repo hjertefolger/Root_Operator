@@ -18,6 +18,10 @@ class ChatStore {
         // In-memory index for O(1) lookups by external_ref.
         // Built lazily on first findByExternalRef() call.
         this._externalRefIndex = null;
+        // Enforce cap on every launch: the per-process counter resets on
+        // restart, so without this a user with short sessions grows the
+        // file past MAX_MESSAGES indefinitely.
+        this.truncateIfNeeded();
     }
 
     /**
@@ -33,6 +37,19 @@ class ChatStore {
                 fs.appendFileSync(this.filePath, line, { encoding: 'utf8' });
             }
         }
+    }
+
+    /**
+     * Return the timestamp of the oldest message in the JSONL, or null if
+     * the file is empty/missing. Used to scope memory retrieval away from
+     * the tail already injected into the appended system prompt.
+     */
+    getOldestTimestamp() {
+        const messages = this.loadMessages();
+        for (const m of messages) {
+            if (m && typeof m.ts === 'string') return m.ts;
+        }
+        return null;
     }
 
     /**

@@ -370,6 +370,24 @@ function startIPCServer() {
     socket.on('close', () => {
       console.error('[channel-bridge] Electron disconnected');
       electronSocket = null;
+      // Fail any in-flight scheduler/memory RPCs rather than waiting out the
+      // 15s timeout; the peer they were waiting for has just vanished.
+      for (const [, cb] of schedulerCallbacks) {
+        clearTimeout(cb.timeout);
+        cb.resolve({
+          content: [{ type: 'text', text: 'Error: Electron bridge disconnected' }],
+          isError: true,
+        });
+      }
+      schedulerCallbacks.clear();
+      for (const [, cb] of memoryCallbacks) {
+        clearTimeout(cb.timeout);
+        cb.resolve({
+          content: [{ type: 'text', text: 'Error: Electron bridge disconnected' }],
+          isError: true,
+        });
+      }
+      memoryCallbacks.clear();
     });
 
     socket.on('error', (error) => {

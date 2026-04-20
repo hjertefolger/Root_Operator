@@ -530,14 +530,14 @@ class DynamicMemory {
         if (!this.isReady()) throw new Error('dynamic memory not ready');
 
         const embedding = await embeddings.embedPassage(content);
-        const { id, isDuplicate } = insertMemory(this.db, {
+        const { id, isDuplicate, existingChatId } = insertMemory(this.db, {
             content,
             embedding,
             chatId,
             sourceRole: 'manual',
             timestamp: new Date(),
         });
-        return { id, isDuplicate };
+        return { id, isDuplicate, existingChatId: existingChatId || null };
     }
 
     /**

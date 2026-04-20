@@ -597,7 +597,17 @@ function init(deps = {}) {
                     }
                     const limit = Math.max(1, Math.min(25, Number(req.args?.limit) || 5));
                     const chatId = req.args?.chat_id !== undefined ? req.args.chat_id : undefined;
-                    const results = await dynamicMemory.searchMemory(query, { chatId, limit });
+                    // Scope retrieval to memories older than the channel-history
+                    // tail already injected into the system prompt, so recall
+                    // surfaces context the agent does not already have.
+                    let beforeTimestamp = null;
+                    try {
+                        const chatStore = getChatStore();
+                        beforeTimestamp = chatStore?.getOldestTimestamp?.() || null;
+                    } catch (_) {
+                        beforeTimestamp = null;
+                    }
+                    const results = await dynamicMemory.searchMemory(query, { chatId, limit, beforeTimestamp });
 
                     if (!results.length) {
                         result = `No matches for "${query}".`;
@@ -620,10 +630,15 @@ function init(deps = {}) {
                         return;
                     }
                     const chatId = req.args?.chat_id !== undefined ? req.args.chat_id : null;
-                    const { id, isDuplicate } = await dynamicMemory.saveMemory(content, { chatId });
-                    result = isDuplicate
-                        ? `Memory already existed as id=${id} (content-hash match, not re-saved).`
-                        : `Saved as id=${id}.`;
+                    const { id, isDuplicate, existingChatId } = await dynamicMemory.saveMemory(content, { chatId });
+                    if (isDuplicate) {
+                        const chatNote = (chatId && existingChatId && existingChatId !== chatId)
+                            ? ` (existing row belongs to chat=${existingChatId}, not chat=${chatId})`
+                            : '';
+                        result = `Memory already existed as id=${id} (content-hash match, not re-saved)${chatNote}.`;
+                    } else {
+                        result = `Saved as id=${id}.`;
+                    }
                     break;
                 }
 
@@ -638,10 +653,14 @@ function init(deps = {}) {
                         channelManager?.sendMemoryResponse(req.callId, 'Content is required.', true);
                         return;
                     }
-                    const updated = await dynamicMemory.updateMemoryById(id, content);
-                    result = updated
-                        ? `Memory id=${id} updated.`
-                        : `No memory with id=${id} — nothing updated.`;
+                    const updateResult = await dynamicMemory.updateMemoryById(id, content);
+                    if (updateResult && updateResult.conflictId) {
+                        result = `Cannot update id=${id}: content conflicts with existing memory id=${updateResult.conflictId} (same content-hash).`;
+                    } else if (updateResult && updateResult.ok) {
+                        result = `Memory id=${id} updated.`;
+                    } else {
+                        result = `No memory with id=${id} — nothing updated.`;
+                    }
                     break;
                 }
 
