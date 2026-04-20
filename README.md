@@ -204,12 +204,16 @@ Root Operator exposes tools to Claude Code via the MCP bridge:
 
 | Tool | Purpose |
 |------|---------|
-| `reply(chat_id, text)` | Send a response back to a connected device |
+| `reply(chat_id, text, attachments?)` | Send a response — and optionally image attachments — back to a connected device |
 | `ro_schedule(name, cron, prompt, chat_id)` | Create a persistent cron job |
 | `ro_list_schedules()` | List all scheduled jobs with status |
 | `ro_delete_schedule(id)` | Delete a scheduled job |
 | `ro_toggle_schedule(id, enabled)` | Enable or disable a job |
 | `ro_run_now(id)` | Trigger a job immediately |
+| `ro_memory_search(query, limit?, chat_id?)` | Recall memories older than the session's channel-history tail |
+| `ro_memory_save(content, chat_id?)` | Save content to memory (bypasses the indexing toggle) |
+| `ro_memory_update(id, content)` | Update a stored memory by id |
+| `ro_memory_delete(id)` | Delete a stored memory by id |
 
 ## Configuration
 
