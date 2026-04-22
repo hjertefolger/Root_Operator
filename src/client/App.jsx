@@ -253,6 +253,18 @@ function App() {
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, handleServerKeyMessage, decryptOutput]);
 
+  const handleRequestAppAction = useCallback(async (action) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
+      throw new Error('Secure session unavailable');
+    }
+    const type = action === 'restart' ? 'app_restart_request' : 'app_exit_request';
+    const encrypted = await encryptInput(JSON.stringify({ type }));
+    if (!encrypted) {
+      throw new Error('Secure session unavailable');
+    }
+    socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
+  }, [e2eReady, encryptInput, socket]);
+
   const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
     if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
       throw new Error('Secure session unavailable');
@@ -358,6 +370,7 @@ function App() {
         pinnedDesktopKidHex={pinnedDesktopKidHex}
         sessionFingerprintHex={sessionFingerprintHex}
         sessionStartedAt={sessionStartedAt}
+        onRequestAppAction={handleRequestAppAction}
       />
       {clientMode === 'channel' ? (
         <ChannelChat

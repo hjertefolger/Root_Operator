@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Fingerprint } from 'lucide-react';
+import { Fingerprint, Power, RotateCw } from 'lucide-react';
 
 function renderFingerprint(hex) {
   if (!hex || hex.length < 16) return null;
@@ -75,8 +75,32 @@ function SecurityPanel({
   sessionStartedAt,
   onClose,
   anchorRef,
+  onRequestAppAction,
 }) {
   const panelRef = useRef(null);
+  // Two-tap confirmation: first tap "arms" the action for ~4s, second tap
+  // actually fires it. Keeps the danger buttons behind an accidental tap
+  // without needing a separate modal dialog.
+  const [armedAction, setArmedAction] = useState(null);
+
+  useEffect(() => {
+    if (!armedAction) return undefined;
+    const timer = setTimeout(() => setArmedAction(null), 4000);
+    return () => clearTimeout(timer);
+  }, [armedAction]);
+
+  const handleActionClick = (action) => {
+    if (!onRequestAppAction) return;
+    if (armedAction !== action) {
+      setArmedAction(action);
+      return;
+    }
+    setArmedAction(null);
+    Promise.resolve(onRequestAppAction(action)).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[SecurityPanel] ${action} request failed:`, error);
+    });
+  };
 
   useEffect(() => {
     const handleClickOutside = (event) => {
@@ -141,6 +165,69 @@ function SecurityPanel({
           Verify with desktop app
         </span>
       </div>
+
+      {onRequestAppAction && (
+        <div className="mt-4 flex gap-2">
+          <button
+            type="button"
+            onClick={() => handleActionClick('restart')}
+            aria-label={armedAction === 'restart' ? 'Confirm restart' : 'Restart desktop app'}
+            style={{
+              flex: 1,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: armedAction === 'restart'
+                ? '1px solid rgba(75,90,255,0.55)'
+                : '1px solid rgba(75,90,255,0.24)',
+              background: armedAction === 'restart'
+                ? 'rgba(75,90,255,0.22)'
+                : 'rgba(75,90,255,0.10)',
+              color: '#9ba8ff',
+              fontFamily: 'var(--font-sans, inherit)',
+              fontSize: 12,
+              letterSpacing: '0.02em',
+              cursor: 'pointer',
+              transition: 'background-color 160ms ease, border-color 160ms ease',
+            }}
+          >
+            <RotateCw size={13} strokeWidth={2.1} />
+            <span>{armedAction === 'restart' ? 'Tap again' : 'Restart'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleActionClick('exit')}
+            aria-label={armedAction === 'exit' ? 'Confirm quit' : 'Quit desktop app'}
+            style={{
+              flex: 1,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: armedAction === 'exit'
+                ? '1px solid rgba(212,77,105,0.55)'
+                : '1px solid rgba(212,77,105,0.24)',
+              background: armedAction === 'exit'
+                ? 'rgba(212,77,105,0.22)'
+                : 'rgba(212,77,105,0.10)',
+              color: '#e99aab',
+              fontFamily: 'var(--font-sans, inherit)',
+              fontSize: 12,
+              letterSpacing: '0.02em',
+              cursor: 'pointer',
+              transition: 'background-color 160ms ease, border-color 160ms ease',
+            }}
+          >
+            <Power size={13} strokeWidth={2.1} />
+            <span>{armedAction === 'exit' ? 'Tap again' : 'Quit'}</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

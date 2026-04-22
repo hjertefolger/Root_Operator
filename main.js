@@ -477,6 +477,38 @@ const {
     teardownChannelMode,
     setOperatingMode,
 } = channelMode;
+// Remote app control — invoked from the paired-device security panel so the
+// user can recover from a stale session without physical access to the Mac.
+// Restart spawns a fresh Electron instance via app.relaunch(); exit just
+// quits. Both delay the teardown by ~500ms so the acknowledgement message
+// has a chance to flush over the WS before the process goes down.
+function requestAppRestart() {
+    logDebug('[APP] Remote restart queued');
+    try {
+        app.relaunch();
+    } catch (error) {
+        logDebug(`[APP] relaunch() failed: ${error && error.message}`);
+    }
+    setTimeout(() => {
+        try {
+            app.quit();
+        } catch (error) {
+            logDebug(`[APP] quit() failed during restart: ${error && error.message}`);
+        }
+    }, 500);
+}
+
+function requestAppExit() {
+    logDebug('[APP] Remote exit queued');
+    setTimeout(() => {
+        try {
+            app.quit();
+        } catch (error) {
+            logDebug(`[APP] quit() failed during exit: ${error && error.message}`);
+        }
+    }, 500);
+}
+
 const websocketBridge = initWebsocketBridge({
     fs,
     path,
@@ -512,6 +544,8 @@ const websocketBridge = initWebsocketBridge({
     computeKeyIdFromJwk,
     verifySignatureWithJwk,
     attachmentsDir: ATTACHMENTS_DIR,
+    requestAppRestart,
+    requestAppExit,
 });
 const {
     handleConnection: websocketHandleConnection,

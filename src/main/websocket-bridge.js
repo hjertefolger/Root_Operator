@@ -27,6 +27,11 @@ function init(deps = {}) {
     const ensureAttachmentsDir = requireFunction('ensureAttachmentsDir', deps.ensureAttachmentsDir);
     const submitChannelUserMessage = requireFunction('submitChannelUserMessage', deps.submitChannelUserMessage);
     const parseStructuredChannelInput = requireFunction('parseStructuredChannelInput', deps.parseStructuredChannelInput);
+    // Remote app control — optional so existing tests that don't wire these
+    // deps keep working. When unwired the handlers short-circuit with an error
+    // ACK instead of a silent drop.
+    const requestAppRestart = typeof deps.requestAppRestart === 'function' ? deps.requestAppRestart : null;
+    const requestAppExit = typeof deps.requestAppExit === 'function' ? deps.requestAppExit : null;
     const buildAttachmentBytesResponsePayload = requireFunction('buildAttachmentBytesResponsePayload', deps.buildAttachmentBytesResponsePayload);
     const sendNotificationState = requireFunction('sendNotificationState', deps.sendNotificationState);
     const upsertPushSubscription = requireFunction('upsertPushSubscription', deps.upsertPushSubscription);
@@ -530,6 +535,34 @@ function init(deps = {}) {
                     logDebug(`[ATTACH] On-demand fetch failed for ${structuredInput.attachment_id || 'unknown'}: ${response.error}`);
                 }
                 sendEncryptedOutput(ws, JSON.stringify(response));
+                return;
+            }
+            if (structuredInput?.type === 'app_restart_request') {
+                logDebug(`[APP] Remote restart requested by device kid=${(ws.kid || '?').substring(0, 8)}`);
+                if (requestAppRestart) {
+                    sendEncryptedOutput(ws, JSON.stringify({ type: 'app_restart_ack' }));
+                    requestAppRestart();
+                } else {
+                    sendEncryptedOutput(ws, JSON.stringify({
+                        type: 'app_restart_ack',
+                        isError: true,
+                        error: 'Remote restart unavailable',
+                    }));
+                }
+                return;
+            }
+            if (structuredInput?.type === 'app_exit_request') {
+                logDebug(`[APP] Remote exit requested by device kid=${(ws.kid || '?').substring(0, 8)}`);
+                if (requestAppExit) {
+                    sendEncryptedOutput(ws, JSON.stringify({ type: 'app_exit_ack' }));
+                    requestAppExit();
+                } else {
+                    sendEncryptedOutput(ws, JSON.stringify({
+                        type: 'app_exit_ack',
+                        isError: true,
+                        error: 'Remote exit unavailable',
+                    }));
+                }
                 return;
             }
             if (getOperatingMode() === 'channel') {

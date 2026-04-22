@@ -85,6 +85,7 @@ function Header({
   pinnedDesktopKidHex,
   sessionFingerprintHex,
   sessionStartedAt,
+  onRequestAppAction,
 }) {
   const isReconnecting = connectionState === 'reconnecting';
   const isSecure = e2eReady;
@@ -239,6 +240,7 @@ function Header({
             sessionStartedAt={sessionStartedAt}
             onClose={() => setSecurityPanelOpen(false)}
             anchorRef={lockButtonRef}
+            onRequestAppAction={onRequestAppAction}
           />
         )}
       </header>
