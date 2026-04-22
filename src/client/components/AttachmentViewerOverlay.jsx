@@ -270,6 +270,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const viewportRectRef = useRef(getViewportFallbackRect());
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
+  const videoRef = useRef(null);
   const contentRef = useRef(null);
   const transformRef = useRef({ scale: 1, x: 0, y: 0 });
   const webViewRef = useRef({ zoom: 1, x: 0, y: 0 });
@@ -304,6 +305,8 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     ? { ...activeAttachment, ...cachedAttachment }
     : activeAttachment;
   const previewSrc = getAttachmentPreviewSrc(resolvedAttachment);
+  const resolvedMime = String(resolvedAttachment?.mime || '').toLowerCase();
+  const isVideoAttachment = resolvedMime.startsWith('video/');
   const fetchState = attachmentId ? attachmentFetchState?.[attachmentId] : null;
   const isLoading = fetchState?.loading === true;
   const fetchError = fetchState?.error || '';
@@ -1558,7 +1561,44 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             </div>
           )}
 
-          {previewSrc && (
+          {previewSrc && isVideoAttachment && (
+            <div
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  onClose?.();
+                }
+              }}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '32px 24px 140px',
+                pointerEvents: 'auto',
+              }}
+            >
+              <video
+                ref={videoRef}
+                key={previewSrc}
+                src={previewSrc}
+                controls
+                playsInline
+                preload="metadata"
+                onError={handleImageError}
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: '100%',
+                  borderRadius: 12,
+                  background: '#000',
+                  outline: 'none',
+                  boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                }}
+              />
+            </div>
+          )}
+
+          {previewSrc && !isVideoAttachment && (
             useLayoutZoomViewer ? (
               <div
                 onPointerDown={handleWebStagePointerDown}
@@ -1741,7 +1781,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           )}
         </div>
 
-        {previewSrc && !errorMessage && (
+        {previewSrc && !errorMessage && !isVideoAttachment && (
           <div
             style={{
               position: 'absolute',
