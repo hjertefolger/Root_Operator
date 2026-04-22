@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
 
 const MAX_SCALE = 6;
 const MAX_WEB_ZOOM = 8;
@@ -719,6 +719,47 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
   }, [activeAttachment?.name, annotatedAttachmentHandler, canSendAnnotated, naturalSize.height, naturalSize.width, onClose, strokes]);
 
+  const handleDownload = useCallback(async () => {
+    if (!activeAttachment) {
+      return;
+    }
+    const src = previewSrc;
+    if (!src) {
+      return;
+    }
+    try {
+      // Fetch the source (works for both object URLs and data URLs) and save
+      // as a blob so the browser honours the download attribute instead of
+      // navigating away. Fallback path: direct anchor click for same-origin
+      // URLs that don't fetch cleanly.
+      const response = await fetch(src);
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = activeAttachment.name || 'attachment';
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      // Release the object URL on the next tick; keeping it briefly avoids
+      // racing Safari's download start.
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      // Last-resort fallback: anchor click against the original src. Won't
+      // always respect the download attribute (cross-origin without CORS
+      // will navigate instead) but better than failing silently.
+      const anchor = document.createElement('a');
+      anchor.href = src;
+      anchor.download = activeAttachment.name || 'attachment';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    }
+  }, [activeAttachment, previewSrc]);
+
   useEffect(() => {
     setActiveIndex(initialIndex);
   }, [initialIndex]);
@@ -1397,6 +1438,28 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           >
             {activeIndex + 1}/{attachmentCount}
           </span>
+
+          <button
+            type="button"
+            onClick={handleDownload}
+            aria-label="Download attachment"
+            disabled={!previewSrc}
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 999,
+              border: 'none',
+              background: 'transparent',
+              color: previewSrc ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.32)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'auto',
+              cursor: previewSrc ? 'pointer' : 'not-allowed',
+            }}
+          >
+            <ArrowDownToLine size={16} strokeWidth={2} />
+          </button>
 
           <button
             type="button"
