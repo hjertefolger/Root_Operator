@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Redo2, Trash, Undo2, Volume2, VolumeX, X } from 'lucide-react';
 
 const MAX_SCALE = 6;
 const MAX_WEB_ZOOM = 8;
@@ -211,6 +211,201 @@ function canvasToBlob(canvas) {
       resolve(blob);
     }, 'image/png');
   });
+}
+
+function formatVideoTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return '0:00';
+  }
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function VideoControlsPill({ videoRef }) {
+  const [paused, setPaused] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const [scrubValue, setScrubValue] = useState(0);
+
+  useEffect(() => {
+    const video = videoRef?.current;
+    if (!video) {
+      return undefined;
+    }
+
+    const syncFromVideo = () => {
+      setPaused(video.paused);
+      setMuted(video.muted);
+      const dur = Number.isFinite(video.duration) ? video.duration : 0;
+      setDuration(dur);
+      if (!isScrubbing) {
+        setCurrentTime(video.currentTime || 0);
+      }
+    };
+
+    syncFromVideo();
+
+    const onPlay = () => setPaused(false);
+    const onPause = () => setPaused(true);
+    const onTimeUpdate = () => {
+      if (!isScrubbing) {
+        setCurrentTime(video.currentTime || 0);
+      }
+    };
+    const onDurationChange = () => {
+      const dur = Number.isFinite(video.duration) ? video.duration : 0;
+      setDuration(dur);
+    };
+    const onVolumeChange = () => setMuted(video.muted);
+
+    video.addEventListener('play', onPlay);
+    video.addEventListener('pause', onPause);
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('loadedmetadata', onDurationChange);
+    video.addEventListener('durationchange', onDurationChange);
+    video.addEventListener('volumechange', onVolumeChange);
+
+    return () => {
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('loadedmetadata', onDurationChange);
+      video.removeEventListener('durationchange', onDurationChange);
+      video.removeEventListener('volumechange', onVolumeChange);
+    };
+  }, [isScrubbing, videoRef]);
+
+  const handlePlayPause = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+  }, [videoRef]);
+
+  const handleMuteToggle = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    video.muted = !video.muted;
+  }, [videoRef]);
+
+  const handleFullscreen = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    const request =
+      video.requestFullscreen
+      || video.webkitRequestFullscreen
+      || video.msRequestFullscreen;
+    if (request) {
+      request.call(video).catch(() => {});
+    }
+  }, [videoRef]);
+
+  const handleScrubStart = useCallback((event) => {
+    setIsScrubbing(true);
+    setScrubValue(Number(event.target.value));
+  }, []);
+
+  const handleScrubChange = useCallback((event) => {
+    setScrubValue(Number(event.target.value));
+  }, []);
+
+  const handleScrubEnd = useCallback((event) => {
+    const video = videoRef?.current;
+    const target = Number(event.target.value);
+    if (video && Number.isFinite(target)) {
+      video.currentTime = target;
+      setCurrentTime(target);
+    }
+    setIsScrubbing(false);
+  }, [videoRef]);
+
+  const displayedTime = isScrubbing ? scrubValue : currentTime;
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        padding: '6px 10px 6px 8px',
+        borderRadius: 999,
+        background: 'rgba(10,10,10,0.82)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
+        backdropFilter: 'blur(18px)',
+        pointerEvents: 'auto',
+        minWidth: 'min(calc(100vw - 48px), 420px)',
+      }}
+    >
+      <IconButton
+        onClick={handlePlayPause}
+        ariaLabel={paused ? 'Play' : 'Pause'}
+        activeStrong
+      >
+        {paused ? <Play size={16} strokeWidth={2.1} /> : <Pause size={16} strokeWidth={2.1} />}
+      </IconButton>
+
+      <input
+        type="range"
+        min={0}
+        max={hasDuration ? duration : 0}
+        step={0.1}
+        value={hasDuration ? displayedTime : 0}
+        onMouseDown={handleScrubStart}
+        onTouchStart={handleScrubStart}
+        onChange={handleScrubChange}
+        onMouseUp={handleScrubEnd}
+        onTouchEnd={handleScrubEnd}
+        disabled={!hasDuration}
+        aria-label="Seek"
+        style={{
+          flex: 1,
+          appearance: 'none',
+          WebkitAppearance: 'none',
+          height: 4,
+          borderRadius: 999,
+          background: `linear-gradient(to right, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0.85) ${
+            hasDuration ? (displayedTime / duration) * 100 : 0
+          }%, rgba(255,255,255,0.16) ${
+            hasDuration ? (displayedTime / duration) * 100 : 0
+          }%, rgba(255,255,255,0.16) 100%)`,
+          outline: 'none',
+          cursor: hasDuration ? 'pointer' : 'default',
+          opacity: hasDuration ? 1 : 0.4,
+        }}
+      />
+
+      <span
+        style={{
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: 11,
+          color: 'rgba(255,255,255,0.72)',
+          whiteSpace: 'nowrap',
+          minWidth: 76,
+          textAlign: 'center',
+        }}
+      >
+        {formatVideoTime(displayedTime)} / {formatVideoTime(duration)}
+      </span>
+
+      <IconButton onClick={handleMuteToggle} ariaLabel={muted ? 'Unmute' : 'Mute'}>
+        {muted ? <VolumeX size={16} strokeWidth={2.1} /> : <Volume2 size={16} strokeWidth={2.1} />}
+      </IconButton>
+
+      <IconButton onClick={handleFullscreen} ariaLabel="Fullscreen">
+        <Maximize2 size={16} strokeWidth={2.1} />
+      </IconButton>
+    </div>
+  );
 }
 
 function IconButton({ children, onClick, disabled, active, activeStrong, accent, ariaLabel }) {
@@ -1582,10 +1777,19 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                 ref={videoRef}
                 key={previewSrc}
                 src={previewSrc}
-                controls
                 playsInline
                 preload="metadata"
                 onError={handleImageError}
+                onClick={(event) => {
+                  // Tapping the video toggles play/pause so the pill's play
+                  // button isn't the only way to start/stop playback.
+                  const v = event.currentTarget;
+                  if (v.paused) {
+                    v.play().catch(() => {});
+                  } else {
+                    v.pause();
+                  }
+                }}
                 style={{
                   maxWidth: '100%',
                   maxHeight: '100%',
@@ -1593,6 +1797,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   background: '#000',
                   outline: 'none',
                   boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                  cursor: 'pointer',
                 }}
               />
             </div>
@@ -1780,6 +1985,24 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             </>
           )}
         </div>
+
+        {previewSrc && !errorMessage && isVideoAttachment && (
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              bottom: 24,
+              transform: 'translateX(-50%)',
+              width: 'min(calc(100vw - 32px), 920px)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+            }}
+          >
+            <VideoControlsPill videoRef={videoRef} />
+          </div>
+        )}
 
         {previewSrc && !errorMessage && !isVideoAttachment && (
           <div
