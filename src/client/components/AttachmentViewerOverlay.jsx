@@ -473,6 +473,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const webPendingViewRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef({ mode: 'idle' });
+  // Tap tracking — stage handlers call preventDefault() on pointerdown, which
+  // suppresses the synthesized click event, so onClick on nested <video> does
+  // not fire reliably. We synthesize a tap from pointerdown/up deltas here.
+  const tapStartRef = useRef(null);
+  const TAP_MAX_DISTANCE = 8;
+  const TAP_MAX_DURATION = 500;
   const drawingPointerIdRef = useRef(null);
   const draftStrokeRef = useRef(null);
   const renderFrameRef = useRef(0);
@@ -594,8 +600,30 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     commitNaturalSizeFromImage(event.currentTarget);
   }, [commitNaturalSizeFromImage]);
 
+  const handleVideoLoadedMetadata = useCallback((event) => {
+    const video = event.currentTarget;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return;
+    }
+    commitNaturalSize(width, height);
+  }, [commitNaturalSize]);
+
   const handleImageError = useCallback(() => {
-    setImageLoadError('Unable to render this image');
+    setImageLoadError(isVideoAttachment ? 'Unable to play this video' : 'Unable to render this image');
+  }, [isVideoAttachment]);
+
+  const handleVideoClick = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
   }, []);
 
   const resetNaturalSize = useCallback(() => {
@@ -925,36 +953,55 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     if (!src) {
       return;
     }
+    const filename = activeAttachment.name || 'attachment';
+    const canShareFiles = (
+      typeof navigator !== 'undefined'
+      && typeof navigator.canShare === 'function'
+      && typeof navigator.share === 'function'
+    );
     try {
-      // Fetch the source (works for both object URLs and data URLs) and save
-      // as a blob so the browser honours the download attribute instead of
-      // navigating away. Fallback path: direct anchor click for same-origin
-      // URLs that don't fetch cleanly.
       const response = await fetch(src);
       const blob = await response.blob();
+
+      // On iOS PWAs and mobile Safari, `<a download>` is unreliable — it often
+      // opens the file in a new webview tab instead of presenting a save
+      // dialog. The Web Share API with a File is the supported path: it
+      // presents the native share sheet (Save to Files, AirDrop, etc.).
+      //
+      // When file-share is supported on the device we treat the share sheet as
+      // the only valid save path. Any rejection or failure surfaces an error
+      // rather than falling back to the broken anchor-download path on iOS.
+      if (canShareFiles) {
+        const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+        if (!navigator.canShare({ files: [file] })) {
+          setSendError('This file type is not supported by the system share sheet.');
+          return;
+        }
+        try {
+          await navigator.share({ files: [file], title: filename });
+          return;
+        } catch (shareError) {
+          if (shareError?.name === 'AbortError') {
+            // User dismissed the share sheet — treat as a quiet cancel.
+            return;
+          }
+          setSendError(shareError?.message || 'Unable to save file. Try again or long-press the attachment.');
+          return;
+        }
+      }
+
+      // Desktop / browsers without file-share support: blob URL + download attr.
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
-      anchor.download = activeAttachment.name || 'attachment';
+      anchor.download = filename;
       anchor.rel = 'noopener';
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
-      // Release the object URL on the next tick; keeping it briefly avoids
-      // racing Safari's download start.
       setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
     } catch (error) {
-      // Last-resort fallback: anchor click against the original src. Won't
-      // always respect the download attribute (cross-origin without CORS
-      // will navigate instead) but better than failing silently.
-      const anchor = document.createElement('a');
-      anchor.href = src;
-      anchor.download = activeAttachment.name || 'attachment';
-      anchor.target = '_blank';
-      anchor.rel = 'noopener';
-      document.body.appendChild(anchor);
-      anchor.click();
-      document.body.removeChild(anchor);
+      setSendError(error?.message || 'Unable to download attachment.');
     }
   }, [activeAttachment, previewSrc]);
 
@@ -1339,6 +1386,17 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
+    if (pointersRef.current.size === 1) {
+      tapStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        time: event.timeStamp,
+      };
+    } else {
+      tapStartRef.current = null;
+    }
+
     if (pointersRef.current.size >= 2) {
       const [pointA, pointB] = Array.from(pointersRef.current.values());
       gestureRef.current = {
@@ -1368,6 +1426,17 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pointersRef.current.size === 1) {
+      tapStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        time: event.timeStamp,
+      };
+    } else {
+      tapStartRef.current = null;
+    }
 
     if (pointersRef.current.size >= 2) {
       const [pointA, pointB] = Array.from(pointersRef.current.values());
@@ -1516,6 +1585,22 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [drawEnabled, scheduleWebViewCommit, useLayoutZoomViewer, zoomWebAtPoint]);
 
   const releasePointer = useCallback((event) => {
+    const tapStart = tapStartRef.current;
+    const isTap = (
+      tapStart
+      && tapStart.pointerId === event.pointerId
+      && event.type !== 'pointercancel'
+      && Math.abs(event.clientX - tapStart.x) <= TAP_MAX_DISTANCE
+      && Math.abs(event.clientY - tapStart.y) <= TAP_MAX_DISTANCE
+      && (event.timeStamp - tapStart.time) <= TAP_MAX_DURATION
+    );
+    if (isTap && isVideoAttachment && videoRef.current) {
+      handleVideoClick();
+    }
+    if (tapStart && tapStart.pointerId === event.pointerId) {
+      tapStartRef.current = null;
+    }
+
     if (gestureRef.current.mode === 'web-swipe' && gestureRef.current.pointerId === event.pointerId && event.type !== 'pointercancel') {
       navigateBySwipe(
         event.clientX - gestureRef.current.startX,
@@ -1575,7 +1660,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
 
     gestureRef.current = { mode: 'idle' };
-  }, [navigateBySwipe, useLayoutZoomViewer]);
+  }, [handleVideoClick, isVideoAttachment, navigateBySwipe, useLayoutZoomViewer]);
 
   if (typeof document === 'undefined' || attachmentCount === 0 || !activeAttachment) {
     return null;
@@ -1637,48 +1722,55 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             {activeIndex + 1}/{attachmentCount}
           </span>
 
-          <button
-            type="button"
-            onClick={handleDownload}
-            aria-label="Download attachment"
-            disabled={!previewSrc}
+          <div
             style={{
-              width: 28,
-              height: 28,
-              borderRadius: 999,
-              border: 'none',
-              background: 'transparent',
-              color: previewSrc ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.32)',
               display: 'inline-flex',
               alignItems: 'center',
-              justifyContent: 'center',
+              gap: 4,
               pointerEvents: 'auto',
-              cursor: previewSrc ? 'pointer' : 'not-allowed',
             }}
           >
-            <ArrowDownToLine size={16} strokeWidth={2} />
-          </button>
+            <button
+              type="button"
+              onClick={handleDownload}
+              aria-label="Download attachment"
+              disabled={!previewSrc}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                border: 'none',
+                background: 'transparent',
+                color: previewSrc ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.32)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: previewSrc ? 'pointer' : 'not-allowed',
+              }}
+            >
+              <ArrowDownToLine size={16} strokeWidth={2} />
+            </button>
 
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            aria-label="Close attachment viewer"
-            style={{
-              width: 28,
-              height: 28,
-              borderRadius: 999,
-              border: 'none',
-              background: 'transparent',
-              color: 'rgba(255,255,255,0.72)',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              pointerEvents: 'auto',
-              cursor: 'pointer',
-            }}
-          >
-            <X size={16} strokeWidth={2} />
-          </button>
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              aria-label="Close attachment viewer"
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                border: 'none',
+                background: 'transparent',
+                color: 'rgba(255,255,255,0.72)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+              }}
+            >
+              <X size={16} strokeWidth={2} />
+            </button>
+          </div>
         </div>
 
         <div
@@ -1716,7 +1808,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               }}
             >
               <Loader size={22} strokeWidth={2.2} className="animate-spin" />
-              <span style={{ fontSize: 13 }}>Loading image...</span>
+              <span style={{ fontSize: 13 }}>{isVideoAttachment ? 'Loading video...' : 'Loading image...'}</span>
             </div>
           )}
 
@@ -1756,54 +1848,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             </div>
           )}
 
-          {previewSrc && isVideoAttachment && (
-            <div
-              onMouseDown={(event) => {
-                if (event.target === event.currentTarget) {
-                  onClose?.();
-                }
-              }}
-              style={{
-                position: 'absolute',
-                inset: 0,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                padding: '32px 24px 140px',
-                pointerEvents: 'auto',
-              }}
-            >
-              <video
-                ref={videoRef}
-                key={previewSrc}
-                src={previewSrc}
-                playsInline
-                preload="metadata"
-                onError={handleImageError}
-                onClick={(event) => {
-                  // Tapping the video toggles play/pause so the pill's play
-                  // button isn't the only way to start/stop playback.
-                  const v = event.currentTarget;
-                  if (v.paused) {
-                    v.play().catch(() => {});
-                  } else {
-                    v.pause();
-                  }
-                }}
-                style={{
-                  maxWidth: '100%',
-                  maxHeight: '100%',
-                  borderRadius: 12,
-                  background: '#000',
-                  outline: 'none',
-                  boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
-                  cursor: 'pointer',
-                }}
-              />
-            </div>
-          )}
-
-          {previewSrc && !isVideoAttachment && (
+          {previewSrc && (
             useLayoutZoomViewer ? (
               <div
                 onPointerDown={handleWebStagePointerDown}
@@ -1835,26 +1880,53 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                     cursor: drawEnabled ? 'crosshair' : (webView.zoom > 1 ? 'grab' : 'default'),
                   }}
                 >
-                  <img
-                    ref={imageRef}
-                    src={previewSrc}
-                    alt={activeAttachment.name}
-                    onLoad={handleImageLoad}
-                    onError={handleImageError}
-                    style={{
-                      display: 'block',
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain',
-                      userSelect: 'none',
-                      WebkitUserSelect: 'none',
-                      WebkitTouchCallout: 'none',
-                      pointerEvents: 'none',
-                      touchAction: 'none',
-                    }}
-                    draggable={false}
-                  />
-                  {hasNaturalSize && (
+                  {isVideoAttachment ? (
+                    <video
+                      ref={videoRef}
+                      key={previewSrc}
+                      src={previewSrc}
+                      playsInline
+                      preload="metadata"
+                      onLoadedMetadata={handleVideoLoadedMetadata}
+                      onError={handleImageError}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        borderRadius: 12,
+                        background: '#000',
+                        outline: 'none',
+                        boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
+                        WebkitTouchCallout: 'none',
+                        touchAction: 'none',
+                        cursor: 'pointer',
+                      }}
+                    />
+                  ) : (
+                    <img
+                      ref={imageRef}
+                      src={previewSrc}
+                      alt={activeAttachment.name}
+                      onLoad={handleImageLoad}
+                      onError={handleImageError}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
+                        WebkitTouchCallout: 'none',
+                        pointerEvents: 'none',
+                        touchAction: 'none',
+                      }}
+                      draggable={false}
+                    />
+                  )}
+                  {!isVideoAttachment && hasNaturalSize && (
                     <canvas
                       ref={canvasRef}
                       onPointerDown={handleDrawPointerDown}
@@ -1892,38 +1964,64 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   cursor: drawEnabled ? 'crosshair' : (transform.scale > 1 ? 'grab' : 'default'),
                 }}
               >
-                <img
-                  ref={imageRef}
-                  src={previewSrc}
-                  alt={activeAttachment.name}
-                  onLoad={handleImageLoad}
-                  onError={handleImageError}
-                  style={{
-                    display: 'block',
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    userSelect: 'none',
-                    WebkitUserSelect: 'none',
-                    WebkitTouchCallout: 'none',
-                  }}
-                  draggable={false}
-                />
-                <canvas
-                  ref={canvasRef}
-                  onPointerDown={handleDrawPointerDown}
-                  onPointerMove={handleDrawPointerMove}
-                  onPointerUp={handleDrawPointerUp}
-                  onPointerCancel={handleDrawPointerCancel}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    width: '100%',
-                    height: '100%',
-                    pointerEvents: drawEnabled ? 'auto' : 'none',
-                    touchAction: 'none',
-                  }}
-                />
+                {isVideoAttachment ? (
+                  <video
+                    ref={videoRef}
+                    key={previewSrc}
+                    src={previewSrc}
+                    playsInline
+                    preload="metadata"
+                    onLoadedMetadata={handleVideoLoadedMetadata}
+                    onError={handleImageError}
+                    onClick={handleVideoClick}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      borderRadius: 12,
+                      background: '#000',
+                      outline: 'none',
+                      boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                      cursor: 'pointer',
+                    }}
+                  />
+                ) : (
+                  <img
+                    ref={imageRef}
+                    src={previewSrc}
+                    alt={activeAttachment.name}
+                    onLoad={handleImageLoad}
+                    onError={handleImageError}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      userSelect: 'none',
+                      WebkitUserSelect: 'none',
+                      WebkitTouchCallout: 'none',
+                    }}
+                    draggable={false}
+                  />
+                )}
+                {!isVideoAttachment && (
+                  <canvas
+                    ref={canvasRef}
+                    onPointerDown={handleDrawPointerDown}
+                    onPointerMove={handleDrawPointerMove}
+                    onPointerUp={handleDrawPointerUp}
+                    onPointerCancel={handleDrawPointerCancel}
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                      pointerEvents: drawEnabled ? 'auto' : 'none',
+                      touchAction: 'none',
+                    }}
+                  />
+                )}
               </div>
             )
           )}
@@ -1995,11 +2093,31 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               transform: 'translateX(-50%)',
               width: 'min(calc(100vw - 32px), 920px)',
               display: 'flex',
+              flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
+              gap: 8,
               pointerEvents: 'none',
             }}
           >
+            {sendError && (
+              <div
+                style={{
+                  maxWidth: 'min(100%, 520px)',
+                  padding: '8px 12px',
+                  borderRadius: 999,
+                  background: 'rgba(88,20,24,0.88)',
+                  border: '1px solid rgba(255,99,132,0.24)',
+                  color: 'rgba(255,220,225,0.96)',
+                  fontSize: 12,
+                  lineHeight: 1.3,
+                  textAlign: 'center',
+                  pointerEvents: 'auto',
+                }}
+              >
+                {sendError}
+              </div>
+            )}
             <VideoControlsPill videoRef={videoRef} />
           </div>
         )}
