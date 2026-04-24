@@ -298,12 +298,27 @@ function VideoControlsPill({ videoRef }) {
   const handleFullscreen = useCallback(() => {
     const video = videoRef?.current;
     if (!video) return;
+    // iOS Safari and iOS PWAs don't implement the standard Fullscreen API on
+    // <video>; they expose webkitEnterFullscreen which hands off to the
+    // native iOS video player. Try that first on mobile WebKit, fall back to
+    // the standard API for desktop Chrome/Safari/Firefox.
+    if (typeof video.webkitEnterFullscreen === 'function') {
+      try {
+        video.webkitEnterFullscreen();
+        return;
+      } catch {
+        // Fall through to standard API.
+      }
+    }
     const request =
       video.requestFullscreen
       || video.webkitRequestFullscreen
       || video.msRequestFullscreen;
     if (request) {
-      request.call(video).catch(() => {});
+      const result = request.call(video);
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+      }
     }
   }, [videoRef]);
 
