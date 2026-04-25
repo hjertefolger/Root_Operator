@@ -461,7 +461,12 @@ async function handleElectronMessage(msg) {
   }
 
   if (msg.type === 'client_message') {
-    const content = `<channel source="root-operator" chat_id="${msg.chat_id}">${msg.content}</channel>`;
+    // Append a system-reminder so Claude is reminded — at the point of action,
+    // not just at session start — to use the reply tool instead of plain text.
+    // Plain prose output stays in the local Mac console and never reaches the
+    // paired device; this reminder closes that gap on every inbound.
+    const reminder = '<system-reminder>Reply naturally via the reply tool. Plaintext replies never reach your human.</system-reminder>';
+    const content = `<channel source="root-operator" chat_id="${msg.chat_id}">${msg.content}</channel>\n${reminder}`;
 
     await mcp.notification({
       method: 'notifications/claude/channel',
