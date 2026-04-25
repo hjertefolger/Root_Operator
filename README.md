@@ -1,7 +1,7 @@
 <h1 align="center">Root_Operator</h1>
 
 <p align="center">
-  <a href="package.json"><img src="https://img.shields.io/badge/version-2.4.1-blue.svg" alt="Version"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/version-2.4.2-blue.svg" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="package.json"><img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform"></a>
   <a href="package.json"><img src="https://img.shields.io/badge/electron-39-blue.svg" alt="Electron"></a>
