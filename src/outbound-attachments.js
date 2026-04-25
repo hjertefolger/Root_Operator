@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 const MAX_OUTBOUND_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_OUTBOUND_VIDEO_SIZE = 100 * 1024 * 1024;
+const MAX_OUTBOUND_DOC_SIZE = 1 * 1024 * 1024; // 1 MB — markdown / plain text documents
 // Back-compat export: callers that pinned to "the max" used this name when
 // images were the only kind. Keep it as the image limit.
 const MAX_OUTBOUND_ATTACHMENT_SIZE = MAX_OUTBOUND_IMAGE_SIZE;
@@ -14,6 +15,7 @@ const OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const OUTBOUND_ATTACHMENT_KIND = 'image';
 const OUTBOUND_ATTACHMENT_KIND_IMAGE = 'image';
 const OUTBOUND_ATTACHMENT_KIND_VIDEO = 'video';
+const OUTBOUND_ATTACHMENT_KIND_DOC = 'doc';
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
     'image/png',
@@ -27,6 +29,17 @@ const ALLOWED_VIDEO_MIME_TYPES = new Set([
     'video/quicktime',
     'video/webm',
 ]);
+
+const ALLOWED_DOC_MIME_TYPES = new Set([
+    'text/markdown',
+    'text/plain',
+]);
+
+const DOC_EXTENSIONS_TO_MIME = {
+    '.md': 'text/markdown',
+    '.markdown': 'text/markdown',
+    '.txt': 'text/plain',
+};
 
 function sanitizeAttachmentName(name) {
     const base = path.basename(String(name || '').trim());
@@ -114,7 +127,36 @@ function detectVideoMime(buffer) {
     return null;
 }
 
-function detectAttachmentMime(buffer) {
+function detectDocMimeFromName(filePath) {
+    if (typeof filePath !== 'string') {
+        return null;
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    return DOC_EXTENSIONS_TO_MIME[ext] || null;
+}
+
+function isLikelyTextBuffer(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        return false;
+    }
+    // Reject any buffer containing NUL bytes (common signal of binary).
+    // Markdown / .txt attachments should never contain NUL.
+    if (buffer.includes(0)) {
+        return false;
+    }
+    // Fatal UTF-8 validation across the full buffer. TextDecoder with
+    // fatal:true throws on any invalid byte sequence, which is a stronger
+    // contract than a NUL-byte sniff and protects against binary blobs that
+    // happen to lack NUL in their first 8KB.
+    try {
+        new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function detectAttachmentMime(buffer, filePath) {
     const image = detectImageMime(buffer);
     if (image) {
         return { mime: image, kind: OUTBOUND_ATTACHMENT_KIND_IMAGE };
@@ -123,12 +165,21 @@ function detectAttachmentMime(buffer) {
     if (video) {
         return { mime: video, kind: OUTBOUND_ATTACHMENT_KIND_VIDEO };
     }
+    // Documents have no magic bytes — fall back to extension. Verify the
+    // sniffed buffer is plausibly text before accepting (NUL byte rejection).
+    const docMime = detectDocMimeFromName(filePath);
+    if (docMime && isLikelyTextBuffer(buffer)) {
+        return { mime: docMime, kind: OUTBOUND_ATTACHMENT_KIND_DOC };
+    }
     return null;
 }
 
 function limitForKind(kind) {
     if (kind === OUTBOUND_ATTACHMENT_KIND_VIDEO) {
         return MAX_OUTBOUND_VIDEO_SIZE;
+    }
+    if (kind === OUTBOUND_ATTACHMENT_KIND_DOC) {
+        return MAX_OUTBOUND_DOC_SIZE;
     }
     return MAX_OUTBOUND_IMAGE_SIZE;
 }
@@ -159,7 +210,7 @@ function readValidatedAttachmentFile(filePath) {
         fs.closeSync(fd);
     }
 
-    const detected = detectAttachmentMime(headBuffer);
+    const detected = detectAttachmentMime(headBuffer, filePath);
     if (!detected) {
         throw new Error(`Unsupported attachment type: ${filePath}`);
     }
@@ -174,14 +225,19 @@ function readValidatedAttachmentFile(filePath) {
     const buffer = fs.readFileSync(filePath);
     // Re-verify the mime against the full buffer — defends against truncated
     // reads and mismatched head/body content.
-    const confirmed = detectAttachmentMime(buffer);
+    const confirmed = detectAttachmentMime(buffer, filePath);
     if (!confirmed || confirmed.kind !== detected.kind || confirmed.mime !== detected.mime) {
         throw new Error(`Unsupported attachment type: ${filePath}`);
     }
 
-    const allowedMimes = detected.kind === OUTBOUND_ATTACHMENT_KIND_VIDEO
-        ? ALLOWED_VIDEO_MIME_TYPES
-        : ALLOWED_IMAGE_MIME_TYPES;
+    let allowedMimes;
+    if (detected.kind === OUTBOUND_ATTACHMENT_KIND_VIDEO) {
+        allowedMimes = ALLOWED_VIDEO_MIME_TYPES;
+    } else if (detected.kind === OUTBOUND_ATTACHMENT_KIND_DOC) {
+        allowedMimes = ALLOWED_DOC_MIME_TYPES;
+    } else {
+        allowedMimes = ALLOWED_IMAGE_MIME_TYPES;
+    }
     if (!allowedMimes.has(confirmed.mime)) {
         throw new Error(`Unsupported attachment type: ${filePath}`);
     }
@@ -326,20 +382,26 @@ function touchAttachmentForGc(filePath, now = new Date()) {
 module.exports = {
     ALLOWED_IMAGE_MIME_TYPES,
     ALLOWED_VIDEO_MIME_TYPES,
+    ALLOWED_DOC_MIME_TYPES,
+    DOC_EXTENSIONS_TO_MIME,
     MAX_OUTBOUND_ATTACHMENT_SIZE,
     MAX_OUTBOUND_IMAGE_SIZE,
     MAX_OUTBOUND_VIDEO_SIZE,
+    MAX_OUTBOUND_DOC_SIZE,
     OUTBOUND_ATTACHMENT_GC_GRACE_MS,
     OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
     OUTBOUND_ATTACHMENT_KIND,
     OUTBOUND_ATTACHMENT_KIND_IMAGE,
     OUTBOUND_ATTACHMENT_KIND_VIDEO,
+    OUTBOUND_ATTACHMENT_KIND_DOC,
     buildStagedAttachmentFilename,
     computeAttachmentId,
     detectAttachmentMime,
+    detectDocMimeFromName,
     detectImageMime,
     detectVideoMime,
     getStagedAttachmentPath,
+    isLikelyTextBuffer,
     loadStagedAttachmentBytes,
     readValidatedAttachmentFile,
     readValidatedImageFile,

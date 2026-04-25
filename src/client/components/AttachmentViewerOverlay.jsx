@@ -1,6 +1,75 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Redo2, Trash, Undo2, Volume2, VolumeX, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+const docRemarkPlugins = [remarkGfm];
+
+// Editorial dark style for rendered markdown documents in the viewer.
+// Heavier line-height + larger headings than chat bubbles — these are
+// long-form docs the user reads, not short messages.
+const docMdComponents = {
+  h1: ({ children }) => (
+    <h1 style={{ fontSize: 26, fontWeight: 600, color: '#fff', letterSpacing: '-0.025em', lineHeight: 1.2, margin: '32px 0 14px' }}>{children}</h1>
+  ),
+  h2: ({ children }) => (
+    <h2 style={{ fontSize: 19, fontWeight: 600, color: 'rgba(255,255,255,0.92)', letterSpacing: '-0.015em', margin: '32px 0 12px' }}>{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 style={{ fontSize: 16, fontWeight: 600, color: 'rgba(255,255,255,0.92)', margin: '24px 0 8px' }}>{children}</h3>
+  ),
+  p: ({ children }) => (
+    <p style={{ fontSize: 15, lineHeight: 1.65, color: 'rgba(255,255,255,0.78)', margin: '0 0 14px' }}>{children}</p>
+  ),
+  strong: ({ children }) => <strong style={{ color: 'rgba(255,255,255,0.95)', fontWeight: 600 }}>{children}</strong>,
+  em: ({ children }) => <em style={{ color: 'rgba(255,255,255,0.85)', fontStyle: 'italic' }}>{children}</em>,
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noreferrer" style={{ color: '#c9854a', textDecoration: 'none' }}>{children}</a>
+  ),
+  ul: ({ children }) => <ul style={{ margin: '6px 0 16px 20px', color: 'rgba(255,255,255,0.78)', fontSize: 15, lineHeight: 1.65 }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ margin: '6px 0 16px 22px', color: 'rgba(255,255,255,0.78)', fontSize: 15, lineHeight: 1.65 }}>{children}</ol>,
+  li: ({ children }) => <li style={{ padding: '3px 0' }}>{children}</li>,
+  blockquote: ({ children }) => (
+    <blockquote style={{ borderLeft: '2px solid #c9854a', background: 'rgba(255,255,255,0.03)', borderRadius: 4, padding: '12px 16px', margin: '14px 0', color: 'rgba(255,255,255,0.88)', fontSize: 15 }}>{children}</blockquote>
+  ),
+  hr: () => <hr style={{ border: 'none', borderTop: '1px dashed rgba(255,255,255,0.12)', margin: '28px 0' }} />,
+  code: ({ inline, children }) => (
+    inline
+      ? <code style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 13, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.06)', padding: '1px 6px', borderRadius: 4, color: 'rgba(255,255,255,0.92)' }}>{children}</code>
+      : <code style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 13, lineHeight: 1.6, color: 'rgba(255,255,255,0.92)' }}>{children}</code>
+  ),
+  pre: ({ children }) => (
+    <pre style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 6, padding: 14, margin: '12px 0', overflowX: 'auto', whiteSpace: 'pre' }}>{children}</pre>
+  ),
+  table: ({ children }) => (
+    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch', margin: '14px 0' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>{children}</table>
+    </div>
+  ),
+  th: ({ children }) => (
+    <th style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'rgba(255,255,255,0.55)', textAlign: 'left', padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.12)' }}>{children}</th>
+  ),
+  td: ({ children }) => (
+    <td style={{ padding: '10px 12px', borderBottom: '1px solid rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.78)', verticalAlign: 'top' }}>{children}</td>
+  ),
+};
+
+function decodeBase64Utf8(b64) {
+  if (typeof b64 !== 'string' || !b64) {
+    return '';
+  }
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  } catch {
+    return '';
+  }
+}
 
 const MAX_SCALE = 6;
 const MAX_WEB_ZOOM = 8;
@@ -523,6 +592,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const previewSrc = getAttachmentPreviewSrc(resolvedAttachment);
   const resolvedMime = String(resolvedAttachment?.mime || '').toLowerCase();
   const isVideoAttachment = resolvedMime.startsWith('video/');
+  const isDocAttachment = resolvedMime === 'text/markdown' || resolvedMime === 'text/plain';
+  const isMarkdownDoc = resolvedMime === 'text/markdown';
+  const docSource = useMemo(
+    () => (isDocAttachment ? decodeBase64Utf8(resolvedAttachment?.bytesBase64) : ''),
+    [isDocAttachment, resolvedAttachment?.bytesBase64],
+  );
   const fetchState = attachmentId ? attachmentFetchState?.[attachmentId] : null;
   const isLoading = fetchState?.loading === true;
   const fetchError = fetchState?.error || '';
@@ -626,8 +701,14 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [commitNaturalSize]);
 
   const handleImageError = useCallback(() => {
-    setImageLoadError(isVideoAttachment ? 'Unable to play this video' : 'Unable to render this image');
-  }, [isVideoAttachment]);
+    if (isDocAttachment) {
+      setImageLoadError('Unable to render this document');
+    } else if (isVideoAttachment) {
+      setImageLoadError('Unable to play this video');
+    } else {
+      setImageLoadError('Unable to render this image');
+    }
+  }, [isDocAttachment, isVideoAttachment]);
 
   const handleVideoClick = useCallback(() => {
     const video = videoRef.current;
@@ -1809,7 +1890,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             touchAction: useLayoutZoomViewer ? 'none' : 'pinch-zoom',
           }}
         >
-          {(isLoading || (previewSrc && naturalSize.width === 0 && !errorMessage) || (!previewSrc && !errorMessage)) && (
+          {(isLoading || (previewSrc && !isDocAttachment && naturalSize.width === 0 && !errorMessage) || (!previewSrc && !errorMessage)) && (
             <div
               style={{
                 position: 'absolute',
@@ -1823,7 +1904,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               }}
             >
               <Loader size={22} strokeWidth={2.2} className="animate-spin" />
-              <span style={{ fontSize: 13 }}>{isVideoAttachment ? 'Loading video...' : 'Loading image...'}</span>
+              <span style={{ fontSize: 13 }}>{isDocAttachment ? 'Loading document...' : isVideoAttachment ? 'Loading video...' : 'Loading image...'}</span>
             </div>
           )}
 
@@ -1863,7 +1944,58 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             </div>
           )}
 
-          {previewSrc && (
+          {previewSrc && isDocAttachment && (
+            <div
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  onClose?.();
+                }
+              }}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                justifyContent: 'center',
+                overflow: 'hidden',
+                pointerEvents: 'auto',
+              }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  maxWidth: 720,
+                  height: '100%',
+                  overflowY: 'auto',
+                  WebkitOverflowScrolling: 'touch',
+                  padding: '12px 24px 100px',
+                  touchAction: 'pan-y pinch-zoom',
+                  fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                }}
+              >
+                {isMarkdownDoc ? (
+                  <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
+                    {docSource}
+                  </ReactMarkdown>
+                ) : (
+                  <pre
+                    style={{
+                      fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+                      fontSize: 13,
+                      lineHeight: 1.6,
+                      color: 'rgba(255,255,255,0.85)',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      margin: 0,
+                    }}
+                  >
+                    {docSource}
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
+
+          {previewSrc && !isDocAttachment && (
             useLayoutZoomViewer ? (
               <div
                 onPointerDown={handleWebStagePointerDown}
@@ -2137,7 +2269,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           </div>
         )}
 
-        {previewSrc && !errorMessage && !isVideoAttachment && (
+        {previewSrc && !errorMessage && !isVideoAttachment && !isDocAttachment && (
           <div
             style={{
               position: 'absolute',
