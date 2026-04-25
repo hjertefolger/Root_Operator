@@ -139,4 +139,7 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 log "exec npm run dev:app"
-exec env RO_AUTO_START_TUNNEL=1 npm run dev:app >> "$LOG" 2>&1
+# Strip RO_DEV_RESTART_DETACHED so the next button-induced restart re-runs
+# the double-fork instead of skipping it (the whole dev tree inherits this
+# env, including electron, which spawns the next worker).
+exec env -u RO_DEV_RESTART_DETACHED RO_AUTO_START_TUNNEL=1 npm run dev:app >> "$LOG" 2>&1
