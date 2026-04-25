@@ -27,6 +27,11 @@ function init(deps = {}) {
     const ensureAttachmentsDir = requireFunction('ensureAttachmentsDir', deps.ensureAttachmentsDir);
     const submitChannelUserMessage = requireFunction('submitChannelUserMessage', deps.submitChannelUserMessage);
     const parseStructuredChannelInput = requireFunction('parseStructuredChannelInput', deps.parseStructuredChannelInput);
+    // Remote app control — optional so existing tests that don't wire these
+    // deps keep working. When unwired the handlers short-circuit with an error
+    // ACK instead of a silent drop.
+    const requestAppRestart = typeof deps.requestAppRestart === 'function' ? deps.requestAppRestart : null;
+    const requestAppExit = typeof deps.requestAppExit === 'function' ? deps.requestAppExit : null;
     const buildAttachmentBytesResponsePayload = requireFunction('buildAttachmentBytesResponsePayload', deps.buildAttachmentBytesResponsePayload);
     const sendNotificationState = requireFunction('sendNotificationState', deps.sendNotificationState);
     const upsertPushSubscription = requireFunction('upsertPushSubscription', deps.upsertPushSubscription);
@@ -53,7 +58,7 @@ function init(deps = {}) {
     const maxConnectionsPerSourcePerMinute = deps.maxConnectionsPerSourcePerMinute ?? 10;
     const maxAuthAttemptsPerConnection = deps.maxAuthAttemptsPerConnection ?? 3;
     const maxInputSize = deps.maxInputSize ?? 131072;
-    const maxFileSize = deps.maxFileSize ?? 20 * 1024 * 1024;
+    const maxFileSize = deps.maxFileSize ?? 100 * 1024 * 1024;
     const maxFileChunkSize = deps.maxFileChunkSize ?? 512 * 1024;
     const maxActiveTransfersPerDevice = deps.maxActiveTransfersPerDevice ?? 3;
     const fileTransferTimeoutMs = deps.fileTransferTimeoutMs ?? 120000;
@@ -532,6 +537,19 @@ function init(deps = {}) {
                 sendEncryptedOutput(ws, JSON.stringify(response));
                 return;
             }
+            if (
+                structuredInput?.type === 'app_restart_request' ||
+                structuredInput?.type === 'app_exit_request'
+            ) {
+                // Defense-in-depth: privileged app control no longer rides on
+                // the chat input channel. The supported path is the dedicated
+                // `e2e_app_control` envelope handled below. A request that
+                // reaches here means a client is on an old protocol or a
+                // paired device pasted a structured payload into chat — drop
+                // it silently rather than dispatch.
+                logDebug(`[SECURITY] Ignoring ${structuredInput.type} on chat input channel; use e2e_app_control envelope`);
+                return;
+            }
             if (getOperatingMode() === 'channel') {
                 const deviceId = ws.kid || 'unknown';
                 const result = await submitChannelUserMessage(deviceId, inputData, deviceId, {
@@ -549,6 +567,161 @@ function init(deps = {}) {
                     logDebug(`[PTY] Writing E2E input (len: ${inputData.length})`);
                     ptyProcess.write(inputData);
                 }
+            }
+            return;
+        }
+        if (ws.authenticated && message.type === 'e2e_app_control') {
+            // Privileged app control on its own envelope so a paired user
+            // typing JSON-shaped chat text cannot reach restart/exit.
+            if (!ws.e2e || !ws.e2e.ready) {
+                logDebug('[E2E] Received app_control but E2E not ready');
+                return;
+            }
+            if (message.data && message.data.length > maxInputSize * 2) {
+                logDebug('[SECURITY] Encrypted app_control payload too large, rejecting before decryption');
+                return;
+            }
+            const decrypted = decryptInput(ws, { iv: message.iv, data: message.data, tag: message.tag });
+            if (decrypted === null) {
+                logDebug('[E2E] Failed to decrypt app_control');
+                return;
+            }
+            let parsed = null;
+            try {
+                parsed = JSON.parse(decrypted);
+            } catch {
+                logDebug('[SECURITY] app_control payload is not JSON; ignoring');
+                return;
+            }
+            const action = parsed && typeof parsed === 'object' ? parsed.action : null;
+            if (action !== 'restart' && action !== 'exit') {
+                logDebug(`[SECURITY] Unknown app_control action: ${action}`);
+                return;
+            }
+            const kidLabel = (ws.kid || '?').substring(0, 8);
+            if (action === 'restart') {
+                logDebug(`[APP] Remote restart requested by device kid=${kidLabel}`);
+                if (requestAppRestart) {
+                    sendEncryptedOutput(ws, JSON.stringify({ type: 'app_restart_ack' }));
+                    requestAppRestart();
+                } else {
+                    sendEncryptedOutput(ws, JSON.stringify({
+                        type: 'app_restart_ack',
+                        isError: true,
+                        error: 'Remote restart unavailable',
+                    }));
+                }
+            } else {
+                logDebug(`[APP] Remote exit requested by device kid=${kidLabel}`);
+                if (requestAppExit) {
+                    sendEncryptedOutput(ws, JSON.stringify({ type: 'app_exit_ack' }));
+                    requestAppExit();
+                } else {
+                    sendEncryptedOutput(ws, JSON.stringify({
+                        type: 'app_exit_ack',
+                        isError: true,
+                        error: 'Remote exit unavailable',
+                    }));
+                }
+            }
+            return;
+        }
+        if (ws.authenticated && message.type === 'e2e_doc_annotation') {
+            // Typed envelope for document annotations from the device. The
+            // server validates the schema, then renders a canonical
+            // formatted message into the channel bridge so Claude sees the
+            // same shape regardless of how the client formatted things —
+            // and free-form chat text can never reach this dispatch.
+            if (!ws.e2e || !ws.e2e.ready) {
+                logDebug('[E2E] Received doc_annotation but E2E not ready');
+                return;
+            }
+            if (message.data && message.data.length > maxInputSize * 4) {
+                logDebug('[SECURITY] Encrypted doc_annotation payload too large, rejecting before decryption');
+                return;
+            }
+            const decrypted = decryptInput(ws, { iv: message.iv, data: message.data, tag: message.tag });
+            if (decrypted === null) {
+                logDebug('[E2E] Failed to decrypt doc_annotation');
+                return;
+            }
+            let parsed = null;
+            try {
+                parsed = JSON.parse(decrypted);
+            } catch {
+                logDebug('[SECURITY] doc_annotation payload is not JSON; ignoring');
+                return;
+            }
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                logDebug('[SECURITY] doc_annotation payload is not an object; ignoring');
+                return;
+            }
+            const filename = typeof parsed.filename === 'string' ? parsed.filename : '';
+            const items = Array.isArray(parsed.items) ? parsed.items : null;
+            if (!filename || filename.length > 200) {
+                logDebug('[SECURITY] doc_annotation: invalid filename');
+                return;
+            }
+            if (!items || items.length === 0 || items.length > 50) {
+                logDebug('[SECURITY] doc_annotation: invalid items count');
+                return;
+            }
+            const safeItems = [];
+            for (let i = 0; i < items.length; i += 1) {
+                const item = items[i];
+                if (!item || typeof item !== 'object' || Array.isArray(item)) {
+                    logDebug(`[SECURITY] doc_annotation: item[${i}] not an object`);
+                    return;
+                }
+                const quote = typeof item.quote === 'string' ? item.quote : '';
+                const comment = typeof item.comment === 'string' ? item.comment : '';
+                if (quote.length === 0 || comment.length === 0) {
+                    logDebug(`[SECURITY] doc_annotation: item[${i}] empty`);
+                    return;
+                }
+                if (quote.length > 1000 || comment.length > 2000) {
+                    logDebug(`[SECURITY] doc_annotation: item[${i}] exceeds caps`);
+                    return;
+                }
+                safeItems.push({ quote, comment });
+            }
+            const safeFilename = filename.replace(/[\r\n]+/g, ' ').trim();
+            if (!safeFilename) {
+                logDebug('[SECURITY] doc_annotation: filename collapsed to empty');
+                return;
+            }
+            const count = safeItems.length;
+            const header = count === 1
+                ? `📝 Annotation on ${safeFilename}`
+                : `📝 ${count} annotations on ${safeFilename}`;
+            const body = safeItems.map((entry, idx) => {
+                const prefix = count === 1 ? '' : `${idx + 1}. `;
+                return `${prefix}> ${entry.quote}\n\n${entry.comment}`;
+            }).join('\n\n---\n\n');
+            const rendered = `${header}\n\n${body}`;
+            if (getOperatingMode() === 'channel') {
+                const deviceId = ws.kid || 'unknown';
+                const result = await submitChannelUserMessage(deviceId, rendered, deviceId, {
+                    echoToLocalChat: true,
+                    senderWs: ws,
+                });
+                if (result.success) {
+                    logDebug(`[CHANNEL] Forwarded doc_annotation (count=${count}, len=${rendered.length})`);
+                } else {
+                    logDebug(`[CHANNEL] Failed to forward doc_annotation: ${result.error}`);
+                }
+                sendEncryptedOutput(ws, JSON.stringify({
+                    type: 'doc_annotation_ack',
+                    isError: !result.success,
+                    error: result.success ? undefined : (result.error || 'forward failed'),
+                }));
+            } else {
+                logDebug('[CHANNEL] doc_annotation arrived in terminal mode; ignoring');
+                sendEncryptedOutput(ws, JSON.stringify({
+                    type: 'doc_annotation_ack',
+                    isError: true,
+                    error: 'Channel mode required for annotations',
+                }));
             }
             return;
         }

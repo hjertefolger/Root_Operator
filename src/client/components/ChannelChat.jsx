@@ -511,7 +511,9 @@ const ChatMessages = memo(function ChatMessages({
   );
 });
 
-const ACCEPTED_FILE_TYPES = 'image/*,.pdf,.txt,.md,.csv,.json,.py,.js,.ts,.jsx,.tsx,.html,.css,.svg,.xml,.yaml,.yml,.toml,.env,.log,.sql,.rb,.go,.rs,.swift,.kt,.java,.c,.cpp,.h,.hpp';
+const ACCEPTED_FILE_TYPES = 'image/*,video/mp4,video/quicktime,video/webm,.pdf,.txt,.md,.csv,.json,.py,.js,.ts,.jsx,.tsx,.html,.css,.svg,.xml,.yaml,.yml,.toml,.env,.log,.sql,.rb,.go,.rs,.swift,.kt,.java,.c,.cpp,.h,.hpp';
+const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_VIDEO_SIZE_BYTES = 100 * 1024 * 1024;
 
 function formatFileSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -639,8 +641,32 @@ const ChatComposer = memo(function ChatComposer({
   const handleFileChange = useCallback((e) => {
     const files = e.target.files;
     if (files?.length) {
-      onAddPendingFiles?.(Array.from(files));
-      textareaRef.current?.focus();
+      const accepted = [];
+      const rejected = [];
+      for (const file of Array.from(files)) {
+        const type = typeof file.type === 'string' ? file.type : '';
+        const isImage = type.startsWith('image/');
+        const isVideo = type.startsWith('video/');
+        const sizeLimit = isVideo ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
+        const typeLabel = isVideo ? '100 MB' : '10 MB';
+        if ((isImage || isVideo) && file.size > sizeLimit) {
+          rejected.push(`${file.name} exceeds ${typeLabel}`);
+          continue;
+        }
+        accepted.push(file);
+      }
+      if (rejected.length > 0) {
+        // Surface the rejection inline so the user knows why a file didn't
+        // attach. Falls back to window.alert for now; the chat surface
+        // doesn't have a toast primitive we can reuse here.
+        if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+          window.alert(`Cannot attach:\n${rejected.join('\n')}`);
+        }
+      }
+      if (accepted.length > 0) {
+        onAddPendingFiles?.(accepted);
+        textareaRef.current?.focus();
+      }
     }
     // Reset input so same file can be re-selected
     e.target.value = '';
@@ -665,7 +691,9 @@ const ChatComposer = memo(function ChatComposer({
           {pendingFiles.map((file, i) => {
             const { stem, ext } = splitFileNameExt(file.name);
             const canPreview = Boolean(
-              onPreviewPendingFile && typeof file.type === 'string' && file.type.startsWith('image/'),
+              onPreviewPendingFile
+                && typeof file.type === 'string'
+                && (file.type.startsWith('image/') || file.type.startsWith('video/')),
             );
             return (
               <div
@@ -862,6 +890,7 @@ function ChannelChat({
   setWaiting,
   onSubmitMessage,
   onSendFile,
+  onSendDocAnnotation,
   uploadProgress = null,
   onAbortUpload,
   canSendOverride,
@@ -1289,6 +1318,7 @@ function ChannelChat({
     nextScrollBehaviorRef.current = 'smooth';
     setActivities([]);
 
+    const ts = new Date().toISOString();
     const displayText = caption
       ? `${caption}\n📎 ${file.name}|${file.size}`
       : `📎 ${file.name}|${file.size}`;
@@ -1296,7 +1326,7 @@ function ChannelChat({
     setMessages(prev => [...prev, {
       role: 'user',
       content: displayText,
-      ts: new Date().toISOString(),
+      ts,
     }]);
 
     setWaiting(true);
@@ -1305,7 +1335,12 @@ function ChannelChat({
       await onSendFile(file, caption);
     } catch (error) {
       console.error('Failed to send file:', error);
+      // Roll back the optimistic message — the upload didn't actually land.
+      setMessages(prev => prev.filter(m => !(m.ts === ts && m.content === displayText)));
       setWaiting(false);
+      if (error?.uploadFailure && typeof window !== 'undefined' && typeof window.alert === 'function') {
+        window.alert(error.message || 'Upload failed.');
+      }
     }
   }, [canSend, onSendFile, setActivities, setMessages, setWaiting]);
 
@@ -1406,6 +1441,7 @@ function ChannelChat({
           onRequestAttachment={requestAttachmentBytes}
           onQueueAnnotatedAttachment={onSendFile ? handleQueueAnnotatedAttachment : undefined}
           onSendAnnotatedAttachment={onSendFile ? handleSendAnnotatedAttachment : undefined}
+          onSendDocAnnotation={canSend && onSendDocAnnotation ? onSendDocAnnotation : undefined}
           onClose={closeAttachmentViewer}
         />
       )}

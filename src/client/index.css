@@ -205,6 +205,17 @@
   }
 }
 
+@keyframes docPillSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* Global styles — intentionally no unlayered `* { margin:0; padding:0 }`
    reset here. Tailwind v4 preflight (in @layer base) already zeroes these,
    and an unlayered universal reset wins against @layer utilities, silently

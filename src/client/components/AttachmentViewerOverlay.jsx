@@ -1,6 +1,75 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Redo2, Trash, Undo2, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Plus, Redo2, Trash, Trash2, Undo2, Volume2, VolumeX, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+const docRemarkPlugins = [remarkGfm];
+
+// Editorial dark style for rendered markdown documents in the viewer.
+// Heavier line-height + larger headings than chat bubbles — these are
+// long-form docs the user reads, not short messages.
+const docMdComponents = {
+  h1: ({ children }) => (
+    <h1 style={{ fontSize: 26, fontWeight: 600, color: '#fff', letterSpacing: '-0.025em', lineHeight: 1.2, margin: '32px 0 14px' }}>{children}</h1>
+  ),
+  h2: ({ children }) => (
+    <h2 style={{ fontSize: 19, fontWeight: 600, color: 'rgba(255,255,255,0.92)', letterSpacing: '-0.015em', margin: '32px 0 12px' }}>{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 style={{ fontSize: 16, fontWeight: 600, color: 'rgba(255,255,255,0.92)', margin: '24px 0 8px' }}>{children}</h3>
+  ),
+  p: ({ children }) => (
+    <p style={{ fontSize: 15, lineHeight: 1.65, color: 'rgba(255,255,255,0.78)', margin: '0 0 14px' }}>{children}</p>
+  ),
+  strong: ({ children }) => <strong style={{ color: 'rgba(255,255,255,0.95)', fontWeight: 600 }}>{children}</strong>,
+  em: ({ children }) => <em style={{ color: 'rgba(255,255,255,0.85)', fontStyle: 'italic' }}>{children}</em>,
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noreferrer" style={{ color: '#c9854a', textDecoration: 'none' }}>{children}</a>
+  ),
+  ul: ({ children }) => <ul style={{ margin: '6px 0 16px 20px', color: 'rgba(255,255,255,0.78)', fontSize: 15, lineHeight: 1.65 }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ margin: '6px 0 16px 22px', color: 'rgba(255,255,255,0.78)', fontSize: 15, lineHeight: 1.65 }}>{children}</ol>,
+  li: ({ children }) => <li style={{ padding: '3px 0' }}>{children}</li>,
+  blockquote: ({ children }) => (
+    <blockquote style={{ borderLeft: '2px solid #c9854a', background: 'rgba(255,255,255,0.03)', borderRadius: 4, padding: '12px 16px', margin: '14px 0', color: 'rgba(255,255,255,0.88)', fontSize: 15 }}>{children}</blockquote>
+  ),
+  hr: () => <hr style={{ border: 'none', borderTop: '1px dashed rgba(255,255,255,0.12)', margin: '28px 0' }} />,
+  code: ({ inline, children }) => (
+    inline
+      ? <code style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 13, background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.06)', padding: '1px 6px', borderRadius: 4, color: 'rgba(255,255,255,0.92)' }}>{children}</code>
+      : <code style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 13, lineHeight: 1.6, color: 'rgba(255,255,255,0.92)' }}>{children}</code>
+  ),
+  pre: ({ children }) => (
+    <pre style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 6, padding: 14, margin: '12px 0', overflowX: 'auto', whiteSpace: 'pre' }}>{children}</pre>
+  ),
+  table: ({ children }) => (
+    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch', margin: '14px 0' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>{children}</table>
+    </div>
+  ),
+  th: ({ children }) => (
+    <th style={{ fontFamily: '"JetBrains Mono", ui-monospace, monospace', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'rgba(255,255,255,0.55)', textAlign: 'left', padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.12)' }}>{children}</th>
+  ),
+  td: ({ children }) => (
+    <td style={{ padding: '10px 12px', borderBottom: '1px solid rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.78)', verticalAlign: 'top' }}>{children}</td>
+  ),
+};
+
+function decodeBase64Utf8(b64) {
+  if (typeof b64 !== 'string' || !b64) {
+    return '';
+  }
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  } catch {
+    return '';
+  }
+}
 
 const MAX_SCALE = 6;
 const MAX_WEB_ZOOM = 8;
@@ -11,6 +80,7 @@ const SWIPE_NAV_LONG_DISTANCE = 120;
 const SWIPE_NAV_VELOCITY = 0.35;
 const SWIPE_NAV_VERTICAL_DRIFT = 48;
 const EMPTY_ANNOTATIONS = { strokes: [], redo: [] };
+const EMPTY_DOC_QUEUE = Object.freeze([]);
 const ANNOTATION_COLORS = [
   { value: '#0a84ff', label: 'Blue' },
   { value: '#ff453a', label: 'Red' },
@@ -213,6 +283,216 @@ function canvasToBlob(canvas) {
   });
 }
 
+function formatVideoTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return '0:00';
+  }
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function VideoControlsPill({ videoRef }) {
+  const [paused, setPaused] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const [scrubValue, setScrubValue] = useState(0);
+
+  useEffect(() => {
+    const video = videoRef?.current;
+    if (!video) {
+      return undefined;
+    }
+
+    const syncFromVideo = () => {
+      setPaused(video.paused);
+      setMuted(video.muted);
+      const dur = Number.isFinite(video.duration) ? video.duration : 0;
+      setDuration(dur);
+      if (!isScrubbing) {
+        setCurrentTime(video.currentTime || 0);
+      }
+    };
+
+    syncFromVideo();
+
+    const onPlay = () => setPaused(false);
+    const onPause = () => setPaused(true);
+    const onTimeUpdate = () => {
+      if (!isScrubbing) {
+        setCurrentTime(video.currentTime || 0);
+      }
+    };
+    const onDurationChange = () => {
+      const dur = Number.isFinite(video.duration) ? video.duration : 0;
+      setDuration(dur);
+    };
+    const onVolumeChange = () => setMuted(video.muted);
+
+    video.addEventListener('play', onPlay);
+    video.addEventListener('pause', onPause);
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('loadedmetadata', onDurationChange);
+    video.addEventListener('durationchange', onDurationChange);
+    video.addEventListener('volumechange', onVolumeChange);
+
+    return () => {
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('loadedmetadata', onDurationChange);
+      video.removeEventListener('durationchange', onDurationChange);
+      video.removeEventListener('volumechange', onVolumeChange);
+    };
+  }, [isScrubbing, videoRef]);
+
+  const handlePlayPause = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+  }, [videoRef]);
+
+  const handleMuteToggle = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    video.muted = !video.muted;
+  }, [videoRef]);
+
+  const handleFullscreen = useCallback(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+    // iOS Safari and iOS PWAs don't implement the standard Fullscreen API on
+    // <video>; they expose webkitEnterFullscreen which hands off to the
+    // native iOS video player. Try that first on mobile WebKit, fall back to
+    // the standard API for desktop Chrome/Safari/Firefox.
+    if (typeof video.webkitEnterFullscreen === 'function') {
+      try {
+        video.webkitEnterFullscreen();
+        return;
+      } catch {
+        // Fall through to standard API.
+      }
+    }
+    const request =
+      video.requestFullscreen
+      || video.webkitRequestFullscreen
+      || video.msRequestFullscreen;
+    if (request) {
+      const result = request.call(video);
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+      }
+    }
+  }, [videoRef]);
+
+  const handleScrubStart = useCallback((event) => {
+    setIsScrubbing(true);
+    setScrubValue(Number(event.target.value));
+  }, []);
+
+  const handleScrubChange = useCallback((event) => {
+    setScrubValue(Number(event.target.value));
+  }, []);
+
+  const handleScrubEnd = useCallback((event) => {
+    const video = videoRef?.current;
+    const target = Number(event.target.value);
+    if (video && Number.isFinite(target)) {
+      video.currentTime = target;
+      setCurrentTime(target);
+    }
+    setIsScrubbing(false);
+  }, [videoRef]);
+
+  const displayedTime = isScrubbing ? scrubValue : currentTime;
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        padding: '6px 10px 6px 8px',
+        borderRadius: 999,
+        background: 'rgba(10,10,10,0.82)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 18px 48px rgba(0,0,0,0.28)',
+        backdropFilter: 'blur(18px)',
+        pointerEvents: 'auto',
+        minWidth: 'min(calc(100vw - 48px), 420px)',
+      }}
+    >
+      <IconButton
+        onClick={handlePlayPause}
+        ariaLabel={paused ? 'Play' : 'Pause'}
+        activeStrong
+      >
+        {paused ? <Play size={16} strokeWidth={2.1} /> : <Pause size={16} strokeWidth={2.1} />}
+      </IconButton>
+
+      <input
+        type="range"
+        min={0}
+        max={hasDuration ? duration : 0}
+        step={0.1}
+        value={hasDuration ? displayedTime : 0}
+        onMouseDown={handleScrubStart}
+        onTouchStart={handleScrubStart}
+        onChange={handleScrubChange}
+        onMouseUp={handleScrubEnd}
+        onTouchEnd={handleScrubEnd}
+        disabled={!hasDuration}
+        aria-label="Seek"
+        style={{
+          flex: 1,
+          appearance: 'none',
+          WebkitAppearance: 'none',
+          height: 4,
+          borderRadius: 999,
+          background: `linear-gradient(to right, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0.85) ${
+            hasDuration ? (displayedTime / duration) * 100 : 0
+          }%, rgba(255,255,255,0.16) ${
+            hasDuration ? (displayedTime / duration) * 100 : 0
+          }%, rgba(255,255,255,0.16) 100%)`,
+          outline: 'none',
+          cursor: hasDuration ? 'pointer' : 'default',
+          opacity: hasDuration ? 1 : 0.4,
+        }}
+      />
+
+      <span
+        style={{
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: 11,
+          color: 'rgba(255,255,255,0.72)',
+          whiteSpace: 'nowrap',
+          minWidth: 76,
+          textAlign: 'center',
+        }}
+      >
+        {formatVideoTime(displayedTime)} / {formatVideoTime(duration)}
+      </span>
+
+      <IconButton onClick={handleMuteToggle} ariaLabel={muted ? 'Unmute' : 'Mute'}>
+        {muted ? <VolumeX size={16} strokeWidth={2.1} /> : <Volume2 size={16} strokeWidth={2.1} />}
+      </IconButton>
+
+      <IconButton onClick={handleFullscreen} ariaLabel="Fullscreen">
+        <Maximize2 size={16} strokeWidth={2.1} />
+      </IconButton>
+    </div>
+  );
+}
+
 function IconButton({ children, onClick, disabled, active, activeStrong, accent, ariaLabel }) {
   let background = 'transparent';
   let color = 'rgba(255,255,255,0.82)';
@@ -255,6 +535,198 @@ function IconButton({ children, onClick, disabled, active, activeStrong, accent,
   );
 }
 
+// Owns the markdown render and the inline annotation marker mutations for
+// a single document attachment. Mounted with a key tied to the attachment
+// so React tears the entire subtree down (and runs the heal cleanup) before
+// the next attachment commits — eliminating any reconciliation overlap
+// between marker mutations and react-markdown's rendered DOM.
+const DocBody = memo(function DocBody({
+  isMarkdownDoc,
+  docSource,
+  docRemarkPlugins,
+  docMdComponents,
+  preStyle,
+  annotations,
+  highlightTick,
+  highlightRects,
+  openAnnotationRef,
+  onContentRefChange,
+}) {
+  const localRef = useRef(null);
+  const setNode = useCallback((node) => {
+    localRef.current = node;
+    if (typeof onContentRefChange === 'function') {
+      onContentRefChange(node);
+    }
+  }, [onContentRefChange]);
+
+  const healAllMarkers = useCallback(() => {
+    const root = localRef.current;
+    if (!root) return;
+    root.querySelectorAll('[data-ann-host]').forEach((host) => {
+      const parent = host.parentNode;
+      if (!parent) return;
+      const before = host.previousSibling;
+      const after = host.nextSibling;
+      parent.removeChild(host);
+      if (
+        before
+        && after
+        && before.nodeType === Node.TEXT_NODE
+        && after.nodeType === Node.TEXT_NODE
+      ) {
+        before.data += after.data;
+        parent.removeChild(after);
+      }
+    });
+  }, []);
+
+  // Sweep on unmount so the OLD subtree is fully healed before React
+  // discards it. Because DocBody is keyed by attachment in the parent,
+  // unmount fires synchronously when the attachment changes — well
+  // before the new DocBody (and its react-markdown children) commit.
+  useLayoutEffect(() => {
+    return () => {
+      healAllMarkers();
+    };
+  }, [healAllMarkers]);
+
+  // Keep markers in sync with the queued annotations. Idempotent: hosts
+  // we already created are matched by data-ann-host id, orphans are
+  // healed.
+  useLayoutEffect(() => {
+    const root = localRef.current;
+    if (!root) return;
+
+    const removeHostAndHeal = (host) => {
+      if (!host || !host.parentNode) return;
+      const parent = host.parentNode;
+      const before = host.previousSibling;
+      const after = host.nextSibling;
+      parent.removeChild(host);
+      if (
+        before
+        && after
+        && before.nodeType === Node.TEXT_NODE
+        && after.nodeType === Node.TEXT_NODE
+      ) {
+        before.data += after.data;
+        parent.removeChild(after);
+      }
+    };
+
+    const existing = new Map();
+    root.querySelectorAll('[data-ann-host]').forEach((el) => {
+      existing.set(el.dataset.annHost, el);
+    });
+
+    for (const entry of annotations) {
+      if (existing.has(entry.id)) {
+        existing.delete(entry.id);
+        continue;
+      }
+      if (!entry.range) continue;
+      // Defensive guard: a Range from a previous attachment can outlive
+      // its DOM if state ever races. Skip silently if the range's
+      // endContainer is no longer attached to this DocBody's subtree.
+      if (!root.contains(entry.range.endContainer)) continue;
+      try {
+        const host = document.createElement('button');
+        host.type = 'button';
+        host.dataset.annHost = entry.id;
+        host.setAttribute('aria-label', 'Edit annotation');
+        Object.assign(host.style, {
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '20px',
+          height: '20px',
+          margin: '0 4px',
+          verticalAlign: 'middle',
+          borderRadius: '999px',
+          border: 'none',
+          padding: '0',
+          background: '#4B5AFF',
+          boxShadow: '0 4px 10px rgba(75,90,255,0.45)',
+          cursor: 'pointer',
+          flexShrink: '0',
+        });
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('width', '11');
+        svg.setAttribute('height', '11');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', '#fff');
+        svg.setAttribute('stroke-width', '2.4');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        const path = document.createElementNS(svgNS, 'path');
+        path.setAttribute('d', 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z');
+        const dot = document.createElementNS(svgNS, 'circle');
+        dot.setAttribute('cx', '12');
+        dot.setAttribute('cy', '10');
+        dot.setAttribute('r', '1.5');
+        dot.setAttribute('fill', '#fff');
+        dot.setAttribute('stroke', 'none');
+        svg.appendChild(path);
+        svg.appendChild(dot);
+        host.appendChild(svg);
+        host.addEventListener('click', (event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          openAnnotationRef.current?.(entry.id);
+        });
+
+        const end = entry.range.endContainer;
+        const offset = entry.range.endOffset;
+        if (end && end.nodeType === Node.TEXT_NODE && end.parentNode) {
+          if (offset >= end.length) {
+            end.parentNode.insertBefore(host, end.nextSibling);
+          } else {
+            const after = end.splitText(offset);
+            after.parentNode.insertBefore(host, after);
+          }
+        } else if (end && end.nodeType === Node.ELEMENT_NODE) {
+          const refNode = end.childNodes[offset] || null;
+          end.insertBefore(host, refNode);
+        }
+      } catch {
+        // Range invalid or detached; skip silently.
+      }
+    }
+
+    existing.forEach(removeHostAndHeal);
+  }, [annotations, highlightTick, openAnnotationRef]);
+
+  return (
+    <div ref={setNode} style={{ position: 'relative' }}>
+      {isMarkdownDoc ? (
+        <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
+          {docSource}
+        </ReactMarkdown>
+      ) : (
+        <pre style={preStyle}>{docSource}</pre>
+      )}
+      {Array.isArray(highlightRects) && highlightRects.map((rect) => (
+        <div
+          key={rect.id}
+          style={{
+            position: 'absolute',
+            top: rect.top,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height,
+            background: 'rgba(75,90,255,0.40)',
+            borderRadius: 2,
+            pointerEvents: 'none',
+          }}
+        />
+      ))}
+    </div>
+  );
+});
+
 const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   attachments,
   externalRef,
@@ -264,12 +736,21 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   onRequestAttachment,
   onQueueAnnotatedAttachment,
   onSendAnnotatedAttachment,
+  onSendDocAnnotation,
   onClose,
 }) {
   const viewportRef = useRef(null);
+  const docContainerRef = useRef(null);
+  // The doc content node is owned by a keyed child component (DocBody)
+  // so its DOM mutations (annotation markers) are contained within a
+  // subtree React fully unmounts on attachment changes. We hold the
+  // current node here via a ref-callback for the parent's read-only
+  // queries (selection, highlight rect computation).
+  const [docContentNode, setDocContentNode] = useState(null);
   const viewportRectRef = useRef(getViewportFallbackRect());
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
+  const videoRef = useRef(null);
   const contentRef = useRef(null);
   const transformRef = useRef({ scale: 1, x: 0, y: 0 });
   const webViewRef = useRef({ zoom: 1, x: 0, y: 0 });
@@ -277,6 +758,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const webPendingViewRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef({ mode: 'idle' });
+  // Tap tracking — stage handlers call preventDefault() on pointerdown, which
+  // suppresses the synthesized click event, so onClick on nested <video> does
+  // not fire reliably. We synthesize a tap from pointerdown/up deltas here.
+  const tapStartRef = useRef(null);
+  const TAP_MAX_DISTANCE = 8;
+  const TAP_MAX_DURATION = 500;
   const drawingPointerIdRef = useRef(null);
   const draftStrokeRef = useRef(null);
   const renderFrameRef = useRef(0);
@@ -294,16 +781,49 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const [sendError, setSendError] = useState('');
   const [openPicker, setOpenPicker] = useState(null);
   const [webView, setWebView] = useState({ zoom: 1, x: 0, y: 0 });
+  const [docSelection, setDocSelection] = useState(null);
+  const [docCommentSheet, setDocCommentSheet] = useState(null);
+  const [docCommentDraft, setDocCommentDraft] = useState('');
+  const [docAnnotationSending, setDocAnnotationSending] = useState(false);
+  const [docAnnotationError, setDocAnnotationError] = useState('');
+  // Internal queue store carries the attachmentId it belongs to so a stale
+  // queue from the previous attachment can never be observed during the
+  // single render in which we're swapping. The derived `docAnnotationQueue`
+  // below reads as the empty queue whenever the stored id no longer
+  // matches the active attachment — DocBody mounts with no markers to
+  // place, even before the post-commit cleanup useEffect runs.
+  const [annotationQueueScoped, setAnnotationQueueScoped] = useState({ attachmentId: '', items: [] });
+  const [highlightTick, setHighlightTick] = useState(0);
+  const [docSheetDragY, setDocSheetDragY] = useState(0);
+  const docSheetDragRef = useRef({ active: false, startY: 0, lastY: 0 });
   const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
   const isDesktopSurface = typeof window !== 'undefined' && Boolean(window.electronAPI);
   const useLayoutZoomViewer = !isDesktopSurface;
   const activeAttachment = attachmentCount > 0 ? attachments[activeIndex] : null;
   const attachmentId = activeAttachment?.id || '';
+  const docAnnotationQueue = annotationQueueScoped.attachmentId === attachmentId
+    ? annotationQueueScoped.items
+    : EMPTY_DOC_QUEUE;
+  const setDocAnnotationQueue = useCallback((updater) => {
+    setAnnotationQueueScoped((prev) => {
+      const base = prev.attachmentId === attachmentId ? prev.items : [];
+      const nextItems = typeof updater === 'function' ? updater(base) : updater;
+      return { attachmentId, items: nextItems };
+    });
+  }, [attachmentId]);
   const cachedAttachment = attachmentId ? attachmentCache?.[attachmentId] : null;
   const resolvedAttachment = cachedAttachment
     ? { ...activeAttachment, ...cachedAttachment }
     : activeAttachment;
   const previewSrc = getAttachmentPreviewSrc(resolvedAttachment);
+  const resolvedMime = String(resolvedAttachment?.mime || '').toLowerCase();
+  const isVideoAttachment = resolvedMime.startsWith('video/');
+  const isDocAttachment = resolvedMime === 'text/markdown' || resolvedMime === 'text/plain';
+  const isMarkdownDoc = resolvedMime === 'text/markdown';
+  const docSource = useMemo(
+    () => (isDocAttachment ? decodeBase64Utf8(resolvedAttachment?.bytesBase64) : ''),
+    [isDocAttachment, resolvedAttachment?.bytesBase64],
+  );
   const fetchState = attachmentId ? attachmentFetchState?.[attachmentId] : null;
   const isLoading = fetchState?.loading === true;
   const fetchError = fetchState?.error || '';
@@ -396,8 +916,36 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     commitNaturalSizeFromImage(event.currentTarget);
   }, [commitNaturalSizeFromImage]);
 
+  const handleVideoLoadedMetadata = useCallback((event) => {
+    const video = event.currentTarget;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return;
+    }
+    commitNaturalSize(width, height);
+  }, [commitNaturalSize]);
+
   const handleImageError = useCallback(() => {
-    setImageLoadError('Unable to render this image');
+    if (isDocAttachment) {
+      setImageLoadError('Unable to render this document');
+    } else if (isVideoAttachment) {
+      setImageLoadError('Unable to play this video');
+    } else {
+      setImageLoadError('Unable to render this image');
+    }
+  }, [isDocAttachment, isVideoAttachment]);
+
+  const handleVideoClick = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
   }, []);
 
   const resetNaturalSize = useCallback(() => {
@@ -719,6 +1267,76 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
   }, [activeAttachment?.name, annotatedAttachmentHandler, canSendAnnotated, naturalSize.height, naturalSize.width, onClose, strokes]);
 
+  const handleDownload = useCallback(async () => {
+    // Always read bytes from the resolved attachment — fetched-on-demand
+    // bytes live in the cache, not on the original metadata object.
+    const source = resolvedAttachment || activeAttachment;
+    if (!source) {
+      return;
+    }
+    if (!source.bytesBase64) {
+      setSendError('Attachment data unavailable.');
+      return;
+    }
+    const filename = source.name || 'attachment';
+    const mime = source.mime || 'application/octet-stream';
+    const canShareFiles = (
+      typeof navigator !== 'undefined'
+      && typeof navigator.canShare === 'function'
+      && typeof navigator.share === 'function'
+    );
+    try {
+      // Decode base64 directly into a Blob. Avoids fetch() on a data: URL,
+      // which is blocked by the production connect-src policy.
+      const binaryString = atob(source.bytesBase64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i += 1) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: mime });
+
+      // On iOS PWAs and mobile Safari, `<a download>` is unreliable — it often
+      // opens the file in a new webview tab instead of presenting a save
+      // dialog. The Web Share API with a File is the supported path: it
+      // presents the native share sheet (Save to Files, AirDrop, etc.).
+      //
+      // When file-share is supported on the device we treat the share sheet as
+      // the only valid save path. Any rejection or failure surfaces an error
+      // rather than falling back to the broken anchor-download path on iOS.
+      if (canShareFiles) {
+        const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+        if (!navigator.canShare({ files: [file] })) {
+          setSendError('This file type is not supported by the system share sheet.');
+          return;
+        }
+        try {
+          await navigator.share({ files: [file], title: filename });
+          return;
+        } catch (shareError) {
+          if (shareError?.name === 'AbortError') {
+            // User dismissed the share sheet — treat as a quiet cancel.
+            return;
+          }
+          setSendError(shareError?.message || 'Unable to save file. Try again or long-press the attachment.');
+          return;
+        }
+      }
+
+      // Desktop / browsers without file-share support: blob URL + download attr.
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      setSendError(error?.message || 'Unable to download attachment.');
+    }
+  }, [resolvedAttachment]);
+
   useEffect(() => {
     setActiveIndex(initialIndex);
   }, [initialIndex]);
@@ -735,6 +1353,266 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       document.body.style.overscrollBehavior = previousOverscroll;
     };
   }, []);
+
+  // Track text selection inside the doc container so we can offer an
+  // "Add comment" floating pill above the selection. Only active when a doc
+  // attachment is rendered and the chat-side annotation handler is wired.
+  useEffect(() => {
+    if (!isDocAttachment || !previewSrc || typeof onSendDocAnnotation !== 'function') {
+      setDocSelection(null);
+      return undefined;
+    }
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return undefined;
+    }
+    let frame = 0;
+    const compute = () => {
+      const sel = window.getSelection?.();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setDocSelection(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      const container = docContainerRef.current;
+      if (!container || !container.contains(range.commonAncestorContainer)) {
+        setDocSelection(null);
+        return;
+      }
+      const text = sel.toString().trim();
+      if (!text) {
+        setDocSelection(null);
+        return;
+      }
+      const rects = range.getClientRects();
+      const rect = rects.length > 0 ? rects[0] : range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setDocSelection(null);
+        return;
+      }
+      // Clone the range now while the doc still owns the selection — iOS
+      // moves focus to the textarea once the sheet opens and would clear it.
+      let cloned = null;
+      try { cloned = range.cloneRange(); } catch {}
+      setDocSelection({
+        text,
+        rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
+        range: cloned,
+      });
+    };
+    const onChange = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(compute);
+    };
+    document.addEventListener('selectionchange', onChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('selectionchange', onChange);
+    };
+  }, [isDocAttachment, previewSrc, onSendDocAnnotation]);
+
+  // Recompute highlight rectangles on viewport resize and orientation change
+  // so existing annotations stay aligned with their text after reflow.
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const bump = () => setHighlightTick((tick) => tick + 1);
+    window.addEventListener('resize', bump);
+    window.addEventListener('orientationchange', bump);
+    return () => {
+      window.removeEventListener('resize', bump);
+      window.removeEventListener('orientationchange', bump);
+    };
+  }, []);
+
+  // Compute highlight rectangles for each queued annotation, transformed into
+  // coordinates relative to the scrolling content wrapper so they scroll
+  // naturally with the doc. Returns rects + per-annotation icon anchor.
+  const highlightInfo = useMemo(() => {
+    void highlightTick;
+    if (!isDocAttachment || docAnnotationQueue.length === 0) return { rects: [], markers: [] };
+    const content = docContentNode;
+    const container = docContainerRef.current;
+    if (!content || !container) return { rects: [], markers: [] };
+    const contentRect = content.getBoundingClientRect();
+    const rects = [];
+    const markers = [];
+    for (const entry of docAnnotationQueue) {
+      if (!entry.range) continue;
+      try {
+        const clientRects = entry.range.getClientRects();
+        let lastRect = null;
+        for (let i = 0; i < clientRects.length; i += 1) {
+          const r = clientRects[i];
+          if (r.width === 0 && r.height === 0) continue;
+          rects.push({
+            id: `${entry.id}_${i}`,
+            top: r.top - contentRect.top,
+            left: r.left - contentRect.left,
+            width: r.width,
+            height: r.height,
+          });
+          lastRect = r;
+        }
+        if (lastRect) {
+          markers.push({
+            id: entry.id,
+            top: lastRect.top - contentRect.top + lastRect.height / 2 - 11,
+            left: lastRect.right - contentRect.left + 4,
+          });
+        }
+      } catch {
+        // Range invalidated (DOM changed) — skip.
+      }
+    }
+    return { rects, markers };
+  }, [docAnnotationQueue, highlightTick, isDocAttachment, docContentNode]);
+  const highlightRects = highlightInfo.rects;
+  const highlightMarkers = highlightInfo.markers;
+
+  // Reset annotation UI when switching attachments.
+  useEffect(() => {
+    setDocSelection(null);
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    setDocAnnotationSending(false);
+    setDocAnnotationQueue([]);
+  }, [activeAttachment?.id]);
+
+  const openDocCommentSheet = useCallback(() => {
+    if (!docSelection) return;
+    setDocCommentSheet({ selection: docSelection });
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docSelection]);
+
+  const closeDocCommentSheet = useCallback(() => {
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    setDocSheetDragY(0);
+    docSheetDragRef.current = { active: false, startY: 0, lastY: 0 };
+  }, []);
+
+  const handleSheetDragStart = useCallback((event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    docSheetDragRef.current = { active: true, startY: event.clientY, lastY: event.clientY };
+    try { event.currentTarget.setPointerCapture?.(event.pointerId); } catch {}
+  }, []);
+
+  const handleSheetDragMove = useCallback((event) => {
+    if (!docSheetDragRef.current.active) return;
+    const dy = event.clientY - docSheetDragRef.current.startY;
+    docSheetDragRef.current.lastY = event.clientY;
+    setDocSheetDragY(Math.max(0, dy));
+  }, []);
+
+  const handleSheetDragEnd = useCallback((event) => {
+    if (!docSheetDragRef.current.active) return;
+    const dy = event.clientY - docSheetDragRef.current.startY;
+    docSheetDragRef.current.active = false;
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId); } catch {}
+    if (dy > 80) {
+      closeDocCommentSheet();
+    } else {
+      setDocSheetDragY(0);
+    }
+  }, [closeDocCommentSheet]);
+
+  const queueDocAnnotation = useCallback(() => {
+    if (!docCommentSheet) return;
+    const comment = docCommentDraft.trim();
+    if (!comment) return;
+    const quoted = docCommentSheet.selection?.text || '';
+    const truncated = quoted.length > 240 ? `${quoted.slice(0, 240).trim()}…` : quoted;
+    const savedRange = docCommentSheet.selection?.range || null;
+    setDocAnnotationQueue((prev) => [
+      ...prev,
+      {
+        id: `ann_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        quote: truncated.replace(/\n+/g, ' '),
+        comment,
+        range: savedRange,
+      },
+    ]);
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    try { window.getSelection?.()?.removeAllRanges?.(); } catch {}
+    setDocSelection(null);
+  }, [docCommentSheet, docCommentDraft]);
+
+  const sendDocAnnotationQueue = useCallback(async () => {
+    if (typeof onSendDocAnnotation !== 'function' || docAnnotationQueue.length === 0) return;
+    const filename = activeAttachment?.name || 'document';
+    setDocAnnotationSending(true);
+    setDocAnnotationError('');
+    try {
+      // Send a typed payload so the server validates structure and never
+      // sees free-form chat text crafted by the user. The server renders
+      // the canonical "📝 Annotation on filename" message from these
+      // fields after schema validation.
+      const items = docAnnotationQueue.map((entry) => ({
+        quote: entry.quote,
+        comment: entry.comment,
+      }));
+      await onSendDocAnnotation({ filename, items });
+      setDocAnnotationQueue([]);
+      onClose?.();
+    } catch (err) {
+      setDocAnnotationError(err?.message || 'Could not send annotations');
+    } finally {
+      setDocAnnotationSending(false);
+    }
+  }, [docAnnotationQueue, onSendDocAnnotation, activeAttachment?.name, onClose]);
+
+  const removeQueuedAnnotation = useCallback((index) => {
+    setDocAnnotationQueue((prev) => prev.filter((_, idx) => idx !== index));
+  }, []);
+
+  const openExistingAnnotation = useCallback((annotationId) => {
+    const entry = docAnnotationQueue.find((item) => item.id === annotationId);
+    if (!entry) return;
+    setDocCommentSheet({
+      selection: { text: entry.quote, range: entry.range || null },
+      editingId: annotationId,
+    });
+    setDocCommentDraft(entry.comment || '');
+    setDocAnnotationError('');
+  }, [docAnnotationQueue]);
+
+  // Live ref to the latest openExistingAnnotation so DOM-attached click
+  // handlers always call the freshest callback even when queue updates.
+  const openExistingAnnotationRef = useRef(openExistingAnnotation);
+  useEffect(() => {
+    openExistingAnnotationRef.current = openExistingAnnotation;
+  }, [openExistingAnnotation]);
+
+  // Marker insertion + heal lifecycle is owned by the keyed <DocBody>
+  // child below. When the doc attachment swaps, DocBody unmounts and its
+  // heal runs synchronously inside its own commit, before React can
+  // reconcile any new content into the same subtree.
+
+  const updateExistingAnnotation = useCallback(() => {
+    if (!docCommentSheet?.editingId) return;
+    const comment = docCommentDraft.trim();
+    if (!comment) return;
+    const editingId = docCommentSheet.editingId;
+    setDocAnnotationQueue((prev) => prev.map((item) => (
+      item.id === editingId ? { ...item, comment } : item
+    )));
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docCommentSheet, docCommentDraft]);
+
+  const deleteExistingAnnotation = useCallback(() => {
+    if (!docCommentSheet?.editingId) return;
+    const editingId = docCommentSheet.editingId;
+    setDocAnnotationQueue((prev) => prev.filter((item) => item.id !== editingId));
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docCommentSheet]);
 
   useLayoutEffect(() => {
     measureViewport();
@@ -1100,6 +1978,17 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
+    if (pointersRef.current.size === 1) {
+      tapStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        time: event.timeStamp,
+      };
+    } else {
+      tapStartRef.current = null;
+    }
+
     if (pointersRef.current.size >= 2) {
       const [pointA, pointB] = Array.from(pointersRef.current.values());
       gestureRef.current = {
@@ -1129,6 +2018,17 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pointersRef.current.size === 1) {
+      tapStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        time: event.timeStamp,
+      };
+    } else {
+      tapStartRef.current = null;
+    }
 
     if (pointersRef.current.size >= 2) {
       const [pointA, pointB] = Array.from(pointersRef.current.values());
@@ -1277,6 +2177,22 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [drawEnabled, scheduleWebViewCommit, useLayoutZoomViewer, zoomWebAtPoint]);
 
   const releasePointer = useCallback((event) => {
+    const tapStart = tapStartRef.current;
+    const isTap = (
+      tapStart
+      && tapStart.pointerId === event.pointerId
+      && event.type !== 'pointercancel'
+      && Math.abs(event.clientX - tapStart.x) <= TAP_MAX_DISTANCE
+      && Math.abs(event.clientY - tapStart.y) <= TAP_MAX_DISTANCE
+      && (event.timeStamp - tapStart.time) <= TAP_MAX_DURATION
+    );
+    if (isTap && isVideoAttachment && videoRef.current) {
+      handleVideoClick();
+    }
+    if (tapStart && tapStart.pointerId === event.pointerId) {
+      tapStartRef.current = null;
+    }
+
     if (gestureRef.current.mode === 'web-swipe' && gestureRef.current.pointerId === event.pointerId && event.type !== 'pointercancel') {
       navigateBySwipe(
         event.clientX - gestureRef.current.startX,
@@ -1336,7 +2252,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     }
 
     gestureRef.current = { mode: 'idle' };
-  }, [navigateBySwipe, useLayoutZoomViewer]);
+  }, [handleVideoClick, isVideoAttachment, navigateBySwipe, useLayoutZoomViewer]);
 
   if (typeof document === 'undefined' || attachmentCount === 0 || !activeAttachment) {
     return null;
@@ -1374,7 +2290,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           flexDirection: 'column',
           gap: 12,
           position: 'relative',
-          paddingBottom: 92,
+          paddingBottom: isDocAttachment ? 0 : 92,
         }}
       >
         <div
@@ -1398,26 +2314,55 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             {activeIndex + 1}/{attachmentCount}
           </span>
 
-          <button
-            type="button"
-            onClick={() => onClose?.()}
-            aria-label="Close attachment viewer"
+          <div
             style={{
-              width: 28,
-              height: 28,
-              borderRadius: 999,
-              border: 'none',
-              background: 'transparent',
-              color: 'rgba(255,255,255,0.72)',
               display: 'inline-flex',
               alignItems: 'center',
-              justifyContent: 'center',
+              gap: 4,
               pointerEvents: 'auto',
-              cursor: 'pointer',
             }}
           >
-            <X size={16} strokeWidth={2} />
-          </button>
+            <button
+              type="button"
+              onClick={handleDownload}
+              aria-label="Download attachment"
+              disabled={!previewSrc}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                border: 'none',
+                background: 'transparent',
+                color: previewSrc ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.32)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: previewSrc ? 'pointer' : 'not-allowed',
+              }}
+            >
+              <ArrowDownToLine size={16} strokeWidth={2} />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onClose?.()}
+              aria-label="Close attachment viewer"
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                border: 'none',
+                background: 'transparent',
+                color: 'rgba(255,255,255,0.72)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+              }}
+            >
+              <X size={16} strokeWidth={2} />
+            </button>
+          </div>
         </div>
 
         <div
@@ -1441,7 +2386,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             touchAction: useLayoutZoomViewer ? 'none' : 'pinch-zoom',
           }}
         >
-          {(isLoading || (previewSrc && naturalSize.width === 0 && !errorMessage) || (!previewSrc && !errorMessage)) && (
+          {(isLoading || (previewSrc && !isDocAttachment && naturalSize.width === 0 && !errorMessage) || (!previewSrc && !errorMessage)) && (
             <div
               style={{
                 position: 'absolute',
@@ -1455,7 +2400,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               }}
             >
               <Loader size={22} strokeWidth={2.2} className="animate-spin" />
-              <span style={{ fontSize: 13 }}>Loading image...</span>
+              <span style={{ fontSize: 13 }}>{isDocAttachment ? 'Loading document...' : isVideoAttachment ? 'Loading video...' : 'Loading image...'}</span>
             </div>
           )}
 
@@ -1495,7 +2440,337 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
             </div>
           )}
 
-          {previewSrc && (
+          {previewSrc && isDocAttachment && (
+            <div
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  onClose?.();
+                }
+              }}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                justifyContent: 'center',
+                overflow: 'hidden',
+                pointerEvents: 'auto',
+              }}
+            >
+              <div
+                ref={docContainerRef}
+                style={{
+                  width: '100%',
+                  maxWidth: 720,
+                  height: '100%',
+                  overflowY: 'auto',
+                  WebkitOverflowScrolling: 'touch',
+                  padding: '12px 24px 32px',
+                  touchAction: 'pan-y pinch-zoom',
+                  fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                  userSelect: 'text',
+                  WebkitUserSelect: 'text',
+                }}
+              >
+                <DocBody
+                  key={annotationKey || 'doc-body'}
+                  isMarkdownDoc={isMarkdownDoc}
+                  docSource={docSource}
+                  docRemarkPlugins={docRemarkPlugins}
+                  docMdComponents={docMdComponents}
+                  preStyle={{
+                    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                    color: 'rgba(255,255,255,0.85)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    margin: 0,
+                  }}
+                  annotations={docAnnotationQueue}
+                  highlightTick={highlightTick}
+                  highlightRects={highlightRects}
+                  openAnnotationRef={openExistingAnnotationRef}
+                  onContentRefChange={setDocContentNode}
+                />
+              </div>
+            </div>
+          )}
+
+          {previewSrc && isDocAttachment && typeof onSendDocAnnotation === 'function' && (() => {
+            const pillVisible = !docCommentSheet && (docSelection || docAnnotationQueue.length > 0);
+            return (
+              <div
+                aria-hidden={!pillVisible}
+                style={{
+                  position: 'fixed',
+                  left: 0,
+                  right: 0,
+                  bottom: 'max(20px, env(safe-area-inset-bottom))',
+                  zIndex: 10001,
+                  display: 'flex',
+                  justifyContent: 'center',
+                  pointerEvents: 'none',
+                  opacity: pillVisible ? 1 : 0,
+                  transform: pillVisible ? 'translateY(0)' : 'translateY(12px)',
+                  transition: 'opacity 200ms ease, transform 200ms ease',
+                }}
+              >
+                {docSelection ? (
+                  <button
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={openDocCommentSheet}
+                    style={{
+                      pointerEvents: pillVisible ? 'auto' : 'none',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      height: 44,
+                      padding: '0 20px 0 16px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: '#4B5AFF',
+                      color: '#fff',
+                      fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      letterSpacing: '-0.01em',
+                      boxShadow: '0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <Plus size={16} strokeWidth={2.6} color="#fff" />
+                    Add comment
+                  </button>
+                ) : docAnnotationQueue.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={sendDocAnnotationQueue}
+                    disabled={docAnnotationSending}
+                    style={{
+                      pointerEvents: pillVisible ? 'auto' : 'none',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      height: 44,
+                      padding: '0 7px 0 20px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: '#4B5AFF',
+                      color: '#fff',
+                      fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      letterSpacing: '-0.01em',
+                      boxShadow: '0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08)',
+                      cursor: docAnnotationSending ? 'not-allowed' : 'pointer',
+                      opacity: docAnnotationSending ? 0.7 : 1,
+                    }}
+                  >
+                    <span>
+                      {docAnnotationQueue.length === 1
+                        ? '1 comment'
+                        : `${docAnnotationQueue.length} comments`}
+                    </span>
+                    <span style={{
+                      width: 30, height: 30, borderRadius: 999,
+                      background: '#fff',
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      {docAnnotationSending ? (
+                        <Loader size={14} strokeWidth={2.6} color="#4B5AFF" className="animate-spin" />
+                      ) : (
+                        <ArrowUp size={14} strokeWidth={2.6} color="#4B5AFF" />
+                      )}
+                    </span>
+                  </button>
+                ) : null}
+              </div>
+            );
+          })()}
+
+          {docCommentSheet && (
+            <div
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) closeDocCommentSheet();
+              }}
+              style={{
+                position: 'fixed',
+                inset: 0,
+                zIndex: 10002,
+                background: 'rgba(0,0,0,0.45)',
+                backdropFilter: 'blur(14px)',
+                WebkitBackdropFilter: 'blur(14px)',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'center',
+                padding: 'max(16px, env(safe-area-inset-bottom)) 16px 16px',
+              }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  maxWidth: 560,
+                  background: '#111114',
+                  borderRadius: 16,
+                  paddingTop: 4,
+                  paddingRight: 16,
+                  paddingBottom: 16,
+                  paddingLeft: 16,
+                  boxShadow: '0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06)',
+                  fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 12,
+                  transform: `translateY(${docSheetDragY}px)`,
+                  transition: docSheetDragRef.current.active ? 'none' : 'transform 200ms ease',
+                }}
+              >
+                <div
+                  onPointerDown={handleSheetDragStart}
+                  onPointerMove={handleSheetDragMove}
+                  onPointerUp={handleSheetDragEnd}
+                  onPointerCancel={handleSheetDragEnd}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'center',
+                    paddingTop: 6,
+                    paddingBottom: 6,
+                    cursor: 'grab',
+                    touchAction: 'none',
+                  }}
+                >
+                  <div style={{
+                    width: 36,
+                    height: 4,
+                    borderRadius: 2,
+                    background: 'rgba(255,255,255,0.18)',
+                  }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.5)' }}>
+                    {docCommentSheet?.editingId ? 'Edit annotation' : 'Annotation'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={closeDocCommentSheet}
+                    aria-label="Cancel annotation"
+                    style={{
+                      width: 28, height: 28, borderRadius: 999, border: 'none',
+                      background: 'transparent', color: 'rgba(255,255,255,0.6)',
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                    }}
+                  >
+                    <X size={16} strokeWidth={2} />
+                  </button>
+                </div>
+                <div
+                  style={{
+                    fontSize: 15,
+                    lineHeight: 1.45,
+                    color: '#fff',
+                    background: '#4B5AFF',
+                    border: 'none',
+                    padding: 12,
+                    borderRadius: 8,
+                    maxHeight: 120,
+                    overflowY: 'auto',
+                  }}
+                >
+                  {docCommentSheet.selection?.text}
+                </div>
+                <textarea
+                  autoFocus
+                  value={docCommentDraft}
+                  onChange={(event) => setDocCommentDraft(event.target.value)}
+                  placeholder="Your comment…"
+                  rows={3}
+                  style={{
+                    width: '100%',
+                    resize: 'none',
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    borderRadius: 8,
+                    padding: 12,
+                    fontFamily: 'inherit',
+                    fontSize: 15,
+                    lineHeight: 1.45,
+                    color: '#fff',
+                    outline: 'none',
+                    boxSizing: 'border-box',
+                  }}
+                />
+                {docAnnotationError && (
+                  <span style={{ fontSize: 12, color: '#ff8a8a' }}>{docAnnotationError}</span>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {docCommentSheet?.editingId && (
+                    <button
+                      type="button"
+                      onClick={deleteExistingAnnotation}
+                      aria-label="Delete annotation"
+                      style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: '50%',
+                        border: 'none',
+                        background: 'rgba(255,255,255,0.06)',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Trash2 size={16} strokeWidth={2} color="rgba(255,255,255,0.7)" />
+                    </button>
+                  )}
+                  <div style={{ flex: 1 }} />
+                  <button
+                    type="button"
+                    onClick={closeDocCommentSheet}
+                    disabled={docAnnotationSending}
+                    style={{
+                      padding: '8px 14px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: 'transparent',
+                      color: 'rgba(255,255,255,0.6)',
+                      fontSize: 13,
+                      cursor: docAnnotationSending ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={docCommentSheet?.editingId ? updateExistingAnnotation : queueDocAnnotation}
+                    disabled={!docCommentDraft.trim()}
+                    aria-label={docCommentSheet?.editingId ? 'Update annotation' : 'Add annotation'}
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: '50%',
+                      border: 'none',
+                      background: docCommentDraft.trim() ? '#4B5AFF' : 'rgba(255,255,255,0.1)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: docCommentDraft.trim() ? 'pointer' : 'default',
+                      transition: 'background 0.15s',
+                    }}
+                  >
+                    {docCommentSheet?.editingId ? (
+                      <ArrowUp size={16} strokeWidth={2.6} color="#fff" />
+                    ) : (
+                      <Plus size={16} strokeWidth={2.6} color="#fff" />
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {previewSrc && !isDocAttachment && (
             useLayoutZoomViewer ? (
               <div
                 onPointerDown={handleWebStagePointerDown}
@@ -1527,26 +2802,53 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                     cursor: drawEnabled ? 'crosshair' : (webView.zoom > 1 ? 'grab' : 'default'),
                   }}
                 >
-                  <img
-                    ref={imageRef}
-                    src={previewSrc}
-                    alt={activeAttachment.name}
-                    onLoad={handleImageLoad}
-                    onError={handleImageError}
-                    style={{
-                      display: 'block',
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain',
-                      userSelect: 'none',
-                      WebkitUserSelect: 'none',
-                      WebkitTouchCallout: 'none',
-                      pointerEvents: 'none',
-                      touchAction: 'none',
-                    }}
-                    draggable={false}
-                  />
-                  {hasNaturalSize && (
+                  {isVideoAttachment ? (
+                    <video
+                      ref={videoRef}
+                      key={previewSrc}
+                      src={previewSrc}
+                      playsInline
+                      preload="metadata"
+                      onLoadedMetadata={handleVideoLoadedMetadata}
+                      onError={handleImageError}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        borderRadius: 12,
+                        background: '#000',
+                        outline: 'none',
+                        boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
+                        WebkitTouchCallout: 'none',
+                        touchAction: 'none',
+                        cursor: 'pointer',
+                      }}
+                    />
+                  ) : (
+                    <img
+                      ref={imageRef}
+                      src={previewSrc}
+                      alt={activeAttachment.name}
+                      onLoad={handleImageLoad}
+                      onError={handleImageError}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
+                        WebkitTouchCallout: 'none',
+                        pointerEvents: 'none',
+                        touchAction: 'none',
+                      }}
+                      draggable={false}
+                    />
+                  )}
+                  {!isVideoAttachment && hasNaturalSize && (
                     <canvas
                       ref={canvasRef}
                       onPointerDown={handleDrawPointerDown}
@@ -1584,38 +2886,64 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   cursor: drawEnabled ? 'crosshair' : (transform.scale > 1 ? 'grab' : 'default'),
                 }}
               >
-                <img
-                  ref={imageRef}
-                  src={previewSrc}
-                  alt={activeAttachment.name}
-                  onLoad={handleImageLoad}
-                  onError={handleImageError}
-                  style={{
-                    display: 'block',
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    userSelect: 'none',
-                    WebkitUserSelect: 'none',
-                    WebkitTouchCallout: 'none',
-                  }}
-                  draggable={false}
-                />
-                <canvas
-                  ref={canvasRef}
-                  onPointerDown={handleDrawPointerDown}
-                  onPointerMove={handleDrawPointerMove}
-                  onPointerUp={handleDrawPointerUp}
-                  onPointerCancel={handleDrawPointerCancel}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    width: '100%',
-                    height: '100%',
-                    pointerEvents: drawEnabled ? 'auto' : 'none',
-                    touchAction: 'none',
-                  }}
-                />
+                {isVideoAttachment ? (
+                  <video
+                    ref={videoRef}
+                    key={previewSrc}
+                    src={previewSrc}
+                    playsInline
+                    preload="metadata"
+                    onLoadedMetadata={handleVideoLoadedMetadata}
+                    onError={handleImageError}
+                    onClick={handleVideoClick}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      borderRadius: 12,
+                      background: '#000',
+                      outline: 'none',
+                      boxShadow: '0 24px 60px rgba(0,0,0,0.48)',
+                      cursor: 'pointer',
+                    }}
+                  />
+                ) : (
+                  <img
+                    ref={imageRef}
+                    src={previewSrc}
+                    alt={activeAttachment.name}
+                    onLoad={handleImageLoad}
+                    onError={handleImageError}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      userSelect: 'none',
+                      WebkitUserSelect: 'none',
+                      WebkitTouchCallout: 'none',
+                    }}
+                    draggable={false}
+                  />
+                )}
+                {!isVideoAttachment && (
+                  <canvas
+                    ref={canvasRef}
+                    onPointerDown={handleDrawPointerDown}
+                    onPointerMove={handleDrawPointerMove}
+                    onPointerUp={handleDrawPointerUp}
+                    onPointerCancel={handleDrawPointerCancel}
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                      pointerEvents: drawEnabled ? 'auto' : 'none',
+                      touchAction: 'none',
+                    }}
+                  />
+                )}
               </div>
             )
           )}
@@ -1678,7 +3006,45 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           )}
         </div>
 
-        {previewSrc && !errorMessage && (
+        {previewSrc && !errorMessage && isVideoAttachment && (
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              bottom: 24,
+              transform: 'translateX(-50%)',
+              width: 'min(calc(100vw - 32px), 920px)',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              pointerEvents: 'none',
+            }}
+          >
+            {sendError && (
+              <div
+                style={{
+                  maxWidth: 'min(100%, 520px)',
+                  padding: '8px 12px',
+                  borderRadius: 999,
+                  background: 'rgba(88,20,24,0.88)',
+                  border: '1px solid rgba(255,99,132,0.24)',
+                  color: 'rgba(255,220,225,0.96)',
+                  fontSize: 12,
+                  lineHeight: 1.3,
+                  textAlign: 'center',
+                  pointerEvents: 'auto',
+                }}
+              >
+                {sendError}
+              </div>
+            )}
+            <VideoControlsPill videoRef={videoRef} />
+          </div>
+        )}
+
+        {previewSrc && !errorMessage && !isVideoAttachment && !isDocAttachment && (
           <div
             style={{
               position: 'absolute',

@@ -2,9 +2,11 @@
 
 ## What Changed
 
-- Extended `mcp__root-operator__reply` / `reply` to accept optional `attachments: string[]` absolute image paths.
+- Extended `mcp__root-operator__reply` / `reply` to accept optional `attachments: string[]` absolute image or video paths.
 - Added outbound attachment staging under `~/.root-operator/workspace/attachments/outbound/`.
-- Validated outbound files as images only (`png`, `jpeg/jpg`, `webp`, `gif`) with MIME sniffing and a `10 MB` cap.
+- Validated outbound files by mime-sniffing the magic bytes of each payload. Supported kinds:
+  - Images (`png`, `jpeg/jpg`, `webp`, `gif`) capped at `10 MB` each.
+  - Videos (`mp4`, `quicktime`/`.mov`, `webm`) capped at `100 MB` each.
 - Stored attachment metadata on assistant `channel_message` records in `ChatStore`, while stripping `bytesBase64` before JSONL persistence.
 - Stripped `bytesBase64` from all `channel_message` and `channel_history` envelopes; transport now carries metadata only (`id`, `name`, `mime`, `size`, `sha256`, `kind`, plus `external_ref` on the parent message).
 - Added a WebSocket capability handshake via `client_capabilities { supportsAttachments: true }`.
@@ -42,6 +44,6 @@
 
 ## Deferred
 
-- Non-image outbound attachments (`pdf`, docs, text files, video).
+- Non-image / non-video outbound attachments (`pdf`, docs, text files).
 - Separate Electron viewer window for attachments.
 - Any iOS-specific client work outside the shared web chat surface.
