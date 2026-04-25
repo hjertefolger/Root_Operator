@@ -510,6 +510,22 @@ function requestAppRestart() {
         return;
     }
     logDebug('[APP] Remote restart queued (production)');
+    // Persist the intent so the relaunched app auto-starts the tunnel.
+    // Without this, app.relaunch() brings back the tray but tunnel + Claude
+    // stay idle, defeating remote recovery. Object form carries TTL +
+    // attempt cap; cleared on successful tunnel-up in whenReady.
+    try {
+        if (store) {
+            const TEN_MIN_MS = 10 * 60 * 1000;
+            store.set('pendingTunnelAutoStart', {
+                requestedAt: Date.now(),
+                expiresAt: Date.now() + TEN_MIN_MS,
+                attempts: 0,
+            });
+        }
+    } catch (error) {
+        logDebug(`[APP] persist auto-start intent failed: ${error && error.message}`);
+    }
     try {
         app.relaunch();
     } catch (error) {
@@ -696,6 +712,52 @@ app.whenReady().then(async () => {
                 logDebug(`[AUTO-START] Tunnel failed to start: ${error.message}`);
             }
         }, 2000);
+    }
+
+    // Recover from a remote Restart triggered via the lock popup. The previous
+    // session persisted `pendingTunnelAutoStart` before `app.relaunch()`; here
+    // we honor it so the tunnel comes back up and Claude re-spawns through the
+    // channel-bridge cascade. TTL + attempt cap protect against surprise
+    // auto-starts after long delays or repeated boot failures.
+    try {
+        const pending = store.get('pendingTunnelAutoStart', null);
+        if (pending && typeof pending === 'object') {
+            const now = Date.now();
+            const expired = pending.expiresAt && now > pending.expiresAt;
+            const attempts = Number.isFinite(pending.attempts) ? pending.attempts : 0;
+            const tooManyAttempts = attempts >= 3;
+            if (expired || tooManyAttempts) {
+                store.delete('pendingTunnelAutoStart');
+                logDebug(`[AUTO-START] discarded stale pendingTunnelAutoStart (expired=${!!expired}, attempts=${attempts})`);
+            } else {
+                // Bump attempts up-front so a crash inside startBridge doesn't
+                // produce an unbounded relaunch→fail loop on next boot.
+                store.set('pendingTunnelAutoStart', { ...pending, attempts: attempts + 1 });
+
+                setTimeout(async () => {
+                    // Race: user hit Cmd+Shift+J or tray Start while we waited.
+                    // Treat that as already-satisfied and clear the flag.
+                    if (isConnecting || server || tunnelProcess) {
+                        try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
+                        logDebug('[AUTO-START] tunnel already running, clearing pending flag');
+                        return;
+                    }
+                    try {
+                        const cfSettings = await getStoredTunnelSettings();
+                        await startBridge(cfSettings);
+                        try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
+                        logDebug('[AUTO-START] Tunnel started after remote restart');
+                    } catch (error) {
+                        // Mirror the IPC START handler: clean up partial state
+                        // so the next attempt starts from a known-good zero.
+                        try { stopBridge(); } catch (_) {}
+                        logDebug(`[AUTO-START] post-restart tunnel failed: ${error.message}`);
+                    }
+                }, 2000);
+            }
+        }
+    } catch (error) {
+        logDebug(`[AUTO-START] pendingTunnelAutoStart check failed: ${error.message}`);
     }
 });
 

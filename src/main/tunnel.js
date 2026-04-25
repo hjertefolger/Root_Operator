@@ -478,6 +478,17 @@ function init(deps = {}) {
     }
 
     async function startBridge(cfSettings) {
+        // Idempotency guard. Multiple paths can fire startBridge concurrently:
+        // Cmd+Shift+J shortcut, tray Start, IPC START, RO_AUTO_START_TUNNEL,
+        // and pendingTunnelAutoStart recovery. Each pre-checks tunnel state
+        // before calling, but their checks aren't atomic with this entry —
+        // a 2s setTimeout + an await on stored settings is plenty of room
+        // for two callers to race. Re-check here, return benign already-running
+        // result without disturbing state.
+        if (getIsConnecting() || getServer() || getTunnelProcess()) {
+            logDebug('[BRIDGE] startBridge called while already starting/running, ignoring');
+            return { alreadyRunning: true };
+        }
         setIsConnecting(true);
         syncStateWithRenderer();
 
