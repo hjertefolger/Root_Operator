@@ -100,6 +100,7 @@ function SecurityPanel({
       // eslint-disable-next-line no-console
       console.warn(`[SecurityPanel] ${action} request failed:`, error);
     });
+    onClose?.();
   };
 
   useEffect(() => {

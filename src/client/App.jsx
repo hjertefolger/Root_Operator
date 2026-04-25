@@ -255,6 +255,18 @@ function App() {
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, handleServerKeyMessage, decryptOutput]);
 
+  const [appActionPending, setAppActionPending] = useState(null);
+
+  useEffect(() => {
+    if (!appActionPending) return undefined;
+    if (connectionState === 'reconnecting' || connectionState === 'disconnected' || connectionState === 'server_stopped') {
+      setAppActionPending(null);
+      return undefined;
+    }
+    const timer = setTimeout(() => setAppActionPending(null), 20000);
+    return () => clearTimeout(timer);
+  }, [appActionPending, connectionState]);
+
   const handleRequestAppAction = useCallback(async (action) => {
     if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
       throw new Error('Secure session unavailable');
@@ -267,6 +279,7 @@ function App() {
       throw new Error('Secure session unavailable');
     }
     socket.send(JSON.stringify({ type: 'e2e_app_control', ...encrypted }));
+    setAppActionPending(action);
   }, [e2eReady, encryptInput, socket]);
 
   const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
@@ -412,6 +425,7 @@ function App() {
         sessionFingerprintHex={sessionFingerprintHex}
         sessionStartedAt={sessionStartedAt}
         onRequestAppAction={handleRequestAppAction}
+        appActionPending={appActionPending}
       />
       {clientMode === 'channel' ? (
         <ChannelChat

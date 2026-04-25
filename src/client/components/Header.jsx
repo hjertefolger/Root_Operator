@@ -86,8 +86,9 @@ function Header({
   sessionFingerprintHex,
   sessionStartedAt,
   onRequestAppAction,
+  appActionPending,
 }) {
-  const isReconnecting = connectionState === 'reconnecting';
+  const isReconnecting = connectionState === 'reconnecting' || Boolean(appActionPending);
   const isSecure = e2eReady;
   const status = getClientStatus(systemState, connectionState, e2eReady, clientMode);
   const statusTooltip = buildStatusTooltip(status, systemState, clientMode);
