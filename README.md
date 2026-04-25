@@ -18,6 +18,9 @@
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
+- 🔁 **Bi-directional file exchange** — images, videos, and docs flow both ways with the agent for tighter building sessions
+- ✏️ **In-place review** — comment on docs for iterative writing, sketch over images (mark, color, undo/redo), pull anything from your Mac straight into your phone's Files
+- 🔔 **Always reachable** — native push on desktop and iOS PWA, desktop chat companion via Shift+Shift, remote restart and quit from the lock screen
 - 🧠 **Continuity & recall** — selected channel history injected into every session; optional local-embedder index for deeper semantic search
 <br>
 
