@@ -55,7 +55,7 @@
 Chat with Claude Code running on your Mac -- from any paired device.
 
 - **Markdown chat** -- rich rendering with full GFM support
-- **File attachments** -- send images and files between devices, rendered as pills in the chat
+- **Bi-directional attachments** -- images, video, and docs flow between Mac and phone with a full-bleed viewer (pinch-zoom, fullscreen video, native iOS share-sheet on download); doc viewer supports inline comments that batch-send back as a structured message
 - **Push notifications** -- background notifications via Web Push (VAPID), respects foreground suppression
 - **Live activity indicators** -- see what Claude is doing in real-time (reading files, running commands)
 - **Persistent history** -- file-backed JSONL message store, survives app restarts
@@ -212,7 +212,7 @@ Root Operator exposes tools to Claude Code via the MCP bridge:
 
 | Tool | Purpose |
 |------|---------|
-| `reply(chat_id, text, attachments?)` | Send a response — and optionally image attachments — back to a connected device |
+| `reply(chat_id, text, attachments?)` | Send a response back, optionally with image, video (mp4/mov/webm up to 25 MB), or doc (.md/.txt up to 1 MB) attachments |
 | `ro_schedule(name, cron, prompt, chat_id)` | Create a persistent cron job |
 | `ro_list_schedules()` | List all scheduled jobs with status |
 | `ro_delete_schedule(id)` | Delete a scheduled job |
