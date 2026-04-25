@@ -179,7 +179,7 @@ function SecurityPanel({
               justifyContent: 'center',
               gap: 6,
               padding: '8px 10px',
-              borderRadius: 8,
+              borderRadius: 999,
               border: armedAction === 'restart'
                 ? '1px solid rgba(75,90,255,0.55)'
                 : '1px solid rgba(75,90,255,0.24)',
@@ -208,7 +208,7 @@ function SecurityPanel({
               justifyContent: 'center',
               gap: 6,
               padding: '8px 10px',
-              borderRadius: 8,
+              borderRadius: 999,
               border: armedAction === 'exit'
                 ? '1px solid rgba(212,77,105,0.55)'
                 : '1px solid rgba(212,77,105,0.24)',

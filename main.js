@@ -2,6 +2,7 @@
  * ROOT OPERATOR - MAIN PROCESS
  */
 const path = require('path');
+const { spawn } = require('child_process');
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage } = require('electron');
 const fs = require('fs');
 const fixPath = async () => {
@@ -479,11 +480,36 @@ const {
 } = channelMode;
 // Remote app control — invoked from the paired-device security panel so the
 // user can recover from a stale session without physical access to the Mac.
-// Restart spawns a fresh Electron instance via app.relaunch(); exit just
-// quits. Both delay the teardown by ~500ms so the acknowledgement message
-// has a chance to flush over the WS before the process goes down.
+// Production: app.relaunch() schedules a fresh packaged-app instance, then
+// app.quit() ends the current one (500ms grace lets the WS ack flush).
+// Dev: app.relaunch() can't bring back the npm/concurrently/vite tree, so
+// we hand off to a detached worker script that kills the dev tree and
+// spawns a fresh `npm run dev:app` with RO_AUTO_START_TUNNEL=1.
+function spawnDevRestartWorker() {
+    const scriptPath = path.join(__dirname, 'scripts', 'dev-restart.sh');
+    const child = spawn('/bin/bash', [scriptPath], {
+        detached: true,
+        stdio: 'ignore',
+        cwd: __dirname,
+        env: {
+            ...process.env,
+            RO_DEV_REPO_DIR: __dirname,
+        },
+    });
+    child.unref();
+}
+
 function requestAppRestart() {
-    logDebug('[APP] Remote restart queued');
+    if (isDev) {
+        logDebug('[APP] Remote restart in dev mode — spawning detached worker');
+        try {
+            spawnDevRestartWorker();
+        } catch (error) {
+            logDebug(`[APP] dev restart worker spawn failed: ${error && error.message}`);
+        }
+        return;
+    }
+    logDebug('[APP] Remote restart queued (production)');
     try {
         app.relaunch();
     } catch (error) {
