@@ -129,7 +129,9 @@ function App() {
   const handleSendFile = useCallback(async (file, caption) => {
     const result = await sendFile(file, caption);
     if (!result.success) {
-      console.error('[FILE] Upload failed:', result.error);
+      const err = new Error(result.error || 'Upload failed');
+      err.uploadFailure = true;
+      throw err;
     }
   }, [sendFile]);
 
@@ -257,12 +259,14 @@ function App() {
     if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
       throw new Error('Secure session unavailable');
     }
-    const type = action === 'restart' ? 'app_restart_request' : 'app_exit_request';
-    const encrypted = await encryptInput(JSON.stringify({ type }));
+    if (action !== 'restart' && action !== 'exit') {
+      throw new Error(`Unsupported app action: ${action}`);
+    }
+    const encrypted = await encryptInput(JSON.stringify({ action }));
     if (!encrypted) {
       throw new Error('Secure session unavailable');
     }
-    socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
+    socket.send(JSON.stringify({ type: 'e2e_app_control', ...encrypted }));
   }, [e2eReady, encryptInput, socket]);
 
   const handleRequestAttachmentBytes = useCallback(async ({ attachmentId, externalRef }) => {
@@ -308,6 +312,43 @@ function App() {
       });
       socket.send(JSON.stringify({ type: 'e2e_input', ...encrypted }));
     });
+  }, [e2eReady, encryptInput, socket]);
+
+  const handleSendDocAnnotation = useCallback(async ({ filename, items }) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !e2eReady) {
+      throw new Error('Secure session unavailable');
+    }
+    if (typeof filename !== 'string' || filename.length === 0) {
+      throw new Error('Document name missing');
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('No annotations to send');
+    }
+    // Cap shape at the client too so a buggy local state can't blast a
+    // huge payload — the server enforces the same bounds defensively.
+    if (items.length > 50) {
+      throw new Error('Too many annotations to send at once');
+    }
+    const safeItems = items.map((item, idx) => {
+      if (!item || typeof item !== 'object') {
+        throw new Error(`Annotation #${idx + 1} is malformed`);
+      }
+      const quote = typeof item.quote === 'string' ? item.quote : '';
+      const comment = typeof item.comment === 'string' ? item.comment : '';
+      if (quote.length === 0 || comment.length === 0) {
+        throw new Error(`Annotation #${idx + 1} is empty`);
+      }
+      return { quote: quote.slice(0, 1000), comment: comment.slice(0, 2000) };
+    });
+    const payload = JSON.stringify({
+      filename: filename.slice(0, 200),
+      items: safeItems,
+    });
+    const encrypted = await encryptInput(payload);
+    if (!encrypted) {
+      throw new Error('Secure session unavailable');
+    }
+    socket.send(JSON.stringify({ type: 'e2e_doc_annotation', ...encrypted }));
   }, [e2eReady, encryptInput, socket]);
 
   // Safe area wrapper for overlay screens
@@ -386,6 +427,7 @@ function App() {
           waiting={channelWaiting}
           setWaiting={setChannelWaiting}
           onSendFile={handleSendFile}
+          onSendDocAnnotation={handleSendDocAnnotation}
           onRequestAttachmentBytes={handleRequestAttachmentBytes}
           uploadProgress={uploadProgress}
           onAbortUpload={abortUpload}

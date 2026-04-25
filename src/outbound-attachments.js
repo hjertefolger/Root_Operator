@@ -3,7 +3,12 @@ const path = require('path');
 const crypto = require('crypto');
 
 const MAX_OUTBOUND_IMAGE_SIZE = 10 * 1024 * 1024;
-const MAX_OUTBOUND_VIDEO_SIZE = 100 * 1024 * 1024;
+// Outbound videos are delivered as a single base64-encoded WebSocket payload
+// today. Holding 100 MB+ as one buffer (decoded + re-encrypted + base64-
+// wrapped again on the wire) is unreliable on iOS over E2E. Cap at 25 MB
+// until chunked outbound delivery exists. Inbound (e2e_file_chunk) already
+// chunks, so device → Mac uploads stay at the larger size set there.
+const MAX_OUTBOUND_VIDEO_SIZE = 25 * 1024 * 1024;
 const MAX_OUTBOUND_DOC_SIZE = 1 * 1024 * 1024; // 1 MB — markdown / plain text documents
 // Back-compat export: callers that pinned to "the max" used this name when
 // images were the only kind. Keep it as the image limit.

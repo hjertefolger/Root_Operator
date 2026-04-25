@@ -67,7 +67,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           attachments: {
             type: 'array',
             description:
-              'Optional absolute paths to local image, video, or doc files on the Mac. Images: PNG, JPEG, WebP, GIF (up to 10 MB each). Videos: MP4, QuickTime (.mov), WebM (up to 100 MB each). Docs: Markdown (.md, .markdown), plain text (.txt) up to 1 MB each.',
+              'Optional absolute paths to local image, video, or doc files on the Mac. Images: PNG, JPEG, WebP, GIF (up to 10 MB each). Videos: MP4, QuickTime (.mov), WebM (up to 25 MB each). Docs: Markdown (.md, .markdown), plain text (.txt) up to 1 MB each.',
             items: {
               type: 'string',
             },

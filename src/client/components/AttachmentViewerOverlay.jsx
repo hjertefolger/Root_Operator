@@ -80,6 +80,7 @@ const SWIPE_NAV_LONG_DISTANCE = 120;
 const SWIPE_NAV_VELOCITY = 0.35;
 const SWIPE_NAV_VERTICAL_DRIFT = 48;
 const EMPTY_ANNOTATIONS = { strokes: [], redo: [] };
+const EMPTY_DOC_QUEUE = Object.freeze([]);
 const ANNOTATION_COLORS = [
   { value: '#0a84ff', label: 'Blue' },
   { value: '#ff453a', label: 'Red' },
@@ -534,6 +535,198 @@ function IconButton({ children, onClick, disabled, active, activeStrong, accent,
   );
 }
 
+// Owns the markdown render and the inline annotation marker mutations for
+// a single document attachment. Mounted with a key tied to the attachment
+// so React tears the entire subtree down (and runs the heal cleanup) before
+// the next attachment commits — eliminating any reconciliation overlap
+// between marker mutations and react-markdown's rendered DOM.
+const DocBody = memo(function DocBody({
+  isMarkdownDoc,
+  docSource,
+  docRemarkPlugins,
+  docMdComponents,
+  preStyle,
+  annotations,
+  highlightTick,
+  highlightRects,
+  openAnnotationRef,
+  onContentRefChange,
+}) {
+  const localRef = useRef(null);
+  const setNode = useCallback((node) => {
+    localRef.current = node;
+    if (typeof onContentRefChange === 'function') {
+      onContentRefChange(node);
+    }
+  }, [onContentRefChange]);
+
+  const healAllMarkers = useCallback(() => {
+    const root = localRef.current;
+    if (!root) return;
+    root.querySelectorAll('[data-ann-host]').forEach((host) => {
+      const parent = host.parentNode;
+      if (!parent) return;
+      const before = host.previousSibling;
+      const after = host.nextSibling;
+      parent.removeChild(host);
+      if (
+        before
+        && after
+        && before.nodeType === Node.TEXT_NODE
+        && after.nodeType === Node.TEXT_NODE
+      ) {
+        before.data += after.data;
+        parent.removeChild(after);
+      }
+    });
+  }, []);
+
+  // Sweep on unmount so the OLD subtree is fully healed before React
+  // discards it. Because DocBody is keyed by attachment in the parent,
+  // unmount fires synchronously when the attachment changes — well
+  // before the new DocBody (and its react-markdown children) commit.
+  useLayoutEffect(() => {
+    return () => {
+      healAllMarkers();
+    };
+  }, [healAllMarkers]);
+
+  // Keep markers in sync with the queued annotations. Idempotent: hosts
+  // we already created are matched by data-ann-host id, orphans are
+  // healed.
+  useLayoutEffect(() => {
+    const root = localRef.current;
+    if (!root) return;
+
+    const removeHostAndHeal = (host) => {
+      if (!host || !host.parentNode) return;
+      const parent = host.parentNode;
+      const before = host.previousSibling;
+      const after = host.nextSibling;
+      parent.removeChild(host);
+      if (
+        before
+        && after
+        && before.nodeType === Node.TEXT_NODE
+        && after.nodeType === Node.TEXT_NODE
+      ) {
+        before.data += after.data;
+        parent.removeChild(after);
+      }
+    };
+
+    const existing = new Map();
+    root.querySelectorAll('[data-ann-host]').forEach((el) => {
+      existing.set(el.dataset.annHost, el);
+    });
+
+    for (const entry of annotations) {
+      if (existing.has(entry.id)) {
+        existing.delete(entry.id);
+        continue;
+      }
+      if (!entry.range) continue;
+      // Defensive guard: a Range from a previous attachment can outlive
+      // its DOM if state ever races. Skip silently if the range's
+      // endContainer is no longer attached to this DocBody's subtree.
+      if (!root.contains(entry.range.endContainer)) continue;
+      try {
+        const host = document.createElement('button');
+        host.type = 'button';
+        host.dataset.annHost = entry.id;
+        host.setAttribute('aria-label', 'Edit annotation');
+        Object.assign(host.style, {
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '20px',
+          height: '20px',
+          margin: '0 4px',
+          verticalAlign: 'middle',
+          borderRadius: '999px',
+          border: 'none',
+          padding: '0',
+          background: '#4B5AFF',
+          boxShadow: '0 4px 10px rgba(75,90,255,0.45)',
+          cursor: 'pointer',
+          flexShrink: '0',
+        });
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('width', '11');
+        svg.setAttribute('height', '11');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', '#fff');
+        svg.setAttribute('stroke-width', '2.4');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        const path = document.createElementNS(svgNS, 'path');
+        path.setAttribute('d', 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z');
+        const dot = document.createElementNS(svgNS, 'circle');
+        dot.setAttribute('cx', '12');
+        dot.setAttribute('cy', '10');
+        dot.setAttribute('r', '1.5');
+        dot.setAttribute('fill', '#fff');
+        dot.setAttribute('stroke', 'none');
+        svg.appendChild(path);
+        svg.appendChild(dot);
+        host.appendChild(svg);
+        host.addEventListener('click', (event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          openAnnotationRef.current?.(entry.id);
+        });
+
+        const end = entry.range.endContainer;
+        const offset = entry.range.endOffset;
+        if (end && end.nodeType === Node.TEXT_NODE && end.parentNode) {
+          if (offset >= end.length) {
+            end.parentNode.insertBefore(host, end.nextSibling);
+          } else {
+            const after = end.splitText(offset);
+            after.parentNode.insertBefore(host, after);
+          }
+        } else if (end && end.nodeType === Node.ELEMENT_NODE) {
+          const refNode = end.childNodes[offset] || null;
+          end.insertBefore(host, refNode);
+        }
+      } catch {
+        // Range invalid or detached; skip silently.
+      }
+    }
+
+    existing.forEach(removeHostAndHeal);
+  }, [annotations, highlightTick, openAnnotationRef]);
+
+  return (
+    <div ref={setNode} style={{ position: 'relative' }}>
+      {isMarkdownDoc ? (
+        <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
+          {docSource}
+        </ReactMarkdown>
+      ) : (
+        <pre style={preStyle}>{docSource}</pre>
+      )}
+      {Array.isArray(highlightRects) && highlightRects.map((rect) => (
+        <div
+          key={rect.id}
+          style={{
+            position: 'absolute',
+            top: rect.top,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height,
+            background: 'rgba(75,90,255,0.40)',
+            borderRadius: 2,
+            pointerEvents: 'none',
+          }}
+        />
+      ))}
+    </div>
+  );
+});
+
 const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   attachments,
   externalRef,
@@ -548,7 +741,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
 }) {
   const viewportRef = useRef(null);
   const docContainerRef = useRef(null);
-  const docContentRef = useRef(null);
+  // The doc content node is owned by a keyed child component (DocBody)
+  // so its DOM mutations (annotation markers) are contained within a
+  // subtree React fully unmounts on attachment changes. We hold the
+  // current node here via a ref-callback for the parent's read-only
+  // queries (selection, highlight rect computation).
+  const [docContentNode, setDocContentNode] = useState(null);
   const viewportRectRef = useRef(getViewportFallbackRect());
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
@@ -588,7 +786,13 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const [docCommentDraft, setDocCommentDraft] = useState('');
   const [docAnnotationSending, setDocAnnotationSending] = useState(false);
   const [docAnnotationError, setDocAnnotationError] = useState('');
-  const [docAnnotationQueue, setDocAnnotationQueue] = useState([]);
+  // Internal queue store carries the attachmentId it belongs to so a stale
+  // queue from the previous attachment can never be observed during the
+  // single render in which we're swapping. The derived `docAnnotationQueue`
+  // below reads as the empty queue whenever the stored id no longer
+  // matches the active attachment — DocBody mounts with no markers to
+  // place, even before the post-commit cleanup useEffect runs.
+  const [annotationQueueScoped, setAnnotationQueueScoped] = useState({ attachmentId: '', items: [] });
   const [highlightTick, setHighlightTick] = useState(0);
   const [docSheetDragY, setDocSheetDragY] = useState(0);
   const docSheetDragRef = useRef({ active: false, startY: 0, lastY: 0 });
@@ -597,6 +801,16 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const useLayoutZoomViewer = !isDesktopSurface;
   const activeAttachment = attachmentCount > 0 ? attachments[activeIndex] : null;
   const attachmentId = activeAttachment?.id || '';
+  const docAnnotationQueue = annotationQueueScoped.attachmentId === attachmentId
+    ? annotationQueueScoped.items
+    : EMPTY_DOC_QUEUE;
+  const setDocAnnotationQueue = useCallback((updater) => {
+    setAnnotationQueueScoped((prev) => {
+      const base = prev.attachmentId === attachmentId ? prev.items : [];
+      const nextItems = typeof updater === 'function' ? updater(base) : updater;
+      return { attachmentId, items: nextItems };
+    });
+  }, [attachmentId]);
   const cachedAttachment = attachmentId ? attachmentCache?.[attachmentId] : null;
   const resolvedAttachment = cachedAttachment
     ? { ...activeAttachment, ...cachedAttachment }
@@ -1054,22 +1268,32 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   }, [activeAttachment?.name, annotatedAttachmentHandler, canSendAnnotated, naturalSize.height, naturalSize.width, onClose, strokes]);
 
   const handleDownload = useCallback(async () => {
-    if (!activeAttachment) {
+    // Always read bytes from the resolved attachment — fetched-on-demand
+    // bytes live in the cache, not on the original metadata object.
+    const source = resolvedAttachment || activeAttachment;
+    if (!source) {
       return;
     }
-    const src = previewSrc;
-    if (!src) {
+    if (!source.bytesBase64) {
+      setSendError('Attachment data unavailable.');
       return;
     }
-    const filename = activeAttachment.name || 'attachment';
+    const filename = source.name || 'attachment';
+    const mime = source.mime || 'application/octet-stream';
     const canShareFiles = (
       typeof navigator !== 'undefined'
       && typeof navigator.canShare === 'function'
       && typeof navigator.share === 'function'
     );
     try {
-      const response = await fetch(src);
-      const blob = await response.blob();
+      // Decode base64 directly into a Blob. Avoids fetch() on a data: URL,
+      // which is blocked by the production connect-src policy.
+      const binaryString = atob(source.bytesBase64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i += 1) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: mime });
 
       // On iOS PWAs and mobile Safari, `<a download>` is unreliable — it often
       // opens the file in a new webview tab instead of presenting a save
@@ -1111,7 +1335,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     } catch (error) {
       setSendError(error?.message || 'Unable to download attachment.');
     }
-  }, [activeAttachment, previewSrc]);
+  }, [resolvedAttachment]);
 
   useEffect(() => {
     setActiveIndex(initialIndex);
@@ -1205,7 +1429,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const highlightInfo = useMemo(() => {
     void highlightTick;
     if (!isDocAttachment || docAnnotationQueue.length === 0) return { rects: [], markers: [] };
-    const content = docContentRef.current;
+    const content = docContentNode;
     const container = docContainerRef.current;
     if (!content || !container) return { rects: [], markers: [] };
     const contentRect = content.getBoundingClientRect();
@@ -1240,7 +1464,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       }
     }
     return { rects, markers };
-  }, [docAnnotationQueue, highlightTick, isDocAttachment]);
+  }, [docAnnotationQueue, highlightTick, isDocAttachment, docContentNode]);
   const highlightRects = highlightInfo.rects;
   const highlightMarkers = highlightInfo.markers;
 
@@ -1320,19 +1544,18 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const sendDocAnnotationQueue = useCallback(async () => {
     if (typeof onSendDocAnnotation !== 'function' || docAnnotationQueue.length === 0) return;
     const filename = activeAttachment?.name || 'document';
-    const count = docAnnotationQueue.length;
-    const header = count === 1
-      ? `📝 Annotation on ${filename}`
-      : `📝 ${count} annotations on ${filename}`;
-    const body = docAnnotationQueue.map((entry, idx) => {
-      const prefix = count === 1 ? '' : `${idx + 1}. `;
-      return `${prefix}> ${entry.quote}\n\n${entry.comment}`;
-    }).join('\n\n---\n\n');
-    const message = `${header}\n\n${body}`;
     setDocAnnotationSending(true);
     setDocAnnotationError('');
     try {
-      await onSendDocAnnotation(message);
+      // Send a typed payload so the server validates structure and never
+      // sees free-form chat text crafted by the user. The server renders
+      // the canonical "📝 Annotation on filename" message from these
+      // fields after schema validation.
+      const items = docAnnotationQueue.map((entry) => ({
+        quote: entry.quote,
+        comment: entry.comment,
+      }));
+      await onSendDocAnnotation({ filename, items });
       setDocAnnotationQueue([]);
       onClose?.();
     } catch (err) {
@@ -1364,92 +1587,10 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
     openExistingAnnotationRef.current = openExistingAnnotation;
   }, [openExistingAnnotation]);
 
-  // Inject inline marker buttons into the DOM at each annotation's range end
-  // so neighboring text is naturally pushed instead of overlapped.
-  useEffect(() => {
-    if (!isDocAttachment) return;
-    const root = docContentRef.current;
-    if (!root) return;
-
-    const existing = new Map();
-    root.querySelectorAll('[data-ann-host]').forEach((el) => {
-      existing.set(el.dataset.annHost, el);
-    });
-
-    for (const entry of docAnnotationQueue) {
-      if (existing.has(entry.id)) {
-        existing.delete(entry.id);
-        continue;
-      }
-      if (!entry.range) continue;
-      try {
-        const host = document.createElement('button');
-        host.type = 'button';
-        host.dataset.annHost = entry.id;
-        host.setAttribute('aria-label', 'Edit annotation');
-        Object.assign(host.style, {
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          width: '20px',
-          height: '20px',
-          margin: '0 4px',
-          verticalAlign: 'middle',
-          borderRadius: '999px',
-          border: 'none',
-          padding: '0',
-          background: '#4B5AFF',
-          boxShadow: '0 4px 10px rgba(75,90,255,0.45)',
-          cursor: 'pointer',
-          flexShrink: '0',
-        });
-        const svgNS = 'http://www.w3.org/2000/svg';
-        const svg = document.createElementNS(svgNS, 'svg');
-        svg.setAttribute('width', '11');
-        svg.setAttribute('height', '11');
-        svg.setAttribute('viewBox', '0 0 24 24');
-        svg.setAttribute('fill', 'none');
-        svg.setAttribute('stroke', '#fff');
-        svg.setAttribute('stroke-width', '2.4');
-        svg.setAttribute('stroke-linecap', 'round');
-        svg.setAttribute('stroke-linejoin', 'round');
-        const path = document.createElementNS(svgNS, 'path');
-        path.setAttribute('d', 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z');
-        const dot = document.createElementNS(svgNS, 'circle');
-        dot.setAttribute('cx', '12');
-        dot.setAttribute('cy', '10');
-        dot.setAttribute('r', '1.5');
-        dot.setAttribute('fill', '#fff');
-        dot.setAttribute('stroke', 'none');
-        svg.appendChild(path);
-        svg.appendChild(dot);
-        host.appendChild(svg);
-        host.addEventListener('click', (event) => {
-          event.stopPropagation();
-          event.preventDefault();
-          openExistingAnnotationRef.current?.(entry.id);
-        });
-
-        const end = entry.range.endContainer;
-        const offset = entry.range.endOffset;
-        if (end && end.nodeType === Node.TEXT_NODE && end.parentNode) {
-          if (offset >= end.length) {
-            end.parentNode.insertBefore(host, end.nextSibling);
-          } else {
-            const after = end.splitText(offset);
-            after.parentNode.insertBefore(host, after);
-          }
-        } else if (end && end.nodeType === Node.ELEMENT_NODE) {
-          const refNode = end.childNodes[offset] || null;
-          end.insertBefore(host, refNode);
-        }
-      } catch {
-        // Range invalid or detached; skip silently.
-      }
-    }
-
-    existing.forEach((el) => el.remove());
-  }, [docAnnotationQueue, isDocAttachment, highlightTick]);
+  // Marker insertion + heal lifecycle is owned by the keyed <DocBody>
+  // child below. When the doc attachment swaps, DocBody unmounts and its
+  // heal runs synchronously inside its own commit, before React can
+  // reconcile any new content into the same subtree.
 
   const updateExistingAnnotation = useCallback(() => {
     if (!docCommentSheet?.editingId) return;
@@ -2330,42 +2471,27 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
                   WebkitUserSelect: 'text',
                 }}
               >
-                <div ref={docContentRef} style={{ position: 'relative' }}>
-                  {isMarkdownDoc ? (
-                    <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
-                      {docSource}
-                    </ReactMarkdown>
-                  ) : (
-                    <pre
-                      style={{
-                        fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-                        fontSize: 13,
-                        lineHeight: 1.6,
-                        color: 'rgba(255,255,255,0.85)',
-                        whiteSpace: 'pre-wrap',
-                        wordBreak: 'break-word',
-                        margin: 0,
-                      }}
-                    >
-                      {docSource}
-                    </pre>
-                  )}
-                  {highlightRects.map((rect) => (
-                    <div
-                      key={rect.id}
-                      style={{
-                        position: 'absolute',
-                        top: rect.top,
-                        left: rect.left,
-                        width: rect.width,
-                        height: rect.height,
-                        background: 'rgba(75,90,255,0.40)',
-                        borderRadius: 2,
-                        pointerEvents: 'none',
-                      }}
-                    />
-                  ))}
-                </div>
+                <DocBody
+                  key={annotationKey || 'doc-body'}
+                  isMarkdownDoc={isMarkdownDoc}
+                  docSource={docSource}
+                  docRemarkPlugins={docRemarkPlugins}
+                  docMdComponents={docMdComponents}
+                  preStyle={{
+                    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                    color: 'rgba(255,255,255,0.85)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    margin: 0,
+                  }}
+                  annotations={docAnnotationQueue}
+                  highlightTick={highlightTick}
+                  highlightRects={highlightRects}
+                  openAnnotationRef={openExistingAnnotationRef}
+                  onContentRefChange={setDocContentNode}
+                />
               </div>
             </div>
           )}

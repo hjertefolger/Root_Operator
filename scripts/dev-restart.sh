@@ -77,6 +77,19 @@ pid_cwd() {
     lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | awk '/^n/ {print substr($0,2); exit}'
 }
 
+# True if the supplied cwd belongs to REPO_DIR (exact match or under
+# REPO_DIR/). Avoids accidentally matching siblings whose path starts with
+# the same prefix (e.g. .../55-Root_Operator-clone-2).
+cwd_belongs_to_repo() {
+    local cwd="$1"
+    [ -n "$cwd" ] || return 1
+    [ "$cwd" = "$REPO_DIR" ] && return 0
+    case "$cwd" in
+        "${REPO_DIR}/"*) return 0 ;;
+    esac
+    return 1
+}
+
 # Find the concurrently process for THIS repo's dev:app and kill its
 # process group. Filtering by cwd avoids killing a parallel dev tree
 # in a different clone.
@@ -84,9 +97,10 @@ PARENT_PID=""
 while read -r pid; do
     [ -z "$pid" ] && continue
     cwd="$(pid_cwd "$pid")"
-    case "$cwd" in
-        "${REPO_DIR}"*) PARENT_PID="$pid"; break ;;
-    esac
+    if cwd_belongs_to_repo "$cwd"; then
+        PARENT_PID="$pid"
+        break
+    fi
 done < <(pgrep -f 'concurrently.*dev:renderer.*dev:client' || true)
 
 if [ -n "${PARENT_PID:-}" ]; then
@@ -102,16 +116,16 @@ for pattern in 'npm run dev:app' 'concurrently.*dev:renderer' 'vite.*config' 'el
     while read -r pid; do
         [ -z "$pid" ] && continue
         cwd="$(pid_cwd "$pid")"
-        case "$cwd" in
-            "${REPO_DIR}"*)
-                log "KILL $pid ($pattern, cwd=$cwd)"
-                kill -KILL "$pid" 2>/dev/null || true
-                ;;
-        esac
+        if cwd_belongs_to_repo "$cwd"; then
+            log "KILL $pid ($pattern, cwd=$cwd)"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
     done < <(pgrep -f "$pattern" || true)
 done
 
-# Wait for vite ports to release; hard-kill any straggler if still bound.
+# Wait for vite ports to release; hard-kill any straggler bound to the
+# port AND owned by this repo. We never KILL a process holding the port
+# whose cwd is a different repo — protects parallel dev trees.
 for port in 5174 5175; do
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         if ! lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -119,12 +133,17 @@ for port in 5174 5175; do
         fi
         sleep 1
     done
-    leftover="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
-    if [ -n "$leftover" ]; then
-        log "port $port still bound by pid $leftover — KILL"
-        kill -KILL "$leftover" 2>/dev/null || true
-        sleep 1
-    fi
+    while read -r leftover; do
+        [ -z "$leftover" ] && continue
+        cwd="$(pid_cwd "$leftover")"
+        if cwd_belongs_to_repo "$cwd"; then
+            log "port $port still bound by pid $leftover (cwd=$cwd) — KILL"
+            kill -KILL "$leftover" 2>/dev/null || true
+        else
+            log "port $port bound by pid $leftover (cwd=${cwd:-?}) — not in this repo, skipping"
+        fi
+    done < <(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+    sleep 1
 done
 
 cd "$REPO_DIR" || { log "FATAL cannot cd to ${REPO_DIR}"; exit 1; }

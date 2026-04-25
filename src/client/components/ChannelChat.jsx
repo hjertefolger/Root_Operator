@@ -890,6 +890,7 @@ function ChannelChat({
   setWaiting,
   onSubmitMessage,
   onSendFile,
+  onSendDocAnnotation,
   uploadProgress = null,
   onAbortUpload,
   canSendOverride,
@@ -1317,6 +1318,7 @@ function ChannelChat({
     nextScrollBehaviorRef.current = 'smooth';
     setActivities([]);
 
+    const ts = new Date().toISOString();
     const displayText = caption
       ? `${caption}\n📎 ${file.name}|${file.size}`
       : `📎 ${file.name}|${file.size}`;
@@ -1324,7 +1326,7 @@ function ChannelChat({
     setMessages(prev => [...prev, {
       role: 'user',
       content: displayText,
-      ts: new Date().toISOString(),
+      ts,
     }]);
 
     setWaiting(true);
@@ -1333,7 +1335,12 @@ function ChannelChat({
       await onSendFile(file, caption);
     } catch (error) {
       console.error('Failed to send file:', error);
+      // Roll back the optimistic message — the upload didn't actually land.
+      setMessages(prev => prev.filter(m => !(m.ts === ts && m.content === displayText)));
       setWaiting(false);
+      if (error?.uploadFailure && typeof window !== 'undefined' && typeof window.alert === 'function') {
+        window.alert(error.message || 'Upload failed.');
+      }
     }
   }, [canSend, onSendFile, setActivities, setMessages, setWaiting]);
 
@@ -1434,7 +1441,7 @@ function ChannelChat({
           onRequestAttachment={requestAttachmentBytes}
           onQueueAnnotatedAttachment={onSendFile ? handleQueueAnnotatedAttachment : undefined}
           onSendAnnotatedAttachment={onSendFile ? handleSendAnnotatedAttachment : undefined}
-          onSendDocAnnotation={canSend ? sendMessage : undefined}
+          onSendDocAnnotation={canSend && onSendDocAnnotation ? onSendDocAnnotation : undefined}
           onClose={closeAttachmentViewer}
         />
       )}
