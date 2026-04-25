@@ -654,6 +654,23 @@ app.whenReady().then(async () => {
         setTray: (value) => { tray = value; },
     });
     updater.start();
+
+    // RO_AUTO_START_TUNNEL=1 lets a launchd / dev restart hook bring the
+    // tunnel up automatically once the app has finished initializing — no
+    // need to send a Cmd+Shift+J keystroke from a remote context. The hook
+    // mirrors the keyboard-shortcut path in tray.js: read stored Cloudflare
+    // settings, then call startBridge.
+    if (process.env.RO_AUTO_START_TUNNEL === '1') {
+        setTimeout(async () => {
+            try {
+                const cfSettings = await getStoredTunnelSettings();
+                await startBridge(cfSettings);
+                logDebug('[AUTO-START] Tunnel started via RO_AUTO_START_TUNNEL');
+            } catch (error) {
+                logDebug(`[AUTO-START] Tunnel failed to start: ${error.message}`);
+            }
+        }, 2000);
+    }
 });
 
 app.on('will-quit', () => {
