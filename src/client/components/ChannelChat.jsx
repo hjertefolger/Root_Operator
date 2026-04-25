@@ -1434,6 +1434,7 @@ function ChannelChat({
           onRequestAttachment={requestAttachmentBytes}
           onQueueAnnotatedAttachment={onSendFile ? handleQueueAnnotatedAttachment : undefined}
           onSendAnnotatedAttachment={onSendFile ? handleSendAnnotatedAttachment : undefined}
+          onSendDocAnnotation={canSend ? sendMessage : undefined}
           onClose={closeAttachmentViewer}
         />
       )}

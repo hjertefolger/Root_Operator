@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Redo2, Trash, Undo2, Volume2, VolumeX, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Plus, Redo2, Trash, Trash2, Undo2, Volume2, VolumeX, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -543,9 +543,12 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   onRequestAttachment,
   onQueueAnnotatedAttachment,
   onSendAnnotatedAttachment,
+  onSendDocAnnotation,
   onClose,
 }) {
   const viewportRef = useRef(null);
+  const docContainerRef = useRef(null);
+  const docContentRef = useRef(null);
   const viewportRectRef = useRef(getViewportFallbackRect());
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
@@ -580,6 +583,15 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
   const [sendError, setSendError] = useState('');
   const [openPicker, setOpenPicker] = useState(null);
   const [webView, setWebView] = useState({ zoom: 1, x: 0, y: 0 });
+  const [docSelection, setDocSelection] = useState(null);
+  const [docCommentSheet, setDocCommentSheet] = useState(null);
+  const [docCommentDraft, setDocCommentDraft] = useState('');
+  const [docAnnotationSending, setDocAnnotationSending] = useState(false);
+  const [docAnnotationError, setDocAnnotationError] = useState('');
+  const [docAnnotationQueue, setDocAnnotationQueue] = useState([]);
+  const [highlightTick, setHighlightTick] = useState(0);
+  const [docSheetDragY, setDocSheetDragY] = useState(0);
+  const docSheetDragRef = useRef({ active: false, startY: 0, lastY: 0 });
   const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
   const isDesktopSurface = typeof window !== 'undefined' && Boolean(window.electronAPI);
   const useLayoutZoomViewer = !isDesktopSurface;
@@ -1117,6 +1129,349 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
       document.body.style.overscrollBehavior = previousOverscroll;
     };
   }, []);
+
+  // Track text selection inside the doc container so we can offer an
+  // "Add comment" floating pill above the selection. Only active when a doc
+  // attachment is rendered and the chat-side annotation handler is wired.
+  useEffect(() => {
+    if (!isDocAttachment || !previewSrc || typeof onSendDocAnnotation !== 'function') {
+      setDocSelection(null);
+      return undefined;
+    }
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return undefined;
+    }
+    let frame = 0;
+    const compute = () => {
+      const sel = window.getSelection?.();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setDocSelection(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      const container = docContainerRef.current;
+      if (!container || !container.contains(range.commonAncestorContainer)) {
+        setDocSelection(null);
+        return;
+      }
+      const text = sel.toString().trim();
+      if (!text) {
+        setDocSelection(null);
+        return;
+      }
+      const rects = range.getClientRects();
+      const rect = rects.length > 0 ? rects[0] : range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setDocSelection(null);
+        return;
+      }
+      // Clone the range now while the doc still owns the selection — iOS
+      // moves focus to the textarea once the sheet opens and would clear it.
+      let cloned = null;
+      try { cloned = range.cloneRange(); } catch {}
+      setDocSelection({
+        text,
+        rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
+        range: cloned,
+      });
+    };
+    const onChange = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(compute);
+    };
+    document.addEventListener('selectionchange', onChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener('selectionchange', onChange);
+    };
+  }, [isDocAttachment, previewSrc, onSendDocAnnotation]);
+
+  // Recompute highlight rectangles on viewport resize and orientation change
+  // so existing annotations stay aligned with their text after reflow.
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const bump = () => setHighlightTick((tick) => tick + 1);
+    window.addEventListener('resize', bump);
+    window.addEventListener('orientationchange', bump);
+    return () => {
+      window.removeEventListener('resize', bump);
+      window.removeEventListener('orientationchange', bump);
+    };
+  }, []);
+
+  // Compute highlight rectangles for each queued annotation, transformed into
+  // coordinates relative to the scrolling content wrapper so they scroll
+  // naturally with the doc. Returns rects + per-annotation icon anchor.
+  const highlightInfo = useMemo(() => {
+    void highlightTick;
+    if (!isDocAttachment || docAnnotationQueue.length === 0) return { rects: [], markers: [] };
+    const content = docContentRef.current;
+    const container = docContainerRef.current;
+    if (!content || !container) return { rects: [], markers: [] };
+    const contentRect = content.getBoundingClientRect();
+    const rects = [];
+    const markers = [];
+    for (const entry of docAnnotationQueue) {
+      if (!entry.range) continue;
+      try {
+        const clientRects = entry.range.getClientRects();
+        let lastRect = null;
+        for (let i = 0; i < clientRects.length; i += 1) {
+          const r = clientRects[i];
+          if (r.width === 0 && r.height === 0) continue;
+          rects.push({
+            id: `${entry.id}_${i}`,
+            top: r.top - contentRect.top,
+            left: r.left - contentRect.left,
+            width: r.width,
+            height: r.height,
+          });
+          lastRect = r;
+        }
+        if (lastRect) {
+          markers.push({
+            id: entry.id,
+            top: lastRect.top - contentRect.top + lastRect.height / 2 - 11,
+            left: lastRect.right - contentRect.left + 4,
+          });
+        }
+      } catch {
+        // Range invalidated (DOM changed) — skip.
+      }
+    }
+    return { rects, markers };
+  }, [docAnnotationQueue, highlightTick, isDocAttachment]);
+  const highlightRects = highlightInfo.rects;
+  const highlightMarkers = highlightInfo.markers;
+
+  // Reset annotation UI when switching attachments.
+  useEffect(() => {
+    setDocSelection(null);
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    setDocAnnotationSending(false);
+    setDocAnnotationQueue([]);
+  }, [activeAttachment?.id]);
+
+  const openDocCommentSheet = useCallback(() => {
+    if (!docSelection) return;
+    setDocCommentSheet({ selection: docSelection });
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docSelection]);
+
+  const closeDocCommentSheet = useCallback(() => {
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    setDocSheetDragY(0);
+    docSheetDragRef.current = { active: false, startY: 0, lastY: 0 };
+  }, []);
+
+  const handleSheetDragStart = useCallback((event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    docSheetDragRef.current = { active: true, startY: event.clientY, lastY: event.clientY };
+    try { event.currentTarget.setPointerCapture?.(event.pointerId); } catch {}
+  }, []);
+
+  const handleSheetDragMove = useCallback((event) => {
+    if (!docSheetDragRef.current.active) return;
+    const dy = event.clientY - docSheetDragRef.current.startY;
+    docSheetDragRef.current.lastY = event.clientY;
+    setDocSheetDragY(Math.max(0, dy));
+  }, []);
+
+  const handleSheetDragEnd = useCallback((event) => {
+    if (!docSheetDragRef.current.active) return;
+    const dy = event.clientY - docSheetDragRef.current.startY;
+    docSheetDragRef.current.active = false;
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId); } catch {}
+    if (dy > 80) {
+      closeDocCommentSheet();
+    } else {
+      setDocSheetDragY(0);
+    }
+  }, [closeDocCommentSheet]);
+
+  const queueDocAnnotation = useCallback(() => {
+    if (!docCommentSheet) return;
+    const comment = docCommentDraft.trim();
+    if (!comment) return;
+    const quoted = docCommentSheet.selection?.text || '';
+    const truncated = quoted.length > 240 ? `${quoted.slice(0, 240).trim()}…` : quoted;
+    const savedRange = docCommentSheet.selection?.range || null;
+    setDocAnnotationQueue((prev) => [
+      ...prev,
+      {
+        id: `ann_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        quote: truncated.replace(/\n+/g, ' '),
+        comment,
+        range: savedRange,
+      },
+    ]);
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+    try { window.getSelection?.()?.removeAllRanges?.(); } catch {}
+    setDocSelection(null);
+  }, [docCommentSheet, docCommentDraft]);
+
+  const sendDocAnnotationQueue = useCallback(async () => {
+    if (typeof onSendDocAnnotation !== 'function' || docAnnotationQueue.length === 0) return;
+    const filename = activeAttachment?.name || 'document';
+    const count = docAnnotationQueue.length;
+    const header = count === 1
+      ? `📝 Annotation on ${filename}`
+      : `📝 ${count} annotations on ${filename}`;
+    const body = docAnnotationQueue.map((entry, idx) => {
+      const prefix = count === 1 ? '' : `${idx + 1}. `;
+      return `${prefix}> ${entry.quote}\n\n${entry.comment}`;
+    }).join('\n\n---\n\n');
+    const message = `${header}\n\n${body}`;
+    setDocAnnotationSending(true);
+    setDocAnnotationError('');
+    try {
+      await onSendDocAnnotation(message);
+      setDocAnnotationQueue([]);
+      onClose?.();
+    } catch (err) {
+      setDocAnnotationError(err?.message || 'Could not send annotations');
+    } finally {
+      setDocAnnotationSending(false);
+    }
+  }, [docAnnotationQueue, onSendDocAnnotation, activeAttachment?.name, onClose]);
+
+  const removeQueuedAnnotation = useCallback((index) => {
+    setDocAnnotationQueue((prev) => prev.filter((_, idx) => idx !== index));
+  }, []);
+
+  const openExistingAnnotation = useCallback((annotationId) => {
+    const entry = docAnnotationQueue.find((item) => item.id === annotationId);
+    if (!entry) return;
+    setDocCommentSheet({
+      selection: { text: entry.quote, range: entry.range || null },
+      editingId: annotationId,
+    });
+    setDocCommentDraft(entry.comment || '');
+    setDocAnnotationError('');
+  }, [docAnnotationQueue]);
+
+  // Live ref to the latest openExistingAnnotation so DOM-attached click
+  // handlers always call the freshest callback even when queue updates.
+  const openExistingAnnotationRef = useRef(openExistingAnnotation);
+  useEffect(() => {
+    openExistingAnnotationRef.current = openExistingAnnotation;
+  }, [openExistingAnnotation]);
+
+  // Inject inline marker buttons into the DOM at each annotation's range end
+  // so neighboring text is naturally pushed instead of overlapped.
+  useEffect(() => {
+    if (!isDocAttachment) return;
+    const root = docContentRef.current;
+    if (!root) return;
+
+    const existing = new Map();
+    root.querySelectorAll('[data-ann-host]').forEach((el) => {
+      existing.set(el.dataset.annHost, el);
+    });
+
+    for (const entry of docAnnotationQueue) {
+      if (existing.has(entry.id)) {
+        existing.delete(entry.id);
+        continue;
+      }
+      if (!entry.range) continue;
+      try {
+        const host = document.createElement('button');
+        host.type = 'button';
+        host.dataset.annHost = entry.id;
+        host.setAttribute('aria-label', 'Edit annotation');
+        Object.assign(host.style, {
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '20px',
+          height: '20px',
+          margin: '0 4px',
+          verticalAlign: 'middle',
+          borderRadius: '999px',
+          border: 'none',
+          padding: '0',
+          background: '#4B5AFF',
+          boxShadow: '0 4px 10px rgba(75,90,255,0.45)',
+          cursor: 'pointer',
+          flexShrink: '0',
+        });
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('width', '11');
+        svg.setAttribute('height', '11');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', '#fff');
+        svg.setAttribute('stroke-width', '2.4');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        const path = document.createElementNS(svgNS, 'path');
+        path.setAttribute('d', 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z');
+        const dot = document.createElementNS(svgNS, 'circle');
+        dot.setAttribute('cx', '12');
+        dot.setAttribute('cy', '10');
+        dot.setAttribute('r', '1.5');
+        dot.setAttribute('fill', '#fff');
+        dot.setAttribute('stroke', 'none');
+        svg.appendChild(path);
+        svg.appendChild(dot);
+        host.appendChild(svg);
+        host.addEventListener('click', (event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          openExistingAnnotationRef.current?.(entry.id);
+        });
+
+        const end = entry.range.endContainer;
+        const offset = entry.range.endOffset;
+        if (end && end.nodeType === Node.TEXT_NODE && end.parentNode) {
+          if (offset >= end.length) {
+            end.parentNode.insertBefore(host, end.nextSibling);
+          } else {
+            const after = end.splitText(offset);
+            after.parentNode.insertBefore(host, after);
+          }
+        } else if (end && end.nodeType === Node.ELEMENT_NODE) {
+          const refNode = end.childNodes[offset] || null;
+          end.insertBefore(host, refNode);
+        }
+      } catch {
+        // Range invalid or detached; skip silently.
+      }
+    }
+
+    existing.forEach((el) => el.remove());
+  }, [docAnnotationQueue, isDocAttachment, highlightTick]);
+
+  const updateExistingAnnotation = useCallback(() => {
+    if (!docCommentSheet?.editingId) return;
+    const comment = docCommentDraft.trim();
+    if (!comment) return;
+    const editingId = docCommentSheet.editingId;
+    setDocAnnotationQueue((prev) => prev.map((item) => (
+      item.id === editingId ? { ...item, comment } : item
+    )));
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docCommentSheet, docCommentDraft]);
+
+  const deleteExistingAnnotation = useCallback(() => {
+    if (!docCommentSheet?.editingId) return;
+    const editingId = docCommentSheet.editingId;
+    setDocAnnotationQueue((prev) => prev.filter((item) => item.id !== editingId));
+    setDocCommentSheet(null);
+    setDocCommentDraft('');
+    setDocAnnotationError('');
+  }, [docCommentSheet]);
 
   useLayoutEffect(() => {
     measureViewport();
@@ -1794,7 +2149,7 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
           flexDirection: 'column',
           gap: 12,
           position: 'relative',
-          paddingBottom: 92,
+          paddingBottom: isDocAttachment ? 0 : 92,
         }}
       >
         <div
@@ -1961,36 +2316,330 @@ const AttachmentViewerOverlay = memo(function AttachmentViewerOverlay({
               }}
             >
               <div
+                ref={docContainerRef}
                 style={{
                   width: '100%',
                   maxWidth: 720,
                   height: '100%',
                   overflowY: 'auto',
                   WebkitOverflowScrolling: 'touch',
-                  padding: '12px 24px 100px',
+                  padding: '12px 24px 32px',
                   touchAction: 'pan-y pinch-zoom',
                   fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                  userSelect: 'text',
+                  WebkitUserSelect: 'text',
                 }}
               >
-                {isMarkdownDoc ? (
-                  <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
-                    {docSource}
-                  </ReactMarkdown>
-                ) : (
-                  <pre
+                <div ref={docContentRef} style={{ position: 'relative' }}>
+                  {isMarkdownDoc ? (
+                    <ReactMarkdown remarkPlugins={docRemarkPlugins} components={docMdComponents}>
+                      {docSource}
+                    </ReactMarkdown>
+                  ) : (
+                    <pre
+                      style={{
+                        fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+                        fontSize: 13,
+                        lineHeight: 1.6,
+                        color: 'rgba(255,255,255,0.85)',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        margin: 0,
+                      }}
+                    >
+                      {docSource}
+                    </pre>
+                  )}
+                  {highlightRects.map((rect) => (
+                    <div
+                      key={rect.id}
+                      style={{
+                        position: 'absolute',
+                        top: rect.top,
+                        left: rect.left,
+                        width: rect.width,
+                        height: rect.height,
+                        background: 'rgba(75,90,255,0.40)',
+                        borderRadius: 2,
+                        pointerEvents: 'none',
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {previewSrc && isDocAttachment && typeof onSendDocAnnotation === 'function' && (() => {
+            const pillVisible = !docCommentSheet && (docSelection || docAnnotationQueue.length > 0);
+            return (
+              <div
+                aria-hidden={!pillVisible}
+                style={{
+                  position: 'fixed',
+                  left: 0,
+                  right: 0,
+                  bottom: 'max(20px, env(safe-area-inset-bottom))',
+                  zIndex: 10001,
+                  display: 'flex',
+                  justifyContent: 'center',
+                  pointerEvents: 'none',
+                  opacity: pillVisible ? 1 : 0,
+                  transform: pillVisible ? 'translateY(0)' : 'translateY(12px)',
+                  transition: 'opacity 200ms ease, transform 200ms ease',
+                }}
+              >
+                {docSelection ? (
+                  <button
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={openDocCommentSheet}
                     style={{
-                      fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-                      fontSize: 13,
-                      lineHeight: 1.6,
-                      color: 'rgba(255,255,255,0.85)',
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-word',
-                      margin: 0,
+                      pointerEvents: pillVisible ? 'auto' : 'none',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      height: 44,
+                      padding: '0 20px 0 16px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: '#4B5AFF',
+                      color: '#fff',
+                      fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      letterSpacing: '-0.01em',
+                      boxShadow: '0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08)',
+                      cursor: 'pointer',
                     }}
                   >
-                    {docSource}
-                  </pre>
+                    <Plus size={16} strokeWidth={2.6} color="#fff" />
+                    Add comment
+                  </button>
+                ) : docAnnotationQueue.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={sendDocAnnotationQueue}
+                    disabled={docAnnotationSending}
+                    style={{
+                      pointerEvents: pillVisible ? 'auto' : 'none',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      height: 44,
+                      padding: '0 7px 0 20px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: '#4B5AFF',
+                      color: '#fff',
+                      fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      letterSpacing: '-0.01em',
+                      boxShadow: '0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08)',
+                      cursor: docAnnotationSending ? 'not-allowed' : 'pointer',
+                      opacity: docAnnotationSending ? 0.7 : 1,
+                    }}
+                  >
+                    <span>
+                      {docAnnotationQueue.length === 1
+                        ? '1 comment'
+                        : `${docAnnotationQueue.length} comments`}
+                    </span>
+                    <span style={{
+                      width: 30, height: 30, borderRadius: 999,
+                      background: '#fff',
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      {docAnnotationSending ? (
+                        <Loader size={14} strokeWidth={2.6} color="#4B5AFF" className="animate-spin" />
+                      ) : (
+                        <ArrowUp size={14} strokeWidth={2.6} color="#4B5AFF" />
+                      )}
+                    </span>
+                  </button>
+                ) : null}
+              </div>
+            );
+          })()}
+
+          {docCommentSheet && (
+            <div
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) closeDocCommentSheet();
+              }}
+              style={{
+                position: 'fixed',
+                inset: 0,
+                zIndex: 10002,
+                background: 'rgba(0,0,0,0.45)',
+                backdropFilter: 'blur(14px)',
+                WebkitBackdropFilter: 'blur(14px)',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'center',
+                padding: 'max(16px, env(safe-area-inset-bottom)) 16px 16px',
+              }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  maxWidth: 560,
+                  background: '#111114',
+                  borderRadius: 16,
+                  paddingTop: 4,
+                  paddingRight: 16,
+                  paddingBottom: 16,
+                  paddingLeft: 16,
+                  boxShadow: '0 20px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06)',
+                  fontFamily: 'Geist, -apple-system, system-ui, sans-serif',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 12,
+                  transform: `translateY(${docSheetDragY}px)`,
+                  transition: docSheetDragRef.current.active ? 'none' : 'transform 200ms ease',
+                }}
+              >
+                <div
+                  onPointerDown={handleSheetDragStart}
+                  onPointerMove={handleSheetDragMove}
+                  onPointerUp={handleSheetDragEnd}
+                  onPointerCancel={handleSheetDragEnd}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'center',
+                    paddingTop: 6,
+                    paddingBottom: 6,
+                    cursor: 'grab',
+                    touchAction: 'none',
+                  }}
+                >
+                  <div style={{
+                    width: 36,
+                    height: 4,
+                    borderRadius: 2,
+                    background: 'rgba(255,255,255,0.18)',
+                  }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.5)' }}>
+                    {docCommentSheet?.editingId ? 'Edit annotation' : 'Annotation'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={closeDocCommentSheet}
+                    aria-label="Cancel annotation"
+                    style={{
+                      width: 28, height: 28, borderRadius: 999, border: 'none',
+                      background: 'transparent', color: 'rgba(255,255,255,0.6)',
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                    }}
+                  >
+                    <X size={16} strokeWidth={2} />
+                  </button>
+                </div>
+                <div
+                  style={{
+                    fontSize: 15,
+                    lineHeight: 1.45,
+                    color: '#fff',
+                    background: '#4B5AFF',
+                    border: 'none',
+                    padding: 12,
+                    borderRadius: 8,
+                    maxHeight: 120,
+                    overflowY: 'auto',
+                  }}
+                >
+                  {docCommentSheet.selection?.text}
+                </div>
+                <textarea
+                  autoFocus
+                  value={docCommentDraft}
+                  onChange={(event) => setDocCommentDraft(event.target.value)}
+                  placeholder="Your comment…"
+                  rows={3}
+                  style={{
+                    width: '100%',
+                    resize: 'none',
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    borderRadius: 8,
+                    padding: 12,
+                    fontFamily: 'inherit',
+                    fontSize: 15,
+                    lineHeight: 1.45,
+                    color: '#fff',
+                    outline: 'none',
+                    boxSizing: 'border-box',
+                  }}
+                />
+                {docAnnotationError && (
+                  <span style={{ fontSize: 12, color: '#ff8a8a' }}>{docAnnotationError}</span>
                 )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {docCommentSheet?.editingId && (
+                    <button
+                      type="button"
+                      onClick={deleteExistingAnnotation}
+                      aria-label="Delete annotation"
+                      style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: '50%',
+                        border: 'none',
+                        background: 'rgba(255,255,255,0.06)',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Trash2 size={16} strokeWidth={2} color="rgba(255,255,255,0.7)" />
+                    </button>
+                  )}
+                  <div style={{ flex: 1 }} />
+                  <button
+                    type="button"
+                    onClick={closeDocCommentSheet}
+                    disabled={docAnnotationSending}
+                    style={{
+                      padding: '8px 14px',
+                      borderRadius: 999,
+                      border: 'none',
+                      background: 'transparent',
+                      color: 'rgba(255,255,255,0.6)',
+                      fontSize: 13,
+                      cursor: docAnnotationSending ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={docCommentSheet?.editingId ? updateExistingAnnotation : queueDocAnnotation}
+                    disabled={!docCommentDraft.trim()}
+                    aria-label={docCommentSheet?.editingId ? 'Update annotation' : 'Add annotation'}
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: '50%',
+                      border: 'none',
+                      background: docCommentDraft.trim() ? '#4B5AFF' : 'rgba(255,255,255,0.1)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: docCommentDraft.trim() ? 'pointer' : 'default',
+                      transition: 'background 0.15s',
+                    }}
+                  >
+                    {docCommentSheet?.editingId ? (
+                      <ArrowUp size={16} strokeWidth={2.6} color="#fff" />
+                    ) : (
+                      <Plus size={16} strokeWidth={2.6} color="#fff" />
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
           )}
