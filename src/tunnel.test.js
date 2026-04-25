@@ -5,7 +5,7 @@ const { init } = require('./main/tunnel');
 
 function createSubject() {
     const state = {
-        currentTunnelUrl: 'https://night-lab.trycloudflare.com',
+        currentTunnelUrl: 'https://example.trycloudflare.com',
         isConnecting: true,
         server: {
             closeCalled: 0,

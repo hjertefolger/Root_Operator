@@ -13,9 +13,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / agent state
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
