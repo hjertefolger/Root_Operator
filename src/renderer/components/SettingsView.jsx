@@ -27,6 +27,7 @@ function SettingsView({ onBack, tunnelState }) {
   // Form state
   const [debugLogging, setDebugLogging] = useState(false);
   const [subdomain, setSubdomain] = useState('');
+  const [savedSubdomain, setSavedSubdomain] = useState('');
   const [assistantName, setAssistantName] = useState(DEFAULT_ASSISTANT_NAME);
   const [pairedDevices, setPairedDevices] = useState([]);
   const [updateActionPending, setUpdateActionPending] = useState(false);
@@ -60,6 +61,7 @@ function SettingsView({ onBack, tunnelState }) {
 
         setDebugLogging(loadedDebug);
         setSubdomain(loadedSubdomain);
+        setSavedSubdomain(loadedSubdomain);
         setAssistantName(loadedAssistantName);
         setPairedDevices(devices || []);
         setDynamicIndexingEnabled(Boolean(indexingEnabled));
@@ -76,6 +78,28 @@ function SettingsView({ onBack, tunnelState }) {
     }
     loadSettings();
   }, [invoke]);
+
+  // Refresh savedSubdomain when tunnel comes online while Settings is open
+  // (user clicked Jump from header, then opened Settings before provisioning completed)
+  useEffect(() => {
+    if (!tunnelState.url || savedSubdomain) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const current = await invoke('GET_SUBDOMAIN');
+        if (cancelled || !current) return;
+        setSavedSubdomain(current);
+        // Only sync edit value if user hasn't started editing
+        if (!subdomain) {
+          setSubdomain(current);
+          initialValues.current.subdomain = current;
+        }
+      } catch (e) {
+        console.error('Failed to refresh subdomain:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tunnelState.url, savedSubdomain, subdomain, invoke]);
 
   // Check if form is dirty
   useEffect(() => {
@@ -178,6 +202,7 @@ function SettingsView({ onBack, tunnelState }) {
           setSaveState('dirty');
           return;
         }
+        setSavedSubdomain(result.subdomain || subdomain);
       }
 
       // Update initial values
@@ -283,7 +308,7 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionTrigger>
             <AccordionContent className="pb-4">
               <div className="flex flex-col gap-2">
-                {subdomain ? (
+                {savedSubdomain ? (
                   <label className="flex items-center cursor-text">
                     <input
                       type="text"
@@ -295,7 +320,7 @@ function SettingsView({ onBack, tunnelState }) {
                       }}
                       maxLength={MAX_SUBDOMAIN_LENGTH}
                       className="font-mono bg-transparent border-none text-sm text-foreground focus:outline-none focus:bg-muted/30 rounded py-0.5 transition-colors"
-                      style={{ width: `${subdomain.length}ch` }}
+                      style={{ width: `${Math.max(subdomain.length, 1)}ch` }}
                     />
                     <span className="font-mono text-sm text-muted-foreground">.{WORKER_DOMAIN}</span>
                   </label>
