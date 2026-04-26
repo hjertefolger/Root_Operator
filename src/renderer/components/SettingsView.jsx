@@ -33,6 +33,8 @@ function SettingsView({ onBack, tunnelState }) {
   const [updateActionPending, setUpdateActionPending] = useState(false);
   const [dynamicIndexingEnabled, setDynamicIndexingEnabled] = useState(false);
   const [dynamicIndexingBusy, setDynamicIndexingBusy] = useState(false);
+  const [autoStartTunnel, setAutoStartTunnel] = useState(true);
+  const [autoStartTunnelBusy, setAutoStartTunnelBusy] = useState(false);
 
   // Initial values for dirty checking
   const initialValues = useRef({});
@@ -48,11 +50,12 @@ function SettingsView({ onBack, tunnelState }) {
   useEffect(() => {
     async function loadSettings() {
       try {
-        const [settings, currentSubdomain, devices, indexingEnabled] = await Promise.all([
+        const [settings, currentSubdomain, devices, indexingEnabled, autoStartStored] = await Promise.all([
           invoke('GET_STORE', 'cfSettings'),
           invoke('GET_SUBDOMAIN'),
           invoke('GET_PAIRED_DEVICES'),
           invoke('GET_DYNAMIC_INDEXING_ENABLED').catch(() => false),
+          invoke('GET_STORE', 'autoStartTunnelOnLaunch').catch(() => true),
         ]);
 
         const loadedDebug = (settings && settings.debugLogging) || false;
@@ -65,6 +68,7 @@ function SettingsView({ onBack, tunnelState }) {
         setAssistantName(loadedAssistantName);
         setPairedDevices(devices || []);
         setDynamicIndexingEnabled(Boolean(indexingEnabled));
+        setAutoStartTunnel(autoStartStored !== false); // default ON if undefined/null
 
         // Store initial values for dirty checking
         initialValues.current = {
@@ -119,6 +123,21 @@ function SettingsView({ onBack, tunnelState }) {
       setPairedDevices(prev => prev.filter(d => d.kid !== kid));
     } catch (e) {
       console.error('Failed to remove device:', e);
+    }
+  };
+
+  const handleAutoStartTunnelToggle = async (nextValue) => {
+    const next = Boolean(nextValue);
+    const previous = autoStartTunnel;
+    setAutoStartTunnel(next); // optimistic
+    setAutoStartTunnelBusy(true);
+    try {
+      await invoke('SET_STORE', 'autoStartTunnelOnLaunch', next);
+    } catch (e) {
+      console.error('Failed to toggle auto-start tunnel:', e);
+      setAutoStartTunnel(previous);
+    } finally {
+      setAutoStartTunnelBusy(false);
     }
   };
 
@@ -391,6 +410,26 @@ function SettingsView({ onBack, tunnelState }) {
                   ))}
                 </div>
               )}
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Auto-start tunnel on launch */}
+          <AccordionItem value="auto-start-tunnel" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Tunnel Auto-Start
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex justify-between items-center gap-3">
+                <span className="text-xs text-muted-foreground">
+                  Bring the tunnel up automatically when Root Operator launches, so paired devices can reach you without hitting Jump.
+                </span>
+                <Switch
+                  id="auto-start-tunnel"
+                  checked={autoStartTunnel}
+                  disabled={autoStartTunnelBusy}
+                  onCheckedChange={handleAutoStartTunnelToggle}
+                />
+              </div>
             </AccordionContent>
           </AccordionItem>
 

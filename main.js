@@ -697,12 +697,19 @@ app.whenReady().then(async () => {
     });
     updater.start();
 
-    // RO_AUTO_START_TUNNEL=1 lets a launchd / dev restart hook bring the
-    // tunnel up automatically once the app has finished initializing — no
-    // need to send a Cmd+Shift+J keystroke from a remote context. The hook
-    // mirrors the keyboard-shortcut path in tray.js: read stored Cloudflare
-    // settings, then call startBridge.
+    // Auto-start priority gate. Three paths can fire on launch; only the
+    // highest-priority one runs, the others are suppressed:
+    //   1. RO_AUTO_START_TUNNEL=1 env var  (dev/launchd restart hook)
+    //   2. pendingTunnelAutoStart flag     (production lock-popup Restart)
+    //   3. autoStartTunnelOnLaunch setting (cold-launch default-ON)
+    let autoStartTriggered = false;
+
+    // (1) RO_AUTO_START_TUNNEL=1 — explicit script signal from dev-restart.sh
+    // or a launchd hook. Highest priority; bypasses crash-loop protection
+    // because the script is asserting "I just started you, bring the tunnel
+    // up" and any failure surfaces in the script's own logs.
     if (process.env.RO_AUTO_START_TUNNEL === '1') {
+        autoStartTriggered = true;
         setTimeout(async () => {
             try {
                 const cfSettings = await getStoredTunnelSettings();
@@ -714,50 +721,116 @@ app.whenReady().then(async () => {
         }, 2000);
     }
 
-    // Recover from a remote Restart triggered via the lock popup. The previous
-    // session persisted `pendingTunnelAutoStart` before `app.relaunch()`; here
-    // we honor it so the tunnel comes back up and Claude re-spawns through the
-    // channel-bridge cascade. TTL + attempt cap protect against surprise
-    // auto-starts after long delays or repeated boot failures.
-    try {
-        const pending = store.get('pendingTunnelAutoStart', null);
-        if (pending && typeof pending === 'object') {
-            const now = Date.now();
-            const expired = pending.expiresAt && now > pending.expiresAt;
-            const attempts = Number.isFinite(pending.attempts) ? pending.attempts : 0;
-            const tooManyAttempts = attempts >= 3;
-            if (expired || tooManyAttempts) {
-                store.delete('pendingTunnelAutoStart');
-                logDebug(`[AUTO-START] discarded stale pendingTunnelAutoStart (expired=${!!expired}, attempts=${attempts})`);
-            } else {
-                // Bump attempts up-front so a crash inside startBridge doesn't
-                // produce an unbounded relaunch→fail loop on next boot.
-                store.set('pendingTunnelAutoStart', { ...pending, attempts: attempts + 1 });
+    // (2) pendingTunnelAutoStart — recovery from a remote Restart triggered
+    // via the lock popup. The previous session persisted the flag before
+    // `app.relaunch()`; here we honor it so the tunnel comes back up and
+    // Claude re-spawns through the channel-bridge cascade. TTL + attempt cap
+    // protect against surprise auto-starts after long delays or repeated
+    // boot failures.
+    if (!autoStartTriggered) {
+        try {
+            const pending = store.get('pendingTunnelAutoStart', null);
+            if (pending && typeof pending === 'object') {
+                const now = Date.now();
+                const expired = pending.expiresAt && now > pending.expiresAt;
+                const attempts = Number.isFinite(pending.attempts) ? pending.attempts : 0;
+                const tooManyAttempts = attempts >= 3;
+                if (expired || tooManyAttempts) {
+                    store.delete('pendingTunnelAutoStart');
+                    // The attempt cap exists to stop a relaunch→fail loop. If we
+                    // discard for tooManyAttempts, the cold-launch path must NOT
+                    // step in and start the tunnel anyway — that would defeat
+                    // the cap. Expired-but-not-capped is benign; suppressing
+                    // cold-launch in that case is conservative but consistent.
+                    autoStartTriggered = true;
+                    logDebug(`[AUTO-START] discarded stale pendingTunnelAutoStart (expired=${!!expired}, attempts=${attempts}); cold-launch suppressed for this boot`);
+                } else {
+                    autoStartTriggered = true;
+                    // Bump attempts up-front so a crash inside startBridge doesn't
+                    // produce an unbounded relaunch→fail loop on next boot.
+                    store.set('pendingTunnelAutoStart', { ...pending, attempts: attempts + 1 });
 
+                    setTimeout(async () => {
+                        // Race: user hit Cmd+Shift+J or tray Start while we waited.
+                        // Treat that as already-satisfied and clear the flag.
+                        if (isConnecting || server || tunnelProcess) {
+                            try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
+                            logDebug('[AUTO-START] tunnel already running, clearing pending flag');
+                            return;
+                        }
+                        try {
+                            const cfSettings = await getStoredTunnelSettings();
+                            await startBridge(cfSettings);
+                            try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
+                            logDebug('[AUTO-START] Tunnel started after remote restart');
+                        } catch (error) {
+                            // Mirror the IPC START handler: clean up partial state
+                            // so the next attempt starts from a known-good zero.
+                            try { stopBridge(); } catch (_) {}
+                            logDebug(`[AUTO-START] post-restart tunnel failed: ${error.message}`);
+                        }
+                    }, 2000);
+                }
+            }
+        } catch (error) {
+            logDebug(`[AUTO-START] pendingTunnelAutoStart check failed: ${error.message}`);
+        }
+    }
+
+    // (3) Cold-launch auto-start — default-ON setting that brings the tunnel
+    // up on plain `open the app` launches. Suppressed if either higher-
+    // priority path fired, if the user toggled it off, or if we detect a
+    // quick-exit crash loop. Also tracks lastLaunchAt so the next boot can
+    // detect a quick exit.
+    if (!autoStartTriggered) {
+        try {
+            const QUICK_EXIT_MS = 30_000;
+            const QUICK_EXIT_THRESHOLD = 3;
+
+            const enabled = store.get('autoStartTunnelOnLaunch', true);
+            const lastLaunchAt = Number(store.get('lastLaunchAt', 0)) || 0;
+            const previousQuickExitCount = Number(store.get('quickExitCount', 0)) || 0;
+
+            const now = Date.now();
+            const previousLaunchWasQuickExit = lastLaunchAt && (now - lastLaunchAt < QUICK_EXIT_MS);
+            const quickExitCount = previousLaunchWasQuickExit ? previousQuickExitCount + 1 : 0;
+
+            store.set('lastLaunchAt', now);
+            store.set('quickExitCount', quickExitCount);
+
+            // After 30s of stable running, declare this session healthy and
+            // reset the counter so a single legitimate quick-exit doesn't
+            // permanently disable auto-start.
+            setTimeout(() => {
+                try { store.set('quickExitCount', 0); } catch (_) {}
+            }, QUICK_EXIT_MS);
+
+            const inCrashLoop = quickExitCount >= QUICK_EXIT_THRESHOLD;
+
+            if (!enabled) {
+                logDebug('[AUTO-START] cold-launch skipped: autoStartTunnelOnLaunch=false');
+            } else if (inCrashLoop) {
+                logDebug(`[AUTO-START] cold-launch skipped: ${quickExitCount} quick exits in a row — counter resets after 30s of stable runtime`);
+            } else {
+                autoStartTriggered = true;
                 setTimeout(async () => {
-                    // Race: user hit Cmd+Shift+J or tray Start while we waited.
-                    // Treat that as already-satisfied and clear the flag.
                     if (isConnecting || server || tunnelProcess) {
-                        try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
-                        logDebug('[AUTO-START] tunnel already running, clearing pending flag');
+                        logDebug('[AUTO-START] cold-launch suppressed: tunnel already running');
                         return;
                     }
                     try {
                         const cfSettings = await getStoredTunnelSettings();
                         await startBridge(cfSettings);
-                        try { store.delete('pendingTunnelAutoStart'); } catch (_) {}
-                        logDebug('[AUTO-START] Tunnel started after remote restart');
+                        logDebug('[AUTO-START] Tunnel started on cold launch');
                     } catch (error) {
-                        // Mirror the IPC START handler: clean up partial state
-                        // so the next attempt starts from a known-good zero.
                         try { stopBridge(); } catch (_) {}
-                        logDebug(`[AUTO-START] post-restart tunnel failed: ${error.message}`);
+                        logDebug(`[AUTO-START] cold-launch tunnel failed: ${error.message}`);
                     }
                 }, 2000);
             }
+        } catch (error) {
+            logDebug(`[AUTO-START] cold-launch check failed: ${error.message}`);
         }
-    } catch (error) {
-        logDebug(`[AUTO-START] pendingTunnelAutoStart check failed: ${error.message}`);
     }
 });
 
