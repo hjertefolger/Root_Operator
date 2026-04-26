@@ -352,7 +352,13 @@ class DynamicMemory {
     }
 
     async _ensureEmbedder() {
-        if (this._embedderReady) return;
+        // Source of truth is the embeddings module. The local _embedderReady
+        // flag is a hint only — if the worker crashed/exited, embeddings
+        // already cleared its own ready state, and we need to re-init.
+        if (this._embedderReady && embeddings.isEmbedderReady()) return;
+        if (!embeddings.isEmbedderReady()) {
+            this._embedderReady = false;
+        }
         if (this._embedderInitPromise) return this._embedderInitPromise;
         const baseDir = this._modelBaseDir();
         this._log(`[MEMORY] Initializing embedder (baseDir=${baseDir})`);
@@ -382,6 +388,19 @@ class DynamicMemory {
 
         const effectiveRole = role === 'user' ? 'user' : 'assistant';
 
+        // Hard input-size cap. A 19,711-char paste once produced ~33 chunks
+        // and held the embedder for 90+ seconds, which on the previous
+        // in-process pipeline pinned the main thread and got the app
+        // SIGKILL'd by the macOS CPU watchdog. The embedder now runs in a
+        // worker, but a per-message work cap is still the right hygiene:
+        // anything larger than this is almost certainly a log paste, code
+        // dump, or pasted file — not signal worth indexing turn by turn.
+        const MAX_INDEXABLE_CHARS = 8_000;
+        if (content.length > MAX_INDEXABLE_CHARS) {
+            this._log(`[MEMORY] Skipping index of ${content.length}-char message (limit ${MAX_INDEXABLE_CHARS})`);
+            return;
+        }
+
         // Cheap pre-filter on the whole message.
         if (shouldExclude(content) && getContentValue(content) === 0) {
             return;
@@ -389,6 +408,14 @@ class DynamicMemory {
 
         const chunks = extractChunks(content, effectiveRole);
         if (!chunks.length) return;
+
+        // Bound chunk count per message. Even within the size cap, a message
+        // could fragment into more chunks than is sensible for one turn.
+        const MAX_CHUNKS_PER_MESSAGE = 25;
+        if (chunks.length > MAX_CHUNKS_PER_MESSAGE) {
+            this._log(`[MEMORY] Truncating ${chunks.length}-chunk message to first ${MAX_CHUNKS_PER_MESSAGE}`);
+            chunks.length = MAX_CHUNKS_PER_MESSAGE;
+        }
 
         const _perfT0 = Date.now();
         let _perfEmbedTotal = 0;
@@ -597,6 +624,12 @@ class DynamicMemory {
             closeDb(this.db);
         } catch (_) { /* ignore */ }
         this.db = null;
+        // Tear down the embedder worker so the app can exit cleanly.
+        // Fire-and-forget — termination is async but app-quit doesn't wait.
+        try {
+            embeddings.shutdownEmbedder().catch(() => {});
+        } catch (_) { /* ignore */ }
+        this._embedderReady = false;
     }
 }
 
