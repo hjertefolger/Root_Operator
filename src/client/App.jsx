@@ -80,6 +80,9 @@ function App() {
   const [channelMessages, setChannelMessages] = useState([]);
   const [channelWaiting, setChannelWaiting] = useState(false);
   const [channelActivities, setChannelActivities] = useState([]);
+  // True once we've received a `channel_history` frame for the current session.
+  // Distinguishes "still loading" from "loaded and empty" in ChannelChat.
+  const [channelHistoryLoaded, setChannelHistoryLoaded] = useState(false);
 
   // Initialize WebSocket connection
   const { socket, connectionState, disconnect, forceReconnect } = useWebSocket();
@@ -159,6 +162,12 @@ function App() {
     pendingAttachmentRequestsRef.current.clear();
   }, [socket]);
 
+  // A new socket means a new session — reset history-loaded so the chat
+  // shows the loading state again until the server's channel_history arrives.
+  useEffect(() => {
+    setChannelHistoryLoaded(false);
+  }, [socket]);
+
   useEffect(() => {
     if (!socket) return;
 
@@ -198,7 +207,12 @@ function App() {
         try { parsed = JSON.parse(plaintext); } catch { return; }
 
         if (parsed.type === 'channel_history') {
-          setChannelMessages(parsed.messages || []);
+          const incoming = Array.isArray(parsed.messages) ? parsed.messages : [];
+          // Replace only on the first arrival per session. Subsequent
+          // re-sends (reconnect mid-conversation) merge so we don't clobber
+          // any channel_message that arrived first on a slow path.
+          setChannelMessages((prev) => (prev.length === 0 ? incoming : mergeMessages(prev, incoming)));
+          setChannelHistoryLoaded(true);
         } else if (parsed.type === 'channel_message') {
           // Clear badge when receiving a message while visible
           if (!document.hidden && 'clearAppBadge' in navigator) {
@@ -436,6 +450,7 @@ function App() {
           draftStorageKey="root_operator_chat_draft"
           messages={channelMessages}
           setMessages={setChannelMessages}
+          historyLoaded={channelHistoryLoaded}
           activities={channelActivities}
           setActivities={setChannelActivities}
           waiting={channelWaiting}

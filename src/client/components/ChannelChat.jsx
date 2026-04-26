@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react';
-import { Check, ArrowUp, ChevronDown, Eye, Loader, Plus, X } from 'lucide-react';
+import { Check, ArrowUp, ChevronDown, Eye, Loader, MessageSquare, Plus, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import AttachmentViewerOverlay from './AttachmentViewerOverlay';
@@ -420,6 +420,7 @@ const ChatMessages = memo(function ChatMessages({
   activities,
   waiting,
   assistantName,
+  historyLoaded,
   scrollContainerRef,
   messagesEndRef,
   attachmentCache,
@@ -474,9 +475,13 @@ const ChatMessages = memo(function ChatMessages({
  ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝`}</pre>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Loader size={14} strokeWidth={2} className="animate-spin" style={{ color: '#4B5AFF' }} />
+            {historyLoaded ? (
+              <MessageSquare size={14} strokeWidth={2} style={{ color: '#4B5AFF' }} />
+            ) : (
+              <Loader size={14} strokeWidth={2} className="animate-spin" style={{ color: '#4B5AFF' }} />
+            )}
             <span style={{ fontSize: 12, color: '#4B5AFF', fontFamily: 'var(--font-mono, ui-monospace, monospace)' }}>
-              Loading Conversation
+              {historyLoaded ? 'Waiting for your first message' : 'Loading Conversation'}
             </span>
           </div>
         </div>
@@ -884,6 +889,7 @@ function ChannelChat({
   assistantName = 'Operator',
   messages,
   setMessages,
+  historyLoaded = false,
   activities,
   setActivities,
   waiting,
@@ -1359,6 +1365,7 @@ function ChannelChat({
         activities={activities}
         waiting={waiting}
         assistantName={assistantName}
+        historyLoaded={historyLoaded}
         scrollContainerRef={scrollContainerRef}
         messagesEndRef={messagesEndRef}
         attachmentCache={attachmentCache}
