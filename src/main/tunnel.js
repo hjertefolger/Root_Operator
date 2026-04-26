@@ -665,12 +665,18 @@ function init(deps = {}) {
 
         tunnelProcess.on('error', (error) => {
             logDebug(`[CF] Tunnel Error: ${error}`);
-            setIsConnecting(false);
             const mainWindow = getMainWindow();
             if (isUsableWindow(mainWindow)) {
                 mainWindow.webContents.send('CF_LOG', `ERR: ${error}`);
-                syncStateWithRenderer();
             }
+            // Tear down all bridge state so the next startBridge() isn't
+            // blocked by the alreadyRunning guard. Without this, an async
+            // cloudflared spawn failure (broken binary, missing X_OK, sandbox
+            // quarantine) leaves server/wakeLock/tunnelProcess set even
+            // though no tunnel actually came up — auto-start "succeeded"
+            // silently and Cmd+Shift+J / tray Start become permanently
+            // wedged for the lifetime of the app.
+            try { stopBridge(); } catch (_) { /* best-effort */ }
         });
 
         tunnelProcess.on('close', (code) => {
