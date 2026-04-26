@@ -410,13 +410,11 @@ function init(deps = {}) {
             const history = getChatStore().loadMessages().map((message) => buildTransportChannelMessage(message, {
                 supportsAttachments: ws.supportsAttachments === true,
             }));
-            if (history.length > 0) {
-                sendEncryptedOutput(ws, JSON.stringify({
-                    type: 'channel_history',
-                    messages: history,
-                }));
-                logDebug(`[CHANNEL] Sent ${history.length} history messages from disk`);
-            }
+            sendEncryptedOutput(ws, JSON.stringify({
+                type: 'channel_history',
+                messages: history,
+            }));
+            logDebug(`[CHANNEL] Sent ${history.length} history messages from disk`);
 
             const latestChannelActivity = getLatestChannelActivity();
             if (latestChannelActivity) {
