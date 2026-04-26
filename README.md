@@ -116,7 +116,7 @@ Two complementary layers give Claude memory without a cloud round-trip.
 
 ## Requirements
 
-- **macOS** 11+ (Big Sur or later) -- Apple Silicon and Intel
+- **macOS** 11+ (Big Sur or later) -- **Apple Silicon (M1 or newer)**. Intel Macs are not supported as of v2.4.4.
 - **Claude Code** (latest, with channels support)
 
 ## Installation

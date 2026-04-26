@@ -113,6 +113,27 @@ function init(deps = {}) {
             appDir.replace('app.asar', 'app.asar.unpacked'),
             'node_modules', 'cloudflared', 'bin', 'cloudflared'
         );
+        // Preflight: surface arch/permission/missing-file failures with a
+        // clear log line BEFORE we hand the binary to cloudflared.use().
+        // Without this, a broken bundle (wrong-arch binary, lost +x bit,
+        // sandbox quarantine, etc.) silently fails inside a child-process
+        // spawn later — invisible in the bridge log.
+        try {
+            const fsLocal = require('fs');
+            if (!fsLocal.existsSync(unpackedBin)) {
+                logDebug(`[CF] PREFLIGHT cloudflared binary missing at ${unpackedBin}`);
+            } else {
+                try {
+                    fsLocal.accessSync(unpackedBin, fsLocal.constants.X_OK);
+                    const stat = fsLocal.statSync(unpackedBin);
+                    logDebug(`[CF] PREFLIGHT cloudflared OK: ${unpackedBin} size=${stat.size} mode=${(stat.mode & 0o777).toString(8)}`);
+                } catch (xErr) {
+                    logDebug(`[CF] PREFLIGHT cloudflared not executable at ${unpackedBin}: ${xErr.message}`);
+                }
+            }
+        } catch (pfErr) {
+            logDebug(`[CF] PREFLIGHT check failed: ${pfErr.message}`);
+        }
         cloudflared.use(unpackedBin);
     }
 
