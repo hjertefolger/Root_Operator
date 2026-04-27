@@ -15,6 +15,7 @@ const RUNTIME_DIR = path.join(ROOT_OPERATOR_DIR, 'runtime');
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 const ATTACHMENTS_DIR = path.join(WORKSPACE_DIR, 'attachments');
 const OUTBOUND_ATTACHMENTS_DIR = path.join(ATTACHMENTS_DIR, 'outbound');
+const CURSOR_ATTACHMENTS_DIR = path.join(ATTACHMENTS_DIR, 'cursor');
 const STATE_FILE = path.join(WORKSPACE_DIR, '.state.json');
 const SYSTEM_PROMPT_FILE = path.join(RUNTIME_DIR, 'system-prompt-append.md');
 const PROJECT_MCP_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
@@ -42,6 +43,7 @@ function ensureWorkspace() {
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
     fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
     fs.mkdirSync(OUTBOUND_ATTACHMENTS_DIR, { recursive: true });
+    fs.mkdirSync(CURSOR_ATTACHMENTS_DIR, { recursive: true });
 
     const state = _readState();
     const isFirstRun = !state.onboardedAt;
@@ -287,6 +289,11 @@ function ensureOutboundAttachmentsDir() {
     return OUTBOUND_ATTACHMENTS_DIR;
 }
 
+function ensureCursorAttachmentsDir() {
+    fs.mkdirSync(CURSOR_ATTACHMENTS_DIR, { recursive: true });
+    return CURSOR_ATTACHMENTS_DIR;
+}
+
 // --- Internal helpers ---
 
 function _readState() {
@@ -314,11 +321,13 @@ module.exports = {
     ensureWorkspaceChatHistory,
     ensureAttachmentsDir,
     ensureOutboundAttachmentsDir,
+    ensureCursorAttachmentsDir,
     ROOT_OPERATOR_DIR,
     WORKSPACE_DIR,
     RUNTIME_DIR,
     MEMORY_DIR,
     ATTACHMENTS_DIR,
     OUTBOUND_ATTACHMENTS_DIR,
+    CURSOR_ATTACHMENTS_DIR,
     CHAT_HISTORY_FILE,
 };

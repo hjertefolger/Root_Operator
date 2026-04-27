@@ -763,6 +763,7 @@ function init(deps = {}) {
         handleAppActivate,
         registerAppShellEvents,
         showAboutWindow,
+        loadRendererWindow,
     };
 }
 

@@ -38,6 +38,9 @@ const VALID_INVOKE_CHANNELS = [
     'TOGGLE_LOCAL_CHAT_ALWAYS_ON_TOP',
     'GET_DYNAMIC_INDEXING_ENABLED',
     'SET_DYNAMIC_INDEXING_ENABLED',
+    'CURSOR_SUBMIT',
+    'CURSOR_DISMISS',
+    'CURSOR_GET_PENDING',
     'viewer:open',
     'viewer:get-state',
     'viewer:annotated',
@@ -56,7 +59,9 @@ const VALID_RECEIVE_CHANNELS = [
     'E2E_FINGERPRINT',
     'SYNC_STATE',
     'LOCAL_CHAT_EVENT',
-    'LOCAL_CHAT_WINDOW_SHOWN'
+    'LOCAL_CHAT_WINDOW_SHOWN',
+    'CURSOR_REPLY',
+    'CURSOR_REPLY_TIMEOUT'
 ];
 
 // Expose protected methods that only allow specific channels

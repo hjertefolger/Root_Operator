@@ -3,7 +3,7 @@
  */
 const path = require('path');
 const { spawn } = require('child_process');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage, screen } = require('electron');
 const fs = require('fs');
 const fixPath = async () => {
     const { default: fp } = await import('fix-path');
@@ -26,8 +26,10 @@ const {
     ensureWorkspaceChatHistory,
     ensureAttachmentsDir,
     ensureOutboundAttachmentsDir,
+    ensureCursorAttachmentsDir,
     ATTACHMENTS_DIR,
     OUTBOUND_ATTACHMENTS_DIR,
+    CURSOR_ATTACHMENTS_DIR,
     WORKSPACE_DIR,
 } = require('./src/workspace');
 const {
@@ -44,6 +46,7 @@ const { killOrphanClaudeIfAny, recordPid, clearPid } = require('./src/orphan-kil
 const { init: initLogging } = require('./src/main/logging');
 const { init: initTray } = require('./src/main/tray');
 const { init: initWindowManager } = require('./src/main/window-manager');
+const { init: initCursorCompanion } = require('./src/main/cursor-companion');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
 const { init: initLocalChat } = require('./src/main/local-chat');
@@ -212,6 +215,7 @@ const {
     initializeDesktopShell,
     registerAppShellEvents,
     showAboutWindow,
+    loadRendererWindow,
 } = windowManager;
 registerAppShellEvents();
 const notifications = initNotifications({
@@ -353,6 +357,24 @@ const {
 sendLocalChatEventRef = sendLocalChatEvent;
 let channelRuntime = createInitialChannelRuntime(DEFAULT_ACTIVITY_ASSISTANT_NAME);
 
+// Cursor companion — small dot follows the cursor; Option+Option opens
+// a bubble for text input; on Enter, the prompt + a screenshot of the
+// cursor area are sent through the existing channel pipeline to Claude
+// Code, and the response renders back in the bubble. Initialised here
+// so we can pass it into channel-mode for reply forwarding; started
+// later in whenReady after the desktop shell comes up.
+const cursorCompanion = initCursorCompanion({
+    BrowserWindow,
+    ipcMain,
+    screen,
+    app,
+    getCursorAttachmentsDir: () => ensureCursorAttachmentsDir(),
+    loadRendererWindow,
+    submitChannelUserMessage,
+    getOperatingMode: () => operatingMode,
+    logDebug,
+});
+
 function sendEncryptedChannelPayload(payload) {
     const body = JSON.stringify(payload);
     for (const client of activeClients) {
@@ -458,6 +480,7 @@ const channelMode = initChannelModeModule({
     sendEncryptedOutput: (...args) => sendEncryptedOutput(...args),
     sendLocalChatEvent,
     notifyAssistantReply,
+    forwardToCursorCompanion: (payload) => cursorCompanion.handleChannelReply(payload),
     outboundAttachmentsDir: OUTBOUND_ATTACHMENTS_DIR,
     initialOperatingMode: operatingMode,
     getOperatingMode: () => operatingMode,
@@ -697,6 +720,20 @@ app.whenReady().then(async () => {
     });
     updater.start();
 
+    // Start the cursor companion after the desktop shell is up: dot
+    // window + cursor poll, then attach the Option+Option listener to
+    // the same uIOhook instance the tray's double-Shift shortcut starts.
+    // Order matters — initDoubleShiftShortcut (called inside
+    // initializeDesktopShell) is what spins up uIOhook; attaching the
+    // Option listener after that ensures we're hooking the running
+    // singleton, not creating a competing one.
+    try {
+        cursorCompanion.start();
+        cursorCompanion.attachOptionListener();
+    } catch (error) {
+        logDebug(`[CURSOR] Companion failed to start: ${error.message}`);
+    }
+
     // Auto-start priority gate. Three paths can fire on launch; only the
     // highest-priority one runs, the others are suppressed:
     //   1. RO_AUTO_START_TUNNEL=1 env var  (dev/launchd restart hook)
@@ -839,6 +876,7 @@ app.on('will-quit', () => {
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
     stopOutboundAttachmentSweep();
+    try { cursorCompanion.stop(); } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;
