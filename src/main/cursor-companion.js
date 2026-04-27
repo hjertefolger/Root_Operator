@@ -32,9 +32,11 @@ const BUBBLE_HEIGHT = 180;
 const BUBBLE_OFFSET_X = 18;
 const BUBBLE_OFFSET_Y = 18;
 
-// Cursor polling cadence — 30Hz is fluid for a cursor companion without
-// burning CPU. Bumped to 60Hz only if user feedback says it feels laggy.
-const CURSOR_POLL_HZ = 30;
+// Cursor polling cadence — match standard display refresh rate so the
+// dot doesn't visibly chop next to the native cursor (which renders at
+// 60Hz on standard displays, 120Hz on ProMotion). Cost is negligible:
+// the early-out below skips setPosition when the cursor hasn't moved.
+const CURSOR_POLL_HZ = 60;
 const CURSOR_POLL_INTERVAL_MS = Math.round(1000 / CURSOR_POLL_HZ);
 
 // Default cursor-area screenshot crop (centered on cursor in DIP space).
