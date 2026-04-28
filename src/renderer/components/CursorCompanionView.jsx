@@ -1,5 +1,96 @@
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, memo } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useElectron } from '../hooks/useElectron';
+
+// Markdown renderer scoped to the cursor reply bubble only. Mirrors the
+// styling of ChannelChat's MessageMarkdown so replies feel consistent
+// across surfaces, but kept self-contained here to avoid coupling the
+// cursor surface to the chat surface.
+const cursorRemarkPlugins = [remarkGfm];
+const CURSOR_MONO = "'SF Mono','Menlo','Consolas','Liberation Mono',monospace";
+const cursorMdComponents = {
+  p: ({ children }) => (
+    <p style={{ marginTop: 0, marginBottom: '0.6em', lineHeight: 1.45, wordBreak: 'break-word' }}>{children}</p>
+  ),
+  strong: ({ children }) => (
+    <strong style={{ fontWeight: 600, color: 'rgba(255,255,255,0.95)' }}>{children}</strong>
+  ),
+  em: ({ children }) => (<em>{children}</em>),
+  code: ({ inline, children }) => {
+    if (inline) {
+      return (
+        <code style={{
+          backgroundColor: 'rgba(255,255,255,0.1)',
+          padding: '2px 6px',
+          borderRadius: 4,
+          fontSize: '0.9em',
+          fontFamily: CURSOR_MONO,
+          border: '1px solid rgba(255,255,255,0.08)',
+          wordBreak: 'break-word',
+        }}>{children}</code>
+      );
+    }
+    return (
+      <code style={{
+        display: 'block',
+        fontSize: 13,
+        fontFamily: CURSOR_MONO,
+        lineHeight: 1.5,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        color: 'rgba(255,255,255,0.88)',
+      }}>{children}</code>
+    );
+  },
+  pre: ({ children }) => (
+    <pre style={{
+      backgroundColor: 'rgba(0,0,0,0.4)',
+      padding: '10px 12px',
+      borderRadius: 8,
+      marginTop: '0.4em',
+      marginBottom: '0.6em',
+      overflowX: 'auto',
+      border: '1px solid rgba(255,255,255,0.06)',
+    }}>{children}</pre>
+  ),
+  ul: ({ children }) => (
+    <ul style={{ marginTop: '0.4em', marginBottom: '0.6em', paddingLeft: '1.4em', lineHeight: 1.45, listStyleType: 'disc' }}>{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol style={{ marginTop: '0.4em', marginBottom: '0.6em', paddingLeft: '1.4em', lineHeight: 1.45 }}>{children}</ol>
+  ),
+  li: ({ children }) => (
+    <li style={{ marginTop: '0.2em', marginBottom: '0.2em' }}>{children}</li>
+  ),
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#8b9aff', textDecoration: 'underline' }}>{children}</a>
+  ),
+  blockquote: ({ children }) => (
+    <blockquote style={{
+      borderLeft: '3px solid rgba(255,255,255,0.25)',
+      paddingLeft: '0.8em',
+      marginTop: '0.4em',
+      marginBottom: '0.6em',
+      marginLeft: 0,
+      marginRight: 0,
+      color: 'rgba(255,255,255,0.7)',
+      fontStyle: 'italic',
+    }}>{children}</blockquote>
+  ),
+  hr: () => (
+    <hr style={{ border: 'none', borderTop: '1px solid rgba(255,255,255,0.12)', marginTop: '0.8em', marginBottom: '0.8em' }} />
+  ),
+};
+const CursorReplyMarkdown = memo(function CursorReplyMarkdown({ content }) {
+  return (
+    <div style={{ fontSize: 15, lineHeight: 1.45, wordBreak: 'break-word', color: 'rgba(255,255,255,0.9)' }}>
+      <ReactMarkdown remarkPlugins={cursorRemarkPlugins} components={cursorMdComponents}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+});
 
 /**
  * Cursor companion: a single morphing element anchored to the system
@@ -343,17 +434,12 @@ function CursorCompanionView() {
               flex: '1 1 auto',
               maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
               overflowY: 'auto',
-              fontSize: 15,
-              lineHeight: 1.45,
-              color: 'rgba(255, 255, 255, 0.9)',
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
               userSelect: 'text',
               opacity: 1,
               animation: 'cursor-fade-in 200ms ease both',
             }}
           >
-            {reply.content.trim()}
+            <CursorReplyMarkdown content={reply.content.trim()} />
           </div>
         )}
 
@@ -417,9 +503,10 @@ function CursorCompanionView() {
         {prompt || ' '}
       </span>
       {/* Hidden response mirror — drives response pill outer height so
-          it hugs content instead of using a rough estimate. Width is
-          locked to the response inner width; font + lineHeight match
-          the visible response container exactly. */}
+          it hugs content instead of using a rough estimate. Renders
+          the same markdown component as the visible response so the
+          measurement accounts for paragraph margins, code blocks,
+          lists, and other markdown structures, not just raw text. */}
       <div
         ref={responseMirrorRef}
         aria-hidden
@@ -428,19 +515,14 @@ function CursorCompanionView() {
           visibility: 'hidden',
           pointerEvents: 'none',
           width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
-          whiteSpace: 'pre-wrap',
-          overflowWrap: 'break-word',
-          wordBreak: 'break-word',
           fontFamily: 'inherit',
-          fontSize: 15,
-          lineHeight: 1.45,
           padding: 0,
           margin: 0,
           left: 0,
           top: 0,
         }}
       >
-        {(reply?.content || error || ' ').trim() || ' '}
+        <CursorReplyMarkdown content={(reply?.content || error || ' ').trim() || ' '} />
       </div>
       {/* Hidden wrapped mirror — drives pill height when content wraps
           or contains explicit newlines. Width is locked to the
