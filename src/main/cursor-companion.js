@@ -30,6 +30,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { getActiveApp } = require('./active-app');
 
 // Window is sized large enough to host every layer combination without
 // resizing the native window mid-animation (which fights CSS transitions).
@@ -108,6 +109,13 @@ let terminalGraceTurnId = null;
 // Half-written prompt persists across dismissals. Cleared on successful submit.
 let draftPrompt = '';
 let draftUpdatedAt = 0;
+
+// Active-app probe for the most recent invocation. Populated as a
+// promise the moment input opens (before our NSPanel can shadow the
+// host app's frontmost status), awaited at submit time. Cleared after
+// each submit. Holds the pending Promise so submit can await it without
+// blocking on a re-probe.
+let activeAppProbe = null;
 
 // Stored on every assistant reply for future triple-Shift recall.
 let lastReply = null;
@@ -359,6 +367,7 @@ function stop() {
     gestureLockUntil = 0;
     isParked = false;
     isShiftHeld = false;
+    activeAppProbe = null;
     lastWinPos = { x: -1, y: -1 };
     depsRef && depsRef.logDebug && depsRef.logDebug('[CURSOR] Companion stopped');
 }
@@ -556,6 +565,11 @@ function getFreshLastReply() {
 
 function openInput() {
     if (!isInitialized || !isUsable(win)) return;
+    // Probe the host app BEFORE we focus our own NSPanel. Although the
+    // panel doesn't change frontmost status in practice, capturing here
+    // guarantees we read what the user was looking at the moment they
+    // double-tapped Shift, not whatever happens to be frontmost at submit.
+    activeAppProbe = getActiveApp().catch(() => null);
     inputOpen = true;
     isParked = false;
     try { win.focus(); } catch (_) {}
@@ -567,6 +581,7 @@ function closeInput() {
     if (!inputOpen) return;
     inputOpen = false;
     isParked = false;
+    activeAppProbe = null;
     applyInteractivity();
     broadcastState({ event: 'input_closed' });
 }
@@ -609,6 +624,7 @@ function dismiss() {
     inputOpen = false;
     replies = [];
     isParked = false;
+    activeAppProbe = null;
     applyInteractivity();
     broadcastState({ event: 'dismissed' });
 }
@@ -714,6 +730,15 @@ function runScreencapture({ x, y, w, h, outPath }) {
     });
 }
 
+function formatActiveAppLine(activeApp) {
+    if (!activeApp) return null;
+    const name = activeApp.name ? activeApp.name.trim() : '';
+    const bundleId = activeApp.bundleId ? activeApp.bundleId.trim() : '';
+    if (!name && !bundleId) return null;
+    if (name && bundleId) return `Active app: ${name} (${bundleId}).`;
+    return `Active app: ${name || bundleId}.`;
+}
+
 // ─── Submission flow ────────────────────────────────────────────────────
 
 async function submitFromBubble({ prompt, screenshot = 'none' }) {
@@ -747,6 +772,14 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     applyInteractivity();
     broadcastState({ event: 'turn_submitted', turnId });
 
+    // Await the active-app probe kicked off when input opened. Capture
+    // and clear synchronously before await so a fast follow-up can't
+    // null out the new invocation's probe when this submit resumes.
+    // Probe enforces its own 250ms total deadline.
+    const probe = activeAppProbe;
+    activeAppProbe = null;
+    const activeApp = probe ? await probe : null;
+
     let capture = null;
     if (captureMode !== 'none') {
         try {
@@ -768,17 +801,25 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
         pending.attachmentPath = capture.path;
     }
 
-    const composedContent = capture
-        ? [
-            prompt.trim(),
-            ``,
-            `<system-reminder>`,
-            capture.mode === 'fullscreen'
-                ? `This message arrives from the Cursor Companion surface — your human attached a full-screen capture of their display (${capture.rect.w}×${capture.rect.h}). Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
-                : `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
-            `</system-reminder>`,
-        ].join('\n')
-        : prompt.trim();
+    const appContextLine = formatActiveAppLine(activeApp);
+    const envelopeLines = [];
+    envelopeLines.push(prompt.trim());
+    if (capture || appContextLine) {
+        envelopeLines.push('', '<system-reminder>');
+        envelopeLines.push(`This message arrives from the Cursor Presence surface.`);
+        if (appContextLine) envelopeLines.push(appContextLine);
+        if (capture) {
+            envelopeLines.push(
+                capture.mode === 'fullscreen'
+                    ? `Attached: full-screen capture of the display (${capture.rect.w}×${capture.rect.h}). Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
+                    : `Attached: ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on the cursor. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
+            );
+        } else if (appContextLine) {
+            envelopeLines.push(`Act on the prompt naturally — the active-app context is situational awareness, not a request.`);
+        }
+        envelopeLines.push('</system-reminder>');
+    }
+    const composedContent = envelopeLines.join('\n');
 
     try {
         const result = await depsRef.submitChannelUserMessage(
