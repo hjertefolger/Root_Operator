@@ -164,6 +164,7 @@ function CursorCompanionView() {
     textHeight: INPUT_LINE_HEIGHT,
   });
   const [responseHeight, setResponseHeight] = useState(PILL_HEIGHT);
+  const [responseWidth, setResponseWidth] = useState(PILL_MIN_WIDTH);
 
   // Subscribe to mode changes from the main process.
   useEffect(() => {
@@ -288,23 +289,43 @@ function CursorCompanionView() {
     );
   }, [mode, prompt]);
 
-  // Measure response content height before paint so the pill hugs the
-  // text with no extra padding underneath. Outer height = inner content
-  // height + 2 × RESPONSE_PADDING_Y, clamped to RESPONSE_MAX_HEIGHT.
+  // Measure response content width AND height before paint so the pill
+  // hugs short replies horizontally as well as vertically. The mirror
+  // is `display: inline-block` with `max-width` set to the same inner
+  // content width the scrollable pane would use at full width — the
+  // browser shrinks the mirror to natural content width when the
+  // content fits in a single line, and caps at max-width when it
+  // wraps. offsetWidth gives us exactly the inner width to render at;
+  // outerWidth derives from that plus the asymmetric padding used by
+  // the scrollable inner div.
+  //
+  // Outer pill: width = inner + RESPONSE_PADDING_X (left)
+  //                            + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD) (right)
+  //             height = inner content height + 2 × RESPONSE_PADDING_Y
+  // Both clamped to PILL_MIN_WIDTH / PILL_HEIGHT (floor) and
+  // RESPONSE_MAX_WIDTH / RESPONSE_MAX_HEIGHT (ceiling).
   useLayoutEffect(() => {
     if (mode !== 'response') return;
     const raw = reply?.content || error || '';
     const content = raw.trim();
     if (!content) {
       setResponseHeight(PILL_HEIGHT);
+      setResponseWidth(PILL_MIN_WIDTH);
       return;
     }
-    const measured = responseMirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
-    const next = Math.min(
-      RESPONSE_MAX_HEIGHT,
-      Math.max(PILL_HEIGHT, measured + RESPONSE_PADDING_Y * 2),
+    const innerHorizPadding = RESPONSE_PADDING_X + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD);
+    const measuredW = responseMirrorRef.current?.offsetWidth || 0;
+    const measuredH = responseMirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
+    const nextW = Math.min(
+      RESPONSE_MAX_WIDTH,
+      Math.max(PILL_MIN_WIDTH, measuredW + innerHorizPadding),
     );
-    setResponseHeight((prev) => (prev === next ? prev : next));
+    const nextH = Math.min(
+      RESPONSE_MAX_HEIGHT,
+      Math.max(PILL_HEIGHT, measuredH + RESPONSE_PADDING_Y * 2),
+    );
+    setResponseWidth((prev) => (prev === nextW ? prev : nextW));
+    setResponseHeight((prev) => (prev === nextH ? prev : nextH));
   }, [mode, reply, error]);
 
   const handleDismiss = useCallback(async () => {
@@ -384,7 +405,7 @@ function CursorCompanionView() {
     : mode === 'loading'
       ? 22
       : mode === 'response'
-        ? RESPONSE_MAX_WIDTH
+        ? responseWidth
         : 8;
   const pillHeight = mode === 'input'
     ? inputBox.height
@@ -619,10 +640,12 @@ function CursorCompanionView() {
             position: 'absolute',
             visibility: 'hidden',
             pointerEvents: 'none',
-            // Match the scrollable inner div's effective content width:
-            // bubble width − left bubble padding − inner-div right
-            // padding (scrollbar gutter is excluded from text wrap).
-            width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
+            // inline-block + max-width lets the browser shrink-to-fit
+            // for short content (so the bubble can hug horizontally)
+            // while still wrapping at the same effective inner width
+            // the scrollable pane would use for long content.
+            display: 'inline-block',
+            maxWidth: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
             fontFamily: 'inherit',
             padding: 0,
             margin: 0,
