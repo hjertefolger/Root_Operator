@@ -227,7 +227,7 @@ function CursorCompanionView() {
             : mode === 'input'
               ? ACCENT
               : mode === 'response'
-                ? 'rgba(255, 255, 255, 0.08)'
+                ? 'rgba(20, 20, 24, 0.92)'
                 : 'transparent',
           boxShadow: mode === 'dot' || mode === 'loading'
             ? 'none'
