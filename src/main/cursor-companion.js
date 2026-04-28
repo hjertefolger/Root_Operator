@@ -43,8 +43,8 @@ const CURSOR_POLL_HZ = 60;
 const CURSOR_POLL_INTERVAL_MS = Math.round(1000 / CURSOR_POLL_HZ);
 
 // Cursor-area screenshot crop in DIP space.
-const CURSOR_LENS_CROP_W = 600;
-const CURSOR_LENS_CROP_H = 400;
+const CURSOR_LENS_CROP_W = 800;
+const CURSOR_LENS_CROP_H = 800;
 
 // Stage-attachment TTL.
 const CURSOR_ATTACHMENT_TTL_MS = 10 * 60 * 1000;
