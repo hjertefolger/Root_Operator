@@ -211,7 +211,7 @@ function CursorCompanionView() {
                 ? 'rgba(255, 255, 255, 0.08)'
                 : 'rgba(15, 15, 18, 0.92)',
           boxShadow: mode === 'dot'
-            ? `0 0 6px 1px rgba(75, 90, 255, 0.35)`
+            ? 'none'
             : mode === 'input'
               ? `0 8px 24px rgba(0, 0, 0, 0.32)`
               : `0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)`,

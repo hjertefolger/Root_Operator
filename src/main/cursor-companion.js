@@ -305,7 +305,13 @@ function noteOptionTap() {
     const now = Date.now();
     if (now - optionTapState.lastTapAt <= DOUBLE_OPTION_WINDOW_MS) {
         optionTapState.lastTapAt = 0;
-        showInput();
+        // Toggle: any non-dot state collapses back to dot, dot expands
+        // to input. Mirrors the Shift+Shift desktop-chat affordance.
+        if (mode === 'dot') {
+            showInput();
+        } else {
+            dismiss();
+        }
         return true;
     }
     optionTapState.lastTapAt = now;
