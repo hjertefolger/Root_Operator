@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useElectron } from '../hooks/useElectron';
 
 /**
@@ -22,17 +22,25 @@ const PILL_HEIGHT = 32;
 const PILL_MIN_WIDTH = 28;
 const PILL_MAX_WIDTH = 560;
 const PILL_PADDING_X = 14;
+const PILL_PADDING_Y = 7;
+const INPUT_LINE_HEIGHT = 18;
+const PILL_INPUT_MAX_HEIGHT = 128;
 const RESPONSE_MAX_WIDTH = 460;
 const RESPONSE_MAX_HEIGHT = 280;
 
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
-  const inputRef = useRef(null);
+  const textareaRef = useRef(null);
   const measureRef = useRef(null);
   const [mode, setMode] = useState('dot');
   const [prompt, setPrompt] = useState('');
   const [reply, setReply] = useState(null);
   const [error, setError] = useState(null);
+  const [inputBox, setInputBox] = useState({
+    width: PILL_MIN_WIDTH,
+    height: PILL_HEIGHT,
+    textHeight: INPUT_LINE_HEIGHT,
+  });
 
   // Subscribe to mode changes from the main process.
   useEffect(() => {
@@ -47,7 +55,8 @@ function CursorCompanionView() {
       if (payload.mode === 'dot') {
         setPrompt('');
         setReply(null);
-        setError(null);
+        // Keep `error` so a failed submission/timeout remains briefly
+        // visible until the user activates the input again.
       }
     });
     const offReply = on('CURSOR_REPLY', (payload) => {
@@ -65,16 +74,56 @@ function CursorCompanionView() {
     };
   }, [on]);
 
-  // Auto-focus the input when entering input mode.
+  // Auto-focus the textarea when entering input mode.
   useEffect(() => {
-    if (mode === 'input' && inputRef.current) {
-      // requestAnimationFrame so focus lands after the window has
-      // become interactive (setIgnoreMouseEvents toggle).
+    if (mode === 'input' && textareaRef.current) {
       requestAnimationFrame(() => {
-        inputRef.current?.focus();
+        textareaRef.current?.focus();
       });
     }
   }, [mode]);
+
+  // Measure prompt synchronously before paint so the pill width never
+  // lags the typed character — eliminates the per-keystroke flicker.
+  //
+  // Width is decided first from the hidden mirror (which measures
+  // unwrapped single-line text). Height is always read from the
+  // textarea's scrollHeight AFTER the width is pinned, so explicit
+  // newlines (Shift+Enter, pasted multi-line text) grow the pill
+  // vertically even when the unwrapped width still fits on one line.
+  useLayoutEffect(() => {
+    if (mode !== 'input') return;
+    const measuredWidth = measureRef.current?.scrollWidth || 0;
+    const desiredWidth = measuredWidth + PILL_PADDING_X * 2 + 2;
+    const nextWidth = Math.min(
+      PILL_MAX_WIDTH,
+      Math.max(PILL_MIN_WIDTH, desiredWidth),
+    );
+
+    let nextTextHeight = INPUT_LINE_HEIGHT;
+    const ta = textareaRef.current;
+    if (ta) {
+      // Pin the textarea to the locked inner width BEFORE reading
+      // scrollHeight, so wrapped content is measured against the width
+      // it will actually render at. Then read scrollHeight as the source
+      // of truth for height — this picks up explicit newlines too.
+      const innerWidth = Math.max(8, nextWidth - PILL_PADDING_X * 2);
+      ta.style.width = `${innerWidth}px`;
+      ta.style.height = '0px';
+      nextTextHeight = Math.min(
+        PILL_INPUT_MAX_HEIGHT - PILL_PADDING_Y * 2,
+        Math.max(INPUT_LINE_HEIGHT, ta.scrollHeight),
+      );
+      ta.style.height = `${nextTextHeight}px`;
+    }
+
+    const nextHeight = Math.max(PILL_HEIGHT, nextTextHeight + PILL_PADDING_Y * 2);
+    setInputBox((prev) =>
+      prev.width === nextWidth && prev.height === nextHeight && prev.textHeight === nextTextHeight
+        ? prev
+        : { width: nextWidth, height: nextHeight, textHeight: nextTextHeight },
+    );
+  }, [mode, prompt]);
 
   const handleDismiss = useCallback(async () => {
     try { await invoke('CURSOR_DISMISS'); } catch (_) {}
@@ -105,20 +154,20 @@ function CursorCompanionView() {
     }
   };
 
-  // Measure the prompt text width using a hidden span so the pill can
-  // grow to fit the typed content. The mirror element shares font
-  // metrics with the input; we read its scrollWidth and clamp.
-  const inputDisplayWidth = useInputWidth(measureRef, prompt);
   const pillWidth = mode === 'input'
-    ? Math.min(PILL_MAX_WIDTH, Math.max(PILL_MIN_WIDTH, inputDisplayWidth + PILL_PADDING_X * 2))
+    ? inputBox.width
     : mode === 'loading'
       ? 64
       : mode === 'response'
         ? RESPONSE_MAX_WIDTH
         : 8;
-  const pillHeight = mode === 'response'
-    ? clampResponseHeight(reply?.content || '')
-    : PILL_HEIGHT;
+  const pillHeight = mode === 'input'
+    ? inputBox.height
+    : mode === 'response'
+      ? clampResponseHeight(reply?.content || error || '')
+      : mode === 'loading'
+        ? PILL_HEIGHT
+        : 8;
   const isPill = mode !== 'dot';
 
   return (
@@ -136,16 +185,19 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. Anchored so its left edge sits at the
-          cursor pointer position. */}
+      {/* The morphing element. Anchored so its top-left sits just below
+          and to the right of the cursor pointer — pill grows rightward
+          (until PILL_MAX_WIDTH) then downward, never above the cursor.
+          This matches the convention in cursor-anchored AI surfaces and
+          guarantees the pill never clips out of the top of the window. */}
       <div
         style={{
           position: 'absolute',
           left: ANCHOR_X,
-          top: ANCHOR_Y - pillHeight / 2 + (mode === 'dot' ? pillHeight / 2 + 2 : 0),
+          top: mode === 'dot' ? ANCHOR_Y + 4 : ANCHOR_Y,
           width: isPill ? pillWidth : 8,
           height: isPill ? pillHeight : 8,
-          borderRadius: isPill ? pillHeight / 2 : '50%',
+          borderRadius: isPill ? Math.min(pillHeight / 2, 16) : '50%',
           background: mode === 'dot'
             ? ACCENT
             : mode === 'response'
@@ -158,12 +210,20 @@ function CursorCompanionView() {
           WebkitBackdropFilter: isPill ? 'blur(14px)' : 'none',
           color: 'rgba(255, 255, 255, 0.95)',
           display: 'flex',
-          alignItems: mode === 'response' ? 'flex-start' : 'center',
+          alignItems: mode === 'response' || mode === 'input' ? 'flex-start' : 'center',
           justifyContent: mode === 'loading' ? 'center' : 'flex-start',
           paddingLeft: isPill ? PILL_PADDING_X : 0,
           paddingRight: isPill ? PILL_PADDING_X : 0,
-          paddingTop: mode === 'response' ? 10 : 0,
-          paddingBottom: mode === 'response' ? 10 : 0,
+          paddingTop: mode === 'response'
+            ? 10
+            : mode === 'input'
+              ? PILL_PADDING_Y
+              : 0,
+          paddingBottom: mode === 'response'
+            ? 10
+            : mode === 'input'
+              ? PILL_PADDING_Y
+              : 0,
           pointerEvents: isPill ? 'auto' : 'none',
           overflow: 'hidden',
           transition:
@@ -176,9 +236,9 @@ function CursorCompanionView() {
         }}
       >
         {mode === 'input' && (
-          <input
-            ref={inputRef}
-            type="text"
+          <textarea
+            ref={textareaRef}
+            rows={1}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             spellCheck={false}
@@ -187,6 +247,8 @@ function CursorCompanionView() {
               flex: '1 1 auto',
               minWidth: 0,
               width: '100%',
+              height: inputBox.textHeight,
+              maxHeight: PILL_INPUT_MAX_HEIGHT - PILL_PADDING_Y * 2,
               background: 'transparent',
               border: 'none',
               outline: 'none',
@@ -196,9 +258,11 @@ function CursorCompanionView() {
               caretColor: ACCENT,
               fontFamily: 'inherit',
               fontSize: 13,
-              lineHeight: `${PILL_HEIGHT}px`,
-              opacity: 1,
-              transition: 'opacity 140ms ease',
+              lineHeight: `${INPUT_LINE_HEIGHT}px`,
+              resize: 'none',
+              overflowY: inputBox.height >= PILL_INPUT_MAX_HEIGHT ? 'auto' : 'hidden',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'break-word',
               userSelect: 'text',
             }}
           />
@@ -239,8 +303,35 @@ function CursorCompanionView() {
         )}
       </div>
 
+      {/* Inline error pill rendered next to the dot when the bubble has
+          collapsed but an error from the previous turn deserves to stay
+          visible. Keeps timeout/submit-failure feedback discoverable. */}
+      {mode === 'dot' && error && (
+        <div
+          style={{
+            position: 'absolute',
+            left: ANCHOR_X + 14,
+            top: ANCHOR_Y + 12,
+            padding: '4px 10px',
+            background: 'rgba(35, 12, 14, 0.92)',
+            color: 'rgba(255, 130, 130, 0.92)',
+            borderRadius: 999,
+            fontSize: 11,
+            lineHeight: 1.4,
+            whiteSpace: 'nowrap',
+            boxShadow: '0 0 0 1px rgba(255, 80, 80, 0.18), 0 4px 14px rgba(0, 0, 0, 0.32)',
+            pointerEvents: 'none',
+            animation: 'cursor-fade-in 200ms ease both',
+          }}
+        >
+          {error}
+        </div>
+      )}
+
       {/* Hidden mirror element to measure prompt text width with the
-          same font metrics as the input. */}
+          same font metrics as the textarea. Used to grow the pill
+          horizontally up to PILL_MAX_WIDTH; beyond that the textarea
+          wraps and grows vertically instead. */}
       <span
         ref={measureRef}
         style={{
@@ -249,7 +340,7 @@ function CursorCompanionView() {
           whiteSpace: 'pre',
           fontFamily: 'inherit',
           fontSize: 13,
-          lineHeight: `${PILL_HEIGHT}px`,
+          lineHeight: `${INPUT_LINE_HEIGHT}px`,
           padding: 0,
           margin: 0,
         }}
@@ -288,16 +379,6 @@ function FourDotLoader() {
       <span style={dot(360)} />
     </div>
   );
-}
-
-function useInputWidth(measureRef, prompt) {
-  const [width, setWidth] = useState(0);
-  useEffect(() => {
-    if (measureRef.current) {
-      setWidth(measureRef.current.scrollWidth);
-    }
-  }, [prompt, measureRef]);
-  return width;
 }
 
 function clampResponseHeight(content) {

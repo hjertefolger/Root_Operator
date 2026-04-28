@@ -191,6 +191,7 @@ function createWindow() {
         show: false,
         frame: false,
         transparent: true,
+        backgroundColor: '#00000000',
         resizable: false,
         movable: false,
         minimizable: false,
@@ -240,6 +241,9 @@ function createWindow() {
 
 function startCursorPoll() {
     if (cursorPollTimer) return;
+    // Run once immediately so the window doesn't briefly show at (0,0)
+    // before the first interval tick.
+    updateWindowPosition();
     cursorPollTimer = setInterval(updateWindowPosition, CURSOR_POLL_INTERVAL_MS);
 }
 
