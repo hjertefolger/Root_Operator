@@ -125,13 +125,21 @@ const PILL_MAX_WIDTH = 260;
 const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
 const RESPONSE_MAX_WIDTH = PILL_MAX_WIDTH;
 const RESPONSE_MAX_HEIGHT = 280;
+// Response padding mirrors ChannelChat MessageBubble (10×14). Right-edge
+// padding is moved off the bubble container and onto the scrollable
+// inner div so the scrollbar (track) sits flush at the bubble's right
+// edge instead of inset by 14px.
 const RESPONSE_PADDING_X = 14;
-const RESPONSE_PADDING_Y = 8;
+const RESPONSE_PADDING_Y = 10;
+const RESPONSE_INNER_RIGHT_PAD = 4;
 const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
   const textareaRef = useRef(null);
+  // Scrollable container inside the response bubble. Drives wheel-driven
+  // scroll while the bubble is visible.
+  const responseScrollRef = useRef(null);
   // Hidden mirror for unwrapped single-line width. Drives pill width.
   const widthMirrorRef = useRef(null);
   // Hidden mirror constrained to the locked PILL_MAX_WIDTH inner space,
@@ -188,6 +196,27 @@ function CursorCompanionView() {
         textareaRef.current?.focus();
       });
     }
+  }, [mode]);
+
+  // Global wheel capture while the response bubble is visible. The
+  // bubble travels with the cursor, so the cursor is never *over* the
+  // bubble's content — but the bubble's owning window is non-click-
+  // through in response mode, which means wheel events anywhere inside
+  // the window's bounds land here. We catch them at the document and
+  // scroll the response pane directly, regardless of where exactly the
+  // cursor sits within the window. Mental model: if a response is on
+  // screen, your wheel scrolls it.
+  useEffect(() => {
+    if (mode !== 'response') return undefined;
+    const handler = (e) => {
+      const node = responseScrollRef.current;
+      if (!node) return;
+      e.preventDefault();
+      const delta = e.deltaMode === 1 ? e.deltaY * INPUT_LINE_HEIGHT : e.deltaY;
+      node.scrollTop += delta;
+    };
+    document.addEventListener('wheel', handler, { passive: false, capture: true });
+    return () => document.removeEventListener('wheel', handler, { capture: true });
   }, [mode]);
 
   // Measure prompt synchronously before paint, BEFORE first render
@@ -357,7 +386,13 @@ function CursorCompanionView() {
           alignItems: mode === 'response' || mode === 'input' ? 'flex-start' : 'center',
           justifyContent: mode === 'loading' ? 'center' : 'flex-start',
           paddingLeft: isPill ? PILL_PADDING_X : 0,
-          paddingRight: isPill ? PILL_PADDING_X : 0,
+          // Response bubble drops its container right padding so the
+          // scrollbar sits at the very right edge of the bubble. The
+          // visual right padding is restored as paddingRight on the
+          // inner scrollable div (see below).
+          paddingRight: mode === 'response'
+            ? 0
+            : isPill ? PILL_PADDING_X : 0,
           paddingTop: mode === 'response'
             ? RESPONSE_PADDING_Y
             : mode === 'input'
@@ -430,6 +465,7 @@ function CursorCompanionView() {
 
         {mode === 'response' && reply && (
           <div
+            ref={responseScrollRef}
             className="cursor-thin-scroll"
             style={{
               flex: '1 1 auto',
@@ -438,6 +474,13 @@ function CursorCompanionView() {
               userSelect: 'text',
               opacity: 1,
               animation: 'cursor-fade-in 200ms ease both',
+              // Right padding lives on this scrollable inner div instead
+              // of the bubble container so the scrollbar (track) sits at
+              // the bubble's right edge — content stays inset by the
+              // ChannelChat-matched 14px while the scrollbar gets the
+              // remaining sliver.
+              paddingRight: RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD,
+              marginRight: -RESPONSE_INNER_RIGHT_PAD,
             }}
           >
             <CursorReplyMarkdown content={reply.content.trim()} />
@@ -516,7 +559,10 @@ function CursorCompanionView() {
             position: 'absolute',
             visibility: 'hidden',
             pointerEvents: 'none',
-            width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
+            // Match the scrollable inner div's effective content width:
+            // bubble width − left bubble padding − inner-div right
+            // padding (scrollbar gutter is excluded from text wrap).
+            width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
             fontFamily: 'inherit',
             padding: 0,
             margin: 0,

@@ -114,18 +114,22 @@ function getApi() {
 }
 
 /**
- * Hotkey toggle (Shift+Shift). Mirrors the prior Option+Option semantics:
- *   dot       → input  (start a turn)
- *   input     → dot    (cancel the input)
- *   loading   → input  (queue a follow-up turn)
- *   response  → input  (continue the conversation)
+ * Hotkey toggle (Shift+Shift). Idempotent — from `dot` it opens the
+ * input pill; from any visible state (input / loading / response) it
+ * dismisses to dot. This makes the gesture race-safe: if both the
+ * main-process detector and the renderer-side fallback fire from the
+ * same physical double-tap, the second invocation is a no-op (already
+ * in dot) instead of bouncing back to input mode.
+ *
+ * Continuing a conversation after a response is now done by tapping
+ * Shift+Shift twice (dismiss → reopen).
  */
 function toggleFromHotkey() {
     if (!isInitialized) return;
-    if (mode === 'input') {
-        dismiss();
-    } else {
+    if (mode === 'dot') {
         showInput();
+    } else {
+        dismiss();
     }
 }
 
