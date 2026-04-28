@@ -154,9 +154,10 @@ function CursorCompanionView() {
 
   // Subscribe to state and reply events.
   useEffect(() => {
+    let sawLiveState = false;
     const offState = on('CURSOR_STATE', (payload) => {
       if (!payload) return;
-      const wasInputOpen = inputOpen;
+      sawLiveState = true;
       if (typeof payload.loading === 'boolean') setLoading(payload.loading);
       if (typeof payload.inputOpen === 'boolean') setInputOpen(payload.inputOpen);
       if (Array.isArray(payload.replies)) {
@@ -192,16 +193,40 @@ function CursorCompanionView() {
       setPresenceAnim(payload.enabled ? 'enter' : 'exit');
     });
 
-    const offRightClick = on('CURSOR_RIGHT_CLICK', (payload) => {
-      if (!payload) return;
-      // Right-click while only ONE reply visible: dismiss it.
-      // Otherwise: dismiss the topmost (latest).
+    const offRightClick = on('CURSOR_RIGHT_CLICK', () => {
+      // Right-click anywhere while replies are visible dismisses the
+      // topmost. The bubble travels with the cursor, so hit-testing
+      // the click against the bubble's rect would always fail by
+      // design — the cursor is never over the bubble it spawned.
       setReplies((curr) => {
         if (curr.length === 0) return curr;
         const top = curr[curr.length - 1];
         void invoke('CURSOR_DISMISS_REPLY', { id: top.id }).catch(() => {});
         return curr;
       });
+    });
+
+    // Mount-time hydration: the renderer can miss the initial state
+    // broadcast if it loads after main has already opened input (dev
+    // HMR reload, slow first paint, etc.). Pull the current state
+    // synchronously so we render the right layers from the first frame.
+    // If a live CURSOR_STATE event arrives before the snapshot resolves,
+    // the live event is fresher — skip the snapshot to avoid clobbering.
+    invoke('CURSOR_GET_STATE').then((state) => {
+      if (!state || state.ok !== true) return;
+      if (sawLiveState) return;
+      if (typeof state.loading === 'boolean') setLoading(state.loading);
+      if (typeof state.inputOpen === 'boolean') setInputOpen(state.inputOpen);
+      if (Array.isArray(state.replies)) setReplies(state.replies);
+      if (typeof state.isParked === 'boolean') setIsParked(state.isParked);
+      if (state.inputOpen && typeof state.draftPrompt === 'string') {
+        setPrompt(state.draftPrompt);
+      }
+    }).catch((err) => {
+      // Loud on purpose: silent .catch is exactly how the preload
+      // allowlist mismatch hid for a session. Surface the same class
+      // of regression next time before users hit it.
+      console.error('[CURSOR] Failed to hydrate state', err);
     });
 
     return () => {

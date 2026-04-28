@@ -298,24 +298,21 @@ function handleShiftKeyUp(event) {
 }
 
 /**
- * Right-click on the topmost reply dismisses ONLY that reply; the
- * uIOhook observation is global, so the renderer must decide whether
- * the click landed within the topmost reply's bounds. We forward the
- * event coordinates and let renderer make the call.
+ * Right-click anywhere dismisses the topmost reply. While the bubble
+ * is following the cursor (the common case), the cursor is never over
+ * the bubble itself, so hit-testing the click against the reply rect
+ * would always fail by design. Parked mode can put the cursor over
+ * the bubble, but the dismiss-on-right-click intent holds either way:
+ * the user wants this reply gone.
  *
- * Loading is intentionally still NOT click-dismissable, but with the
- * new layered model "loading" is just a layer alongside others; the
- * dismiss behaviour we care about is per-reply.
+ * Loading is intentionally still not click-dismissable.
  */
 function handleGlobalMouseDown(event) {
     if (replies.length === 0) return;
     if (!event || event.button !== 2) return;
     if (!isUsable(win)) return;
     try {
-        win.webContents.send('CURSOR_RIGHT_CLICK', {
-            screenX: event.x,
-            screenY: event.y,
-        });
+        win.webContents.send('CURSOR_RIGHT_CLICK', {});
     } catch (_) {}
 }
 
@@ -929,19 +926,6 @@ function registerIpcHandlers() {
         return { success: true };
     });
 
-    ipcMain.handle('CURSOR_DRAFT_FLUSH', (event, payload = {}) => {
-        // Synchronous draft flush before blur/dismiss races. Called by
-        // the renderer right before any path that could lose the draft.
-        if (!isFromCursorWindow(event)) {
-            return { success: false, error: 'unauthorized' };
-        }
-        if (typeof payload.prompt !== 'string') {
-            return { success: false, error: 'invalid' };
-        }
-        setDraftPrompt(payload.prompt);
-        return { success: true };
-    });
-
     ipcMain.handle('CURSOR_BLUR_PARK', (event, payload = {}) => {
         if (!isFromCursorWindow(event)) {
             return { success: false, error: 'unauthorized' };
@@ -982,12 +966,6 @@ function registerIpcHandlers() {
         };
     });
 
-    ipcMain.handle('CURSOR_GET_PENDING', (event) => {
-        if (!isFromCursorWindow(event)) {
-            return { pending: false };
-        }
-        return { pending: pending !== null, turnId: pending?.turnId || null, mode: getMode() };
-    });
 }
 
 function isFromCursorWindow(event) {
