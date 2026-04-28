@@ -874,16 +874,24 @@ const ReplyBubble = memo(function ReplyBubble({
   reply, offsetY, zIndex, isTop, onContextMenu, scrollRefSetter, onMeasure,
 }) {
   const mirrorRef = useRef(null);
+  const naturalMirrorRef = useRef(null);
   const [size, setSize] = useState({ width: PILL_MIN_WIDTH, height: PILL_HEIGHT });
 
   useLayoutEffect(() => {
     const innerHorizPadding = RESPONSE_PADDING_X + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD);
+    const maxInner = RESPONSE_MAX_WIDTH - innerHorizPadding;
+    const naturalW = naturalMirrorRef.current?.offsetWidth || 0;
     const measuredW = mirrorRef.current?.offsetWidth || 0;
     const measuredH = mirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
-    const nextW = Math.min(
-      RESPONSE_MAX_WIDTH,
-      Math.max(PILL_MIN_WIDTH, measuredW + innerHorizPadding),
-    );
+    // If unwrapped content would exceed max inner width, lock the bubble to
+    // RESPONSE_MAX_WIDTH so wrapped paragraphs visually align with the input
+    // pill at full width. Otherwise hug the constrained measurement.
+    const nextW = naturalW > maxInner
+      ? RESPONSE_MAX_WIDTH
+      : Math.min(
+          RESPONSE_MAX_WIDTH,
+          Math.max(PILL_MIN_WIDTH, measuredW + innerHorizPadding),
+        );
     const nextH = Math.min(
       RESPONSE_MAX_HEIGHT,
       Math.max(PILL_HEIGHT, measuredH + RESPONSE_PADDING_Y * 2),
@@ -936,7 +944,7 @@ const ReplyBubble = memo(function ReplyBubble({
           <CursorReplyMarkdown content={(reply.content || '').trim()} />
         </div>
       </div>
-      {/* Hidden mirror — measures content for size. */}
+      {/* Hidden mirror — measures content at max-width to determine wrapped height. */}
       <div
         ref={mirrorRef}
         aria-hidden
@@ -946,6 +954,26 @@ const ReplyBubble = memo(function ReplyBubble({
           pointerEvents: 'none',
           display: 'inline-block',
           maxWidth: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
+          fontFamily: 'inherit',
+          padding: 0,
+          margin: 0,
+          left: 0,
+          top: 0,
+        }}
+      >
+        <CursorReplyMarkdown content={(reply.content || ' ').trim() || ' '} />
+      </div>
+      {/* Natural mirror — measures unwrapped paragraph width to detect overflow.
+          If the widest natural line exceeds the inner max, we lock to max-width
+          so wrapped content aligns with the input pill instead of hugging short. */}
+      <div
+        ref={naturalMirrorRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          pointerEvents: 'none',
+          display: 'inline-block',
           fontFamily: 'inherit',
           padding: 0,
           margin: 0,
