@@ -34,6 +34,8 @@ const PILL_MAX_WIDTH = 220;
 const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
 const RESPONSE_MAX_WIDTH = 460;
 const RESPONSE_MAX_HEIGHT = 280;
+const RESPONSE_PADDING_X = 14;
+const RESPONSE_PADDING_Y = 10;
 const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 function CursorCompanionView() {
@@ -45,6 +47,10 @@ function CursorCompanionView() {
   // wrapping with the same font/wrap rules as the textarea. Drives pill
   // height for both wrapped content AND content with explicit newlines.
   const wrapMirrorRef = useRef(null);
+  // Hidden mirror that renders response content at the response inner
+  // width with identical font/line-height/wrap rules. Drives the
+  // response pill's outer height so it hugs content with no slack.
+  const responseMirrorRef = useRef(null);
   const [mode, setMode] = useState('dot');
   const [prompt, setPrompt] = useState('');
   const [reply, setReply] = useState(null);
@@ -54,6 +60,7 @@ function CursorCompanionView() {
     height: PILL_HEIGHT,
     textHeight: INPUT_LINE_HEIGHT,
   });
+  const [responseHeight, setResponseHeight] = useState(PILL_HEIGHT);
 
   // Subscribe to mode changes from the main process.
   useEffect(() => {
@@ -133,6 +140,24 @@ function CursorCompanionView() {
     );
   }, [mode, prompt]);
 
+  // Measure response content height before paint so the pill hugs the
+  // text with no extra padding underneath. Outer height = inner content
+  // height + 2 × RESPONSE_PADDING_Y, clamped to RESPONSE_MAX_HEIGHT.
+  useLayoutEffect(() => {
+    if (mode !== 'response') return;
+    const content = reply?.content || error || '';
+    if (!content) {
+      setResponseHeight(PILL_HEIGHT);
+      return;
+    }
+    const measured = responseMirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
+    const next = Math.min(
+      RESPONSE_MAX_HEIGHT,
+      Math.max(PILL_HEIGHT, measured + RESPONSE_PADDING_Y * 2),
+    );
+    setResponseHeight((prev) => (prev === next ? prev : next));
+  }, [mode, reply, error]);
+
   const handleDismiss = useCallback(async () => {
     try { await invoke('CURSOR_DISMISS'); } catch (_) {}
   }, [invoke]);
@@ -190,7 +215,7 @@ function CursorCompanionView() {
   const pillHeight = mode === 'input'
     ? inputBox.height
     : mode === 'response'
-      ? clampResponseHeight(reply?.content || error || '')
+      ? responseHeight
       : mode === 'loading'
         ? 12
         : 8;
@@ -243,12 +268,12 @@ function CursorCompanionView() {
           paddingLeft: isPill ? PILL_PADDING_X : 0,
           paddingRight: isPill ? PILL_PADDING_X : 0,
           paddingTop: mode === 'response'
-            ? 10
+            ? RESPONSE_PADDING_Y
             : mode === 'input'
               ? PILL_PADDING_Y
               : 0,
           paddingBottom: mode === 'response'
-            ? 10
+            ? RESPONSE_PADDING_Y
             : mode === 'input'
               ? PILL_PADDING_Y
               : 0,
@@ -315,7 +340,7 @@ function CursorCompanionView() {
           <div
             style={{
               flex: '1 1 auto',
-              maxHeight: RESPONSE_MAX_HEIGHT - 20,
+              maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
               overflowY: 'auto',
               fontSize: 15,
               lineHeight: 1.45,
@@ -390,6 +415,32 @@ function CursorCompanionView() {
       >
         {prompt || ' '}
       </span>
+      {/* Hidden response mirror — drives response pill outer height so
+          it hugs content instead of using a rough estimate. Width is
+          locked to the response inner width; font + lineHeight match
+          the visible response container exactly. */}
+      <div
+        ref={responseMirrorRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          pointerEvents: 'none',
+          width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
+          whiteSpace: 'pre-wrap',
+          overflowWrap: 'break-word',
+          wordBreak: 'break-word',
+          fontFamily: 'inherit',
+          fontSize: 15,
+          lineHeight: 1.45,
+          padding: 0,
+          margin: 0,
+          left: 0,
+          top: 0,
+        }}
+      >
+        {reply?.content || error || ' '}
+      </div>
       {/* Hidden wrapped mirror — drives pill height when content wraps
           or contains explicit newlines. Width is locked to the
           textarea's eventual inner width at PILL_MAX_WIDTH, font and
@@ -458,14 +509,6 @@ function ActivityDots() {
       <div style={dotStyle(2)} />
     </div>
   );
-}
-
-function clampResponseHeight(content) {
-  if (!content) return PILL_HEIGHT;
-  // Rough estimate: 20px per line, ~50 chars per line at 13px mono.
-  const approxLines = Math.max(1, Math.ceil(content.length / 50));
-  const estHeight = 20 + approxLines * 20;
-  return Math.min(RESPONSE_MAX_HEIGHT, Math.max(40, estHeight));
 }
 
 export default CursorCompanionView;
