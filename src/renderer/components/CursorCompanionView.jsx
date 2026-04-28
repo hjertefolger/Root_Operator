@@ -496,8 +496,8 @@ function CursorCompanionView() {
         onMouseDown={handlePillMouseDown}
         style={{
           position: 'absolute',
-          left: mode === 'loading' ? ANCHOR_X + 6 : ANCHOR_X + 14,
-          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 18,
+          left: mode === 'loading' ? ANCHOR_X + 10 : ANCHOR_X + 14,
+          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 14,
           width: pillWidth,
           height: pillHeight,
           // Presence enter/exit animation. The keyframe controls
