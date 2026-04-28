@@ -196,8 +196,11 @@ function createWindow() {
         maximizable: false,
         fullscreenable: false,
         skipTaskbar: true,
-        // focusable so we can receive keyboard input when in input mode.
-        // Mouse events are forwarded through except when input is active.
+        // NSPanel on macOS — can become key window (accept keystrokes)
+        // while another app is foreground, without activating our entire
+        // app or stealing the dock focus. Without this, Option+Option
+        // opens the pill but the underlying app keeps keyboard focus.
+        type: process.platform === 'darwin' ? 'panel' : undefined,
         focusable: true,
         hasShadow: false,
         webPreferences: {
