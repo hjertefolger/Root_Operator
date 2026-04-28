@@ -53,6 +53,9 @@ function init(deps = {}) {
 
     const getUpdater = typeof deps.getUpdater === 'function' ? deps.getUpdater : () => null;
     const getDynamicMemory = typeof deps.getDynamicMemory === 'function' ? deps.getDynamicMemory : () => null;
+    const getCursorCompanionController = typeof deps.getCursorCompanionController === 'function'
+        ? deps.getCursorCompanionController
+        : () => null;
     const getLocalChatWindow = typeof deps.getLocalChatWindow === 'function' ? deps.getLocalChatWindow : () => null;
     const getMainWindow = typeof deps.getMainWindow === 'function' ? deps.getMainWindow : () => null;
     const getTunnelProcess = typeof deps.getTunnelProcess === 'function' ? deps.getTunnelProcess : () => null;
@@ -95,6 +98,28 @@ function init(deps = {}) {
             syncStateWithRenderer();
         }
         return true;
+    });
+
+    // Cursor Companion master toggle. Lives outside SET_STORE because
+    // toggling has lifecycle side effects (start/stop subsystem,
+    // suspend/resume input listeners, animation choreography). Renderer
+    // surfaces (Settings UI) call these directly so the whole stack
+    // stays in sync.
+    ipcMain.handle('GET_CURSOR_COMPANION_ENABLED', () => {
+        const ctl = getCursorCompanionController();
+        if (!ctl) return false;
+        try { return Boolean(ctl.isEnabled()); } catch (_) { return false; }
+    });
+
+    ipcMain.handle('SET_CURSOR_COMPANION_ENABLED', (event, value) => {
+        const ctl = getCursorCompanionController();
+        if (!ctl) return { success: false, enabled: false };
+        try {
+            const next = ctl.setEnabled(Boolean(value), 'settings');
+            return { success: true, enabled: next };
+        } catch (error) {
+            return { success: false, enabled: ctl.isEnabled(), error: error.message };
+        }
     });
 
     ipcMain.handle('GET_TUNNEL_STATE', () => getTunnelState());

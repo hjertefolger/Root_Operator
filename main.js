@@ -3,7 +3,7 @@
  */
 const path = require('path');
 const { spawn } = require('child_process');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage, screen, powerMonitor } = require('electron');
 const fs = require('fs');
 const fixPath = async () => {
     const { default: fp } = await import('fix-path');
@@ -47,6 +47,7 @@ const { init: initLogging } = require('./src/main/logging');
 const { init: initTray } = require('./src/main/tray');
 const { init: initWindowManager } = require('./src/main/window-manager');
 const { init: initCursorCompanion } = require('./src/main/cursor-companion');
+const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
 const { init: initLocalChat } = require('./src/main/local-chat');
@@ -133,6 +134,22 @@ const setWebSocketServer = (value) => (wss = value);
 const setTunnelProcessState = (value) => (tunnelProcess = value);
 const setWakeLock = (value) => (wakeLock = value);
 const setAppQuittingState = (value) => (isAppQuitting = Boolean(value));
+
+// Forward-reference for the cursor-companion controller. The tray
+// module needs `toggleCursorCompanionEnabled` injected at construction
+// time, but the controller can only be built after the cursor-companion
+// module is initialized later in this file. We bind through this ref so
+// the Cmd+Shift+L hotkey resolves the live toggle when fired.
+let cursorCompanionController = null;
+function toggleCursorCompanionEnabledFromHotkey() {
+    if (!cursorCompanionController) return;
+    try {
+        cursorCompanionController.toggle('hotkey');
+    } catch (error) {
+        logDebug(`[CURSOR_CTL] toggle from hotkey failed: ${error.message}`);
+    }
+}
+
 const trayModule = initTray({
     app,
     Tray,
@@ -156,12 +173,16 @@ const trayModule = initTray({
     getTunnelProcess: () => tunnelProcess,
     logDebug,
     toggleLocalChatWindow: (...args) => windowManager.toggleLocalChatWindow(...args),
+    toggleCursorCompanionEnabled: toggleCursorCompanionEnabledFromHotkey,
 });
 const {
     formatTrayTooltip,
     setTrayIconState,
     createTray,
     initDoubleShiftShortcut,
+    suspendDoubleShiftShortcut,
+    resumeDoubleShiftShortcut,
+    restartDoubleShiftShortcut,
     stopDoubleShiftShortcut,
     registerGlobalShortcuts,
 } = trayModule;
@@ -718,24 +739,61 @@ app.whenReady().then(async () => {
         registerGlobalShortcuts,
         initDoubleShiftShortcut,
         onDoubleShift: () => {
+            // Gate the gesture on the persistent enabled flag. When OFF,
+            // double-Shift is a no-op on our side — the keys fall through
+            // to whatever else might claim them.
+            if (!cursorCompanionController || !cursorCompanionController.isEnabled()) {
+                return;
+            }
             try { cursorCompanion.toggleFromHotkey(); } catch (_) { /* ignore */ }
         },
         setTray: (value) => { tray = value; },
     });
     updater.start();
 
-    // Start the cursor companion after the desktop shell is up: dot
-    // window + cursor poll + global Shift/mousedown listeners. Order
-    // matters — initDoubleShiftShortcut (called inside
-    // initializeDesktopShell) is what spins up uIOhook; attaching our
-    // listeners after that ensures we're hooking the running singleton,
-    // not creating a competing one. The hotkey itself (Shift+Shift)
-    // is owned by the tray's double-Shift detector and dispatches into
-    // cursorCompanion.toggleFromHotkey via the onDoubleShift callback.
+    // Build the cursor-companion controller now that the desktop shell
+    // is up. It owns the persistent enabled flag and the start/stop
+    // lifecycle. bootstrap() reads the flag and starts the companion
+    // if the user previously enabled it.
+    cursorCompanionController = initCursorCompanionController({
+        getStore: () => store,
+        cursorCompanion,
+        logDebug,
+        broadcastEnabled: (enabled) => {
+            // Notify all open renderer windows so the Settings UI can
+            // reflect the new state without a re-fetch.
+            for (const w of BrowserWindow.getAllWindows()) {
+                try { w.webContents.send('CURSOR_COMPANION_ENABLED_CHANGED', { enabled }); } catch (_) {}
+            }
+        },
+    });
+    cursorCompanionController.bootstrap();
+
+    // powerMonitor lifecycle — the macOS CGEvent tap that uIOhook sits
+    // on can be silently invalidated when the screen locks, the user
+    // switches sessions, or the machine sleeps/resumes. We rebuild it on
+    // unlock/resume so Shift+Shift stays reliable across the day.
     try {
-        cursorCompanion.start();
+        powerMonitor.on('lock-screen', () => {
+            suspendDoubleShiftShortcut('lock-screen');
+        });
+        powerMonitor.on('unlock-screen', () => {
+            // 200 ms gives macOS time to finish its own loginwindow
+            // tap-disable before we re-arm.
+            restartDoubleShiftShortcut('unlock-screen', 200);
+        });
+        powerMonitor.on('suspend', () => {
+            suspendDoubleShiftShortcut('suspend');
+        });
+        powerMonitor.on('resume', () => {
+            restartDoubleShiftShortcut('resume', 200);
+        });
+        // Mac-specific resign/become-active are noisy (fire on cmd-tab),
+        // so we only listen on darwin and only treat them as informational
+        // — we don't suspend on resign-active because cmd-tabbing should
+        // not break the gesture for casual app-switching.
     } catch (error) {
-        logDebug(`[CURSOR] Companion failed to start: ${error.message}`);
+        logDebug(`[POWER] Failed to attach powerMonitor listeners: ${error.message}`);
     }
 
     // Auto-start priority gate. Three paths can fire on launch; only the
@@ -880,7 +938,13 @@ app.on('will-quit', () => {
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
     stopOutboundAttachmentSweep();
-    try { cursorCompanion.stop(); } catch (_) { /* ignore */ }
+    try {
+        if (cursorCompanionController) {
+            cursorCompanionController.shutdown();
+        } else {
+            cursorCompanion.stop();
+        }
+    } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;
@@ -921,6 +985,7 @@ initIpcHandlers({
     getMainWindow: () => mainWindow,
     dismissUpdateBanner,
     getDynamicMemory: () => dynamicMemory,
+    getCursorCompanionController: () => cursorCompanionController,
     setOperatingMode,
     getOperatingMode: () => operatingMode,
     setAppQuitting: setAppQuittingState,

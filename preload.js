@@ -45,6 +45,8 @@ const VALID_INVOKE_CHANNELS = [
     'CURSOR_BLUR_PARK',
     'CURSOR_FOCUS_RESUME',
     'CURSOR_GET_PENDING',
+    'GET_CURSOR_COMPANION_ENABLED',
+    'SET_CURSOR_COMPANION_ENABLED',
     'viewer:open',
     'viewer:get-state',
     'viewer:annotated',
@@ -66,7 +68,9 @@ const VALID_RECEIVE_CHANNELS = [
     'LOCAL_CHAT_WINDOW_SHOWN',
     'CURSOR_REPLY',
     'CURSOR_REPLY_TIMEOUT',
-    'CURSOR_MODE'
+    'CURSOR_MODE',
+    'CURSOR_ENABLED_CHANGED',
+    'CURSOR_COMPANION_ENABLED_CHANGED'
 ];
 
 // Expose protected methods that only allow specific channels

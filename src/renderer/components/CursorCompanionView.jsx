@@ -165,6 +165,19 @@ function CursorCompanionView() {
   });
   const [responseHeight, setResponseHeight] = useState(PILL_HEIGHT);
   const [responseWidth, setResponseWidth] = useState(PILL_MIN_WIDTH);
+  // 'enter' plays a fade-in + scale-up; 'exit' plays the reverse just
+  // before main closes the window; 'visible' is the steady state with
+  // the keyframe animation cleared so other inline styles (blur dim,
+  // hover, etc.) can drive opacity without fighting the animation's
+  // final frame. The controller drives this via the CURSOR_ENABLED_CHANGED
+  // event; useEffect below transitions enter→visible after the keyframe
+  // completes.
+  const [presenceAnim, setPresenceAnim] = useState('enter');
+  useEffect(() => {
+    if (presenceAnim !== 'enter') return undefined;
+    const t = setTimeout(() => setPresenceAnim('visible'), 240);
+    return () => clearTimeout(t);
+  }, [presenceAnim]);
 
   // Subscribe to mode changes from the main process.
   useEffect(() => {
@@ -194,9 +207,14 @@ function CursorCompanionView() {
       setReply({ content: payload.content, ts: payload.ts || null });
       setError(null);
     });
+    const offEnabled = on('CURSOR_ENABLED_CHANGED', (payload) => {
+      if (!payload || typeof payload.enabled !== 'boolean') return;
+      setPresenceAnim(payload.enabled ? 'enter' : 'exit');
+    });
     return () => {
       offMode?.();
       offReply?.();
+      offEnabled?.();
     };
   }, [on]);
 
@@ -373,7 +391,22 @@ function CursorCompanionView() {
   // shift up/down events. Detect locally and dispatch the gesture
   // through the unified main-process entry — same lock applies, so the
   // tray-side path's late event is suppressed.
+  //
+  // Reset the tap timestamp whenever the textarea blurs or the panel
+  // leaves input mode. Without this reset, a stale "tap 1" from an
+  // earlier interaction can survive into a fresh focus and turn one
+  // Shift press into a phantom double-tap.
   const shiftTapAtRef = useRef(0);
+  useEffect(() => {
+    if (mode !== 'input') {
+      shiftTapAtRef.current = 0;
+    }
+  }, [mode]);
+  useEffect(() => {
+    if (isBlurred) {
+      shiftTapAtRef.current = 0;
+    }
+  }, [isBlurred]);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Escape') {
@@ -382,6 +415,9 @@ function CursorCompanionView() {
       return;
     }
     if (e.key === 'Shift') {
+      // Auto-repeat fires Shift keydown again while held; that should
+      // not advance the double-tap state machine.
+      if (e.repeat) return;
       const now = Date.now();
       if (now - shiftTapAtRef.current <= 320) {
         shiftTapAtRef.current = 0;
@@ -442,6 +478,16 @@ function CursorCompanionView() {
           top: ANCHOR_Y + 18,
           width: pillWidth,
           height: pillHeight,
+          // Presence enter/exit animation. The keyframe controls
+          // opacity + transform; the steady state is opacity:1 +
+          // scale(1) once the keyframe finishes (animation-fill-mode:
+          // forwards in the keyframe definition).
+          animation: presenceAnim === 'enter'
+            ? 'cursor-presence-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both'
+            : presenceAnim === 'exit'
+              ? 'cursor-presence-exit 200ms ease both'
+              : undefined,
+          transformOrigin: 'top left',
           borderRadius: isPill ? PILL_RADIUS : '50%',
           // Subtle dim while parked-and-blurred so the user gets a
           // visual cue that the pill is awaiting a click to refocus.
@@ -687,6 +733,14 @@ function CursorCompanionView() {
         @keyframes cursor-fade-in {
           from { opacity: 0; transform: translateY(2px); }
           to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes cursor-presence-enter {
+          from { opacity: 0; transform: scale(0.65); }
+          to { opacity: 1; transform: scale(1); }
+        }
+        @keyframes cursor-presence-exit {
+          from { opacity: 1; transform: scale(1); }
+          to { opacity: 0; transform: scale(0.65); }
         }
         .cursor-thin-scroll::-webkit-scrollbar {
           width: 4px;

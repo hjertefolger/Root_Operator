@@ -91,3 +91,18 @@ test('gesture lock window is non-zero', () => {
     assert.ok(__test.GESTURE_LOCK_MS >= 100, 'lock should be at least 100ms');
     assert.ok(__test.GESTURE_LOCK_MS <= 1000, 'lock should not exceed 1s');
 });
+
+test('stop() clears mode, parked flag, shift-held, and gesture lock', () => {
+    // Pre-load all the derived state we expect stop() to clear.
+    __test.setModeForTest('response');
+    __test.setShiftHeldForTest(true);
+    __test.setParkedForTest(true);
+    __test.setGestureLockUntilForTest(Date.now() + 60_000);
+
+    __test.runStopForTest();
+
+    assert.equal(__test.getModeForTest(), 'dot');
+    assert.equal(__test.getShiftHeldForTest(), false);
+    assert.equal(__test.getParkedForTest(), false);
+    assert.equal(__test.getGestureLockUntilForTest(), 0);
+});

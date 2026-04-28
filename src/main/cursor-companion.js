@@ -148,9 +148,42 @@ function getApi() {
         dismiss,
         handleChannelReply,
         toggleFromHotkey,
+        notifyEnabledChanged,
         isPending: () => pending !== null,
         getMode: () => mode,
     };
+}
+
+/**
+ * Tell the renderer that the master enabled flag flipped. Used by the
+ * controller to drive entrance/exit animations: on enable, the dot
+ * fades + scales in from the default position; on disable, whatever
+ * state is currently visible (dot, input pill, loading, response)
+ * fades + scales out before the window is closed.
+ *
+ * On enable, the window may still be loading when this fires (start()
+ * just created the BrowserWindow); we defer the send until the
+ * webContents has finished its initial load so the entrance animation
+ * actually reaches the renderer instead of being dropped on the floor.
+ */
+function notifyEnabledChanged(enabled) {
+    if (!isUsable(win)) return;
+    const value = Boolean(enabled);
+    const send = () => {
+        if (!isUsable(win)) return;
+        try {
+            win.webContents.send('CURSOR_ENABLED_CHANGED', { enabled: value });
+        } catch (err) {
+            depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] notifyEnabledChanged failed: ${err.message}`);
+        }
+    };
+    try {
+        if (win.webContents.isLoading()) {
+            win.webContents.once('did-finish-load', send);
+            return;
+        }
+    } catch (_) { /* fall through to immediate send */ }
+    send();
 }
 
 /**
@@ -301,6 +334,14 @@ function stop() {
     win = null;
     pending = null;
     mode = 'dot';
+    // Reset all derived state so a subsequent start() begins from a
+    // clean slate. Without this, a stale gesture lock or parked flag
+    // from the previous session can cause the first interaction after
+    // a re-enable to behave wrong.
+    gestureLockUntil = 0;
+    isParked = false;
+    isShiftHeld = false;
+    lastWinPos = { x: -1, y: -1 };
     depsRef && depsRef.logDebug && depsRef.logDebug('[CURSOR] Companion stopped');
 }
 
@@ -786,6 +827,8 @@ module.exports = {
         getParkedForTest: () => isParked,
         setParkedForTest: (next) => { isParked = Boolean(next); },
         setModeForTest: (next) => { mode = next; },
+        setGestureLockUntilForTest: (next) => { gestureLockUntil = Number(next) || 0; },
+        runStopForTest: () => stop(),
         DRAFT_TTL_MS,
         LAST_REPLY_TTL_MS,
         GESTURE_LOCK_MS,

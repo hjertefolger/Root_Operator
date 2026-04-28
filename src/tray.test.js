@@ -10,12 +10,14 @@ function createSubject({
     tunnelSettings = { token: 'abc' },
     startBridgeImpl = async () => {},
     toggleLocalChatWindowImpl = () => {},
+    toggleCursorCompanionImpl = () => {},
 } = {}) {
     const registrations = new Map();
     const stopCalls = [];
     const startCalls = [];
     const debugLogs = [];
     const localChatToggleCalls = [];
+    const cursorCompanionToggleCalls = [];
 
     const subject = init({
         app: {},
@@ -52,6 +54,10 @@ function createSubject({
             localChatToggleCalls.push(Date.now());
             toggleLocalChatWindowImpl();
         },
+        toggleCursorCompanionEnabled: () => {
+            cursorCompanionToggleCalls.push(Date.now());
+            toggleCursorCompanionImpl();
+        },
     });
 
     return {
@@ -68,6 +74,7 @@ function createSubject({
         getStopCalls: () => stopCalls,
         getDebugLogs: () => debugLogs,
         getLocalChatToggleCalls: () => localChatToggleCalls,
+        getCursorCompanionToggleCalls: () => cursorCompanionToggleCalls,
     };
 }
 
@@ -130,4 +137,36 @@ test('Cmd/Ctrl+Shift+K logs when toggleLocalChatWindow throws', async () => {
     await harness.triggerShortcut('CommandOrControl+Shift+K');
 
     assert.match(harness.getDebugLogs().join('\n'), /Failed to toggle desktop chat: chat-boom/);
+});
+
+test('registerGlobalShortcuts registers Cmd/Ctrl+Shift+L for the cursor companion toggle', async () => {
+    const harness = createSubject();
+
+    harness.subject.registerGlobalShortcuts();
+
+    assert.ok(harness.getRegisteredAccelerators().includes('CommandOrControl+Shift+L'));
+
+    await harness.triggerShortcut('CommandOrControl+Shift+L');
+
+    assert.equal(harness.getCursorCompanionToggleCalls().length, 1);
+});
+
+test('Cmd/Ctrl+Shift+L logs when toggleCursorCompanionEnabled throws', async () => {
+    const harness = createSubject({
+        toggleCursorCompanionImpl: () => { throw new Error('cursor-boom'); },
+    });
+
+    harness.subject.registerGlobalShortcuts();
+    await harness.triggerShortcut('CommandOrControl+Shift+L');
+
+    assert.match(harness.getDebugLogs().join('\n'), /Failed to toggle cursor companion: cursor-boom/);
+});
+
+test('J, K, and L hotkeys all register independently', () => {
+    const harness = createSubject();
+    harness.subject.registerGlobalShortcuts();
+    const accelerators = harness.getRegisteredAccelerators();
+    assert.ok(accelerators.includes('CommandOrControl+Shift+J'));
+    assert.ok(accelerators.includes('CommandOrControl+Shift+K'));
+    assert.ok(accelerators.includes('CommandOrControl+Shift+L'));
 });
