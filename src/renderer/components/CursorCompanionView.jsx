@@ -133,6 +133,16 @@ function CursorCompanionView() {
   const textareaRef = useRef(null);
   const widthMirrorRef = useRef(null);
   const wrapMirrorRef = useRef(null);
+  // Tracks textarea mount via callback ref. Necessary because the
+  // textarea lives inside LayerWrapper, which defers mounting its
+  // children by one render after `inputOpen` flips. Without this,
+  // the auto-focus effect fires while `textareaRef.current` is still
+  // null and never runs again.
+  const [textareaMounted, setTextareaMounted] = useState(false);
+  const setTextareaRef = useCallback((node) => {
+    textareaRef.current = node;
+    setTextareaMounted(node !== null);
+  }, []);
 
   // Layered state from main.
   const [loading, setLoading] = useState(false);
@@ -253,20 +263,24 @@ function CursorCompanionView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [on, invoke]);
 
-  // Auto-focus textarea when input opens.
+  // Auto-focus textarea when input opens. Depends on textareaMounted
+  // because LayerWrapper defers mounting the textarea by one render
+  // after inputOpen flips — running this effect on inputOpen alone
+  // would see textareaRef.current still null and silently skip focus.
   useEffect(() => {
-    if (inputOpen && textareaRef.current) {
-      requestAnimationFrame(() => {
-        const node = textareaRef.current;
-        if (!node) return;
-        node.focus();
-        try {
-          const end = node.value.length;
-          node.setSelectionRange(end, end);
-        } catch (_) {}
-      });
-    }
-  }, [inputOpen]);
+    if (!inputOpen || !textareaMounted) return;
+    const node = textareaRef.current;
+    if (!node) return;
+    requestAnimationFrame(() => {
+      const live = textareaRef.current;
+      if (!live) return;
+      live.focus();
+      try {
+        const end = live.value.length;
+        live.setSelectionRange(end, end);
+      } catch (_) {}
+    });
+  }, [inputOpen, textareaMounted]);
 
   // Debounced draft sync.
   useEffect(() => {
@@ -569,7 +583,7 @@ function CursorCompanionView() {
             }}
           >
             <textarea
-              ref={textareaRef}
+              ref={setTextareaRef}
               rows={1}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
