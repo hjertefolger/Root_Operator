@@ -77,13 +77,9 @@ function CursorCompanionView() {
       setReply({ content: payload.content, ts: payload.ts || null });
       setError(null);
     });
-    const offTimeout = on('CURSOR_REPLY_TIMEOUT', () => {
-      setError('No response after 90 seconds.');
-    });
     return () => {
       offMode?.();
       offReply?.();
-      offTimeout?.();
     };
   }, [on]);
 
@@ -154,10 +150,28 @@ function CursorCompanionView() {
     }
   }, [invoke, prompt]);
 
+  // Renderer-side double-Alt fallback: when the cursor-companion
+  // window has keyboard focus (input mode), macOS treats Option as a
+  // dead-key for compose input and uiohook-napi can miss the discrete
+  // keydown. Detect double-tap-Alt locally here so the toggle still
+  // collapses input → dot.
+  const altTapAtRef = useRef(0);
+
   const handleKeyDown = (e) => {
     if (e.key === 'Escape') {
       e.preventDefault();
       handleDismiss();
+      return;
+    }
+    if (e.key === 'Alt') {
+      const now = Date.now();
+      if (now - altTapAtRef.current <= 320) {
+        altTapAtRef.current = 0;
+        e.preventDefault();
+        handleDismiss();
+      } else {
+        altTapAtRef.current = now;
+      }
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -169,7 +183,7 @@ function CursorCompanionView() {
   const pillWidth = mode === 'input'
     ? inputBox.width
     : mode === 'loading'
-      ? 64
+      ? 12
       : mode === 'response'
         ? RESPONSE_MAX_WIDTH
         : 8;
@@ -178,9 +192,9 @@ function CursorCompanionView() {
     : mode === 'response'
       ? clampResponseHeight(reply?.content || error || '')
       : mode === 'loading'
-        ? PILL_HEIGHT
+        ? 12
         : 8;
-  const isPill = mode !== 'dot';
+  const isPill = mode === 'input' || mode === 'response';
 
   return (
     <div
@@ -216,14 +230,14 @@ function CursorCompanionView() {
               ? ACCENT
               : mode === 'response'
                 ? 'rgba(255, 255, 255, 0.08)'
-                : 'rgba(15, 15, 18, 0.92)',
-          boxShadow: mode === 'dot'
+                : 'transparent',
+          boxShadow: mode === 'dot' || mode === 'loading'
             ? 'none'
             : mode === 'input'
               ? `0 8px 24px rgba(0, 0, 0, 0.32)`
               : `0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)`,
-          backdropFilter: mode === 'response' || mode === 'loading' ? 'blur(14px)' : 'none',
-          WebkitBackdropFilter: mode === 'response' || mode === 'loading' ? 'blur(14px)' : 'none',
+          backdropFilter: mode === 'response' ? 'blur(14px)' : 'none',
+          WebkitBackdropFilter: mode === 'response' ? 'blur(14px)' : 'none',
           color: mode === 'input' ? '#ffffff' : 'rgba(255, 255, 255, 0.9)',
           display: 'flex',
           alignItems: mode === 'response' || mode === 'input' ? 'flex-start' : 'center',

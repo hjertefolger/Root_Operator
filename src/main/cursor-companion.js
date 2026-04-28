@@ -52,8 +52,9 @@ const CURSOR_ATTACHMENT_TTL_MS = 10 * 60 * 1000;
 // Double-tap-Option detection window.
 const DOUBLE_OPTION_WINDOW_MS = 320;
 
-// Single-flight pending lock.
-const PENDING_TIMEOUT_MS = 90_000;
+// Single-flight pending lock. No auto-timeout — Claude turns can take
+// long, and a stale "no response" pill is worse than waiting. The lock
+// releases on actual reply or on user dismiss (Esc / Option+Option).
 
 const CURSOR_CHAT_ID = 'cursor-companion';
 
@@ -173,9 +174,6 @@ function stop() {
         try { win.close(); } catch (_) {}
     }
     win = null;
-    if (pending && pending.timeoutHandle) {
-        clearTimeout(pending.timeoutHandle);
-    }
     pending = null;
     mode = 'dot';
     depsRef && depsRef.logDebug && depsRef.logDebug('[CURSOR] Companion stopped');
@@ -400,7 +398,6 @@ async function submitFromBubble({ prompt }) {
     pending = {
         turnId,
         startedAt: Date.now(),
-        timeoutHandle: setTimeout(() => clearPendingForTimeout(turnId), PENDING_TIMEOUT_MS),
     };
     setMode('loading');
 
@@ -461,21 +458,7 @@ async function submitFromBubble({ prompt }) {
 }
 
 function clearPending() {
-    if (pending && pending.timeoutHandle) {
-        clearTimeout(pending.timeoutHandle);
-    }
     pending = null;
-}
-
-function clearPendingForTimeout(turnId) {
-    if (pending && pending.turnId === turnId) {
-        depsRef.logDebug(`[CURSOR] Pending turn ${turnId} timed out after ${PENDING_TIMEOUT_MS}ms`);
-        clearPending();
-        if (isUsable(win)) {
-            win.webContents.send('CURSOR_REPLY_TIMEOUT');
-        }
-        setMode('dot');
-    }
 }
 
 /**
