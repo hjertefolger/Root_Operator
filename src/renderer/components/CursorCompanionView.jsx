@@ -84,7 +84,7 @@ const cursorMdComponents = {
 };
 const CursorReplyMarkdown = memo(function CursorReplyMarkdown({ content }) {
   return (
-    <div style={{ fontSize: 15, lineHeight: 1.45, wordBreak: 'break-word', color: 'rgba(255,255,255,0.9)' }}>
+    <div className="cursor-reply-md" style={{ fontSize: 15, lineHeight: 1.45, wordBreak: 'break-word', color: 'rgba(255,255,255,0.9)' }}>
       <ReactMarkdown remarkPlugins={cursorRemarkPlugins} components={cursorMdComponents}>
         {content}
       </ReactMarkdown>
@@ -702,6 +702,8 @@ function CursorCompanionView() {
         .cursor-thin-scroll::-webkit-scrollbar-thumb:hover {
           background-color: rgba(255, 255, 255, 0.32);
         }
+        .cursor-reply-md > *:first-child { margin-top: 0 !important; }
+        .cursor-reply-md > *:last-child { margin-bottom: 0 !important; }
       `}</style>
     </div>
   );
