@@ -332,10 +332,10 @@ function setMode(next, payload) {
  *   - input mode:                  always captures (so the user can
  *                                  click into the textarea or select
  *                                  text)
- *   - response mode + Shift held:  captures so a Shift+scroll wheel
- *                                  event lands on the response bubble
- *                                  and scrolls the overflow pane
- *                                  instead of scrolling the host app
+ *   - response mode:               always captures so wheel events
+ *                                  land on the bubble and scroll the
+ *                                  overflow pane naturally — no
+ *                                  modifier required
  *
  * All other states stay click-through with mouse-move forwarding so
  * the underlying app remains usable. Click-anywhere dismiss for the
@@ -345,7 +345,7 @@ function setMode(next, payload) {
  */
 function applyInteractivity() {
     if (!isUsable(win)) return;
-    const interactive = mode === 'input' || (mode === 'response' && isShiftHeld);
+    const interactive = mode === 'input' || mode === 'response';
     if (interactive) {
         win.setIgnoreMouseEvents(false);
     } else {
