@@ -625,15 +625,17 @@ function CursorCompanionView() {
 }
 
 /**
- * 2×2 dot loader, identical to the desktop chat's ActivityDots
- * indicator (see ChannelChat.jsx). Sequential active idx 0→1→3→2
- * traces a clockwise rotation; opacity + scale transition each step.
+ * Two-dot pulse loader, mirrored from the SecurityPanel's TwoDots
+ * (next to SECURED_SESSION in the web chat lock popup). Alternates
+ * left ↔ right on a 720ms cadence with a 600ms opacity+scale
+ * transition. Calmer than a 4-dot rotation in the small footprint —
+ * one signal, not four.
  */
 function ActivityDots() {
   const [active, setActive] = useState(0);
 
   useEffect(() => {
-    const t = setInterval(() => setActive((p) => (p + 1) % 4), 260);
+    const t = setInterval(() => setActive((p) => (p + 1) % 2), 720);
     return () => clearInterval(t);
   }, []);
 
@@ -641,18 +643,16 @@ function ActivityDots() {
     width: 4,
     height: 4,
     borderRadius: '50%',
-    background: ACCENT,
-    opacity: active === idx ? 1 : 0.16,
+    backgroundColor: ACCENT,
+    opacity: active === idx ? 1 : 0.18,
     transform: active === idx ? 'scale(1)' : 'scale(0.78)',
-    transition: 'opacity 0.24s ease, transform 0.24s ease',
+    transition: 'opacity 0.6s ease, transform 0.6s ease',
   });
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '4px 4px', gap: 4 }}>
+    <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
       <div style={dotStyle(0)} />
       <div style={dotStyle(1)} />
-      <div style={dotStyle(3)} />
-      <div style={dotStyle(2)} />
     </div>
   );
 }
