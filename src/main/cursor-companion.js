@@ -418,7 +418,17 @@ async function submitFromBubble({ prompt }) {
             CURSOR_CHAT_ID,
             composedContent,
             CURSOR_CHAT_ID,
-            { echoToLocalChat: false },
+            {
+                // Single source of truth: the cursor turn lands in the same
+                // channel-history as every other surface, and every surface
+                // (desktop chat, web/paired devices) sees it. The clean
+                // displayContent strips the technical screenshot prefix —
+                // human-facing surfaces and conversation memory show the
+                // user's actual prompt, while Claude still receives the
+                // full composed content needed to read the screenshot.
+                echoToLocalChat: true,
+                displayContent: prompt.trim(),
+            },
         );
         if (!result || result.success === false) {
             clearPending();

@@ -522,7 +522,16 @@ function init(deps = {}) {
     }
 
     async function submitChannelUserMessage(chatId, content, userId, options = {}) {
-        const { echoToLocalChat = false, senderWs = null } = options;
+        const {
+            echoToLocalChat = false,
+            senderWs = null,
+            // Optional clean version for chat surfaces and memory. Use when
+            // the agent-facing `content` carries technical noise (file paths,
+            // structured prefixes) that shouldn't appear in the conversation
+            // memory or in human-facing chat views. Defaults to `content`,
+            // preserving existing behaviour for callers that don't pass it.
+            displayContent = null,
+        } = options;
         const assistantName = getActivityAssistantName();
         const channelManager = getChannelManager();
 
@@ -532,6 +541,9 @@ function init(deps = {}) {
 
         const ts = getNowDate().toISOString();
         const dynamicMemory = getDynamicMemory();
+        const displayBody = (typeof displayContent === 'string' && displayContent.length > 0)
+            ? displayContent
+            : content;
 
         // Per-turn enrichment is gone. Channel-history tail lives in the
         // appended system prompt, and agent-facing recall of older memories
@@ -542,7 +554,7 @@ function init(deps = {}) {
         const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
 
         if (isDynamicMemoryReady(dynamicMemory)) {
-            dynamicMemory.indexMessage('user', content, chatId).catch((error) => {
+            dynamicMemory.indexMessage('user', displayBody, chatId).catch((error) => {
                 logDebug(`[MEMORY] Index (user) error: ${error.message}`);
             });
         }
@@ -558,19 +570,19 @@ function init(deps = {}) {
             detail: `Waiting for the ${assistantName} chat bridge to reconnect.`,
         }, { force: true });
 
-        const userWrite = chatStore.addMessage({ role: 'user', content, ts });
+        const userWrite = chatStore.addMessage({ role: 'user', content: displayBody, ts });
         markOutboundAttachmentsForGc(userWrite.evicted);
 
         if (echoToLocalChat) {
             sendLocalChatEvent({
                 type: 'channel_message',
                 role: 'user',
-                content,
+                content: displayBody,
                 ts,
             });
         }
 
-        const body = JSON.stringify({ type: 'channel_message', role: 'user', content, ts });
+        const body = JSON.stringify({ type: 'channel_message', role: 'user', content: displayBody, ts });
         for (const client of getActiveClients()) {
             if (client !== senderWs && client.readyState === WebSocket.OPEN) {
                 sendEncryptedOutput(client, body);
