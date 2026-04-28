@@ -197,16 +197,16 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. Pill mode anchors the top-left at the
-          cursor pointer hot spot, growing right then down — never
-          above. Dot mode sits offset south-east of the hot spot so it
-          doesn't overlap the cursor arrow visual (the arrow extends
-          ~15×22 px from the hot spot). */}
+      {/* The morphing element. Input mode anchors the top-left at the
+          cursor pointer hot spot so the cursor sits inside the typing
+          pill. Dot, loading, and response modes sit offset south-east
+          of the hot spot so the bubble visibly grows from where the
+          dot was, instead of teleporting under the cursor. */}
       <div
         style={{
           position: 'absolute',
-          left: mode === 'dot' ? ANCHOR_X + 14 : ANCHOR_X,
-          top: mode === 'dot' ? ANCHOR_Y + 18 : ANCHOR_Y,
+          left: mode === 'input' ? ANCHOR_X : ANCHOR_X + 14,
+          top: mode === 'input' ? ANCHOR_Y : ANCHOR_Y + 18,
           width: isPill ? pillWidth : 8,
           height: isPill ? pillHeight : 8,
           borderRadius: isPill ? PILL_RADIUS : '50%',
