@@ -27,6 +27,7 @@ function init(deps = {}) {
         getTunnelProcess = () => null,
         logDebug = () => {},
         doubleShiftWindowMs = 300,
+        toggleLocalChatWindow = () => {},
     } = deps;
 
     let tray = null;
@@ -241,6 +242,18 @@ function init(deps = {}) {
 
         if (!startTunnelRegistered) {
             logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+J');
+        }
+
+        const desktopChatRegistered = globalShortcut.register('CommandOrControl+Shift+K', () => {
+            try {
+                toggleLocalChatWindow();
+            } catch (error) {
+                logDebug(`[SHORTCUT] Failed to toggle desktop chat: ${error.message}`);
+            }
+        });
+
+        if (!desktopChatRegistered) {
+            logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+K');
         }
     }
 

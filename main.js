@@ -155,6 +155,7 @@ const trayModule = initTray({
     getServer: () => server,
     getTunnelProcess: () => tunnelProcess,
     logDebug,
+    toggleLocalChatWindow: (...args) => windowManager.toggleLocalChatWindow(...args),
 });
 const {
     formatTrayTooltip,
@@ -716,21 +717,23 @@ app.whenReady().then(async () => {
         createTray,
         registerGlobalShortcuts,
         initDoubleShiftShortcut,
-        toggleLocalChatWindow,
+        onDoubleShift: () => {
+            try { cursorCompanion.toggleFromHotkey(); } catch (_) { /* ignore */ }
+        },
         setTray: (value) => { tray = value; },
     });
     updater.start();
 
     // Start the cursor companion after the desktop shell is up: dot
-    // window + cursor poll, then attach the Option+Option listener to
-    // the same uIOhook instance the tray's double-Shift shortcut starts.
-    // Order matters — initDoubleShiftShortcut (called inside
-    // initializeDesktopShell) is what spins up uIOhook; attaching the
-    // Option listener after that ensures we're hooking the running
-    // singleton, not creating a competing one.
+    // window + cursor poll + global Shift/mousedown listeners. Order
+    // matters — initDoubleShiftShortcut (called inside
+    // initializeDesktopShell) is what spins up uIOhook; attaching our
+    // listeners after that ensures we're hooking the running singleton,
+    // not creating a competing one. The hotkey itself (Shift+Shift)
+    // is owned by the tray's double-Shift detector and dispatches into
+    // cursorCompanion.toggleFromHotkey via the onDoubleShift callback.
     try {
         cursorCompanion.start();
-        cursorCompanion.attachOptionListener();
     } catch (error) {
         logDebug(`[CURSOR] Companion failed to start: ${error.message}`);
     }

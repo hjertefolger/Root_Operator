@@ -388,7 +388,7 @@ function init(deps = {}) {
         return mainWindow;
     }
 
-    function initializeDesktopShell({ createTray, registerGlobalShortcuts, initDoubleShiftShortcut, toggleLocalChatWindow, setTray } = {}) {
+    function initializeDesktopShell({ createTray, registerGlobalShortcuts, initDoubleShiftShortcut, onDoubleShift, setTray } = {}) {
         applyDevDockIcon();
         app.setActivationPolicy('accessory');
         if (app.dock) app.dock.hide();
@@ -405,10 +405,13 @@ function init(deps = {}) {
         if (typeof registerGlobalShortcuts === 'function') {
             registerGlobalShortcuts();
         }
+        // Double-Shift now drives the cursor companion (open input from
+        // dot, dismiss otherwise). Desktop chat moved to Cmd+Shift+K and
+        // is registered inside registerGlobalShortcuts().
         if (typeof initDoubleShiftShortcut === 'function') {
             initDoubleShiftShortcut(() => {
-                if (typeof toggleLocalChatWindow === 'function') {
-                    toggleLocalChatWindow();
+                if (typeof onDoubleShift === 'function') {
+                    onDoubleShift();
                 }
             });
         }

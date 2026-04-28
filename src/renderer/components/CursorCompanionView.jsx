@@ -267,12 +267,11 @@ function CursorCompanionView() {
     }
   }, [invoke, prompt]);
 
-  // Renderer-side double-Alt fallback: when the cursor-companion
-  // window has keyboard focus (input mode), macOS treats Option as a
-  // dead-key for compose input and uiohook-napi can miss the discrete
-  // keydown. Detect double-tap-Alt locally here so the toggle still
-  // collapses input → dot.
-  const altTapAtRef = useRef(0);
+  // Renderer-side double-Shift fallback: when the cursor-companion
+  // window has keyboard focus (input mode), uIOhook can miss the
+  // discrete shift up/down events from inside the focused panel. Detect
+  // double-tap-Shift locally so the toggle still collapses input → dot.
+  const shiftTapAtRef = useRef(0);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Escape') {
@@ -280,14 +279,14 @@ function CursorCompanionView() {
       handleDismiss();
       return;
     }
-    if (e.key === 'Alt') {
+    if (e.key === 'Shift') {
       const now = Date.now();
-      if (now - altTapAtRef.current <= 320) {
-        altTapAtRef.current = 0;
+      if (now - shiftTapAtRef.current <= 320) {
+        shiftTapAtRef.current = 0;
         e.preventDefault();
         handleDismiss();
       } else {
-        altTapAtRef.current = now;
+        shiftTapAtRef.current = now;
       }
       return;
     }
@@ -400,6 +399,7 @@ function CursorCompanionView() {
             onChange={(e) => setPrompt(e.target.value)}
             spellCheck={false}
             autoComplete="off"
+            className="cursor-thin-scroll"
             style={{
               flex: '1 1 auto',
               minWidth: 0,
@@ -430,6 +430,7 @@ function CursorCompanionView() {
 
         {mode === 'response' && reply && (
           <div
+            className="cursor-thin-scroll"
             style={{
               flex: '1 1 auto',
               maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
@@ -557,6 +558,20 @@ function CursorCompanionView() {
         @keyframes cursor-fade-in {
           from { opacity: 0; transform: translateY(2px); }
           to { opacity: 1; transform: translateY(0); }
+        }
+        .cursor-thin-scroll::-webkit-scrollbar {
+          width: 4px;
+          height: 4px;
+        }
+        .cursor-thin-scroll::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .cursor-thin-scroll::-webkit-scrollbar-thumb {
+          background-color: rgba(255, 255, 255, 0.18);
+          border-radius: 999px;
+        }
+        .cursor-thin-scroll::-webkit-scrollbar-thumb:hover {
+          background-color: rgba(255, 255, 255, 0.32);
         }
       `}</style>
     </div>

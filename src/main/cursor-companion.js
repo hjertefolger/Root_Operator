@@ -49,12 +49,9 @@ const CURSOR_LENS_CROP_H = 400;
 // Stage-attachment TTL.
 const CURSOR_ATTACHMENT_TTL_MS = 10 * 60 * 1000;
 
-// Double-tap-Option detection window.
-const DOUBLE_OPTION_WINDOW_MS = 320;
-
 // Single-flight pending lock. No auto-timeout — Claude turns can take
 // long, and a stale "no response" pill is worse than waiting. The lock
-// releases on actual reply or on user dismiss (Esc / Option+Option).
+// releases on actual reply or on user dismiss (Esc / Shift+Shift).
 
 const CURSOR_CHAT_ID = 'cursor-companion';
 
@@ -63,11 +60,11 @@ let win = null;
 let cursorPollTimer = null;
 let lastWinPos = { x: -1, y: -1 };
 let pending = null;
-let optionTapState = { lastTapAt: 0 };
 let isInitialized = false;
 let uiohookRef = null;
-let optionKeyCodes = [];
-let optionListenerAttached = false;
+let shiftKeyCodes = [];
+let mouseListenerAttached = false;
+let isShiftHeld = false;
 let mode = 'dot'; // dot | input | loading | response
 
 function isUsable(w) {
@@ -110,51 +107,96 @@ function getApi() {
         showInput,
         dismiss,
         handleChannelReply,
-        attachOptionListener,
-        detachOptionListener,
+        toggleFromHotkey,
         isPending: () => pending !== null,
         getMode: () => mode,
     };
 }
 
-function attachOptionListener() {
-    if (optionListenerAttached) return;
+/**
+ * Hotkey toggle (Shift+Shift). Mirrors the prior Option+Option semantics:
+ *   dot       → input  (start a turn)
+ *   input     → dot    (cancel the input)
+ *   loading   → input  (queue a follow-up turn)
+ *   response  → input  (continue the conversation)
+ */
+function toggleFromHotkey() {
+    if (!isInitialized) return;
+    if (mode === 'input') {
+        dismiss();
+    } else {
+        showInput();
+    }
+}
+
+/**
+ * Attach passive listeners to the uIOhook singleton:
+ *   - Shift keydown/keyup → track held state for Shift+wheel scroll capture
+ *   - mousedown           → click-anywhere dismiss for the response bubble
+ *
+ * Caller must invoke this AFTER the tray's double-Shift listener has
+ * started uIOhook, so we hook the running singleton rather than spinning
+ * up a competing instance.
+ */
+function attachInputListeners() {
+    if (mouseListenerAttached) return;
     try {
         const { uIOhook, UiohookKey } = require('uiohook-napi');
         uiohookRef = uIOhook;
-        optionKeyCodes = [UiohookKey.Alt, UiohookKey.AltRight].filter((k) => k != null);
-        if (optionKeyCodes.length === 0) {
-            depsRef.logDebug('[CURSOR] uiohook-napi exposes no Alt key codes; Option-tap disabled');
-            return;
-        }
-        uiohookRef.on('keydown', handleOptionKeyDown);
-        optionListenerAttached = true;
-        depsRef.logDebug('[CURSOR] Double-Option activation listener attached');
+        shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight].filter((k) => k != null);
+        uiohookRef.on('keydown', handleShiftKeyDown);
+        uiohookRef.on('keyup', handleShiftKeyUp);
+        uiohookRef.on('mousedown', handleGlobalMouseDown);
+        mouseListenerAttached = true;
+        depsRef.logDebug('[CURSOR] Shift + global click listeners attached');
     } catch (err) {
-        depsRef.logDebug(`[CURSOR] Failed to attach Option listener: ${err.message}`);
+        depsRef.logDebug(`[CURSOR] Failed to attach input listeners: ${err.message}`);
     }
 }
 
-function detachOptionListener() {
-    if (!optionListenerAttached || !uiohookRef) return;
+function detachInputListeners() {
+    if (!mouseListenerAttached || !uiohookRef) return;
     try {
-        uiohookRef.off('keydown', handleOptionKeyDown);
+        uiohookRef.off('keydown', handleShiftKeyDown);
+        uiohookRef.off('keyup', handleShiftKeyUp);
+        uiohookRef.off('mousedown', handleGlobalMouseDown);
     } catch (err) {
-        depsRef.logDebug(`[CURSOR] detach Option listener failed: ${err.message}`);
+        depsRef.logDebug(`[CURSOR] detach input listeners failed: ${err.message}`);
     }
-    optionListenerAttached = false;
+    mouseListenerAttached = false;
     uiohookRef = null;
-    optionKeyCodes = [];
+    shiftKeyCodes = [];
+    isShiftHeld = false;
 }
 
-function handleOptionKeyDown(event) {
-    if (!event || !optionKeyCodes.includes(event.keycode)) {
-        if (event && optionTapState.lastTapAt !== 0 && !optionKeyCodes.includes(event.keycode)) {
-            optionTapState.lastTapAt = 0;
-        }
-        return;
-    }
-    noteOptionTap();
+function handleShiftKeyDown(event) {
+    if (!event || !shiftKeyCodes.includes(event.keycode)) return;
+    if (isShiftHeld) return;
+    isShiftHeld = true;
+    applyInteractivity();
+}
+
+function handleShiftKeyUp(event) {
+    if (!event || !shiftKeyCodes.includes(event.keycode)) return;
+    if (!isShiftHeld) return;
+    isShiftHeld = false;
+    applyInteractivity();
+}
+
+/**
+ * Click anywhere dismisses the response bubble. uIOhook gives us a
+ * passive observation of the click — the click itself still flows to
+ * the foreground app, so the user's intended action (clicking a button
+ * in their browser, focusing a Slack thread, etc.) happens normally;
+ * the bubble just collapses out of the way as a side-effect.
+ *
+ * Loading state is intentionally NOT dismissable by click — a click
+ * during a pending turn shouldn't kill the in-flight request.
+ * Response state IS dismissable.
+ */
+function handleGlobalMouseDown() {
+    if (mode !== 'response') return;
+    dismiss();
 }
 
 function start() {
@@ -164,12 +206,13 @@ function start() {
     if (win) return;
     createWindow();
     startCursorPoll();
+    attachInputListeners();
     depsRef.logDebug('[CURSOR] Companion started');
 }
 
 function stop() {
     stopCursorPoll();
-    detachOptionListener();
+    detachInputListeners();
     if (isUsable(win)) {
         try { win.close(); } catch (_) {}
     }
@@ -275,16 +318,39 @@ function updateWindowPosition() {
 function setMode(next, payload) {
     mode = next;
     if (!isUsable(win)) return;
-    // Toggle interactivity: input mode is the only state that captures
-    // mouse clicks (so the user can click in/select the field). All other
-    // states are click-through so the underlying app stays usable.
     if (next === 'input') {
-        win.setIgnoreMouseEvents(false);
         try { win.focus(); } catch (_) {}
+    }
+    applyInteractivity();
+    win.webContents.send('CURSOR_MODE', { mode: next, ...(payload || {}) });
+}
+
+/**
+ * Compute and apply the window's mouse-event behaviour given the
+ * current mode and shift state. Two surfaces capture mouse events:
+ *
+ *   - input mode:                  always captures (so the user can
+ *                                  click into the textarea or select
+ *                                  text)
+ *   - response mode + Shift held:  captures so a Shift+scroll wheel
+ *                                  event lands on the response bubble
+ *                                  and scrolls the overflow pane
+ *                                  instead of scrolling the host app
+ *
+ * All other states stay click-through with mouse-move forwarding so
+ * the underlying app remains usable. Click-anywhere dismiss for the
+ * response bubble is handled separately via the global mousedown
+ * uIOhook listener — that observation pathway works regardless of
+ * window interactivity.
+ */
+function applyInteractivity() {
+    if (!isUsable(win)) return;
+    const interactive = mode === 'input' || (mode === 'response' && isShiftHeld);
+    if (interactive) {
+        win.setIgnoreMouseEvents(false);
     } else {
         win.setIgnoreMouseEvents(true, { forward: true });
     }
-    win.webContents.send('CURSOR_MODE', { mode: next, ...(payload || {}) });
 }
 
 function showInput() {
@@ -524,15 +590,14 @@ function isFromCursorWindow(event) {
 module.exports = {
     init,
     __test: {
-        noteOptionTap,
         getPendingForTest: () => pending,
         getModeForTest: () => mode,
-        resetTapStateForTest: () => { optionTapState.lastTapAt = 0; },
+        setShiftHeldForTest: (held) => { isShiftHeld = Boolean(held); },
+        getShiftHeldForTest: () => isShiftHeld,
         setScreenForTest: (screen) => {
             depsRef = depsRef || {};
             depsRef.screen = screen;
         },
-        DOUBLE_OPTION_WINDOW_MS,
         CURSOR_LENS_CROP_W,
         CURSOR_LENS_CROP_H,
         WIN_WIDTH,
