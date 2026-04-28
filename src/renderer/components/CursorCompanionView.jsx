@@ -965,7 +965,9 @@ const ReplyBubble = memo(function ReplyBubble({
       </div>
       {/* Natural mirror — measures unwrapped paragraph width to detect overflow.
           If the widest natural line exceeds the inner max, we lock to max-width
-          so wrapped content aligns with the input pill instead of hugging short. */}
+          so wrapped content aligns with the input pill instead of hugging short.
+          width:max-content escapes the narrow companion-window containing block
+          so the measurement reflects intrinsic content width, not parent width. */}
       <div
         ref={naturalMirrorRef}
         aria-hidden
@@ -973,7 +975,8 @@ const ReplyBubble = memo(function ReplyBubble({
           position: 'absolute',
           visibility: 'hidden',
           pointerEvents: 'none',
-          display: 'inline-block',
+          display: 'block',
+          width: 'max-content',
           fontFamily: 'inherit',
           padding: 0,
           margin: 0,
