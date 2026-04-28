@@ -35,7 +35,7 @@ const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 l
 const RESPONSE_MAX_WIDTH = 460;
 const RESPONSE_MAX_HEIGHT = 280;
 const RESPONSE_PADDING_X = 14;
-const RESPONSE_PADDING_Y = 10;
+const RESPONSE_PADDING_Y = 8;
 const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 function CursorCompanionView() {
@@ -145,7 +145,8 @@ function CursorCompanionView() {
   // height + 2 × RESPONSE_PADDING_Y, clamped to RESPONSE_MAX_HEIGHT.
   useLayoutEffect(() => {
     if (mode !== 'response') return;
-    const content = reply?.content || error || '';
+    const raw = reply?.content || error || '';
+    const content = raw.trim();
     if (!content) {
       setResponseHeight(PILL_HEIGHT);
       return;
@@ -208,7 +209,7 @@ function CursorCompanionView() {
   const pillWidth = mode === 'input'
     ? inputBox.width
     : mode === 'loading'
-      ? 12
+      ? 22
       : mode === 'response'
         ? RESPONSE_MAX_WIDTH
         : 8;
@@ -217,7 +218,7 @@ function CursorCompanionView() {
     : mode === 'response'
       ? responseHeight
       : mode === 'loading'
-        ? 12
+        ? 22
         : 8;
   const isPill = mode === 'input' || mode === 'response';
 
@@ -244,8 +245,8 @@ function CursorCompanionView() {
           position: 'absolute',
           left: ANCHOR_X + 14,
           top: ANCHOR_Y + 18,
-          width: isPill ? pillWidth : 8,
-          height: isPill ? pillHeight : 8,
+          width: pillWidth,
+          height: pillHeight,
           borderRadius: isPill ? PILL_RADIUS : '50%',
           background: mode === 'dot'
             ? ACCENT
@@ -352,7 +353,7 @@ function CursorCompanionView() {
               animation: 'cursor-fade-in 200ms ease both',
             }}
           >
-            {reply.content}
+            {reply.content.trim()}
           </div>
         )}
 
@@ -439,7 +440,7 @@ function CursorCompanionView() {
           top: 0,
         }}
       >
-        {reply?.content || error || ' '}
+        {(reply?.content || error || ' ').trim() || ' '}
       </div>
       {/* Hidden wrapped mirror — drives pill height when content wraps
           or contains explicit newlines. Width is locked to the

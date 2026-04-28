@@ -286,11 +286,9 @@ function setMode(next, payload) {
 
 function showInput() {
     if (!isInitialized || !isUsable(win)) return;
-    if (pending) {
-        // Already waiting on a reply — ignore the activation. The
-        // renderer is already in loading mode.
-        return;
-    }
+    // Allow opening the input pill regardless of pending state — the
+    // user can fire follow-up turns while a previous one is still in
+    // flight (parity with desktop/web chat).
     setMode('input');
 }
 
@@ -303,12 +301,15 @@ function noteOptionTap() {
     const now = Date.now();
     if (now - optionTapState.lastTapAt <= DOUBLE_OPTION_WINDOW_MS) {
         optionTapState.lastTapAt = 0;
-        // Toggle: any non-dot state collapses back to dot, dot expands
-        // to input. Mirrors the Shift+Shift desktop-chat affordance.
-        if (mode === 'dot') {
-            showInput();
-        } else {
+        // Option+Option semantics:
+        //   dot       → input  (start a turn)
+        //   input     → dot    (cancel the input)
+        //   loading   → input  (queue a follow-up turn)
+        //   response  → input  (continue the conversation)
+        if (mode === 'input') {
             dismiss();
+        } else {
+            showInput();
         }
         return true;
     }
@@ -382,9 +383,6 @@ function runScreencapture({ x, y, w, h, outPath }) {
 // ─── Submission flow ────────────────────────────────────────────────────
 
 async function submitFromBubble({ prompt }) {
-    if (pending) {
-        return { success: false, error: 'A previous cursor turn is still in flight.' };
-    }
     if (typeof prompt !== 'string' || prompt.trim().length === 0) {
         return { success: false, error: 'Empty prompt' };
     }
@@ -392,8 +390,12 @@ async function submitFromBubble({ prompt }) {
         return { success: false, error: 'Channel mode is not active.' };
     }
 
-    // Establish the pending lock BEFORE capture so the channel reply
-    // forwarder routes the response to us, not local chat.
+    // Establish the pending marker BEFORE capture so the channel reply
+    // forwarder routes the next response to us, not local chat. A
+    // follow-up sent while a previous turn is still pending replaces
+    // the marker — channel-history persists every turn so nothing is
+    // lost on the conversation side; the renderer just renders the
+    // most recent reply in its bubble.
     const turnId = newTurnId();
     pending = {
         turnId,
@@ -414,7 +416,7 @@ async function submitFromBubble({ prompt }) {
 
     const composedContent = [
         `<system-reminder>`,
-        `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot, then act on it naturally: notice what's important or interesting, answer what's asked, or just acknowledge if no action is needed.`,
+        `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
         `</system-reminder>`,
         ``,
         `Cursor companion: I'm pointing at something on my screen.`,
