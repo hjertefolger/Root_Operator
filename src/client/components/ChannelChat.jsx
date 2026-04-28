@@ -371,7 +371,9 @@ const ChatMessageItem = memo(function ChatMessageItem({
 }) {
   const isUser = role === 'user';
   const { text, files } = isUser ? parseFileAttachments(content) : { text: content, files: [] };
-  const assistantAttachments = isUser ? [] : (Array.isArray(attachments) ? attachments : []);
+  const structuredAttachments = Array.isArray(attachments) ? attachments : [];
+  const assistantAttachments = isUser ? [] : structuredAttachments;
+  const userAttachments = isUser ? structuredAttachments : [];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start', gap: 4 }}>
@@ -405,6 +407,15 @@ const ChatMessageItem = memo(function ChatMessageItem({
       {!isUser && assistantAttachments.length > 0 && (
         <AssistantAttachmentList
           attachments={assistantAttachments}
+          externalRef={externalRef}
+          attachmentCache={attachmentCache}
+          attachmentFetchState={attachmentFetchState}
+          onOpenAttachmentViewer={onOpenAttachmentViewer}
+        />
+      )}
+      {isUser && userAttachments.length > 0 && (
+        <AssistantAttachmentList
+          attachments={userAttachments}
           externalRef={externalRef}
           attachmentCache={attachmentCache}
           attachmentFetchState={attachmentFetchState}

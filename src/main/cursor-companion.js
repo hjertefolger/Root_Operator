@@ -436,8 +436,14 @@ async function submitFromBubble({ prompt }) {
                 // human-facing surfaces and conversation memory show the
                 // user's actual prompt, while Claude still receives the
                 // full composed content needed to read the screenshot.
+                //
+                // The screenshot is also surfaced as a real attachment on
+                // the user message, so it renders as a file pill below
+                // the bubble in desktop/PWA chat — same envelope shape as
+                // a user-uploaded file in the regular chat composer.
                 echoToLocalChat: true,
                 displayContent: prompt.trim(),
+                attachments: [capture.path],
             },
         );
         if (!result || result.success === false) {

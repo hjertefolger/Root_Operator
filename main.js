@@ -316,6 +316,7 @@ const localChat = initLocalChat({
     OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
     getStagedAttachmentPath,
     loadStagedAttachmentBytes,
+    stageOutboundAttachments,
     stripAttachmentBytes,
     touchAttachmentForGc,
     logDebug,

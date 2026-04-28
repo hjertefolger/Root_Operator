@@ -26,7 +26,10 @@ const PILL_PADDING_Y = 10;
 const INPUT_LINE_HEIGHT = 22;
 const PILL_HEIGHT = INPUT_LINE_HEIGHT + PILL_PADDING_Y * 2; // 42
 const PILL_RADIUS = 18;
-const PILL_MIN_WIDTH = 180;
+// The expanded pill starts just wide enough to host the cursor as an
+// affordance — narrow, dot-adjacent, not a fixed-width box. Then it
+// grows naturally with the typed content.
+const PILL_MIN_WIDTH = 64;
 const PILL_MAX_WIDTH = 280;
 const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
 const RESPONSE_MAX_WIDTH = 460;
@@ -36,7 +39,12 @@ const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system,
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
   const textareaRef = useRef(null);
-  const measureRef = useRef(null);
+  // Hidden mirror for unwrapped single-line width. Drives pill width.
+  const widthMirrorRef = useRef(null);
+  // Hidden mirror constrained to the locked PILL_MAX_WIDTH inner space,
+  // wrapping with the same font/wrap rules as the textarea. Drives pill
+  // height for both wrapped content AND content with explicit newlines.
+  const wrapMirrorRef = useRef(null);
   const [mode, setMode] = useState('dot');
   const [prompt, setPrompt] = useState('');
   const [reply, setReply] = useState(null);
@@ -88,38 +96,37 @@ function CursorCompanionView() {
     }
   }, [mode]);
 
-  // Measure prompt synchronously before paint so the pill width never
-  // lags the typed character — eliminates the per-keystroke flicker.
+  // Measure prompt synchronously before paint, BEFORE first render
+  // commits, using two hidden mirrors. No DOM mutations on the textarea
+  // itself — both width and height are React-state-driven so the outer
+  // pill and inner textarea always update in the same paint frame and
+  // never disagree, which was the root cause of the per-keystroke
+  // flicker.
   //
-  // Width is decided first from the hidden mirror (which measures
-  // unwrapped single-line text). Height is always read from the
-  // textarea's scrollHeight AFTER the width is pinned, so explicit
-  // newlines (Shift+Enter, pasted multi-line text) grow the pill
-  // vertically even when the unwrapped width still fits on one line.
+  // Width comes from the single-line `widthMirrorRef`. Height comes
+  // from the wrap-locked `wrapMirrorRef` whenever the content would
+  // wrap or contains explicit newlines; otherwise it's exactly one
+  // line. The wrap mirror has identical font + width constraints as
+  // the textarea will have, so its rendered height is what the
+  // textarea will render at.
   useLayoutEffect(() => {
     if (mode !== 'input') return;
-    const measuredWidth = measureRef.current?.scrollWidth || 0;
-    const desiredWidth = measuredWidth + PILL_PADDING_X * 2 + 2;
+    const singleLineWidth = widthMirrorRef.current?.scrollWidth || 0;
+    const desiredWidth = singleLineWidth + PILL_PADDING_X * 2 + 2;
     const nextWidth = Math.min(
       PILL_MAX_WIDTH,
       Math.max(PILL_MIN_WIDTH, desiredWidth),
     );
 
+    const wantsWrap = desiredWidth > PILL_MAX_WIDTH;
+    const hasNewlines = prompt.includes('\n');
     let nextTextHeight = INPUT_LINE_HEIGHT;
-    const ta = textareaRef.current;
-    if (ta) {
-      // Pin the textarea to the locked inner width BEFORE reading
-      // scrollHeight, so wrapped content is measured against the width
-      // it will actually render at. Then read scrollHeight as the source
-      // of truth for height — this picks up explicit newlines too.
-      const innerWidth = Math.max(8, nextWidth - PILL_PADDING_X * 2);
-      ta.style.width = `${innerWidth}px`;
-      ta.style.height = '0px';
+    if (wantsWrap || hasNewlines) {
+      const wrapHeight = wrapMirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
       nextTextHeight = Math.min(
         PILL_INPUT_MAX_HEIGHT - PILL_PADDING_Y * 2,
-        Math.max(INPUT_LINE_HEIGHT, ta.scrollHeight),
+        Math.max(INPUT_LINE_HEIGHT, wrapHeight),
       );
-      ta.style.height = `${nextTextHeight}px`;
     }
 
     const nextHeight = Math.max(PILL_HEIGHT, nextTextHeight + PILL_PADDING_Y * 2);
@@ -190,16 +197,16 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. Anchored so its top-left sits just below
-          and to the right of the cursor pointer — pill grows rightward
-          (until PILL_MAX_WIDTH) then downward, never above the cursor.
-          This matches the convention in cursor-anchored AI surfaces and
-          guarantees the pill never clips out of the top of the window. */}
+      {/* The morphing element. Pill mode anchors the top-left at the
+          cursor pointer hot spot, growing right then down — never
+          above. Dot mode sits offset south-east of the hot spot so it
+          doesn't overlap the cursor arrow visual (the arrow extends
+          ~15×22 px from the hot spot). */}
       <div
         style={{
           position: 'absolute',
-          left: ANCHOR_X,
-          top: mode === 'dot' ? ANCHOR_Y + 4 : ANCHOR_Y,
+          left: mode === 'dot' ? ANCHOR_X + 14 : ANCHOR_X,
+          top: mode === 'dot' ? ANCHOR_Y + 18 : ANCHOR_Y,
           width: isPill ? pillWidth : 8,
           height: isPill ? pillHeight : 8,
           borderRadius: isPill ? PILL_RADIUS : '50%',
@@ -236,12 +243,22 @@ function CursorCompanionView() {
           pointerEvents: isPill ? 'auto' : 'none',
           overflow: 'hidden',
           transition:
-            'width 180ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-            'height 220ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-            'border-radius 220ms ease, ' +
-            'background 200ms ease, ' +
-            'box-shadow 200ms ease, ' +
-            'padding 180ms ease',
+            mode === 'input'
+              // While typing, height changes must be instant so the
+              // outer pill and the React-driven textarea height stay
+              // synchronized. Width can still animate since the
+              // textarea width follows via 100%.
+              ? 'width 140ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'border-radius 220ms ease, ' +
+                'background 200ms ease, ' +
+                'box-shadow 200ms ease, ' +
+                'padding 180ms ease'
+              : 'width 180ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'height 220ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'border-radius 220ms ease, ' +
+                'background 200ms ease, ' +
+                'box-shadow 200ms ease, ' +
+                'padding 180ms ease',
         }}
       >
         {mode === 'input' && (
@@ -338,25 +355,53 @@ function CursorCompanionView() {
         </div>
       )}
 
-      {/* Hidden mirror element to measure prompt text width with the
-          same font metrics as the textarea. Used to grow the pill
-          horizontally up to PILL_MAX_WIDTH; beyond that the textarea
-          wraps and grows vertically instead. */}
+      {/* Hidden single-line mirror — drives pill width via scrollWidth
+          of unwrapped content. */}
       <span
-        ref={measureRef}
+        ref={widthMirrorRef}
+        aria-hidden
         style={{
           position: 'absolute',
           visibility: 'hidden',
+          pointerEvents: 'none',
           whiteSpace: 'pre',
           fontFamily: 'inherit',
           fontSize: 15,
           lineHeight: `${INPUT_LINE_HEIGHT}px`,
           padding: 0,
           margin: 0,
+          left: 0,
+          top: 0,
         }}
       >
         {prompt || ' '}
       </span>
+      {/* Hidden wrapped mirror — drives pill height when content wraps
+          or contains explicit newlines. Width is locked to the
+          textarea's eventual inner width at PILL_MAX_WIDTH, font and
+          wrap rules match the textarea exactly. */}
+      <div
+        ref={wrapMirrorRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          pointerEvents: 'none',
+          width: `${PILL_MAX_WIDTH - PILL_PADDING_X * 2}px`,
+          whiteSpace: 'pre-wrap',
+          overflowWrap: 'break-word',
+          wordBreak: 'break-word',
+          fontFamily: 'inherit',
+          fontSize: 15,
+          lineHeight: `${INPUT_LINE_HEIGHT}px`,
+          padding: 0,
+          margin: 0,
+          left: 0,
+          top: 0,
+        }}
+      >
+        {prompt || ' '}
+      </div>
 
       <style>{`
         @keyframes cursor-fade-in {
