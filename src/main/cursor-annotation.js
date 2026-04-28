@@ -29,6 +29,7 @@ let isInitialized = false;
 let currentFreezePath = null;
 let currentDisplay = null;
 let currentRectInit = null;
+let currentCursorAnchor = null; // window-local cursor point at invocation
 let currentActiveApp = null;
 let pendingCommitHandler = null;
 
@@ -133,6 +134,13 @@ async function openAnnotation() {
         Math.min(point.y - display.bounds.y - rectH / 2, display.bounds.height - rectH),
     );
     currentRectInit = { x: rectX, y: rectY, w: rectW, h: rectH };
+    // Cursor anchor in window-local (display-relative) coordinates.
+    // Toolbar uses this so it spawns next to the cursor, mirroring how
+    // the cursor presence input/replies anchor at the cursor.
+    currentCursorAnchor = {
+        x: Math.max(0, Math.min(point.x - display.bounds.x, display.bounds.width)),
+        y: Math.max(0, Math.min(point.y - display.bounds.y, display.bounds.height)),
+    };
     currentActiveApp = await activeAppPromise;
 
     createAnnotationWindow();
@@ -197,6 +205,7 @@ function cleanupFreeze(reason) {
     currentFreezePath = null;
     currentDisplay = null;
     currentRectInit = null;
+    currentCursorAnchor = null;
     currentActiveApp = null;
     if (!p) return;
     try { fs.unlinkSync(p); } catch (_) { /* already gone */ }
@@ -236,6 +245,7 @@ function getInitState() {
         freezeDataUrl,
         display: { ...currentDisplay },
         rect: { ...currentRectInit },
+        cursorAnchor: currentCursorAnchor ? { ...currentCursorAnchor } : null,
     };
 }
 

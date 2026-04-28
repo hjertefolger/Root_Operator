@@ -103,6 +103,11 @@ let isShiftHeld = false;
 // Layered visibility. Each is independent.
 let inputOpen = false;
 let replies = []; // array of { id, content, ts, role }
+// Monotonic counter incremented on every pushReply, even when the
+// stack evicts the oldest entry. Used by the activity-terminal path
+// to detect "did THIS turn produce a reply?" without being fooled by
+// REPLY_STACK_CAP eviction or manual dismissal during pending.
+let replySequence = 0;
 let terminalGraceTimer = null;
 let terminalGraceTurnId = null;
 
@@ -111,6 +116,11 @@ let terminalGraceTurnId = null;
 // slot for v1; future iterations may stack multiple attachments.
 //   { path, name, size, rect: { w, h }, activeApp: { name, bundleId } }
 let pendingAttachment = null;
+
+// app.on('hide') handler — macOS Cmd+H hides all windows in the app,
+// including our NSPanel. The user's intent is "hide chat", not "kill
+// the cursor dot." We re-show on next tick to ride past the cascade.
+let appHideHandler = null;
 
 // Half-written prompt persists across dismissals. Cleared on successful submit.
 let draftPrompt = '';
@@ -369,13 +379,48 @@ function start() {
     startCursorPoll();
     attachInputListeners();
     startAttachmentSweep();
+    attachAppHideHandler();
     depsRef.logDebug('[CURSOR] Companion started');
+}
+
+function attachAppHideHandler() {
+    if (appHideHandler) return;
+    const { app } = depsRef;
+    if (!app || typeof app.on !== 'function') return;
+    appHideHandler = () => {
+        // macOS Cmd+H → app.hide() → all windows hide. The cursor
+        // panel should stay alive when Cursor Presence is enabled, so
+        // re-show on the next tick (gives the OS a beat to finish its
+        // hide animation before we contradict it).
+        setImmediate(() => {
+            if (isUsable(win) && !win.isVisible()) {
+                try { win.showInactive(); } catch (_) {}
+            }
+        });
+    };
+    app.on('hide', appHideHandler);
+}
+
+function detachAppHideHandler() {
+    if (!appHideHandler) return;
+    const { app } = depsRef || {};
+    if (app) {
+        try {
+            if (typeof app.off === 'function') {
+                app.off('hide', appHideHandler);
+            } else if (typeof app.removeListener === 'function') {
+                app.removeListener('hide', appHideHandler);
+            }
+        } catch (_) { /* best-effort detach */ }
+    }
+    appHideHandler = null;
 }
 
 function stop() {
     stopCursorPoll();
     stopAttachmentSweep();
     detachInputListeners();
+    detachAppHideHandler();
     if (terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
         terminalGraceTimer = null;
@@ -681,6 +726,7 @@ function pushReply({ content, ts, role = 'assistant' }) {
     if (typeof content !== 'string' || content.trim().length === 0) return;
     replies.push({ id: newReplyId(), content, ts: ts || null, role });
     while (replies.length > REPLY_STACK_CAP) replies.shift();
+    replySequence += 1;
     setLastReply(content, ts);
     applyInteractivity();
     broadcastState({ event: 'reply_appended' });
@@ -836,7 +882,16 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     // marker; older turns still flow through, their replies arriving on
     // the stack via handleChannelReply.
     const turnId = newTurnId();
-    pending = { turnId, startedAt: Date.now(), attachmentPath: null };
+    pending = {
+        turnId,
+        startedAt: Date.now(),
+        attachmentPath: null,
+        // Monotonic counter snapshot — survives REPLY_STACK_CAP
+        // eviction and manual dismissals, unlike `replies.length`.
+        // The activity-terminal path uses this to decide whether THIS
+        // turn produced a reply.
+        replySequenceAtSubmit: replySequence,
+    };
 
     if (terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
@@ -960,15 +1015,30 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
 }
 
 /**
- * Forward a channel reply to the renderer when there's a pending cursor
- * turn. Each reply pushes onto the visible stack (cap REPLY_STACK_CAP).
+ * Forward a channel reply to the renderer when its chat_id targets the
+ * cursor surface. Each reply pushes onto the visible stack (cap
+ * REPLY_STACK_CAP).
+ *
+ * The chat_id filter (set by the reply tool from the originating
+ * channel message) is the source of truth — replies tagged for the
+ * cursor surface always land here, even after `pending` clears.
+ *
+ * Why no `!pending` gate: the activity stream can emit `finished`
+ * before the `claude_reply` socket message arrives. The grace timer
+ * (TERMINAL_GRACE_MS) covers the typical race, but Claude can take
+ * longer than that to actually call the reply tool. A reply tagged for
+ * cursor must always reach the cursor stack; dropping it would mean
+ * "your prompt is in chat history but invisible on the cursor surface
+ * that asked the question."
  *
  * Cancels any in-flight terminal grace timer — the reply we were
  * waiting for has now arrived.
  */
 function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
-    if (!pending) return false;
-    if (chatId && chatId !== CURSOR_CHAT_ID) return false;
+    // Strict surface correlation: reply must explicitly target the
+    // cursor surface. Replies from desktop chat / paired devices
+    // arrive with their own chat_id and must never bleed in here.
+    if (chatId !== CURSOR_CHAT_ID) return false;
     if (!isUsable(win)) return false;
 
     if (terminalGraceTimer) {
@@ -1023,7 +1093,14 @@ function handleChannelActivity(activity = {}) {
     // turn, it's already on the stack — just clear pending. If not,
     // start a grace timer: the reply socket message may be in flight
     // and arrive shortly after the activity stream goes idle.
-    const hasReplyForTurn = replies.length > 0;
+    //
+    // Compare against the monotonic replySequence at submit. This
+    // survives REPLY_STACK_CAP eviction (which would freeze
+    // replies.length) and manual stack dismissal during pending.
+    const baseline = typeof pending.replySequenceAtSubmit === 'number'
+        ? pending.replySequenceAtSubmit
+        : 0;
+    const hasReplyForTurn = replySequence > baseline;
     if (hasReplyForTurn) {
         pending = null;
         broadcastState({ event: 'turn_completed', turnId: turnIdAtEntry });
