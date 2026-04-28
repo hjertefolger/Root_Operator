@@ -18,24 +18,20 @@ const ANCHOR_X = 16;
 const ANCHOR_Y = 16;
 
 const ACCENT = '#4B5AFF';
-const PILL_HEIGHT = 32;
-// Pill needs enough inner room to render a comfortable handful of mono
-// characters BEFORE any per-keystroke width growth — otherwise the
-// textarea is too narrow to fit even one character without wrapping,
-// and scrollHeight reports multi-line on the very first keystroke.
-// 160px outer → ~132px inner → ~20 mono chars before the pill starts
-// extending.
-const PILL_MIN_WIDTH = 160;
-// Wrap to a second row well before the pill stretches across the
-// screen — a comfortable ~36-char single line, then growth goes
-// vertical instead of horizontal.
-const PILL_MAX_WIDTH = 280;
+// Pill / response styling mirrors the desktop chat message bubbles:
+// 18px radius, 10×14 padding, fontSize 15, lineHeight 1.45 (≈22px),
+// system sans (Geist Sans) — see ChatMessage in ChannelChat.jsx.
 const PILL_PADDING_X = 14;
-const PILL_PADDING_Y = 7;
-const INPUT_LINE_HEIGHT = 18;
-const PILL_INPUT_MAX_HEIGHT = 128;
+const PILL_PADDING_Y = 10;
+const INPUT_LINE_HEIGHT = 22;
+const PILL_HEIGHT = INPUT_LINE_HEIGHT + PILL_PADDING_Y * 2; // 42
+const PILL_RADIUS = 18;
+const PILL_MIN_WIDTH = 180;
+const PILL_MAX_WIDTH = 280;
+const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
 const RESPONSE_MAX_WIDTH = 460;
 const RESPONSE_MAX_HEIGHT = 280;
+const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
@@ -190,7 +186,7 @@ function CursorCompanionView() {
         // areas around the pill itself.
         pointerEvents: 'none',
         userSelect: 'none',
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        fontFamily: PILL_FONT_FAMILY,
       }}
       onKeyDown={handleKeyDown}
     >
@@ -206,18 +202,22 @@ function CursorCompanionView() {
           top: mode === 'dot' ? ANCHOR_Y + 4 : ANCHOR_Y,
           width: isPill ? pillWidth : 8,
           height: isPill ? pillHeight : 8,
-          borderRadius: isPill ? Math.min(pillHeight / 2, 16) : '50%',
+          borderRadius: isPill ? PILL_RADIUS : '50%',
           background: mode === 'dot'
             ? ACCENT
-            : mode === 'response'
-              ? 'rgba(10, 10, 12, 0.94)'
-              : 'rgba(15, 15, 18, 0.92)',
+            : mode === 'input'
+              ? ACCENT
+              : mode === 'response'
+                ? 'rgba(255, 255, 255, 0.08)'
+                : 'rgba(15, 15, 18, 0.92)',
           boxShadow: mode === 'dot'
             ? `0 0 6px 1px rgba(75, 90, 255, 0.35)`
-            : `0 0 0 1px rgba(75, 90, 255, 0.3), 0 8px 24px rgba(0, 0, 0, 0.42)`,
-          backdropFilter: isPill ? 'blur(14px)' : 'none',
-          WebkitBackdropFilter: isPill ? 'blur(14px)' : 'none',
-          color: 'rgba(255, 255, 255, 0.95)',
+            : mode === 'input'
+              ? `0 8px 24px rgba(0, 0, 0, 0.32)`
+              : `0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)`,
+          backdropFilter: mode === 'response' || mode === 'loading' ? 'blur(14px)' : 'none',
+          WebkitBackdropFilter: mode === 'response' || mode === 'loading' ? 'blur(14px)' : 'none',
+          color: mode === 'input' ? '#ffffff' : 'rgba(255, 255, 255, 0.9)',
           display: 'flex',
           alignItems: mode === 'response' || mode === 'input' ? 'flex-start' : 'center',
           justifyContent: mode === 'loading' ? 'center' : 'flex-start',
@@ -263,21 +263,22 @@ function CursorCompanionView() {
               outline: 'none',
               padding: 0,
               margin: 0,
-              color: 'rgba(255, 255, 255, 0.95)',
-              caretColor: ACCENT,
+              color: '#ffffff',
+              caretColor: '#ffffff',
               fontFamily: 'inherit',
-              fontSize: 13,
+              fontSize: 15,
               lineHeight: `${INPUT_LINE_HEIGHT}px`,
               resize: 'none',
               overflowY: inputBox.height >= PILL_INPUT_MAX_HEIGHT ? 'auto' : 'hidden',
               whiteSpace: 'pre-wrap',
               overflowWrap: 'break-word',
+              wordBreak: 'break-word',
               userSelect: 'text',
             }}
           />
         )}
 
-        {mode === 'loading' && <FourDotLoader />}
+        {mode === 'loading' && <ActivityDots />}
 
         {mode === 'response' && reply && (
           <div
@@ -285,9 +286,9 @@ function CursorCompanionView() {
               flex: '1 1 auto',
               maxHeight: RESPONSE_MAX_HEIGHT - 20,
               overflowY: 'auto',
-              fontSize: 13,
-              lineHeight: 1.55,
-              color: 'rgba(255, 255, 255, 0.95)',
+              fontSize: 15,
+              lineHeight: 1.45,
+              color: 'rgba(255, 255, 255, 0.9)',
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
               userSelect: 'text',
@@ -348,7 +349,7 @@ function CursorCompanionView() {
           visibility: 'hidden',
           whiteSpace: 'pre',
           fontFamily: 'inherit',
-          fontSize: 13,
+          fontSize: 15,
           lineHeight: `${INPUT_LINE_HEIGHT}px`,
           padding: 0,
           margin: 0,
@@ -362,30 +363,40 @@ function CursorCompanionView() {
           from { opacity: 0; transform: translateY(2px); }
           to { opacity: 1; transform: translateY(0); }
         }
-        @keyframes cursor-loader-bounce {
-          0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
-          40% { transform: scale(1); opacity: 1; }
-        }
       `}</style>
     </div>
   );
 }
 
-function FourDotLoader() {
-  const dot = (delayMs) => ({
-    width: 5,
-    height: 5,
+/**
+ * 2×2 dot loader, identical to the desktop chat's ActivityDots
+ * indicator (see ChannelChat.jsx). Sequential active idx 0→1→3→2
+ * traces a clockwise rotation; opacity + scale transition each step.
+ */
+function ActivityDots() {
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => setActive((p) => (p + 1) % 4), 260);
+    return () => clearInterval(t);
+  }, []);
+
+  const dotStyle = (idx) => ({
+    width: 4,
+    height: 4,
     borderRadius: '50%',
     background: ACCENT,
-    animation: `cursor-loader-bounce 1.0s ${delayMs}ms ease-in-out infinite`,
-    display: 'inline-block',
+    opacity: active === idx ? 1 : 0.16,
+    transform: active === idx ? 'scale(1)' : 'scale(0.78)',
+    transition: 'opacity 0.24s ease, transform 0.24s ease',
   });
+
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-      <span style={dot(0)} />
-      <span style={dot(120)} />
-      <span style={dot(240)} />
-      <span style={dot(360)} />
+    <div style={{ display: 'grid', gridTemplateColumns: '4px 4px', gap: 4 }}>
+      <div style={dotStyle(0)} />
+      <div style={dotStyle(1)} />
+      <div style={dotStyle(3)} />
+      <div style={dotStyle(2)} />
     </div>
   );
 }
