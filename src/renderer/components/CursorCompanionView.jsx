@@ -130,7 +130,7 @@ const RESPONSE_MAX_HEIGHT = 280;
 // inner div so the scrollbar (track) sits flush at the bubble's right
 // edge instead of inset by 14px.
 const RESPONSE_PADDING_X = 14;
-const RESPONSE_PADDING_Y = 10;
+const RESPONSE_PADDING_Y = 8;
 const RESPONSE_INNER_RIGHT_PAD = 4;
 const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
@@ -496,7 +496,7 @@ function CursorCompanionView() {
         onMouseDown={handlePillMouseDown}
         style={{
           position: 'absolute',
-          left: mode === 'loading' ? ANCHOR_X + 10 : ANCHOR_X + 14,
+          left: mode === 'loading' ? ANCHOR_X + 8 : ANCHOR_X + 14,
           top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 14,
           width: pillWidth,
           height: pillHeight,
