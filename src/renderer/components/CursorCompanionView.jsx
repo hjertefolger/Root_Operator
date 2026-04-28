@@ -154,6 +154,10 @@ function CursorCompanionView() {
   const [prompt, setPrompt] = useState('');
   const [reply, setReply] = useState(null);
   const [error, setError] = useState(null);
+  // True while the textarea has lost focus in input mode. Drives the
+  // park-on-blur affordance — main pauses cursor following so the user
+  // can move the system cursor onto the bubble and click to refocus.
+  const [isBlurred, setIsBlurred] = useState(false);
   const [inputBox, setInputBox] = useState({
     width: PILL_MIN_WIDTH,
     height: PILL_HEIGHT,
@@ -167,13 +171,19 @@ function CursorCompanionView() {
       if (!payload || typeof payload.mode !== 'string') return;
       setMode(payload.mode);
       if (payload.mode === 'input') {
-        setPrompt('');
+        // Restore the persisted draft (12h TTL) so accidentally
+        // dismissing a half-written prompt doesn't cost the user the
+        // text — Shift+Shift back open and it reappears.
+        const restored = typeof payload.draftPrompt === 'string' ? payload.draftPrompt : '';
+        setPrompt(restored);
         setReply(null);
         setError(null);
+        setIsBlurred(false);
       }
       if (payload.mode === 'dot') {
         setPrompt('');
         setReply(null);
+        setIsBlurred(false);
         // Keep `error` so a failed submission/timeout remains briefly
         // visible until the user activates the input again.
       }
@@ -189,14 +199,32 @@ function CursorCompanionView() {
     };
   }, [on]);
 
-  // Auto-focus the textarea when entering input mode.
+  // Auto-focus the textarea when entering input mode and place caret at
+  // end so a restored draft is immediately editable.
   useEffect(() => {
     if (mode === 'input' && textareaRef.current) {
       requestAnimationFrame(() => {
-        textareaRef.current?.focus();
+        const node = textareaRef.current;
+        if (!node) return;
+        node.focus();
+        try {
+          const end = node.value.length;
+          node.setSelectionRange(end, end);
+        } catch (_) {}
       });
     }
   }, [mode]);
+
+  // Debounced draft sync to main. Lets the tray-side Shift+Shift path
+  // dismiss with a current draft even though the renderer wasn't the
+  // gesture source.
+  useEffect(() => {
+    if (mode !== 'input') return undefined;
+    const t = setTimeout(() => {
+      void invoke('CURSOR_DRAFT_UPDATE', { prompt }).catch(() => {});
+    }, 120);
+    return () => clearTimeout(t);
+  }, [prompt, mode, invoke]);
 
   // Global wheel capture while the response bubble is visible. The
   // bubble travels with the cursor, so the cursor is never *over* the
@@ -280,8 +308,10 @@ function CursorCompanionView() {
   }, [mode, reply, error]);
 
   const handleDismiss = useCallback(async () => {
-    try { await invoke('CURSOR_DISMISS'); } catch (_) {}
-  }, [invoke]);
+    // Pass the current prompt so main can persist it as the draft —
+    // covers Esc and any other explicit-dismiss path.
+    try { await invoke('CURSOR_DISMISS', { prompt }); } catch (_) {}
+  }, [invoke, prompt]);
 
   const handleSubmit = useCallback(async (withScreenshot = false) => {
     const trimmed = prompt.trim();
@@ -296,10 +326,32 @@ function CursorCompanionView() {
     }
   }, [invoke, prompt]);
 
-  // Renderer-side double-Shift fallback: when the cursor-companion
-  // window has keyboard focus (input mode), uIOhook can miss the
-  // discrete shift up/down events from inside the focused panel. Detect
-  // double-tap-Shift locally so the toggle still collapses input → dot.
+  const handleBlur = useCallback(() => {
+    setIsBlurred(true);
+    void invoke('CURSOR_BLUR_PARK').catch(() => {});
+  }, [invoke]);
+
+  const handleFocus = useCallback(() => {
+    setIsBlurred(false);
+    void invoke('CURSOR_FOCUS_RESUME').catch(() => {});
+  }, [invoke]);
+
+  // Click-to-refocus while the bubble is parked. Native click on the
+  // textarea focuses it for free; this handler covers clicks landing on
+  // the pill padding/border around the textarea.
+  const handlePillMouseDown = useCallback((e) => {
+    if (mode !== 'input') return;
+    if (!isBlurred) return;
+    if (e.target === textareaRef.current) return;
+    e.preventDefault();
+    textareaRef.current?.focus();
+  }, [mode, isBlurred]);
+
+  // Renderer-side double-Shift detector. When the cursor-companion
+  // panel has keyboard focus (input mode), uIOhook can miss discrete
+  // shift up/down events. Detect locally and dispatch the gesture
+  // through the unified main-process entry — same lock applies, so the
+  // tray-side path's late event is suppressed.
   const shiftTapAtRef = useRef(0);
 
   const handleKeyDown = (e) => {
@@ -313,7 +365,7 @@ function CursorCompanionView() {
       if (now - shiftTapAtRef.current <= 320) {
         shiftTapAtRef.current = 0;
         e.preventDefault();
-        handleDismiss();
+        void invoke('CURSOR_SHIFT_GESTURE', { prompt }).catch(() => {});
       } else {
         shiftTapAtRef.current = now;
       }
@@ -362,6 +414,7 @@ function CursorCompanionView() {
           offset of the cursor pointer hot spot so the bubble grows from
           where the dot is, never teleports under the cursor. */}
       <div
+        onMouseDown={handlePillMouseDown}
         style={{
           position: 'absolute',
           left: ANCHOR_X + 14,
@@ -369,6 +422,9 @@ function CursorCompanionView() {
           width: pillWidth,
           height: pillHeight,
           borderRadius: isPill ? PILL_RADIUS : '50%',
+          // Subtle dim while parked-and-blurred so the user gets a
+          // visual cue that the pill is awaiting a click to refocus.
+          opacity: mode === 'input' && isBlurred ? 0.78 : 1,
           background: mode === 'dot'
             ? ACCENT
             : mode === 'input'
@@ -434,6 +490,8 @@ function CursorCompanionView() {
             rows={1}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            onBlur={handleBlur}
+            onFocus={handleFocus}
             spellCheck={false}
             autoComplete="off"
             className="cursor-thin-scroll"

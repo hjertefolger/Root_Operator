@@ -55,6 +55,25 @@ const CURSOR_ATTACHMENT_TTL_MS = 10 * 60 * 1000;
 
 const CURSOR_CHAT_ID = 'cursor-companion';
 
+// Suppression window after a Shift+Shift gesture is dispatched. Both
+// the renderer-side detector (textarea keydown) and the tray-side
+// uIOhook keyup detector observe the same physical double-tap. Whichever
+// fires first claims the gesture; subsequent dispatches inside this
+// window are dropped. Without this, the second source's late event sees
+// the just-applied state and toggles back, which is what produced the
+// "Shift+Shift relaunches input from response" race.
+const GESTURE_LOCK_MS = 250;
+
+// Drafts are in-memory only and time-bounded. 12h is generous enough to
+// survive a meeting/lunch/etc but short enough that a draft from
+// yesterday won't surprise-restore in a long-running app session.
+const DRAFT_TTL_MS = 12 * 60 * 60 * 1000;
+
+// Last reply persists across dismissals so a future triple-tap gesture
+// can recall it. Shorter TTL than draft — recall is a "the thing I just
+// asked about" affordance, not a long-term memory.
+const LAST_REPLY_TTL_MS = 30 * 60 * 1000;
+
 let depsRef = null;
 let win = null;
 let cursorPollTimer = null;
@@ -66,6 +85,27 @@ let shiftKeyCodes = [];
 let mouseListenerAttached = false;
 let isShiftHeld = false;
 let mode = 'dot'; // dot | input | loading | response
+
+// Half-written prompt persists across dismissals so the user can step
+// away to look something up and come back to it. Cleared on successful
+// submit.
+let draftPrompt = '';
+let draftUpdatedAt = 0;
+
+// Stored on every assistant reply. Wired now so a future triple-Shift
+// gesture can recall the last response without an additional patch.
+let lastReply = null;
+let lastReplyUpdatedAt = 0;
+
+// Gesture suppression: timestamp until which subsequent gesture
+// dispatches should be ignored. Updated by handleShiftGesture.
+let gestureLockUntil = 0;
+
+// Cursor-following pause. The window normally chases the pointer at
+// 60Hz; while parked it stays at its current screen position so the
+// user can move the system cursor onto the bubble (e.g. to refocus the
+// textarea after a blur). Auto-cleared whenever mode leaves `input`.
+let isParked = false;
 
 function isUsable(w) {
     return Boolean(w && !w.isDestroyed());
@@ -114,23 +154,61 @@ function getApi() {
 }
 
 /**
- * Hotkey toggle (Shift+Shift). Idempotent — from `dot` it opens the
- * input pill; from any visible state (input / loading / response) it
- * dismisses to dot. This makes the gesture race-safe: if both the
- * main-process detector and the renderer-side fallback fire from the
- * same physical double-tap, the second invocation is a no-op (already
- * in dot) instead of bouncing back to input mode.
+ * Single Shift+Shift gesture entry. Both the tray-side uIOhook detector
+ * (via `toggleFromHotkey`) and the renderer-side textarea-keydown
+ * detector (via the `CURSOR_SHIFT_GESTURE` IPC) funnel through here so
+ * the per-mode dispatch and the suppression lock are applied uniformly.
  *
- * Continuing a conversation after a response is now done by tapping
- * Shift+Shift twice (dismiss → reopen).
+ * Per-mode mapping:
+ *   dot       → showInput        (start a turn, restore draft if any)
+ *   input     → dismiss          (preserve draft for next open)
+ *   loading   → no-op            (avoid confusing an in-flight turn)
+ *   response  → showInput        (continue the conversation)
+ *
+ * options.prompt — if provided (renderer path), it's the latest textarea
+ * value at the moment the gesture fired. We persist it as the draft
+ * before any mode transition so dismiss-from-input never loses the most
+ * recent keystroke.
+ */
+function handleShiftGesture(source = 'tray', options = {}) {
+    if (!isInitialized) return;
+
+    // Persist any renderer-supplied prompt as the draft *before* the
+    // lock check. If the tray-side keyup detector won the race and
+    // already dismissed input, this gesture is about to be suppressed —
+    // but the renderer's `prompt` is fresher than the last debounced
+    // CURSOR_DRAFT_UPDATE (max 120ms stale), so we save it anyway. That
+    // closes the last sub-frame of typing that could otherwise be lost
+    // when CURSOR_MODE→dot clears the renderer's prompt state.
+    if (source === 'renderer' && typeof options.prompt === 'string') {
+        setDraftPrompt(options.prompt);
+    }
+
+    const now = Date.now();
+    if (now < gestureLockUntil) {
+        depsRef.logDebug(`[CURSOR] gesture suppressed (source=${source})`);
+        return;
+    }
+    gestureLockUntil = now + GESTURE_LOCK_MS;
+
+    if (mode === 'loading') {
+        return;
+    }
+    if (mode === 'input') {
+        dismiss();
+        return;
+    }
+    showInput();
+}
+
+/**
+ * Tray-side hotkey path. Kept for the existing main.js wiring. The
+ * tray detector has no access to the in-flight textarea contents, so
+ * any draft persistence here relies on the renderer's debounced
+ * `CURSOR_DRAFT_UPDATE` syncs prior to the gesture.
  */
 function toggleFromHotkey() {
-    if (!isInitialized) return;
-    if (mode === 'dot') {
-        showInput();
-    } else {
-        dismiss();
-    }
+    handleShiftGesture('tray');
 }
 
 /**
@@ -304,6 +382,7 @@ function stopCursorPoll() {
 
 function updateWindowPosition() {
     if (!isUsable(win)) return;
+    if (isParked) return;
 
     const point = depsRef.screen.getCursorScreenPoint();
     const targetX = point.x - ANCHOR_X;
@@ -321,12 +400,57 @@ function updateWindowPosition() {
 
 function setMode(next, payload) {
     mode = next;
+    // Cursor following always resumes when leaving input — parking is
+    // an input-mode affordance only.
+    if (next !== 'input') isParked = false;
     if (!isUsable(win)) return;
     if (next === 'input') {
         try { win.focus(); } catch (_) {}
     }
     applyInteractivity();
     win.webContents.send('CURSOR_MODE', { mode: next, ...(payload || {}) });
+}
+
+function getFreshDraft() {
+    if (!draftPrompt) return '';
+    if (Date.now() - draftUpdatedAt > DRAFT_TTL_MS) {
+        draftPrompt = '';
+        draftUpdatedAt = 0;
+        return '';
+    }
+    return draftPrompt;
+}
+
+function setDraftPrompt(next) {
+    const value = typeof next === 'string' ? next : '';
+    if (value.length === 0) {
+        draftPrompt = '';
+        draftUpdatedAt = 0;
+        return;
+    }
+    draftPrompt = value;
+    draftUpdatedAt = Date.now();
+}
+
+function clearDraftPrompt() {
+    draftPrompt = '';
+    draftUpdatedAt = 0;
+}
+
+function setLastReply(content, ts) {
+    if (typeof content !== 'string' || content.length === 0) return;
+    lastReply = { content, ts: ts || null };
+    lastReplyUpdatedAt = Date.now();
+}
+
+function getFreshLastReply() {
+    if (!lastReply) return null;
+    if (Date.now() - lastReplyUpdatedAt > LAST_REPLY_TTL_MS) {
+        lastReply = null;
+        lastReplyUpdatedAt = 0;
+        return null;
+    }
+    return lastReply;
 }
 
 /**
@@ -362,32 +486,12 @@ function showInput() {
     // Allow opening the input pill regardless of pending state — the
     // user can fire follow-up turns while a previous one is still in
     // flight (parity with desktop/web chat).
-    setMode('input');
+    setMode('input', { draftPrompt: getFreshDraft() });
 }
 
 function dismiss() {
     if (!isInitialized) return;
     setMode('dot');
-}
-
-function noteOptionTap() {
-    const now = Date.now();
-    if (now - optionTapState.lastTapAt <= DOUBLE_OPTION_WINDOW_MS) {
-        optionTapState.lastTapAt = 0;
-        // Option+Option semantics:
-        //   dot       → input  (start a turn)
-        //   input     → dot    (cancel the input)
-        //   loading   → input  (queue a follow-up turn)
-        //   response  → input  (continue the conversation)
-        if (mode === 'input') {
-            dismiss();
-        } else {
-            showInput();
-        }
-        return true;
-    }
-    optionTapState.lastTapAt = now;
-    return false;
 }
 
 // ─── Capture ────────────────────────────────────────────────────────────
@@ -531,6 +635,9 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
             setMode('dot');
             return { success: false, error: result?.error || 'Channel submission failed' };
         }
+        // Successful submit invalidates the draft — the prompt now lives
+        // in conversation history, not in the user's pending intent.
+        clearDraftPrompt();
         return { success: true, turnId };
     } catch (err) {
         clearPending();
@@ -561,6 +668,7 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
         ts,
         role,
     });
+    setLastReply(content, ts);
     clearPending();
     setMode('response');
     return true;
@@ -581,11 +689,54 @@ function registerIpcHandlers() {
         });
     });
 
-    ipcMain.handle('CURSOR_DISMISS', (event) => {
+    ipcMain.handle('CURSOR_DISMISS', (event, payload = {}) => {
         if (!isFromCursorWindow(event)) {
             return { success: false, error: 'unauthorized' };
         }
+        // Esc / explicit dismiss preserves any non-empty draft. The
+        // renderer ships the latest textarea value here so the dismiss
+        // path doesn't depend on the debounced draft sync having run.
+        if (typeof payload.prompt === 'string' && mode === 'input') {
+            setDraftPrompt(payload.prompt);
+        }
         dismiss();
+        return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_SHIFT_GESTURE', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        handleShiftGesture('renderer', { prompt: payload.prompt });
+        return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_DRAFT_UPDATE', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        if (typeof payload.prompt !== 'string') {
+            return { success: false, error: 'invalid' };
+        }
+        setDraftPrompt(payload.prompt);
+        return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_BLUR_PARK', (event) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        if (mode === 'input') {
+            isParked = true;
+        }
+        return { success: true, parked: isParked };
+    });
+
+    ipcMain.handle('CURSOR_FOCUS_RESUME', (event) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        isParked = false;
         return { success: true };
     });
 
@@ -613,6 +764,31 @@ module.exports = {
             depsRef = depsRef || {};
             depsRef.screen = screen;
         },
+        getDraftForTest: () => ({ prompt: draftPrompt, updatedAt: draftUpdatedAt }),
+        setDraftForTest: (prompt, updatedAt) => {
+            draftPrompt = prompt || '';
+            draftUpdatedAt = updatedAt || (prompt ? Date.now() : 0);
+        },
+        getFreshDraftForTest: getFreshDraft,
+        getLastReplyForTest: () => lastReply,
+        setLastReplyForTest: (content, ts, updatedAt) => {
+            if (content == null) {
+                lastReply = null;
+                lastReplyUpdatedAt = 0;
+                return;
+            }
+            lastReply = { content, ts: ts || null };
+            lastReplyUpdatedAt = updatedAt || Date.now();
+        },
+        getFreshLastReplyForTest: getFreshLastReply,
+        getGestureLockUntilForTest: () => gestureLockUntil,
+        resetGestureLockForTest: () => { gestureLockUntil = 0; },
+        getParkedForTest: () => isParked,
+        setParkedForTest: (next) => { isParked = Boolean(next); },
+        setModeForTest: (next) => { mode = next; },
+        DRAFT_TTL_MS,
+        LAST_REPLY_TTL_MS,
+        GESTURE_LOCK_MS,
         CURSOR_LENS_CROP_W,
         CURSOR_LENS_CROP_H,
         WIN_WIDTH,
