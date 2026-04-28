@@ -455,7 +455,7 @@ function runScreencapture({ x, y, w, h, outPath }) {
 
 // ─── Submission flow ────────────────────────────────────────────────────
 
-async function submitFromBubble({ prompt }) {
+async function submitFromBubble({ prompt, withScreenshot = false }) {
     if (typeof prompt !== 'string' || prompt.trim().length === 0) {
         return { success: false, error: 'Empty prompt' };
     }
@@ -476,24 +476,32 @@ async function submitFromBubble({ prompt }) {
     };
     setMode('loading');
 
-    let capture;
-    try {
-        capture = await captureCursorArea();
-    } catch (err) {
-        depsRef.logDebug(`[CURSOR] Capture failed: ${err.message}`);
-        clearPending();
-        setMode('dot');
-        return { success: false, error: `Could not capture screen: ${err.message}` };
+    // Vision is opt-in per turn: Option+Enter attaches a cursor-area
+    // screenshot, plain Enter sends just the prompt. Keeps casual
+    // follow-ups text-only and reserves the screenshot envelope for
+    // moments the human is actually pointing at something.
+    let capture = null;
+    if (withScreenshot) {
+        try {
+            capture = await captureCursorArea();
+        } catch (err) {
+            depsRef.logDebug(`[CURSOR] Capture failed: ${err.message}`);
+            clearPending();
+            setMode('dot');
+            return { success: false, error: `Could not capture screen: ${err.message}` };
+        }
+        pending.attachmentPath = capture.path;
     }
-    pending.attachmentPath = capture.path;
 
-    const composedContent = [
-        prompt.trim(),
-        ``,
-        `<system-reminder>`,
-        `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
-        `</system-reminder>`,
-    ].join('\n');
+    const composedContent = capture
+        ? [
+            prompt.trim(),
+            ``,
+            `<system-reminder>`,
+            `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
+            `</system-reminder>`,
+        ].join('\n')
+        : prompt.trim();
 
     try {
         const result = await depsRef.submitChannelUserMessage(
@@ -515,7 +523,7 @@ async function submitFromBubble({ prompt }) {
                 // a user-uploaded file in the regular chat composer.
                 echoToLocalChat: true,
                 displayContent: prompt.trim(),
-                attachments: [capture.path],
+                attachments: capture ? [capture.path] : [],
             },
         );
         if (!result || result.success === false) {
@@ -567,7 +575,10 @@ function registerIpcHandlers() {
         if (!isFromCursorWindow(event)) {
             return { success: false, error: 'unauthorized' };
         }
-        return submitFromBubble({ prompt: payload.prompt });
+        return submitFromBubble({
+            prompt: payload.prompt,
+            withScreenshot: payload.withScreenshot === true,
+        });
     });
 
     ipcMain.handle('CURSOR_DISMISS', (event) => {

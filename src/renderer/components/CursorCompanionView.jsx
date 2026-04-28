@@ -283,11 +283,11 @@ function CursorCompanionView() {
     try { await invoke('CURSOR_DISMISS'); } catch (_) {}
   }, [invoke]);
 
-  const handleSubmit = useCallback(async () => {
+  const handleSubmit = useCallback(async (withScreenshot = false) => {
     const trimmed = prompt.trim();
     if (trimmed.length === 0) return;
     try {
-      const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed });
+      const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed, withScreenshot });
       if (!result?.success) {
         setError(result?.error || 'Failed to submit');
       }
@@ -321,7 +321,9 @@ function CursorCompanionView() {
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      handleSubmit();
+      // Option+Enter attaches the cursor-area screenshot.
+      // Plain Enter sends the prompt only — no vision context.
+      handleSubmit(e.altKey === true);
     }
   };
 
