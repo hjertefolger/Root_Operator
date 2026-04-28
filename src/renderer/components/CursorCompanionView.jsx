@@ -113,7 +113,7 @@ const ACCENT = '#4B5AFF';
 // 18px radius, 10×14 padding, fontSize 15, lineHeight 1.45 (≈22px),
 // system sans (Geist Sans) — see ChatMessage in ChannelChat.jsx.
 const PILL_PADDING_X = 14;
-const PILL_PADDING_Y = 10;
+const PILL_PADDING_Y = 8;
 const INPUT_LINE_HEIGHT = 22;
 const PILL_HEIGHT = INPUT_LINE_HEIGHT + PILL_PADDING_Y * 2; // 42
 const PILL_RADIUS = 18;
