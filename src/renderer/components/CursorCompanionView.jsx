@@ -497,7 +497,7 @@ function CursorCompanionView() {
         style={{
           position: 'absolute',
           left: mode === 'loading' ? ANCHOR_X + 8 : ANCHOR_X + 14,
-          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 16,
+          top: mode === 'loading' ? ANCHOR_Y + 10 : ANCHOR_Y + 18,
           width: pillWidth,
           height: pillHeight,
           // Presence enter/exit animation. The keyframe controls
