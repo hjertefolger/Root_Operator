@@ -944,7 +944,9 @@ const ReplyBubble = memo(function ReplyBubble({
           <CursorReplyMarkdown content={(reply.content || '').trim()} />
         </div>
       </div>
-      {/* Hidden mirror — measures content at max-width to determine wrapped height. */}
+      {/* Hidden mirror — measures content at max-width to determine wrapped height.
+          width:max-content escapes the narrow companion-window containing block;
+          maxWidth caps the wrap width so multi-line measurements are correct. */}
       <div
         ref={mirrorRef}
         aria-hidden
@@ -952,7 +954,8 @@ const ReplyBubble = memo(function ReplyBubble({
           position: 'absolute',
           visibility: 'hidden',
           pointerEvents: 'none',
-          display: 'inline-block',
+          display: 'block',
+          width: 'max-content',
           maxWidth: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
           fontFamily: 'inherit',
           padding: 0,
