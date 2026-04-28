@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useElectron } from '../hooks/useElectron';
-import MessageMarkdown from '../../shared/MessageMarkdown';
 
 /**
  * Cursor companion: a single morphing element anchored to the system
@@ -344,13 +343,17 @@ function CursorCompanionView() {
               flex: '1 1 auto',
               maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
               overflowY: 'auto',
+              fontSize: 15,
+              lineHeight: 1.45,
               color: 'rgba(255, 255, 255, 0.9)',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
               userSelect: 'text',
               opacity: 1,
               animation: 'cursor-fade-in 200ms ease both',
             }}
           >
-            <MessageMarkdown content={reply.content.trim()} />
+            {reply.content.trim()}
           </div>
         )}
 
@@ -414,10 +417,9 @@ function CursorCompanionView() {
         {prompt || ' '}
       </span>
       {/* Hidden response mirror — drives response pill outer height so
-          it hugs content instead of using a rough estimate. Renders
-          the same markdown component as the visible response so the
-          measured height accounts for paragraph margins, code blocks,
-          lists, and other markdown structures, not just raw text. */}
+          it hugs content instead of using a rough estimate. Width is
+          locked to the response inner width; font + lineHeight match
+          the visible response container exactly. */}
       <div
         ref={responseMirrorRef}
         aria-hidden
@@ -426,14 +428,19 @@ function CursorCompanionView() {
           visibility: 'hidden',
           pointerEvents: 'none',
           width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
+          whiteSpace: 'pre-wrap',
+          overflowWrap: 'break-word',
+          wordBreak: 'break-word',
           fontFamily: 'inherit',
+          fontSize: 15,
+          lineHeight: 1.45,
           padding: 0,
           margin: 0,
           left: 0,
           top: 0,
         }}
       >
-        <MessageMarkdown content={(reply?.content || error || ' ').trim() || ' '} />
+        {(reply?.content || error || ' ').trim() || ' '}
       </div>
       {/* Hidden wrapped mirror — drives pill height when content wraps
           or contains explicit newlines. Width is locked to the
