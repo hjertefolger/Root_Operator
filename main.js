@@ -398,6 +398,21 @@ const cursorCompanion = initCursorCompanion({
     logDebug,
 });
 
+// Bind cursor companion's loader/response transitions to the same
+// authoritative activity stream that drives desktop chat indicators.
+// Single source of truth for "is Claude working?" — cursor stays in
+// loading until the activity stream reaches a terminal phase
+// (finished/idle/failed/error). Without this, the cursor surface
+// collapsed to response on the first assistant message even when
+// Claude was still mid-tool-loop.
+activityTracker.setChannelActivityListener((activity) => {
+    try {
+        cursorCompanion.handleChannelActivity(activity);
+    } catch (err) {
+        logDebug(`[CURSOR] handleChannelActivity error: ${err && err.message}`);
+    }
+});
+
 function sendEncryptedChannelPayload(payload) {
     const body = JSON.stringify(payload);
     for (const client of activeClients) {

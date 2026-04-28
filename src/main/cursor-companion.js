@@ -147,6 +147,7 @@ function getApi() {
         showInput,
         dismiss,
         handleChannelReply,
+        handleChannelActivity,
         toggleFromHotkey,
         notifyEnabledChanged,
         isPending: () => pending !== null,
@@ -607,17 +608,25 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
     if (depsRef.getOperatingMode() !== 'channel') {
         return { success: false, error: 'Channel mode is not active.' };
     }
+    // Single-flight cursor submits. The channel protocol has no
+    // per-turn correlation id (replies and activity are global,
+    // chat_id is shared across all cursor turns), so a follow-up
+    // while a prior turn is in flight would let the older turn's
+    // reply or terminal phase clobber the newer turn's state. Block
+    // at the submit boundary instead. The user can still open the
+    // input pill and type the next prompt — Enter just rejects
+    // until the prior turn reaches terminal.
+    if (pending !== null) {
+        return { success: false, error: 'Previous reply still pending' };
+    }
 
     // Establish the pending marker BEFORE capture so the channel reply
-    // forwarder routes the next response to us, not local chat. A
-    // follow-up sent while a previous turn is still pending replaces
-    // the marker — channel-history persists every turn so nothing is
-    // lost on the conversation side; the renderer just renders the
-    // most recent reply in its bubble.
+    // forwarder routes the next response to us, not local chat.
     const turnId = newTurnId();
     pending = {
         turnId,
         startedAt: Date.now(),
+        latestReply: null,
     };
     setMode('loading');
 
@@ -695,6 +704,20 @@ function clearPending() {
 /**
  * Forward a channel reply to the renderer when there's a pending cursor
  * turn. Caller is channel-mode's reply handler.
+ *
+ * Data-only: every assistant message during a pending turn updates
+ * `pending.latestReply` and pushes the latest text to the renderer (so
+ * the response bubble has up-to-date content the moment activity says
+ * the turn ended), but does NOT exit `loading` mode. Terminal transition
+ * lives in `handleChannelActivity` — bound to the same authoritative
+ * activity stream that drives desktop chat indicators, so cursor and
+ * desktop chat agree on "is Claude working?".
+ *
+ * Single-message turns: activity-tracker emits `phase: 'finished'`
+ * immediately after the reply; cursor flips to response one tick later.
+ * Multi-message turns: each interim reply updates the stored content
+ * but stays in loading; the final message + terminal phase together
+ * produce the visible response.
  */
 function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
     if (!pending) return false;
@@ -703,6 +726,7 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
         clearPending();
         return false;
     }
+    pending.latestReply = { content, ts, role };
     win.webContents.send('CURSOR_REPLY', {
         turnId: pending.turnId,
         content,
@@ -710,9 +734,84 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
         role,
     });
     setLastReply(content, ts);
+    return true;
+}
+
+/**
+ * Activity-tracker subscriber. The cursor loader stays visible until
+ * the activity stream reaches a terminal phase. Mirrors what desktop
+ * chat reads, so the two surfaces never disagree on whether Claude is
+ * still working.
+ *
+ * Phases:
+ *   forwarded / thinking / tool / replying  → keep loading
+ *   tool_complete / tool_failed             → keep loading (Claude may continue)
+ *   finished / idle                         → terminal: flip to response (or dot if no reply)
+ *   failed / error                          → terminal: error pill
+ *
+ * Only acts while `pending` is set. The stale-turn guard captures the
+ * pending turnId at entry; if a follow-up replaced `pending` underneath
+ * us mid-flight, we leave the new turn alone.
+ */
+function handleChannelActivity(activity = {}) {
+    if (!pending) return;
+    const phase = typeof activity.phase === 'string' ? activity.phase : '';
+
+    // Admin reset (resetChannelActivity): force-clear pending without
+    // presenting any captured partial reply as the final response. A
+    // teardown/restart isn't a successful turn completion.
+    if (activity.reset === true) {
+        clearPending();
+        setMode('dot');
+        return;
+    }
+
+    if (!isTerminalPhase(phase)) return;
+
+    const turnIdAtEntry = pending.turnId;
+    const isFailure = phase === 'failed' || phase === 'error';
+    const latestReply = pending.latestReply || null;
+
+    if (isFailure) {
+        if (!isUsable(win)) {
+            clearPending();
+            return;
+        }
+        win.webContents.send('CURSOR_ERROR', {
+            turnId: turnIdAtEntry,
+            message: activity.label || activity.detail || 'Reply failed',
+        });
+        clearPending();
+        // Keep mode at loading→dot collapse path: no response bubble
+        // for a failed turn; the renderer error pill renders next to
+        // the dot once mode goes back to dot.
+        setMode('dot');
+        return;
+    }
+
+    // Terminal idle/finished: if we captured at least one reply,
+    // present it; otherwise quietly return to dot.
+    if (!latestReply) {
+        clearPending();
+        setMode('dot');
+        return;
+    }
+
+    if (pending && pending.turnId !== turnIdAtEntry) {
+        // A follow-up turn started after this terminal event was
+        // queued; let the new turn run its own lifecycle.
+        return;
+    }
+
     clearPending();
     setMode('response');
-    return true;
+}
+
+function isTerminalPhase(phase) {
+    return phase === 'finished'
+        || phase === 'idle'
+        || phase === 'failed'
+        || phase === 'error';
 }
 
 // ─── IPC handlers ───────────────────────────────────────────────────────

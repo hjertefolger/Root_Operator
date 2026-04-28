@@ -220,6 +220,11 @@ function CursorCompanionView() {
       setReply({ content: payload.content, ts: payload.ts || null });
       setError(null);
     });
+    const offError = on('CURSOR_ERROR', (payload) => {
+      if (!payload || typeof payload.message !== 'string') return;
+      setError(payload.message);
+      setReply(null);
+    });
     const offEnabled = on('CURSOR_ENABLED_CHANGED', (payload) => {
       if (!payload || typeof payload.enabled !== 'boolean') return;
       setPresenceAnim(payload.enabled ? 'enter' : 'exit');
@@ -227,6 +232,7 @@ function CursorCompanionView() {
     return () => {
       offMode?.();
       offReply?.();
+      offError?.();
       offEnabled?.();
     };
   }, [on]);
@@ -480,15 +486,18 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. All modes share the same south-east
-          offset of the cursor pointer hot spot so the bubble grows from
-          where the dot is, never teleports under the cursor. */}
+      {/* The morphing element. Dot/input/response share the south-east
+          offset (+14,+18) so the bubble grows from where the dot is.
+          Loading mode uses a tighter offset (+6,+8) so the 22px
+          two-dot indicator's visual center lines up with the 6px dot's
+          center horizontally, ~2px higher — feels like an active
+          status orbiter instead of a satellite drifting away. */}
       <div
         onMouseDown={handlePillMouseDown}
         style={{
           position: 'absolute',
-          left: ANCHOR_X + 14,
-          top: ANCHOR_Y + 18,
+          left: mode === 'loading' ? ANCHOR_X + 6 : ANCHOR_X + 14,
+          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 18,
           width: pillWidth,
           height: pillHeight,
           // Presence enter/exit animation. The keyframe controls
