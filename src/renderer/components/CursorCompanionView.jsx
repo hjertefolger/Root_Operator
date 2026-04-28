@@ -503,27 +503,29 @@ function CursorCompanionView() {
         {prompt || ' '}
       </span>
       {/* Hidden response mirror — drives response pill outer height so
-          it hugs content instead of using a rough estimate. Renders
-          the same markdown component as the visible response so the
-          measurement accounts for paragraph margins, code blocks,
-          lists, and other markdown structures, not just raw text. */}
-      <div
-        ref={responseMirrorRef}
-        aria-hidden
-        style={{
-          position: 'absolute',
-          visibility: 'hidden',
-          pointerEvents: 'none',
-          width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
-          fontFamily: 'inherit',
-          padding: 0,
-          margin: 0,
-          left: 0,
-          top: 0,
-        }}
-      >
-        <CursorReplyMarkdown content={(reply?.content || error || ' ').trim() || ' '} />
-      </div>
+          it hugs content instead of using a rough estimate. Only
+          mounted in response mode; rendering ReactMarkdown on every
+          input-mode keystroke caused layout shifts that could steal
+          textarea focus / hide the caret. */}
+      {mode === 'response' && (
+        <div
+          ref={responseMirrorRef}
+          aria-hidden
+          style={{
+            position: 'absolute',
+            visibility: 'hidden',
+            pointerEvents: 'none',
+            width: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X * 2}px`,
+            fontFamily: 'inherit',
+            padding: 0,
+            margin: 0,
+            left: 0,
+            top: 0,
+          }}
+        >
+          <CursorReplyMarkdown content={(reply?.content || error || ' ').trim() || ' '} />
+        </div>
+      )}
       {/* Hidden wrapped mirror — drives pill height when content wraps
           or contains explicit newlines. Width is locked to the
           textarea's eventual inner width at PILL_MAX_WIDTH, font and
