@@ -179,6 +179,19 @@ function CursorCompanionView() {
     return () => clearTimeout(t);
   }, [presenceAnim]);
 
+  // True for a brief window after a mode change so width/height can
+  // animate smoothly across the morph (dot → pill expand, etc). Cleared
+  // after the morph window so subsequent keystroke-driven width updates
+  // snap rather than animate — prevents the per-keystroke wrap flicker
+  // at the right edge while still giving the initial expand a smooth
+  // feel.
+  const [isMorphing, setIsMorphing] = useState(false);
+  useEffect(() => {
+    setIsMorphing(true);
+    const t = setTimeout(() => setIsMorphing(false), 280);
+    return () => clearTimeout(t);
+  }, [mode]);
+
   // Subscribe to mode changes from the main process.
   useEffect(() => {
     const offMode = on('CURSOR_MODE', (payload) => {
@@ -531,24 +544,30 @@ function CursorCompanionView() {
           pointerEvents: isPill ? 'auto' : 'none',
           overflow: 'hidden',
           transition:
-            mode === 'input'
-              // While typing, BOTH width and height must be instant so
-              // the outer pill and the React-driven textarea stay in
-              // lockstep across the wrap boundary. Animating width
-              // caused the textarea (width: 100%) to be mid-animation
-              // while the height calc assumed the final locked width,
-              // wrapping content to 2 lines inside a 1-line pill —
-              // the per-keystroke flicker at the right edge.
-              ? 'border-radius 220ms ease, ' +
-                'background 200ms ease, ' +
-                'box-shadow 200ms ease, ' +
-                'padding 180ms ease'
-              : 'width 180ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'height 220ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'border-radius 220ms ease, ' +
-                'background 200ms ease, ' +
-                'box-shadow 200ms ease, ' +
-                'padding 180ms ease',
+            mode === 'input' && !isMorphing
+              // Steady-state typing: BOTH width and height must be
+              // instant so the outer pill and the React-driven textarea
+              // stay in lockstep across the wrap boundary. Animating
+              // width caused the textarea (width: 100%) to be
+              // mid-animation while the height calc assumed the final
+              // locked width, wrapping content to 2 lines inside a
+              // 1-line pill — the per-keystroke flicker at the right
+              // edge. So once the morph window closes, snap on
+              // keystrokes.
+              ? 'border-radius 240ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'background 220ms ease, ' +
+                'box-shadow 220ms ease, ' +
+                'padding 200ms ease'
+              // Mode-change morph window (or any non-input mode):
+              // animate width/height too so dot → pill, pill → loader,
+              // loader → response feel like one continuous element
+              // smoothly reshaping rather than a hard snap.
+              : 'width 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'height 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'border-radius 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+                'background 220ms ease, ' +
+                'box-shadow 220ms ease, ' +
+                'padding 220ms ease',
         }}
       >
         {mode === 'input' && (
