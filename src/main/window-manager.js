@@ -409,9 +409,9 @@ function init(deps = {}) {
         // dot, dismiss otherwise). Desktop chat moved to Cmd+Shift+K and
         // is registered inside registerGlobalShortcuts().
         if (typeof initDoubleShiftShortcut === 'function') {
-            initDoubleShiftShortcut(() => {
+            initDoubleShiftShortcut((payload) => {
                 if (typeof onDoubleShift === 'function') {
-                    onDoubleShift();
+                    onDoubleShift(payload);
                 }
             });
         }
