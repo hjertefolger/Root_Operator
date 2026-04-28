@@ -442,14 +442,14 @@ function CursorCompanionView() {
       ? 22
       : mode === 'response'
         ? responseWidth
-        : 8;
+        : 6;
   const pillHeight = mode === 'input'
     ? inputBox.height
     : mode === 'response'
       ? responseHeight
       : mode === 'loading'
         ? 22
-        : 8;
+        : 6;
   const isPill = mode === 'input' || mode === 'response';
 
   return (
