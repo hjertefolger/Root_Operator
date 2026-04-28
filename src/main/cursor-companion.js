@@ -415,15 +415,11 @@ async function submitFromBubble({ prompt }) {
     pending.attachmentPath = capture.path;
 
     const composedContent = [
-        `<system-reminder>`,
-        `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
-        `</system-reminder>`,
-        ``,
-        `Cursor companion: I'm pointing at something on my screen.`,
-        `Read the screenshot at ${capture.path}.`,
-        `Crop is ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} centred on the cursor.`,
-        ``,
         prompt.trim(),
+        ``,
+        `<system-reminder>`,
+        `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
+        `</system-reminder>`,
     ].join('\n');
 
     try {
