@@ -30,7 +30,7 @@ const PILL_RADIUS = 18;
 // affordance — narrow, dot-adjacent, not a fixed-width box. Then it
 // grows naturally with the typed content.
 const PILL_MIN_WIDTH = 64;
-const PILL_MAX_WIDTH = 220;
+const PILL_MAX_WIDTH = 260;
 const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
 const RESPONSE_MAX_WIDTH = 460;
 const RESPONSE_MAX_HEIGHT = 280;
