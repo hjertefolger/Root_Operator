@@ -26,7 +26,10 @@ const PILL_HEIGHT = 32;
 // 160px outer → ~132px inner → ~20 mono chars before the pill starts
 // extending.
 const PILL_MIN_WIDTH = 160;
-const PILL_MAX_WIDTH = 560;
+// Wrap to a second row well before the pill stretches across the
+// screen — a comfortable ~36-char single line, then growth goes
+// vertical instead of horizontal.
+const PILL_MAX_WIDTH = 280;
 const PILL_PADDING_X = 14;
 const PILL_PADDING_Y = 7;
 const INPUT_LINE_HEIGHT = 18;
