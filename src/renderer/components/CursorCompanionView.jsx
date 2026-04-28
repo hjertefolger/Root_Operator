@@ -461,14 +461,14 @@ function CursorCompanionView() {
       ? 22
       : mode === 'response'
         ? responseWidth
-        : 6;
+        : 5;
   const pillHeight = mode === 'input'
     ? inputBox.height
     : mode === 'response'
       ? responseHeight
       : mode === 'loading'
         ? 22
-        : 6;
+        : 5;
   const isPill = mode === 'input' || mode === 'response';
 
   return (
@@ -807,8 +807,8 @@ function ActivityDots() {
   }, []);
 
   const dotStyle = (idx) => ({
-    width: 5,
-    height: 5,
+    width: 4,
+    height: 4,
     borderRadius: '50%',
     backgroundColor: ACCENT,
     opacity: active === idx ? 1 : 0.18,
@@ -817,7 +817,7 @@ function ActivityDots() {
   });
 
   return (
-    <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
+    <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
       <div style={dotStyle(0)} />
       <div style={dotStyle(1)} />
     </div>
