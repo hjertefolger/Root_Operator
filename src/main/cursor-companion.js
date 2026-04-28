@@ -82,6 +82,7 @@ let pending = null;
 let isInitialized = false;
 let uiohookRef = null;
 let shiftKeyCodes = [];
+let escKeyCode = null;
 let mouseListenerAttached = false;
 let isShiftHeld = false;
 let mode = 'dot'; // dot | input | loading | response
@@ -260,11 +261,13 @@ function attachInputListeners() {
         const { uIOhook, UiohookKey } = require('uiohook-napi');
         uiohookRef = uIOhook;
         shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight].filter((k) => k != null);
+        escKeyCode = UiohookKey.Escape != null ? UiohookKey.Escape : null;
         uiohookRef.on('keydown', handleShiftKeyDown);
+        uiohookRef.on('keydown', handleGlobalEscDown);
         uiohookRef.on('keyup', handleShiftKeyUp);
         uiohookRef.on('mousedown', handleGlobalMouseDown);
         mouseListenerAttached = true;
-        depsRef.logDebug('[CURSOR] Shift + global click listeners attached');
+        depsRef.logDebug('[CURSOR] Shift + Esc + global click listeners attached');
     } catch (err) {
         depsRef.logDebug(`[CURSOR] Failed to attach input listeners: ${err.message}`);
     }
@@ -274,6 +277,7 @@ function detachInputListeners() {
     if (!mouseListenerAttached || !uiohookRef) return;
     try {
         uiohookRef.off('keydown', handleShiftKeyDown);
+        uiohookRef.off('keydown', handleGlobalEscDown);
         uiohookRef.off('keyup', handleShiftKeyUp);
         uiohookRef.off('mousedown', handleGlobalMouseDown);
     } catch (err) {
@@ -282,6 +286,7 @@ function detachInputListeners() {
     mouseListenerAttached = false;
     uiohookRef = null;
     shiftKeyCodes = [];
+    escKeyCode = null;
     isShiftHeld = false;
 }
 
@@ -300,18 +305,39 @@ function handleShiftKeyUp(event) {
 }
 
 /**
- * Click anywhere dismisses the response bubble. uIOhook gives us a
- * passive observation of the click — the click itself still flows to
- * the foreground app, so the user's intended action (clicking a button
- * in their browser, focusing a Slack thread, etc.) happens normally;
- * the bubble just collapses out of the way as a side-effect.
+ * Right-click anywhere dismisses the response bubble. uIOhook gives us
+ * a passive observation — the click itself still flows to the
+ * foreground app (the user's intended right-click context menu / etc.
+ * still fires normally), the bubble just collapses out of the way as
+ * a side-effect.
  *
- * Loading state is intentionally NOT dismissable by click — a click
- * during a pending turn shouldn't kill the in-flight request.
- * Response state IS dismissable.
+ * Left-click / middle-click do NOT dismiss — Tom's call: clicking
+ * around while reading shouldn't kill the response. Esc + Shift+Shift
+ * (continue conversation) and right-click are the explicit dismiss
+ * paths.
+ *
+ * Loading state is intentionally NOT dismissable — a click during a
+ * pending turn shouldn't kill the in-flight request. Response state
+ * is dismissable on right-click.
+ *
+ * uIOhook button codes: 1=left, 2=right, 3=middle.
  */
-function handleGlobalMouseDown() {
+function handleGlobalMouseDown(event) {
     if (mode !== 'response') return;
+    if (!event || event.button !== 2) return;
+    dismiss();
+}
+
+/**
+ * Esc dismisses the response bubble globally (passive uIOhook keydown
+ * observation, regardless of which app has focus). Esc inside the
+ * input pill is handled by the renderer's textarea keydown for draft
+ * persistence — that path doesn't conflict because the response
+ * bubble has no focused input.
+ */
+function handleGlobalEscDown(event) {
+    if (mode !== 'response') return;
+    if (!event || event.keycode !== escKeyCode) return;
     dismiss();
 }
 
