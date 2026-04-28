@@ -497,7 +497,7 @@ function CursorCompanionView() {
         style={{
           position: 'absolute',
           left: mode === 'loading' ? ANCHOR_X + 8 : ANCHOR_X + 14,
-          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 14,
+          top: mode === 'loading' ? ANCHOR_Y + 8 : ANCHOR_Y + 16,
           width: pillWidth,
           height: pillHeight,
           // Presence enter/exit animation. The keyframe controls
@@ -807,8 +807,8 @@ function ActivityDots() {
   }, []);
 
   const dotStyle = (idx) => ({
-    width: 4,
-    height: 4,
+    width: 5,
+    height: 5,
     borderRadius: '50%',
     backgroundColor: ACCENT,
     opacity: active === idx ? 1 : 0.18,
@@ -817,7 +817,7 @@ function ActivityDots() {
   });
 
   return (
-    <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
+    <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
       <div style={dotStyle(0)} />
       <div style={dotStyle(1)} />
     </div>
