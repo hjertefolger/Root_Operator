@@ -314,11 +314,15 @@ function CursorCompanionView() {
     try { await invoke('CURSOR_DISMISS', { prompt }); } catch (_) {}
   }, [invoke, prompt]);
 
-  const handleSubmit = useCallback(async (withScreenshot = false) => {
+  // screenshot: 'none' | 'cursor' | 'fullscreen'
+  //   none       — plain Enter
+  //   cursor     — Option+Enter (800×800 crop centred on cursor)
+  //   fullscreen — Option+Shift+Enter (entire display containing the cursor)
+  const handleSubmit = useCallback(async (screenshot = 'none') => {
     const trimmed = prompt.trim();
     if (trimmed.length === 0) return;
     try {
-      const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed, withScreenshot });
+      const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed, screenshot });
       if (!result?.success) {
         setError(result?.error || 'Failed to submit');
       }
@@ -385,9 +389,19 @@ function CursorCompanionView() {
     if (e.key !== 'Shift') {
       shiftTapAtRef.current = 0;
     }
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    if (e.key === 'Enter' && !e.nativeEvent?.isComposing) {
+      // Plain Enter:           text only
+      // Option+Enter:          cursor-area crop
+      // Option+Shift+Enter:    full screen
+      // Shift+Enter (no alt):  newline (default textarea behaviour)
+      // Cmd/Ctrl+Enter:        ignored — leave for OS / future binding
+      if (e.metaKey || e.ctrlKey) return;
+      if (e.shiftKey && !e.altKey) return;
       e.preventDefault();
-      handleSubmit(e.altKey === true);
+      const screenshot = e.altKey
+        ? (e.shiftKey ? 'fullscreen' : 'cursor')
+        : 'none';
+      handleSubmit(screenshot);
     }
   };
 

@@ -21,6 +21,33 @@ const MAX_ASSISTANT_NAME_LENGTH = 24;
 // Worker domain from environment (must be set in .env file)
 const WORKER_DOMAIN = import.meta.env.VITE_WORKER_DOMAIN;
 
+function ShortcutList({ groups }) {
+  return (
+    <div className="flex flex-col gap-4">
+      {groups.map((group) => (
+        <div key={group.label} className="flex flex-col">
+          <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/60 mb-1.5">
+            {group.label}
+          </span>
+          <div className="flex flex-col">
+            {group.items.map((item) => (
+              <div
+                key={`${group.label}-${item.description}`}
+                className="flex items-center justify-between gap-3 py-1.5"
+              >
+                <span className="text-xs text-foreground">{item.description}</span>
+                <span className="font-mono text-[11px] text-muted-foreground rounded-md bg-muted/40 px-2 py-0.5">
+                  {item.shortcut}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SettingsView({ onBack, tunnelState }) {
   const { invoke, on } = useElectron();
 
@@ -468,23 +495,56 @@ function SettingsView({ onBack, tunnelState }) {
             </AccordionContent>
           </AccordionItem>
 
-          {/* Cursor Companion master toggle */}
-          <AccordionItem value="cursor-companion" className="border-none">
+          {/* Cursor Presence master toggle */}
+          <AccordionItem value="cursor-presence" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
-              Cursor Companion
+              Cursor Presence
             </AccordionTrigger>
             <AccordionContent className="pb-4">
               <div className="flex justify-between items-center gap-3">
                 <span className="text-xs text-muted-foreground">
-                  A small dot follows your cursor. Double-tap Shift to ask anything; Option+Enter attaches a screenshot of what you're pointing at. Toggle with Cmd+Shift+L.
+                  A small dot follows your cursor.
+                  Double-tap Shift to ask anything from anywhere.
                 </span>
                 <Switch
-                  id="cursor-companion"
+                  id="cursor-presence"
                   checked={cursorCompanionEnabled}
                   disabled={cursorCompanionBusy}
                   onCheckedChange={handleCursorCompanionToggle}
                 />
               </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Keyboard Shortcuts */}
+          <AccordionItem value="keyboard-shortcuts" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Keyboard Shortcuts
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <ShortcutList
+                groups={[
+                  {
+                    label: 'Main',
+                    items: [
+                      { description: 'Toggle tunnel', shortcut: '⌘ ⇧ J' },
+                      { description: 'Toggle desktop chat', shortcut: '⌘ ⇧ K' },
+                      { description: 'Toggle Cursor Presence', shortcut: '⌘ ⇧ L' },
+                    ],
+                  },
+                  {
+                    label: 'Cursor Presence',
+                    items: [
+                      { description: 'Open prompt from anywhere', shortcut: '⇧ ⇧' },
+                      { description: 'Send', shortcut: '↵' },
+                      { description: 'Send with cursor screenshot', shortcut: '⌥ ↵' },
+                      { description: 'Send with full screenshot', shortcut: '⌥ ⇧ ↵' },
+                      { description: 'Dismiss reply', shortcut: 'Right-click / Esc' },
+                      { description: 'Continue conversation from reply', shortcut: '⇧ ⇧' },
+                    ],
+                  },
+                ]}
+              />
             </AccordionContent>
           </AccordionItem>
 

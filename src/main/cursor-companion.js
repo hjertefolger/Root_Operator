@@ -629,7 +629,7 @@ async function captureCursorArea() {
 
     const dir = depsRef.getCursorAttachmentsDir();
     fs.mkdirSync(dir, { recursive: true });
-    const filename = `cursor-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.png`;
+    const filename = `presence-${crypto.randomBytes(3).toString('hex')}.png`;
     const filepath = path.join(dir, filename);
 
     await hideOverlayForCapture();
@@ -645,7 +645,45 @@ async function captureCursorArea() {
         await restoreOverlayAfterCapture();
     }
 
-    return { path: filepath, rect: { x: cropX, y: cropY, w: CURSOR_LENS_CROP_W, h: CURSOR_LENS_CROP_H } };
+    return {
+        path: filepath,
+        rect: { x: cropX, y: cropY, w: CURSOR_LENS_CROP_W, h: CURSOR_LENS_CROP_H },
+        mode: 'cursor',
+    };
+}
+
+async function captureFullScreen() {
+    const point = depsRef.screen.getCursorScreenPoint();
+    const display = depsRef.screen.getDisplayNearestPoint(point);
+
+    const dir = depsRef.getCursorAttachmentsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const filename = `presence-${crypto.randomBytes(3).toString('hex')}.png`;
+    const filepath = path.join(dir, filename);
+
+    await hideOverlayForCapture();
+    try {
+        await runScreencapture({
+            x: display.bounds.x,
+            y: display.bounds.y,
+            w: display.bounds.width,
+            h: display.bounds.height,
+            outPath: filepath,
+        });
+    } finally {
+        await restoreOverlayAfterCapture();
+    }
+
+    return {
+        path: filepath,
+        rect: {
+            x: display.bounds.x,
+            y: display.bounds.y,
+            w: display.bounds.width,
+            h: display.bounds.height,
+        },
+        mode: 'fullscreen',
+    };
 }
 
 function hideOverlayForCapture() {
@@ -678,13 +716,15 @@ function runScreencapture({ x, y, w, h, outPath }) {
 
 // ─── Submission flow ────────────────────────────────────────────────────
 
-async function submitFromBubble({ prompt, withScreenshot = false }) {
+async function submitFromBubble({ prompt, screenshot = 'none' }) {
     if (typeof prompt !== 'string' || prompt.trim().length === 0) {
         return { success: false, error: 'Empty prompt' };
     }
     if (depsRef.getOperatingMode() !== 'channel') {
         return { success: false, error: 'Channel mode is not active.' };
     }
+
+    const captureMode = screenshot === 'cursor' || screenshot === 'fullscreen' ? screenshot : 'none';
 
     // Concurrent turns are allowed — channel-bridge serialises behind
     // the scenes, but the cursor surface lets the user compose and fire
@@ -694,8 +734,6 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
     const turnId = newTurnId();
     pending = { turnId, startedAt: Date.now(), attachmentPath: null };
 
-    // Cancel any in-flight terminal grace timer; new turn means a new
-    // active span.
     if (terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
         terminalGraceTimer = null;
@@ -710,21 +748,19 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
     broadcastState({ event: 'turn_submitted', turnId });
 
     let capture = null;
-    if (withScreenshot) {
+    if (captureMode !== 'none') {
         try {
-            capture = await captureCursorArea();
+            capture = captureMode === 'fullscreen'
+                ? await captureFullScreen()
+                : await captureCursorArea();
         } catch (err) {
-            depsRef.logDebug(`[CURSOR] Capture failed: ${err.message}`);
-            // Stale-turn guard: another turn may have replaced pending
-            // while screencapture was running.
+            depsRef.logDebug(`[CURSOR] Capture (${captureMode}) failed: ${err.message}`);
             if (pending && pending.turnId === turnId) {
                 pending = null;
                 broadcastState({ event: 'capture_failed', turnId });
             }
             return { success: false, error: `Could not capture screen: ${err.message}` };
         }
-        // Re-check pending after the await: if the user toggled the
-        // companion off mid-capture, our pending was cleared.
         if (!pending || pending.turnId !== turnId) {
             try { fs.unlinkSync(capture.path); } catch (_) {}
             return { success: false, error: 'Turn was cancelled' };
@@ -737,7 +773,9 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
             prompt.trim(),
             ``,
             `<system-reminder>`,
-            `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
+            capture.mode === 'fullscreen'
+                ? `This message arrives from the Cursor Companion surface — your human attached a full-screen capture of their display (${capture.rect.w}×${capture.rect.h}). Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
+                : `This message arrives from the Cursor Companion surface — your human is pointing at something on their screen. The attached screenshot is a ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on their cursor at the moment they invoked you. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`,
             `</system-reminder>`,
         ].join('\n')
         : prompt.trim();
@@ -875,7 +913,9 @@ function registerIpcHandlers() {
         }
         return submitFromBubble({
             prompt: payload.prompt,
-            withScreenshot: payload.withScreenshot === true,
+            screenshot: payload.screenshot === 'cursor' || payload.screenshot === 'fullscreen'
+                ? payload.screenshot
+                : 'none',
         });
     });
 
