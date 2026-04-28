@@ -211,16 +211,14 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. Input mode anchors the top-left at the
-          cursor pointer hot spot so the cursor sits inside the typing
-          pill. Dot, loading, and response modes sit offset south-east
-          of the hot spot so the bubble visibly grows from where the
-          dot was, instead of teleporting under the cursor. */}
+      {/* The morphing element. All modes share the same south-east
+          offset of the cursor pointer hot spot so the bubble grows from
+          where the dot is, never teleports under the cursor. */}
       <div
         style={{
           position: 'absolute',
-          left: mode === 'input' ? ANCHOR_X : ANCHOR_X + 14,
-          top: mode === 'input' ? ANCHOR_Y : ANCHOR_Y + 18,
+          left: ANCHOR_X + 14,
+          top: ANCHOR_Y + 18,
           width: isPill ? pillWidth : 8,
           height: isPill ? pillHeight : 8,
           borderRadius: isPill ? PILL_RADIUS : '50%',
@@ -258,12 +256,14 @@ function CursorCompanionView() {
           overflow: 'hidden',
           transition:
             mode === 'input'
-              // While typing, height changes must be instant so the
-              // outer pill and the React-driven textarea height stay
-              // synchronized. Width can still animate since the
-              // textarea width follows via 100%.
-              ? 'width 140ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'border-radius 220ms ease, ' +
+              // While typing, BOTH width and height must be instant so
+              // the outer pill and the React-driven textarea stay in
+              // lockstep across the wrap boundary. Animating width
+              // caused the textarea (width: 100%) to be mid-animation
+              // while the height calc assumed the final locked width,
+              // wrapping content to 2 lines inside a 1-line pill —
+              // the per-keystroke flicker at the right edge.
+              ? 'border-radius 220ms ease, ' +
                 'background 200ms ease, ' +
                 'box-shadow 200ms ease, ' +
                 'padding 180ms ease'
