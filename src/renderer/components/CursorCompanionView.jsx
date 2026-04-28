@@ -19,7 +19,13 @@ const ANCHOR_Y = 16;
 
 const ACCENT = '#4B5AFF';
 const PILL_HEIGHT = 32;
-const PILL_MIN_WIDTH = 28;
+// Pill needs enough inner room to render a comfortable handful of mono
+// characters BEFORE any per-keystroke width growth — otherwise the
+// textarea is too narrow to fit even one character without wrapping,
+// and scrollHeight reports multi-line on the very first keystroke.
+// 160px outer → ~132px inner → ~20 mono chars before the pill starts
+// extending.
+const PILL_MIN_WIDTH = 160;
 const PILL_MAX_WIDTH = 560;
 const PILL_PADDING_X = 14;
 const PILL_PADDING_Y = 7;
