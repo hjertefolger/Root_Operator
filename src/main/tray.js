@@ -46,6 +46,8 @@ function init(deps = {}) {
     // arriving moments before app quit can re-start uIOhook after we've
     // torn it down.
     let pendingResumeTimer = null;
+    let resumeRetryAttempt = 0;
+    const RESUME_RETRY_BACKOFF_MS = [200, 500, 1500, 3000];
 
     function resetShiftDetectorState() {
         lastShiftKeyUpCode = null;
@@ -262,6 +264,8 @@ function init(deps = {}) {
             clearTimeout(pendingResumeTimer);
             pendingResumeTimer = null;
         }
+        // Suspending invalidates any in-flight retry chain.
+        resumeRetryAttempt = 0;
         if (!shortcutHook || !shiftShortcutStarted) {
             return;
         }
@@ -276,23 +280,51 @@ function init(deps = {}) {
     }
 
     // Resume the native tap. Listeners and callback are preserved.
+    // On failure, schedule bounded exponential-backoff retries — macOS
+    // can refuse uIOhook.start() briefly during slow unlock/login
+    // animations or fast user switching transitions, and a single
+    // 200ms attempt is not enough to ride that out.
     function resumeDoubleShiftShortcut(reason = '') {
         if (shiftShortcutStarted) {
+            resumeRetryAttempt = 0;
             return;
         }
         if (!shortcutHook) {
-            // Hook was never initialized successfully — try the full init.
             initDoubleShiftShortcut(shiftToggleCallback);
+            if (shiftShortcutStarted) {
+                resumeRetryAttempt = 0;
+            } else {
+                scheduleResumeRetry(reason);
+            }
             return;
         }
         try {
             shortcutHook.start();
             shiftShortcutStarted = true;
             resetShiftDetectorState();
+            resumeRetryAttempt = 0;
             logDebug(`[SHORTCUT] Double-Shift resumed (${reason || 'no reason'})`);
         } catch (error) {
-            logDebug(`[SHORTCUT] Resume failed (${reason}): ${error.message}`);
+            logDebug(`[SHORTCUT] Resume failed (${reason}, attempt ${resumeRetryAttempt + 1}): ${error.message}`);
+            scheduleResumeRetry(reason);
         }
+    }
+
+    function scheduleResumeRetry(reason) {
+        if (resumeRetryAttempt >= RESUME_RETRY_BACKOFF_MS.length) {
+            logDebug(`[SHORTCUT] Resume gave up after ${resumeRetryAttempt} attempts (${reason})`);
+            resumeRetryAttempt = 0;
+            return;
+        }
+        const delay = RESUME_RETRY_BACKOFF_MS[resumeRetryAttempt];
+        resumeRetryAttempt += 1;
+        if (pendingResumeTimer) {
+            clearTimeout(pendingResumeTimer);
+        }
+        pendingResumeTimer = setTimeout(() => {
+            pendingResumeTimer = null;
+            resumeDoubleShiftShortcut(`${reason}-retry-${resumeRetryAttempt}`);
+        }, delay);
     }
 
     // Restart the native tap. macOS finishes its own auth/animation
@@ -325,6 +357,7 @@ function init(deps = {}) {
             clearTimeout(pendingResumeTimer);
             pendingResumeTimer = null;
         }
+        resumeRetryAttempt = 0;
 
         if (!shortcutHook) {
             shiftListenersAttached = false;

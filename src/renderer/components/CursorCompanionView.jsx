@@ -1,12 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, useCallback, memo } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useElectron } from '../hooks/useElectron';
 
-// Markdown renderer scoped to the cursor reply bubble only. Mirrors the
-// styling of ChannelChat's MessageMarkdown so replies feel consistent
-// across surfaces, but kept self-contained here to avoid coupling the
-// cursor surface to the chat surface.
+// Markdown renderer scoped to the cursor reply bubble only.
 const cursorRemarkPlugins = [remarkGfm];
 const CURSOR_MONO = "'SF Mono','Menlo','Consolas','Liberation Mono',monospace";
 const cursorMdComponents = {
@@ -82,6 +79,7 @@ const cursorMdComponents = {
     <hr style={{ border: 'none', borderTop: '1px solid rgba(255,255,255,0.12)', marginTop: '0.8em', marginBottom: '0.8em' }} />
   ),
 };
+
 const CursorReplyMarkdown = memo(function CursorReplyMarkdown({ content }) {
   return (
     <div className="cursor-reply-md" style={{ fontSize: 15, lineHeight: 1.45, wordBreak: 'break-word', color: 'rgba(255,255,255,0.9)' }}>
@@ -92,86 +90,61 @@ const CursorReplyMarkdown = memo(function CursorReplyMarkdown({ content }) {
   );
 });
 
-/**
- * Cursor companion: a single morphing element anchored to the system
- * cursor. States: dot → input → loading → response → dot.
- *
- * The native window stays a fixed size (the renderer's canvas); shape
- * morphs happen via CSS transitions on the inner pill element. The
- * cursor pointer-arrow corresponds to (ANCHOR_X, ANCHOR_Y) in
- * window-local coordinates — the same offset used in the main process
- * positioning logic — so the pill's left edge sits right under the
- * pointer.
- */
-
-// Must match cursor-companion.js
+// Geometry — must match cursor-companion.js
 const ANCHOR_X = 16;
 const ANCHOR_Y = 16;
 
 const ACCENT = '#4B5AFF';
-// Pill / response styling mirrors the desktop chat message bubbles:
-// 18px radius, 10×14 padding, fontSize 15, lineHeight 1.45 (≈22px),
-// system sans (Geist Sans) — see ChatMessage in ChannelChat.jsx.
 const PILL_PADDING_X = 14;
 const PILL_PADDING_Y = 8;
 const INPUT_LINE_HEIGHT = 22;
 const PILL_HEIGHT = INPUT_LINE_HEIGHT + PILL_PADDING_Y * 2; // 42
 const PILL_RADIUS = 18;
-// The expanded pill starts just wide enough to host the cursor as an
-// affordance — narrow, dot-adjacent, not a fixed-width box. Then it
-// grows naturally with the typed content.
 const PILL_MIN_WIDTH = 64;
 const PILL_MAX_WIDTH = 260;
-const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2; // 5 lines + padding = 130
+const PILL_INPUT_MAX_HEIGHT = INPUT_LINE_HEIGHT * 5 + PILL_PADDING_Y * 2;
 const RESPONSE_MAX_WIDTH = PILL_MAX_WIDTH;
 const RESPONSE_MAX_HEIGHT = 280;
-// Response padding mirrors ChannelChat MessageBubble (10×14). Right-edge
-// padding is moved off the bubble container and onto the scrollable
-// inner div so the scrollbar (track) sits flush at the bubble's right
-// edge instead of inset by 14px.
 const RESPONSE_PADDING_X = 14;
 const RESPONSE_PADDING_Y = 8;
 const RESPONSE_INNER_RIGHT_PAD = 4;
 const PILL_FONT_FAMILY = "'Geist Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
+// Layer geometry
+const LAYER_GAP = 8;
+const LOADER_SIZE = 22;
+const DOT_SIZE = 5;
+const STACK_PEEK_OFFSET = 6; // px each older reply is offset down behind the newer one
+
+// Stack anchor: where the topmost layer's top-left sits, relative to cursor.
+const STACK_LEFT = ANCHOR_X + 14;
+const STACK_TOP = ANCHOR_Y + 18;
+const LOADER_LEFT = ANCHOR_X + 8;
+const LOADER_TOP = ANCHOR_Y + 10;
+
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
   const textareaRef = useRef(null);
-  // Scrollable container inside the response bubble. Drives wheel-driven
-  // scroll while the bubble is visible.
-  const responseScrollRef = useRef(null);
-  // Hidden mirror for unwrapped single-line width. Drives pill width.
   const widthMirrorRef = useRef(null);
-  // Hidden mirror constrained to the locked PILL_MAX_WIDTH inner space,
-  // wrapping with the same font/wrap rules as the textarea. Drives pill
-  // height for both wrapped content AND content with explicit newlines.
   const wrapMirrorRef = useRef(null);
-  // Hidden mirror that renders response content at the response inner
-  // width with identical font/line-height/wrap rules. Drives the
-  // response pill's outer height so it hugs content with no slack.
-  const responseMirrorRef = useRef(null);
-  const [mode, setMode] = useState('dot');
+
+  // Layered state from main.
+  const [loading, setLoading] = useState(false);
+  const [inputOpen, setInputOpen] = useState(false);
+  const [replies, setReplies] = useState([]); // [{ id, content, ts, role }]
+  const [isParked, setIsParked] = useState(false);
+
   const [prompt, setPrompt] = useState('');
-  const [reply, setReply] = useState(null);
   const [error, setError] = useState(null);
-  // True while the textarea has lost focus in input mode. Drives the
-  // park-on-blur affordance — main pauses cursor following so the user
-  // can move the system cursor onto the bubble and click to refocus.
   const [isBlurred, setIsBlurred] = useState(false);
   const [inputBox, setInputBox] = useState({
     width: PILL_MIN_WIDTH,
     height: PILL_HEIGHT,
     textHeight: INPUT_LINE_HEIGHT,
   });
-  const [responseHeight, setResponseHeight] = useState(PILL_HEIGHT);
-  const [responseWidth, setResponseWidth] = useState(PILL_MIN_WIDTH);
-  // 'enter' plays a fade-in + scale-up; 'exit' plays the reverse just
-  // before main closes the window; 'visible' is the steady state with
-  // the keyframe animation cleared so other inline styles (blur dim,
-  // hover, etc.) can drive opacity without fighting the animation's
-  // final frame. The controller drives this via the CURSOR_ENABLED_CHANGED
-  // event; useEffect below transitions enter→visible after the keyframe
-  // completes.
+  const [replySizes, setReplySizes] = useState({}); // { [id]: { width, height } }
+
+  // Presence for the whole companion (master toggle).
   const [presenceAnim, setPresenceAnim] = useState('enter');
   useEffect(() => {
     if (presenceAnim !== 'enter') return undefined;
@@ -179,68 +152,70 @@ function CursorCompanionView() {
     return () => clearTimeout(t);
   }, [presenceAnim]);
 
-  // True for a brief window after a mode change so width/height can
-  // animate smoothly across the morph (dot → pill expand, etc). Cleared
-  // after the morph window so subsequent keystroke-driven width updates
-  // snap rather than animate — prevents the per-keystroke wrap flicker
-  // at the right edge while still giving the initial expand a smooth
-  // feel.
-  const [isMorphing, setIsMorphing] = useState(false);
+  // Subscribe to state and reply events.
   useEffect(() => {
-    setIsMorphing(true);
-    const t = setTimeout(() => setIsMorphing(false), 280);
-    return () => clearTimeout(t);
-  }, [mode]);
+    const offState = on('CURSOR_STATE', (payload) => {
+      if (!payload) return;
+      const wasInputOpen = inputOpen;
+      if (typeof payload.loading === 'boolean') setLoading(payload.loading);
+      if (typeof payload.inputOpen === 'boolean') setInputOpen(payload.inputOpen);
+      if (Array.isArray(payload.replies)) {
+        setReplies(payload.replies);
+      }
+      if (typeof payload.isParked === 'boolean') setIsParked(payload.isParked);
 
-  // Subscribe to mode changes from the main process.
-  useEffect(() => {
-    const offMode = on('CURSOR_MODE', (payload) => {
-      if (!payload || typeof payload.mode !== 'string') return;
-      setMode(payload.mode);
-      if (payload.mode === 'input') {
-        // Restore the persisted draft (12h TTL) so accidentally
-        // dismissing a half-written prompt doesn't cost the user the
-        // text — Shift+Shift back open and it reappears.
+      // Input just opened — restore draft.
+      if (payload.event === 'input_opened') {
         const restored = typeof payload.draftPrompt === 'string' ? payload.draftPrompt : '';
         setPrompt(restored);
-        setReply(null);
         setError(null);
         setIsBlurred(false);
       }
-      if (payload.mode === 'dot') {
+      // Input just closed (dismiss / submit) — clear local prompt buffer.
+      if (payload.event === 'input_closed' || payload.event === 'turn_submitted' || payload.event === 'dismissed') {
         setPrompt('');
-        setReply(null);
         setIsBlurred(false);
-        // Keep `error` so a failed submission/timeout remains briefly
-        // visible until the user activates the input again.
+      }
+      // Replies were cleared.
+      if (payload.event === 'replies_cleared' || payload.event === 'dismissed') {
+        setReplySizes({});
       }
     });
-    const offReply = on('CURSOR_REPLY', (payload) => {
-      if (!payload || typeof payload.content !== 'string') return;
-      setReply({ content: payload.content, ts: payload.ts || null });
-      setError(null);
-    });
+
     const offError = on('CURSOR_ERROR', (payload) => {
       if (!payload || typeof payload.message !== 'string') return;
       setError(payload.message);
-      setReply(null);
     });
+
     const offEnabled = on('CURSOR_ENABLED_CHANGED', (payload) => {
       if (!payload || typeof payload.enabled !== 'boolean') return;
       setPresenceAnim(payload.enabled ? 'enter' : 'exit');
     });
+
+    const offRightClick = on('CURSOR_RIGHT_CLICK', (payload) => {
+      if (!payload) return;
+      // Right-click while only ONE reply visible: dismiss it.
+      // Otherwise: dismiss the topmost (latest).
+      setReplies((curr) => {
+        if (curr.length === 0) return curr;
+        const top = curr[curr.length - 1];
+        void invoke('CURSOR_DISMISS_REPLY', { id: top.id }).catch(() => {});
+        return curr;
+      });
+    });
+
     return () => {
-      offMode?.();
-      offReply?.();
+      offState?.();
       offError?.();
       offEnabled?.();
+      offRightClick?.();
     };
-  }, [on]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [on, invoke]);
 
-  // Auto-focus the textarea when entering input mode and place caret at
-  // end so a restored draft is immediately editable.
+  // Auto-focus textarea when input opens.
   useEffect(() => {
-    if (mode === 'input' && textareaRef.current) {
+    if (inputOpen && textareaRef.current) {
       requestAnimationFrame(() => {
         const node = textareaRef.current;
         if (!node) return;
@@ -251,31 +226,27 @@ function CursorCompanionView() {
         } catch (_) {}
       });
     }
-  }, [mode]);
+  }, [inputOpen]);
 
-  // Debounced draft sync to main. Lets the tray-side Shift+Shift path
-  // dismiss with a current draft even though the renderer wasn't the
-  // gesture source.
+  // Debounced draft sync.
   useEffect(() => {
-    if (mode !== 'input') return undefined;
+    if (!inputOpen) return undefined;
     const t = setTimeout(() => {
       void invoke('CURSOR_DRAFT_UPDATE', { prompt }).catch(() => {});
     }, 120);
     return () => clearTimeout(t);
-  }, [prompt, mode, invoke]);
+  }, [prompt, inputOpen, invoke]);
 
-  // Global wheel capture while the response bubble is visible. The
-  // bubble travels with the cursor, so the cursor is never *over* the
-  // bubble's content — but the bubble's owning window is non-click-
-  // through in response mode, which means wheel events anywhere inside
-  // the window's bounds land here. We catch them at the document and
-  // scroll the response pane directly, regardless of where exactly the
-  // cursor sits within the window. Mental model: if a response is on
-  // screen, your wheel scrolls it.
+  // Global wheel capture while replies are visible — bubble travels
+  // with the cursor (when not parked) so we forward wheel into the
+  // topmost reply's scrollable pane.
+  const replyScrollRefs = useRef({}); // { [id]: HTMLElement }
   useEffect(() => {
-    if (mode !== 'response') return undefined;
+    if (replies.length === 0) return undefined;
     const handler = (e) => {
-      const node = responseScrollRef.current;
+      const top = replies[replies.length - 1];
+      if (!top) return;
+      const node = replyScrollRefs.current[top.id];
       if (!node) return;
       e.preventDefault();
       const delta = e.deltaMode === 1 ? e.deltaY * INPUT_LINE_HEIGHT : e.deltaY;
@@ -283,23 +254,11 @@ function CursorCompanionView() {
     };
     document.addEventListener('wheel', handler, { passive: false, capture: true });
     return () => document.removeEventListener('wheel', handler, { capture: true });
-  }, [mode]);
+  }, [replies]);
 
-  // Measure prompt synchronously before paint, BEFORE first render
-  // commits, using two hidden mirrors. No DOM mutations on the textarea
-  // itself — both width and height are React-state-driven so the outer
-  // pill and inner textarea always update in the same paint frame and
-  // never disagree, which was the root cause of the per-keystroke
-  // flicker.
-  //
-  // Width comes from the single-line `widthMirrorRef`. Height comes
-  // from the wrap-locked `wrapMirrorRef` whenever the content would
-  // wrap or contains explicit newlines; otherwise it's exactly one
-  // line. The wrap mirror has identical font + width constraints as
-  // the textarea will have, so its rendered height is what the
-  // textarea will render at.
+  // Measure prompt for input pill width/height.
   useLayoutEffect(() => {
-    if (mode !== 'input') return;
+    if (!inputOpen) return;
     const singleLineWidth = widthMirrorRef.current?.scrollWidth || 0;
     const desiredWidth = singleLineWidth + PILL_PADDING_X * 2 + 2;
     const nextWidth = Math.min(
@@ -324,50 +283,9 @@ function CursorCompanionView() {
         ? prev
         : { width: nextWidth, height: nextHeight, textHeight: nextTextHeight },
     );
-  }, [mode, prompt]);
-
-  // Measure response content width AND height before paint so the pill
-  // hugs short replies horizontally as well as vertically. The mirror
-  // is `display: inline-block` with `max-width` set to the same inner
-  // content width the scrollable pane would use at full width — the
-  // browser shrinks the mirror to natural content width when the
-  // content fits in a single line, and caps at max-width when it
-  // wraps. offsetWidth gives us exactly the inner width to render at;
-  // outerWidth derives from that plus the asymmetric padding used by
-  // the scrollable inner div.
-  //
-  // Outer pill: width = inner + RESPONSE_PADDING_X (left)
-  //                            + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD) (right)
-  //             height = inner content height + 2 × RESPONSE_PADDING_Y
-  // Both clamped to PILL_MIN_WIDTH / PILL_HEIGHT (floor) and
-  // RESPONSE_MAX_WIDTH / RESPONSE_MAX_HEIGHT (ceiling).
-  useLayoutEffect(() => {
-    if (mode !== 'response') return;
-    const raw = reply?.content || error || '';
-    const content = raw.trim();
-    if (!content) {
-      setResponseHeight(PILL_HEIGHT);
-      setResponseWidth(PILL_MIN_WIDTH);
-      return;
-    }
-    const innerHorizPadding = RESPONSE_PADDING_X + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD);
-    const measuredW = responseMirrorRef.current?.offsetWidth || 0;
-    const measuredH = responseMirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
-    const nextW = Math.min(
-      RESPONSE_MAX_WIDTH,
-      Math.max(PILL_MIN_WIDTH, measuredW + innerHorizPadding),
-    );
-    const nextH = Math.min(
-      RESPONSE_MAX_HEIGHT,
-      Math.max(PILL_HEIGHT, measuredH + RESPONSE_PADDING_Y * 2),
-    );
-    setResponseWidth((prev) => (prev === nextW ? prev : nextW));
-    setResponseHeight((prev) => (prev === nextH ? prev : nextH));
-  }, [mode, reply, error]);
+  }, [inputOpen, prompt]);
 
   const handleDismiss = useCallback(async () => {
-    // Pass the current prompt so main can persist it as the draft —
-    // covers Esc and any other explicit-dismiss path.
     try { await invoke('CURSOR_DISMISS', { prompt }); } catch (_) {}
   }, [invoke, prompt]);
 
@@ -386,41 +304,32 @@ function CursorCompanionView() {
 
   const handleBlur = useCallback(() => {
     setIsBlurred(true);
-    void invoke('CURSOR_BLUR_PARK').catch(() => {});
-  }, [invoke]);
+    // Synchronously persist the draft before parking. Closes the gap
+    // between the debounced draft sync and a tray-side dismissal that
+    // could otherwise lose the most recent keystroke.
+    void invoke('CURSOR_BLUR_PARK', { prompt }).catch(() => {});
+  }, [invoke, prompt]);
 
   const handleFocus = useCallback(() => {
     setIsBlurred(false);
     void invoke('CURSOR_FOCUS_RESUME').catch(() => {});
   }, [invoke]);
 
-  // Click-to-refocus while the bubble is parked. Native click on the
-  // textarea focuses it for free; this handler covers clicks landing on
-  // the pill padding/border around the textarea.
   const handlePillMouseDown = useCallback((e) => {
-    if (mode !== 'input') return;
+    if (!inputOpen) return;
     if (!isBlurred) return;
     if (e.target === textareaRef.current) return;
     e.preventDefault();
     textareaRef.current?.focus();
-  }, [mode, isBlurred]);
+  }, [inputOpen, isBlurred]);
 
-  // Renderer-side double-Shift detector. When the cursor-companion
-  // panel has keyboard focus (input mode), uIOhook can miss discrete
-  // shift up/down events. Detect locally and dispatch the gesture
-  // through the unified main-process entry — same lock applies, so the
-  // tray-side path's late event is suppressed.
-  //
-  // Reset the tap timestamp whenever the textarea blurs or the panel
-  // leaves input mode. Without this reset, a stale "tap 1" from an
-  // earlier interaction can survive into a fresh focus and turn one
-  // Shift press into a phantom double-tap.
+  // Renderer-side double-Shift detector.
   const shiftTapAtRef = useRef(0);
   useEffect(() => {
-    if (mode !== 'input') {
+    if (!inputOpen) {
       shiftTapAtRef.current = 0;
     }
-  }, [mode]);
+  }, [inputOpen]);
   useEffect(() => {
     if (isBlurred) {
       shiftTapAtRef.current = 0;
@@ -434,8 +343,6 @@ function CursorCompanionView() {
       return;
     }
     if (e.key === 'Shift') {
-      // Auto-repeat fires Shift keydown again while held; that should
-      // not advance the double-tap state machine.
       if (e.repeat) return;
       const now = Date.now();
       if (now - shiftTapAtRef.current <= 320) {
@@ -447,29 +354,59 @@ function CursorCompanionView() {
       }
       return;
     }
+    // Reset double-shift tracker on any non-Shift key — protects against
+    // Shift-for-capitalization → quick second Shift being misread as
+    // Shift+Shift.
+    if (e.key !== 'Shift') {
+      shiftTapAtRef.current = 0;
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      // Option+Enter attaches the cursor-area screenshot.
-      // Plain Enter sends the prompt only — no vision context.
       handleSubmit(e.altKey === true);
     }
   };
 
-  const pillWidth = mode === 'input'
-    ? inputBox.width
-    : mode === 'loading'
-      ? 22
-      : mode === 'response'
-        ? responseWidth
-        : 5;
-  const pillHeight = mode === 'input'
-    ? inputBox.height
-    : mode === 'response'
-      ? responseHeight
-      : mode === 'loading'
-        ? 22
-        : 5;
-  const isPill = mode === 'input' || mode === 'response';
+  // Per-reply right-click handler — local so it identifies which reply.
+  const handleReplyContextMenu = useCallback((replyId) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void invoke('CURSOR_DISMISS_REPLY', { id: replyId }).catch(() => {});
+  }, [invoke]);
+
+  // Compute which layers are active and their vertical offsets.
+  // Layer order top→bottom: loader, input, reply-stack.
+  const showDot = !loading && !inputOpen && replies.length === 0;
+
+  // Measured stack heights for layout. Reply stack outer height = topmost
+  // reply's measured height + (count-1)*peek.
+  const topReply = replies.length > 0 ? replies[replies.length - 1] : null;
+  const topReplySize = topReply ? (replySizes[topReply.id] || { width: PILL_MIN_WIDTH, height: PILL_HEIGHT }) : null;
+  const stackOuterHeight = topReplySize
+    ? topReplySize.height + (replies.length - 1) * STACK_PEEK_OFFSET
+    : 0;
+
+  // Vertical positions of each layer (anchored at STACK_TOP).
+  let cursor = STACK_TOP;
+  const positions = {};
+  if (loading) {
+    // Loader is positioned independently with its own offset to keep the
+    // 22px box visually centred on the cursor when it's the only thing
+    // visible. When stacked above other layers, we still use LOADER_TOP
+    // for the loader and offset subsequent layers below it.
+    positions.loader = { left: LOADER_LEFT, top: LOADER_TOP };
+    cursor = LOADER_TOP + LOADER_SIZE + LAYER_GAP;
+  }
+  if (inputOpen) {
+    positions.input = { left: STACK_LEFT, top: cursor };
+    cursor += inputBox.height + LAYER_GAP;
+  }
+  if (replies.length > 0) {
+    positions.replyStack = { left: STACK_LEFT, top: cursor };
+    cursor += stackOuterHeight + LAYER_GAP;
+  }
+  if (showDot) {
+    positions.dot = { left: STACK_LEFT, top: STACK_TOP };
+  }
 
   return (
     <div
@@ -477,193 +414,155 @@ function CursorCompanionView() {
         position: 'fixed',
         inset: 0,
         background: 'transparent',
-        // Default click-through. The main process toggles
-        // setIgnoreMouseEvents per-mode; this CSS belt is for the empty
-        // areas around the pill itself.
         pointerEvents: 'none',
         userSelect: 'none',
         fontFamily: PILL_FONT_FAMILY,
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* The morphing element. Dot/input/response share the south-east
-          offset (+14,+18) so the bubble grows from where the dot is.
-          Loading mode uses a tighter offset (+6,+8) so the 22px
-          two-dot indicator's visual center lines up with the 6px dot's
-          center horizontally, ~2px higher — feels like an active
-          status orbiter instead of a satellite drifting away. */}
-      <div
-        onMouseDown={handlePillMouseDown}
-        style={{
-          position: 'absolute',
-          left: mode === 'loading' ? ANCHOR_X + 8 : ANCHOR_X + 14,
-          top: mode === 'loading' ? ANCHOR_Y + 10 : ANCHOR_Y + 18,
-          width: pillWidth,
-          height: pillHeight,
-          // Presence enter/exit animation. The keyframe controls
-          // opacity + transform; the steady state is opacity:1 +
-          // scale(1) once the keyframe finishes (animation-fill-mode:
-          // forwards in the keyframe definition).
-          animation: presenceAnim === 'enter'
-            ? 'cursor-presence-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both'
-            : presenceAnim === 'exit'
-              ? 'cursor-presence-exit 200ms ease both'
-              : undefined,
-          transformOrigin: 'top left',
-          borderRadius: isPill ? PILL_RADIUS : '50%',
-          // Subtle dim while parked-and-blurred so the user gets a
-          // visual cue that the pill is awaiting a click to refocus.
-          opacity: mode === 'input' && isBlurred ? 0.78 : 1,
-          background: mode === 'dot'
-            ? ACCENT
-            : mode === 'input'
-              ? ACCENT
-              : mode === 'response'
-                ? 'rgba(20, 20, 24, 0.92)'
-                : 'transparent',
-          boxShadow: mode === 'dot' || mode === 'loading'
-            ? 'none'
-            : mode === 'input'
-              ? `0 8px 24px rgba(0, 0, 0, 0.32)`
-              : `0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)`,
-          backdropFilter: mode === 'response' ? 'blur(14px)' : 'none',
-          WebkitBackdropFilter: mode === 'response' ? 'blur(14px)' : 'none',
-          color: mode === 'input' ? '#ffffff' : 'rgba(255, 255, 255, 0.9)',
-          display: 'flex',
-          alignItems: mode === 'response' || mode === 'input' ? 'flex-start' : 'center',
-          justifyContent: mode === 'loading' ? 'center' : 'flex-start',
-          paddingLeft: isPill ? PILL_PADDING_X : 0,
-          // Response bubble drops its container right padding so the
-          // scrollbar sits at the very right edge of the bubble. The
-          // visual right padding is restored as paddingRight on the
-          // inner scrollable div (see below).
-          paddingRight: mode === 'response'
-            ? 0
-            : isPill ? PILL_PADDING_X : 0,
-          paddingTop: mode === 'response'
-            ? RESPONSE_PADDING_Y
-            : mode === 'input'
-              ? PILL_PADDING_Y
-              : 0,
-          paddingBottom: mode === 'response'
-            ? RESPONSE_PADDING_Y
-            : mode === 'input'
-              ? PILL_PADDING_Y
-              : 0,
-          pointerEvents: isPill ? 'auto' : 'none',
-          overflow: 'hidden',
-          transition:
-            mode === 'input' && !isMorphing
-              // Steady-state typing: BOTH width and height must be
-              // instant so the outer pill and the React-driven textarea
-              // stay in lockstep across the wrap boundary. Animating
-              // width caused the textarea (width: 100%) to be
-              // mid-animation while the height calc assumed the final
-              // locked width, wrapping content to 2 lines inside a
-              // 1-line pill — the per-keystroke flicker at the right
-              // edge. So once the morph window closes, snap on
-              // keystrokes.
-              ? 'border-radius 240ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'background 220ms ease, ' +
-                'box-shadow 220ms ease, ' +
-                'padding 200ms ease'
-              // Mode-change morph window (or any non-input mode):
-              // animate width/height too so dot → pill, pill → loader,
-              // loader → response feel like one continuous element
-              // smoothly reshaping rather than a hard snap.
-              : 'width 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'height 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'border-radius 260ms cubic-bezier(0.22, 1, 0.36, 1), ' +
-                'background 220ms ease, ' +
-                'box-shadow 220ms ease, ' +
-                'padding 220ms ease',
-        }}
-      >
-        {mode === 'input' && (
-          <textarea
-            ref={textareaRef}
-            rows={1}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onBlur={handleBlur}
-            onFocus={handleFocus}
-            spellCheck={false}
-            autoComplete="off"
-            className="cursor-thin-scroll"
+      {/* Dot layer */}
+      <LayerWrapper visible={showDot} duration={220}>
+        {(state) => (
+          <div
             style={{
-              flex: '1 1 auto',
-              minWidth: 0,
-              width: '100%',
-              height: inputBox.textHeight,
-              maxHeight: PILL_INPUT_MAX_HEIGHT - PILL_PADDING_Y * 2,
-              background: 'transparent',
-              border: 'none',
-              outline: 'none',
-              padding: 0,
-              margin: 0,
-              color: '#ffffff',
-              caretColor: '#ffffff',
-              fontFamily: 'inherit',
-              fontSize: 15,
-              lineHeight: `${INPUT_LINE_HEIGHT}px`,
-              resize: 'none',
-              overflowY: inputBox.height >= PILL_INPUT_MAX_HEIGHT ? 'auto' : 'hidden',
-              whiteSpace: 'pre-wrap',
-              overflowWrap: 'break-word',
-              wordBreak: 'break-word',
-              userSelect: 'text',
+              position: 'absolute',
+              left: STACK_LEFT,
+              top: STACK_TOP,
+              width: DOT_SIZE,
+              height: DOT_SIZE,
+              borderRadius: '50%',
+              backgroundColor: ACCENT,
+              opacity: state === 'visible' ? 1 : 0,
+              transform: state === 'visible' ? 'scale(1)' : 'scale(0.65)',
+              transition: 'opacity 200ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1)',
+              transformOrigin: 'top left',
+              animation: presenceAnim === 'enter' ? 'cursor-presence-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both'
+                : presenceAnim === 'exit' ? 'cursor-presence-exit 200ms ease both' : undefined,
+              pointerEvents: 'none',
             }}
           />
         )}
+      </LayerWrapper>
 
-        {mode === 'loading' && <ActivityDots />}
-
-        {mode === 'response' && reply && (
-          <div
-            ref={responseScrollRef}
-            className="cursor-thin-scroll"
-            style={{
-              flex: '1 1 auto',
-              maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
-              overflowY: 'auto',
-              userSelect: 'text',
-              opacity: 1,
-              animation: 'cursor-fade-in 200ms ease both',
-              // Right padding lives on this scrollable inner div instead
-              // of the bubble container so the scrollbar (track) sits at
-              // the bubble's right edge — content stays inset by the
-              // ChannelChat-matched 14px while the scrollbar gets the
-              // remaining sliver.
-              paddingRight: RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD,
-              marginRight: -RESPONSE_INNER_RIGHT_PAD,
-            }}
-          >
-            <CursorReplyMarkdown content={reply.content.trim()} />
-          </div>
-        )}
-
-        {mode === 'response' && error && !reply && (
+      {/* Loader layer */}
+      <LayerWrapper visible={loading} duration={220}>
+        {(state) => (
           <div
             style={{
-              flex: '1 1 auto',
-              fontSize: 12,
-              color: 'rgba(255, 120, 120, 0.9)',
+              position: 'absolute',
+              left: positions.loader?.left ?? LOADER_LEFT,
+              top: positions.loader?.top ?? LOADER_TOP,
+              width: LOADER_SIZE,
+              height: LOADER_SIZE,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              opacity: state === 'visible' ? 1 : 0,
+              transform: state === 'visible' ? 'scale(1)' : 'scale(0.7)',
+              transition: 'opacity 200ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), top 240ms cubic-bezier(0.22, 1, 0.36, 1)',
+              transformOrigin: 'top left',
+              pointerEvents: 'none',
             }}
           >
-            {error}
+            <ActivityDots />
           </div>
         )}
-      </div>
+      </LayerWrapper>
 
-      {/* Inline error pill rendered next to the dot when the bubble has
-          collapsed but an error from the previous turn deserves to stay
-          visible. Keeps timeout/submit-failure feedback discoverable. */}
-      {mode === 'dot' && error && (
+      {/* Input pill layer */}
+      <LayerWrapper visible={inputOpen} duration={220}>
+        {(state) => (
+          <div
+            onMouseDown={handlePillMouseDown}
+            style={{
+              position: 'absolute',
+              left: positions.input?.left ?? STACK_LEFT,
+              top: positions.input?.top ?? STACK_TOP,
+              width: inputBox.width,
+              height: inputBox.height,
+              borderRadius: PILL_RADIUS,
+              background: ACCENT,
+              boxShadow: '0 8px 24px rgba(0, 0, 0, 0.32)',
+              color: '#ffffff',
+              display: 'flex',
+              alignItems: 'flex-start',
+              paddingLeft: PILL_PADDING_X,
+              paddingRight: PILL_PADDING_X,
+              paddingTop: PILL_PADDING_Y,
+              paddingBottom: PILL_PADDING_Y,
+              overflow: 'hidden',
+              opacity: state === 'visible' ? (isBlurred ? 0.78 : 1) : 0,
+              transform: state === 'visible' ? 'scale(1)' : 'scale(0.85)',
+              transformOrigin: 'top left',
+              transition: 'opacity 200ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), top 240ms cubic-bezier(0.22, 1, 0.36, 1), border-radius 240ms cubic-bezier(0.22, 1, 0.36, 1), background 220ms ease, box-shadow 220ms ease',
+              pointerEvents: 'auto',
+            }}
+          >
+            <textarea
+              ref={textareaRef}
+              rows={1}
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onBlur={handleBlur}
+              onFocus={handleFocus}
+              spellCheck={false}
+              autoComplete="off"
+              className="cursor-thin-scroll"
+              style={{
+                flex: '1 1 auto',
+                minWidth: 0,
+                width: '100%',
+                height: inputBox.textHeight,
+                maxHeight: PILL_INPUT_MAX_HEIGHT - PILL_PADDING_Y * 2,
+                background: 'transparent',
+                border: 'none',
+                outline: 'none',
+                padding: 0,
+                margin: 0,
+                color: '#ffffff',
+                caretColor: '#ffffff',
+                fontFamily: 'inherit',
+                fontSize: 15,
+                lineHeight: `${INPUT_LINE_HEIGHT}px`,
+                resize: 'none',
+                overflowY: inputBox.height >= PILL_INPUT_MAX_HEIGHT ? 'auto' : 'hidden',
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'break-word',
+                wordBreak: 'break-word',
+                userSelect: 'text',
+              }}
+            />
+          </div>
+        )}
+      </LayerWrapper>
+
+      {/* Reply stack layer */}
+      <LayerWrapper visible={replies.length > 0} duration={220}>
+        {(state) => (
+          <ReplyStack
+            replies={replies}
+            origin={positions.replyStack || { left: STACK_LEFT, top: STACK_TOP }}
+            visible={state === 'visible'}
+            onContextMenu={handleReplyContextMenu}
+            scrollRefs={replyScrollRefs}
+            onMeasure={(id, size) => {
+              setReplySizes((prev) => {
+                const existing = prev[id];
+                if (existing && existing.width === size.width && existing.height === size.height) return prev;
+                return { ...prev, [id]: size };
+              });
+            }}
+          />
+        )}
+      </LayerWrapper>
+
+      {/* Error pill rendered next to the dot when nothing else is visible. */}
+      {showDot && error && (
         <div
           style={{
             position: 'absolute',
-            left: ANCHOR_X + 14,
-            top: ANCHOR_Y + 12,
+            left: STACK_LEFT,
+            top: STACK_TOP + 8,
             padding: '4px 10px',
             background: 'rgba(35, 12, 14, 0.92)',
             color: 'rgba(255, 130, 130, 0.92)',
@@ -680,8 +579,7 @@ function CursorCompanionView() {
         </div>
       )}
 
-      {/* Hidden single-line mirror — drives pill width via scrollWidth
-          of unwrapped content. */}
+      {/* Hidden mirrors for input width/height measurement. */}
       <span
         ref={widthMirrorRef}
         aria-hidden
@@ -701,39 +599,6 @@ function CursorCompanionView() {
       >
         {prompt || ' '}
       </span>
-      {/* Hidden response mirror — drives response pill outer height so
-          it hugs content instead of using a rough estimate. Only
-          mounted in response mode; rendering ReactMarkdown on every
-          input-mode keystroke caused layout shifts that could steal
-          textarea focus / hide the caret. */}
-      {mode === 'response' && (
-        <div
-          ref={responseMirrorRef}
-          aria-hidden
-          style={{
-            position: 'absolute',
-            visibility: 'hidden',
-            pointerEvents: 'none',
-            // inline-block + max-width lets the browser shrink-to-fit
-            // for short content (so the bubble can hug horizontally)
-            // while still wrapping at the same effective inner width
-            // the scrollable pane would use for long content.
-            display: 'inline-block',
-            maxWidth: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
-            fontFamily: 'inherit',
-            padding: 0,
-            margin: 0,
-            left: 0,
-            top: 0,
-          }}
-        >
-          <CursorReplyMarkdown content={(reply?.content || error || ' ').trim() || ' '} />
-        </div>
-      )}
-      {/* Hidden wrapped mirror — drives pill height when content wraps
-          or contains explicit newlines. Width is locked to the
-          textarea's eventual inner width at PILL_MAX_WIDTH, font and
-          wrap rules match the textarea exactly. */}
       <div
         ref={wrapMirrorRef}
         aria-hidden
@@ -792,11 +657,189 @@ function CursorCompanionView() {
 }
 
 /**
- * Two-dot pulse loader, mirrored from the SecurityPanel's TwoDots
- * (next to SECURED_SESSION in the web chat lock popup). Alternates
- * left ↔ right on a 720ms cadence with a 600ms opacity+scale
- * transition. Calmer than a 4-dot rotation in the small footprint —
- * one signal, not four.
+ * LayerWrapper — handles enter/exit animation for a single layer.
+ *
+ * Children prop receives the current presence state ('entering',
+ * 'visible', 'exiting') so the child element can drive its own
+ * transitions. Unmounts the child after the exit duration so the
+ * underlying DOM is clean.
+ */
+function LayerWrapper({ visible, duration = 220, children }) {
+  const [shouldRender, setShouldRender] = useState(visible);
+  const [state, setState] = useState(visible ? 'visible' : 'exiting');
+
+  useEffect(() => {
+    if (visible) {
+      setShouldRender(true);
+      // Next frame, switch to visible so transitions run from the
+      // initial styles to the visible styles.
+      const r = requestAnimationFrame(() => setState('visible'));
+      return () => cancelAnimationFrame(r);
+    }
+    // Exiting: keep mounted, switch state, unmount after duration.
+    setState('exiting');
+    const t = setTimeout(() => setShouldRender(false), duration);
+    return () => clearTimeout(t);
+  }, [visible, duration]);
+
+  // When initially mounted, ensure first frame is 'entering' so the
+  // transition has a starting point to animate from.
+  useEffect(() => {
+    if (visible && shouldRender && state === 'visible') {
+      // already applied
+    }
+  }, [visible, shouldRender, state]);
+
+  if (!shouldRender) return null;
+  return children(state);
+}
+
+/**
+ * ReplyStack — renders the reply deck. Latest on top, older replies
+ * peeking from below by STACK_PEEK_OFFSET each. Each reply's bubble is
+ * absolutely positioned within the stack outer.
+ */
+function ReplyStack({ replies, origin, visible, onContextMenu, scrollRefs, onMeasure }) {
+  // Order: replies[0] = oldest, replies[last] = newest.
+  // Newest sits at z-top fully visible; older are offset down behind it.
+  const count = replies.length;
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: origin.left,
+        top: origin.top,
+        opacity: visible ? 1 : 0,
+        transition: 'opacity 200ms ease, top 240ms cubic-bezier(0.22, 1, 0.36, 1)',
+        pointerEvents: 'auto',
+      }}
+    >
+      {replies.map((reply, idx) => {
+        const fromTop = count - 1 - idx; // 0 for newest, increases for older
+        // Newest at z-top, older behind. Older offset DOWN by peek so
+        // their bottom edge sticks out below the newer one.
+        const z = idx; // higher idx = newer = on top in stack but... we want older to peek
+        // Actually: newer should be visually on TOP (z-index higher), with older offset down.
+        // Newer = idx=count-1. Older = idx=0.
+        // To make older "peek from below the newer": render older translated DOWN, with z-index LOWER.
+        // Easier: position newer at top: 0, older at top: peek*fromTop.
+        // But for "peek from bottom" — we want OLDER reply to extend below newer's bottom edge.
+        // So older sits LOWER and BEHIND. translateY(peek * (count-1-idx)).
+        const offsetY = fromTop * STACK_PEEK_OFFSET;
+        const isTop = fromTop === 0;
+        return (
+          <ReplyBubble
+            key={reply.id}
+            reply={reply}
+            offsetY={offsetY}
+            zIndex={idx}
+            isTop={isTop}
+            onContextMenu={onContextMenu(reply.id)}
+            scrollRefSetter={(node) => {
+              if (node) scrollRefs.current[reply.id] = node;
+              else delete scrollRefs.current[reply.id];
+            }}
+            onMeasure={onMeasure}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+const ReplyBubble = memo(function ReplyBubble({
+  reply, offsetY, zIndex, isTop, onContextMenu, scrollRefSetter, onMeasure,
+}) {
+  const mirrorRef = useRef(null);
+  const [size, setSize] = useState({ width: PILL_MIN_WIDTH, height: PILL_HEIGHT });
+
+  useLayoutEffect(() => {
+    const innerHorizPadding = RESPONSE_PADDING_X + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD);
+    const measuredW = mirrorRef.current?.offsetWidth || 0;
+    const measuredH = mirrorRef.current?.offsetHeight || INPUT_LINE_HEIGHT;
+    const nextW = Math.min(
+      RESPONSE_MAX_WIDTH,
+      Math.max(PILL_MIN_WIDTH, measuredW + innerHorizPadding),
+    );
+    const nextH = Math.min(
+      RESPONSE_MAX_HEIGHT,
+      Math.max(PILL_HEIGHT, measuredH + RESPONSE_PADDING_Y * 2),
+    );
+    setSize((prev) => (prev.width === nextW && prev.height === nextH ? prev : { width: nextW, height: nextH }));
+    onMeasure(reply.id, { width: nextW, height: nextH });
+  }, [reply.id, reply.content, onMeasure]);
+
+  return (
+    <>
+      <div
+        onContextMenu={onContextMenu}
+        style={{
+          position: 'absolute',
+          left: 0,
+          top: offsetY,
+          width: size.width,
+          height: size.height,
+          borderRadius: PILL_RADIUS,
+          background: 'rgba(20, 20, 24, 0.92)',
+          boxShadow: '0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)',
+          backdropFilter: 'blur(14px)',
+          WebkitBackdropFilter: 'blur(14px)',
+          color: 'rgba(255, 255, 255, 0.9)',
+          display: 'flex',
+          alignItems: 'flex-start',
+          paddingLeft: RESPONSE_PADDING_X,
+          paddingRight: 0,
+          paddingTop: RESPONSE_PADDING_Y,
+          paddingBottom: RESPONSE_PADDING_Y,
+          overflow: 'hidden',
+          zIndex,
+          opacity: isTop ? 1 : 0.78,
+          transition: 'top 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease, width 240ms ease, height 240ms ease',
+          pointerEvents: isTop ? 'auto' : 'none',
+        }}
+      >
+        <div
+          ref={scrollRefSetter}
+          className="cursor-thin-scroll"
+          style={{
+            flex: '1 1 auto',
+            maxHeight: RESPONSE_MAX_HEIGHT - RESPONSE_PADDING_Y * 2,
+            overflowY: isTop ? 'auto' : 'hidden',
+            userSelect: 'text',
+            paddingRight: RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD,
+            marginRight: -RESPONSE_INNER_RIGHT_PAD,
+          }}
+        >
+          <CursorReplyMarkdown content={(reply.content || '').trim()} />
+        </div>
+      </div>
+      {/* Hidden mirror — measures content for size. */}
+      <div
+        ref={mirrorRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          pointerEvents: 'none',
+          display: 'inline-block',
+          maxWidth: `${RESPONSE_MAX_WIDTH - RESPONSE_PADDING_X - (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD)}px`,
+          fontFamily: 'inherit',
+          padding: 0,
+          margin: 0,
+          left: 0,
+          top: 0,
+        }}
+      >
+        <CursorReplyMarkdown content={(reply.content || ' ').trim() || ' '} />
+      </div>
+    </>
+  );
+});
+
+/**
+ * Two-dot pulse loader — same size as the main dot (5×5) with a 4px gap.
+ * Alternates left ↔ right on a 720ms cadence.
  */
 function ActivityDots() {
   const [active, setActive] = useState(0);
@@ -807,8 +850,8 @@ function ActivityDots() {
   }, []);
 
   const dotStyle = (idx) => ({
-    width: 4,
-    height: 4,
+    width: DOT_SIZE,
+    height: DOT_SIZE,
     borderRadius: '50%',
     backgroundColor: ACCENT,
     opacity: active === idx ? 1 : 0.18,
@@ -817,7 +860,7 @@ function ActivityDots() {
   });
 
   return (
-    <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexShrink: 0 }}>
+    <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
       <div style={dotStyle(0)} />
       <div style={dotStyle(1)} />
     </div>

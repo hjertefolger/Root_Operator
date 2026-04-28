@@ -1,39 +1,43 @@
 /**
  * ROOT OPERATOR — CURSOR COMPANION
  *
- * Single morphing element anchored to the system cursor. States:
- *   dot → input pill → loading dots → response → dot
+ * Cursor-anchored ambient surface. Layers stack vertically below the
+ * cursor, each independently visible:
  *
- * One transparent always-on-top window holds the renderer. The window
- * tracks the mouse pointer at 60Hz; the inner element morphs its shape
- * via CSS as state transitions occur. The pointer-arrow sits at the
- * left edge of the pill when typing — text grows to the right, and
- * the whole pill (with text intact) follows the mouse if it moves
- * mid-typing.
+ *   1. dot          — ambient idle marker
+ *   2. loader       — two-dot indicator while a turn is in flight
+ *   3. input pill   — composer for the next prompt
+ *   4. reply stack  — completed assistant messages, latest on top
  *
- * Mouse events are click-through except while input is active; keyboard
- * input still flows to the renderer because the window is focusable.
+ * Any combination is valid. Loader can be visible while the user is
+ * typing a follow-up; replies can stack underneath both. When a layer
+ * exits, the layers below smoothly slide up into the freed slot.
  *
- * The capture + submission flow is unchanged in shape: on Enter we hide
- * the overlay, run `screencapture -x -R`, restore, and submit through
- * the existing channel-bridge with a text message that references the
- * staged screenshot. The reply is forwarded back to the same renderer.
+ * Concurrent-turn semantics mirror desktop/web chat: there is no
+ * single-flight rejection. The user may submit while a previous turn is
+ * still in flight; both replies will land in the stack in arrival order.
+ *
+ * Mouse events are click-through except where a focusable layer is
+ * visible (input or any reply). Keyboard input flows to the renderer
+ * because the window is an NSPanel that can become key.
+ *
+ * The capture + submission flow: on Option+Enter we hide the overlay,
+ * run `screencapture -x -R`, restore, and submit through the existing
+ * channel-bridge with a system-reminder envelope referencing the staged
+ * screenshot. The reply is forwarded back to the same renderer.
  */
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-// Window is sized large enough to host every state without resizing the
-// native window mid-animation (which fights CSS transitions). Inner
-// element morphs via CSS within this fixed canvas.
+// Window is sized large enough to host every layer combination without
+// resizing the native window mid-animation (which fights CSS transitions).
 const WIN_WIDTH = 720;
-const WIN_HEIGHT = 320;
+const WIN_HEIGHT = 720;
 
 // Cursor anchor inside the window: the mouse pointer-arrow corresponds
-// to (ANCHOR_X, ANCHOR_Y) in window-local coordinates. In dot mode, the
-// dot renders just south-east of this point. In input mode, this point
-// sits at the left edge of the pill, vertically centered.
+// to (ANCHOR_X, ANCHOR_Y) in window-local coordinates.
 const ANCHOR_X = 16;
 const ANCHOR_Y = 16;
 
@@ -49,9 +53,20 @@ const CURSOR_LENS_CROP_H = 800;
 // Stage-attachment TTL.
 const CURSOR_ATTACHMENT_TTL_MS = 10 * 60 * 1000;
 
-// Single-flight pending lock. No auto-timeout — Claude turns can take
-// long, and a stale "no response" pill is worse than waiting. The lock
-// releases on actual reply or on user dismiss (Esc / Shift+Shift).
+// Sweep cadence for stale screenshot attachments.
+const CURSOR_ATTACHMENT_SWEEP_INTERVAL_MS = 60 * 1000;
+
+// Maximum visible replies in the stack. Older replies fall off the
+// visible deck but remain in the channel-history that drives all other
+// surfaces.
+const REPLY_STACK_CAP = 3;
+
+// Grace window for terminal activity arriving before any reply. macOS
+// activity stream and websocket reply delivery are independent; the
+// `finished` phase can fire before the `claude_reply` socket message
+// lands. The grace timer holds loading state for this many ms after
+// terminal-without-reply, cancelled by handleChannelReply.
+const TERMINAL_GRACE_MS = 750;
 
 const CURSOR_CHAT_ID = 'cursor-companion';
 
@@ -59,9 +74,7 @@ const CURSOR_CHAT_ID = 'cursor-companion';
 // the renderer-side detector (textarea keydown) and the tray-side
 // uIOhook keyup detector observe the same physical double-tap. Whichever
 // fires first claims the gesture; subsequent dispatches inside this
-// window are dropped. Without this, the second source's late event sees
-// the just-applied state and toggles back, which is what produced the
-// "Shift+Shift relaunches input from response" race.
+// window are dropped.
 const GESTURE_LOCK_MS = 250;
 
 // Drafts are in-memory only and time-bounded. 12h is generous enough to
@@ -70,13 +83,13 @@ const GESTURE_LOCK_MS = 250;
 const DRAFT_TTL_MS = 12 * 60 * 60 * 1000;
 
 // Last reply persists across dismissals so a future triple-tap gesture
-// can recall it. Shorter TTL than draft — recall is a "the thing I just
-// asked about" affordance, not a long-term memory.
+// can recall it.
 const LAST_REPLY_TTL_MS = 30 * 60 * 1000;
 
 let depsRef = null;
 let win = null;
 let cursorPollTimer = null;
+let attachmentSweepTimer = null;
 let lastWinPos = { x: -1, y: -1 };
 let pending = null;
 let isInitialized = false;
@@ -85,27 +98,28 @@ let shiftKeyCodes = [];
 let escKeyCode = null;
 let mouseListenerAttached = false;
 let isShiftHeld = false;
-let mode = 'dot'; // dot | input | loading | response
 
-// Half-written prompt persists across dismissals so the user can step
-// away to look something up and come back to it. Cleared on successful
-// submit.
+// Layered visibility. Each is independent.
+let inputOpen = false;
+let replies = []; // array of { id, content, ts, role }
+let terminalGraceTimer = null;
+let terminalGraceTurnId = null;
+
+// Half-written prompt persists across dismissals. Cleared on successful submit.
 let draftPrompt = '';
 let draftUpdatedAt = 0;
 
-// Stored on every assistant reply. Wired now so a future triple-Shift
-// gesture can recall the last response without an additional patch.
+// Stored on every assistant reply for future triple-Shift recall.
 let lastReply = null;
 let lastReplyUpdatedAt = 0;
 
 // Gesture suppression: timestamp until which subsequent gesture
-// dispatches should be ignored. Updated by handleShiftGesture.
+// dispatches should be ignored.
 let gestureLockUntil = 0;
 
-// Cursor-following pause. The window normally chases the pointer at
-// 60Hz; while parked it stays at its current screen position so the
-// user can move the system cursor onto the bubble (e.g. to refocus the
-// textarea after a blur). Auto-cleared whenever mode leaves `input`.
+// Cursor-following pause. While parked the window stays at its current
+// screen position so the user can move the system cursor onto a
+// reply/input layer to interact with it. Auto-cleared when input closes.
 let isParked = false;
 
 function isUsable(w) {
@@ -114,6 +128,27 @@ function isUsable(w) {
 
 function newTurnId() {
     return `cursor-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function newReplyId() {
+    return `reply-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+/**
+ * Derived single-word "mode" for legacy callers and tests.
+ * Priority: input > response (replies present) > loading > dot.
+ * Loading combined with input/replies still surfaces as the foreground
+ * layer's name; the loader is a co-resident layer, not a mode.
+ */
+function getMode() {
+    if (inputOpen) return 'input';
+    if (replies.length > 0) return 'response';
+    if (pending !== null) return 'loading';
+    return 'dot';
+}
+
+function isLoading() {
+    return pending !== null;
 }
 
 function init(deps) {
@@ -152,21 +187,12 @@ function getApi() {
         toggleFromHotkey,
         notifyEnabledChanged,
         isPending: () => pending !== null,
-        getMode: () => mode,
+        getMode,
     };
 }
 
 /**
- * Tell the renderer that the master enabled flag flipped. Used by the
- * controller to drive entrance/exit animations: on enable, the dot
- * fades + scales in from the default position; on disable, whatever
- * state is currently visible (dot, input pill, loading, response)
- * fades + scales out before the window is closed.
- *
- * On enable, the window may still be loading when this fires (start()
- * just created the BrowserWindow); we defer the send until the
- * webContents has finished its initial load so the entrance animation
- * actually reaches the renderer instead of being dropped on the floor.
+ * Tell the renderer that the master enabled flag flipped.
  */
 function notifyEnabledChanged(enabled) {
     if (!isUsable(win)) return;
@@ -189,32 +215,17 @@ function notifyEnabledChanged(enabled) {
 }
 
 /**
- * Single Shift+Shift gesture entry. Both the tray-side uIOhook detector
- * (via `toggleFromHotkey`) and the renderer-side textarea-keydown
- * detector (via the `CURSOR_SHIFT_GESTURE` IPC) funnel through here so
- * the per-mode dispatch and the suppression lock are applied uniformly.
+ * Single Shift+Shift gesture entry. Per-mode mapping:
+ *   input open                → close input (preserve draft)
+ *   input closed (any layers) → open input (restore draft if any)
+ *   nothing visible           → open input
  *
- * Per-mode mapping:
- *   dot       → showInput        (start a turn, restore draft if any)
- *   input     → dismiss          (preserve draft for next open)
- *   loading   → no-op            (avoid confusing an in-flight turn)
- *   response  → showInput        (continue the conversation)
- *
- * options.prompt — if provided (renderer path), it's the latest textarea
- * value at the moment the gesture fired. We persist it as the draft
- * before any mode transition so dismiss-from-input never loses the most
- * recent keystroke.
+ * Loading state alone no longer blocks the gesture — concurrent-turn
+ * UX means the user can compose a follow-up while a turn is in flight.
  */
 function handleShiftGesture(source = 'tray', options = {}) {
     if (!isInitialized) return;
 
-    // Persist any renderer-supplied prompt as the draft *before* the
-    // lock check. If the tray-side keyup detector won the race and
-    // already dismissed input, this gesture is about to be suppressed —
-    // but the renderer's `prompt` is fresher than the last debounced
-    // CURSOR_DRAFT_UPDATE (max 120ms stale), so we save it anyway. That
-    // closes the last sub-frame of typing that could otherwise be lost
-    // when CURSOR_MODE→dot clears the renderer's prompt state.
     if (source === 'renderer' && typeof options.prompt === 'string') {
         setDraftPrompt(options.prompt);
     }
@@ -226,35 +237,17 @@ function handleShiftGesture(source = 'tray', options = {}) {
     }
     gestureLockUntil = now + GESTURE_LOCK_MS;
 
-    if (mode === 'loading') {
+    if (inputOpen) {
+        closeInput();
         return;
     }
-    if (mode === 'input') {
-        dismiss();
-        return;
-    }
-    showInput();
+    openInput();
 }
 
-/**
- * Tray-side hotkey path. Kept for the existing main.js wiring. The
- * tray detector has no access to the in-flight textarea contents, so
- * any draft persistence here relies on the renderer's debounced
- * `CURSOR_DRAFT_UPDATE` syncs prior to the gesture.
- */
 function toggleFromHotkey() {
     handleShiftGesture('tray');
 }
 
-/**
- * Attach passive listeners to the uIOhook singleton:
- *   - Shift keydown/keyup → track held state for Shift+wheel scroll capture
- *   - mousedown           → click-anywhere dismiss for the response bubble
- *
- * Caller must invoke this AFTER the tray's double-Shift listener has
- * started uIOhook, so we hook the running singleton rather than spinning
- * up a competing instance.
- */
 function attachInputListeners() {
     if (mouseListenerAttached) return;
     try {
@@ -305,40 +298,37 @@ function handleShiftKeyUp(event) {
 }
 
 /**
- * Right-click anywhere dismisses the response bubble. uIOhook gives us
- * a passive observation — the click itself still flows to the
- * foreground app (the user's intended right-click context menu / etc.
- * still fires normally), the bubble just collapses out of the way as
- * a side-effect.
+ * Right-click on the topmost reply dismisses ONLY that reply; the
+ * uIOhook observation is global, so the renderer must decide whether
+ * the click landed within the topmost reply's bounds. We forward the
+ * event coordinates and let renderer make the call.
  *
- * Left-click / middle-click do NOT dismiss — Tom's call: clicking
- * around while reading shouldn't kill the response. Esc + Shift+Shift
- * (continue conversation) and right-click are the explicit dismiss
- * paths.
- *
- * Loading state is intentionally NOT dismissable — a click during a
- * pending turn shouldn't kill the in-flight request. Response state
- * is dismissable on right-click.
- *
- * uIOhook button codes: 1=left, 2=right, 3=middle.
+ * Loading is intentionally still NOT click-dismissable, but with the
+ * new layered model "loading" is just a layer alongside others; the
+ * dismiss behaviour we care about is per-reply.
  */
 function handleGlobalMouseDown(event) {
-    if (mode !== 'response') return;
+    if (replies.length === 0) return;
     if (!event || event.button !== 2) return;
-    dismiss();
+    if (!isUsable(win)) return;
+    try {
+        win.webContents.send('CURSOR_RIGHT_CLICK', {
+            screenX: event.x,
+            screenY: event.y,
+        });
+    } catch (_) {}
 }
 
 /**
- * Esc dismisses the response bubble globally (passive uIOhook keydown
- * observation, regardless of which app has focus). Esc inside the
- * input pill is handled by the renderer's textarea keydown for draft
- * persistence — that path doesn't conflict because the response
- * bubble has no focused input.
+ * Esc dismisses layers in priority order: input first (preserve draft),
+ * then the entire reply stack. Renderer's own keydown handles the
+ * input-mode case; this handler only fires when input is closed.
  */
 function handleGlobalEscDown(event) {
-    if (mode !== 'response') return;
     if (!event || event.keycode !== escKeyCode) return;
-    dismiss();
+    if (inputOpen) return; // renderer handles the input-mode Esc
+    if (replies.length === 0) return;
+    clearReplies();
 }
 
 function start() {
@@ -349,22 +339,26 @@ function start() {
     createWindow();
     startCursorPoll();
     attachInputListeners();
+    startAttachmentSweep();
     depsRef.logDebug('[CURSOR] Companion started');
 }
 
 function stop() {
     stopCursorPoll();
+    stopAttachmentSweep();
     detachInputListeners();
+    if (terminalGraceTimer) {
+        clearTimeout(terminalGraceTimer);
+        terminalGraceTimer = null;
+        terminalGraceTurnId = null;
+    }
     if (isUsable(win)) {
         try { win.close(); } catch (_) {}
     }
     win = null;
     pending = null;
-    mode = 'dot';
-    // Reset all derived state so a subsequent start() begins from a
-    // clean slate. Without this, a stale gesture lock or parked flag
-    // from the previous session can cause the first interaction after
-    // a re-enable to behave wrong.
+    inputOpen = false;
+    replies = [];
     gestureLockUntil = 0;
     isParked = false;
     isShiftHeld = false;
@@ -389,10 +383,8 @@ function createWindow() {
         maximizable: false,
         fullscreenable: false,
         skipTaskbar: true,
-        // NSPanel on macOS — can become key window (accept keystrokes)
-        // while another app is foreground, without activating our entire
-        // app or stealing the dock focus. Without this, Option+Option
-        // opens the pill but the underlying app keeps keyboard focus.
+        // NSPanel on macOS — can become key window without activating
+        // our entire app or stealing dock focus.
         type: process.platform === 'darwin' ? 'panel' : undefined,
         focusable: true,
         hasShadow: false,
@@ -413,8 +405,6 @@ function createWindow() {
     if (typeof w.setHiddenInMissionControl === 'function') {
         w.setHiddenInMissionControl(true);
     }
-    // Default mode is dot — fully click-through. Toggled to interactive
-    // when input mode opens so the renderer can receive keystrokes.
     w.setIgnoreMouseEvents(true, { forward: true });
 
     loadRendererWindow(w, '?view=cursor-companion');
@@ -435,8 +425,6 @@ function createWindow() {
 
 function startCursorPoll() {
     if (cursorPollTimer) return;
-    // Run once immediately so the window doesn't briefly show at (0,0)
-    // before the first interval tick.
     updateWindowPosition();
     cursorPollTimer = setInterval(updateWindowPosition, CURSOR_POLL_INTERVAL_MS);
 }
@@ -464,19 +452,65 @@ function updateWindowPosition() {
     }
 }
 
-// ─── Mode transitions ───────────────────────────────────────────────────
+function startAttachmentSweep() {
+    if (attachmentSweepTimer) return;
+    sweepStaleAttachments();
+    attachmentSweepTimer = setInterval(sweepStaleAttachments, CURSOR_ATTACHMENT_SWEEP_INTERVAL_MS);
+}
 
-function setMode(next, payload) {
-    mode = next;
-    // Cursor following always resumes when leaving input — parking is
-    // an input-mode affordance only.
-    if (next !== 'input') isParked = false;
-    if (!isUsable(win)) return;
-    if (next === 'input') {
-        try { win.focus(); } catch (_) {}
+function stopAttachmentSweep() {
+    if (attachmentSweepTimer) {
+        clearInterval(attachmentSweepTimer);
+        attachmentSweepTimer = null;
     }
-    applyInteractivity();
-    win.webContents.send('CURSOR_MODE', { mode: next, ...(payload || {}) });
+}
+
+function sweepStaleAttachments() {
+    try {
+        const dir = depsRef.getCursorAttachmentsDir();
+        if (!fs.existsSync(dir)) return;
+        const cutoff = Date.now() - CURSOR_ATTACHMENT_TTL_MS;
+        for (const name of fs.readdirSync(dir)) {
+            const filepath = path.join(dir, name);
+            try {
+                const stat = fs.statSync(filepath);
+                if (stat.mtimeMs < cutoff) {
+                    fs.unlinkSync(filepath);
+                }
+            } catch (_) { /* file may have been removed already */ }
+        }
+    } catch (err) {
+        depsRef.logDebug(`[CURSOR] attachment sweep failed: ${err.message}`);
+    }
+}
+
+// ─── State broadcasting ────────────────────────────────────────────────
+
+function broadcastState(extra = {}) {
+    if (!isUsable(win)) return;
+    try {
+        win.webContents.send('CURSOR_STATE', {
+            loading: isLoading(),
+            inputOpen,
+            replies: replies.slice(),
+            isParked,
+            ...extra,
+        });
+    } catch (err) {
+        depsRef.logDebug(`[CURSOR] broadcastState failed: ${err.message}`);
+    }
+}
+
+function applyInteractivity() {
+    if (!isUsable(win)) return;
+    // Window must accept mouse events whenever any focusable layer is
+    // visible: input pill OR any reply (right-click / scroll / hover).
+    const interactive = inputOpen || replies.length > 0;
+    if (interactive) {
+        win.setIgnoreMouseEvents(false);
+    } else {
+        win.setIgnoreMouseEvents(true, { forward: true });
+    }
 }
 
 function getFreshDraft() {
@@ -521,45 +555,65 @@ function getFreshLastReply() {
     return lastReply;
 }
 
-/**
- * Compute and apply the window's mouse-event behaviour given the
- * current mode and shift state. Two surfaces capture mouse events:
- *
- *   - input mode:                  always captures (so the user can
- *                                  click into the textarea or select
- *                                  text)
- *   - response mode:               always captures so wheel events
- *                                  land on the bubble and scroll the
- *                                  overflow pane naturally — no
- *                                  modifier required
- *
- * All other states stay click-through with mouse-move forwarding so
- * the underlying app remains usable. Click-anywhere dismiss for the
- * response bubble is handled separately via the global mousedown
- * uIOhook listener — that observation pathway works regardless of
- * window interactivity.
- */
-function applyInteractivity() {
-    if (!isUsable(win)) return;
-    const interactive = mode === 'input' || mode === 'response';
-    if (interactive) {
-        win.setIgnoreMouseEvents(false);
-    } else {
-        win.setIgnoreMouseEvents(true, { forward: true });
-    }
+// ─── Layer transitions ─────────────────────────────────────────────────
+
+function openInput() {
+    if (!isInitialized || !isUsable(win)) return;
+    inputOpen = true;
+    isParked = false;
+    try { win.focus(); } catch (_) {}
+    applyInteractivity();
+    broadcastState({ event: 'input_opened', draftPrompt: getFreshDraft() });
+}
+
+function closeInput() {
+    if (!inputOpen) return;
+    inputOpen = false;
+    isParked = false;
+    applyInteractivity();
+    broadcastState({ event: 'input_closed' });
+}
+
+function clearReplies() {
+    if (replies.length === 0) return;
+    replies = [];
+    applyInteractivity();
+    broadcastState({ event: 'replies_cleared' });
+}
+
+function dismissReplyById(id) {
+    const before = replies.length;
+    replies = replies.filter((r) => r.id !== id);
+    if (replies.length === before) return false;
+    applyInteractivity();
+    broadcastState({ event: 'reply_dismissed', dismissedId: id });
+    return true;
+}
+
+function pushReply({ content, ts, role = 'assistant' }) {
+    if (typeof content !== 'string' || content.trim().length === 0) return;
+    replies.push({ id: newReplyId(), content, ts: ts || null, role });
+    while (replies.length > REPLY_STACK_CAP) replies.shift();
+    setLastReply(content, ts);
+    applyInteractivity();
+    broadcastState({ event: 'reply_appended' });
 }
 
 function showInput() {
-    if (!isInitialized || !isUsable(win)) return;
-    // Allow opening the input pill regardless of pending state — the
-    // user can fire follow-up turns while a previous one is still in
-    // flight (parity with desktop/web chat).
-    setMode('input', { draftPrompt: getFreshDraft() });
+    openInput();
 }
 
+/**
+ * Full dismiss to dot — clears everything. Used by the legacy dismiss
+ * IPC for callers that want the old "back to ambient" behaviour.
+ */
 function dismiss() {
     if (!isInitialized) return;
-    setMode('dot');
+    inputOpen = false;
+    replies = [];
+    isParked = false;
+    applyInteractivity();
+    broadcastState({ event: 'dismissed' });
 }
 
 // ─── Capture ────────────────────────────────────────────────────────────
@@ -634,41 +688,49 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
     if (depsRef.getOperatingMode() !== 'channel') {
         return { success: false, error: 'Channel mode is not active.' };
     }
-    // Single-flight cursor submits. The channel protocol has no
-    // per-turn correlation id (replies and activity are global,
-    // chat_id is shared across all cursor turns), so a follow-up
-    // while a prior turn is in flight would let the older turn's
-    // reply or terminal phase clobber the newer turn's state. Block
-    // at the submit boundary instead. The user can still open the
-    // input pill and type the next prompt — Enter just rejects
-    // until the prior turn reaches terminal.
-    if (pending !== null) {
-        return { success: false, error: 'Previous reply still pending' };
+
+    // Concurrent turns are allowed — channel-bridge serialises behind
+    // the scenes, but the cursor surface lets the user compose and fire
+    // as fast as they want. New submission replaces the current pending
+    // marker; older turns still flow through, their replies arriving on
+    // the stack via handleChannelReply.
+    const turnId = newTurnId();
+    pending = { turnId, startedAt: Date.now(), attachmentPath: null };
+
+    // Cancel any in-flight terminal grace timer; new turn means a new
+    // active span.
+    if (terminalGraceTimer) {
+        clearTimeout(terminalGraceTimer);
+        terminalGraceTimer = null;
+        terminalGraceTurnId = null;
     }
 
-    // Establish the pending marker BEFORE capture so the channel reply
-    // forwarder routes the next response to us, not local chat.
-    const turnId = newTurnId();
-    pending = {
-        turnId,
-        startedAt: Date.now(),
-        latestReply: null,
-    };
-    setMode('loading');
+    // Closing input is part of the submit gesture — replies smoothly
+    // shift up into the freed slot in the renderer.
+    inputOpen = false;
+    isParked = false;
+    applyInteractivity();
+    broadcastState({ event: 'turn_submitted', turnId });
 
-    // Vision is opt-in per turn: Option+Enter attaches a cursor-area
-    // screenshot, plain Enter sends just the prompt. Keeps casual
-    // follow-ups text-only and reserves the screenshot envelope for
-    // moments the human is actually pointing at something.
     let capture = null;
     if (withScreenshot) {
         try {
             capture = await captureCursorArea();
         } catch (err) {
             depsRef.logDebug(`[CURSOR] Capture failed: ${err.message}`);
-            clearPending();
-            setMode('dot');
+            // Stale-turn guard: another turn may have replaced pending
+            // while screencapture was running.
+            if (pending && pending.turnId === turnId) {
+                pending = null;
+                broadcastState({ event: 'capture_failed', turnId });
+            }
             return { success: false, error: `Could not capture screen: ${err.message}` };
+        }
+        // Re-check pending after the await: if the user toggled the
+        // companion off mid-capture, our pending was cleared.
+        if (!pending || pending.turnId !== turnId) {
+            try { fs.unlinkSync(capture.path); } catch (_) {}
+            return { success: false, error: 'Turn was cancelled' };
         }
         pending.attachmentPath = capture.path;
     }
@@ -689,106 +751,68 @@ async function submitFromBubble({ prompt, withScreenshot = false }) {
             composedContent,
             CURSOR_CHAT_ID,
             {
-                // Single source of truth: the cursor turn lands in the same
-                // channel-history as every other surface, and every surface
-                // (desktop chat, web/paired devices) sees it. The clean
-                // displayContent strips the technical screenshot prefix —
-                // human-facing surfaces and conversation memory show the
-                // user's actual prompt, while Claude still receives the
-                // full composed content needed to read the screenshot.
-                //
-                // The screenshot is also surfaced as a real attachment on
-                // the user message, so it renders as a file pill below
-                // the bubble in desktop/PWA chat — same envelope shape as
-                // a user-uploaded file in the regular chat composer.
                 echoToLocalChat: true,
                 displayContent: prompt.trim(),
                 attachments: capture ? [capture.path] : [],
             },
         );
         if (!result || result.success === false) {
-            clearPending();
-            setMode('dot');
+            if (pending && pending.turnId === turnId) {
+                pending = null;
+                broadcastState({ event: 'submit_failed', turnId });
+            }
             return { success: false, error: result?.error || 'Channel submission failed' };
         }
-        // Successful submit invalidates the draft — the prompt now lives
-        // in conversation history, not in the user's pending intent.
         clearDraftPrompt();
         return { success: true, turnId };
     } catch (err) {
-        clearPending();
-        setMode('dot');
+        if (pending && pending.turnId === turnId) {
+            pending = null;
+            broadcastState({ event: 'submit_failed', turnId });
+        }
         depsRef.logDebug(`[CURSOR] Submit error: ${err.message}`);
         return { success: false, error: err.message };
     }
 }
 
-function clearPending() {
-    pending = null;
-}
-
 /**
  * Forward a channel reply to the renderer when there's a pending cursor
- * turn. Caller is channel-mode's reply handler.
+ * turn. Each reply pushes onto the visible stack (cap REPLY_STACK_CAP).
  *
- * Data-only: every assistant message during a pending turn updates
- * `pending.latestReply` and pushes the latest text to the renderer (so
- * the response bubble has up-to-date content the moment activity says
- * the turn ended), but does NOT exit `loading` mode. Terminal transition
- * lives in `handleChannelActivity` — bound to the same authoritative
- * activity stream that drives desktop chat indicators, so cursor and
- * desktop chat agree on "is Claude working?".
- *
- * Single-message turns: activity-tracker emits `phase: 'finished'`
- * immediately after the reply; cursor flips to response one tick later.
- * Multi-message turns: each interim reply updates the stored content
- * but stays in loading; the final message + terminal phase together
- * produce the visible response.
+ * Cancels any in-flight terminal grace timer — the reply we were
+ * waiting for has now arrived.
  */
 function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
     if (!pending) return false;
     if (chatId && chatId !== CURSOR_CHAT_ID) return false;
-    if (!isUsable(win)) {
-        clearPending();
-        return false;
+    if (!isUsable(win)) return false;
+
+    if (terminalGraceTimer) {
+        clearTimeout(terminalGraceTimer);
+        terminalGraceTimer = null;
+        terminalGraceTurnId = null;
     }
-    pending.latestReply = { content, ts, role };
-    win.webContents.send('CURSOR_REPLY', {
-        turnId: pending.turnId,
-        content,
-        ts,
-        role,
-    });
-    setLastReply(content, ts);
+
+    pushReply({ content, ts, role });
     return true;
 }
 
 /**
- * Activity-tracker subscriber. The cursor loader stays visible until
- * the activity stream reaches a terminal phase. Mirrors what desktop
- * chat reads, so the two surfaces never disagree on whether Claude is
- * still working.
- *
- * Phases:
- *   forwarded / thinking / tool / replying  → keep loading
- *   tool_complete / tool_failed             → keep loading (Claude may continue)
- *   finished / idle                         → terminal: flip to response (or dot if no reply)
- *   failed / error                          → terminal: error pill
- *
- * Only acts while `pending` is set. The stale-turn guard captures the
- * pending turnId at entry; if a follow-up replaced `pending` underneath
- * us mid-flight, we leave the new turn alone.
+ * Activity-tracker subscriber. Drives the loading layer and handles
+ * terminal phases.
  */
 function handleChannelActivity(activity = {}) {
     if (!pending) return;
     const phase = typeof activity.phase === 'string' ? activity.phase : '';
 
-    // Admin reset (resetChannelActivity): force-clear pending without
-    // presenting any captured partial reply as the final response. A
-    // teardown/restart isn't a successful turn completion.
     if (activity.reset === true) {
-        clearPending();
-        setMode('dot');
+        pending = null;
+        if (terminalGraceTimer) {
+            clearTimeout(terminalGraceTimer);
+            terminalGraceTimer = null;
+            terminalGraceTurnId = null;
+        }
+        broadcastState({ event: 'activity_reset' });
         return;
     }
 
@@ -796,41 +820,44 @@ function handleChannelActivity(activity = {}) {
 
     const turnIdAtEntry = pending.turnId;
     const isFailure = phase === 'failed' || phase === 'error';
-    const latestReply = pending.latestReply || null;
 
     if (isFailure) {
-        if (!isUsable(win)) {
-            clearPending();
-            return;
+        pending = null;
+        if (isUsable(win)) {
+            try {
+                win.webContents.send('CURSOR_ERROR', {
+                    turnId: turnIdAtEntry,
+                    message: activity.label || activity.detail || 'Reply failed',
+                });
+            } catch (_) {}
         }
-        win.webContents.send('CURSOR_ERROR', {
-            turnId: turnIdAtEntry,
-            message: activity.label || activity.detail || 'Reply failed',
-        });
-        clearPending();
-        // Keep mode at loading→dot collapse path: no response bubble
-        // for a failed turn; the renderer error pill renders next to
-        // the dot once mode goes back to dot.
-        setMode('dot');
+        broadcastState({ event: 'turn_failed', turnId: turnIdAtEntry });
         return;
     }
 
-    // Terminal idle/finished: if we captured at least one reply,
-    // present it; otherwise quietly return to dot.
-    if (!latestReply) {
-        clearPending();
-        setMode('dot');
+    // Terminal idle/finished. If at least one reply arrived during this
+    // turn, it's already on the stack — just clear pending. If not,
+    // start a grace timer: the reply socket message may be in flight
+    // and arrive shortly after the activity stream goes idle.
+    const hasReplyForTurn = replies.length > 0;
+    if (hasReplyForTurn) {
+        pending = null;
+        broadcastState({ event: 'turn_completed', turnId: turnIdAtEntry });
         return;
     }
 
-    if (pending && pending.turnId !== turnIdAtEntry) {
-        // A follow-up turn started after this terminal event was
-        // queued; let the new turn run its own lifecycle.
-        return;
+    if (terminalGraceTimer) {
+        clearTimeout(terminalGraceTimer);
     }
-
-    clearPending();
-    setMode('response');
+    terminalGraceTurnId = turnIdAtEntry;
+    terminalGraceTimer = setTimeout(() => {
+        terminalGraceTimer = null;
+        if (pending && pending.turnId === terminalGraceTurnId) {
+            pending = null;
+            broadcastState({ event: 'turn_completed_no_reply', turnId: terminalGraceTurnId });
+        }
+        terminalGraceTurnId = null;
+    }, TERMINAL_GRACE_MS);
 }
 
 function isTerminalPhase(phase) {
@@ -859,14 +886,28 @@ function registerIpcHandlers() {
         if (!isFromCursorWindow(event)) {
             return { success: false, error: 'unauthorized' };
         }
-        // Esc / explicit dismiss preserves any non-empty draft. The
-        // renderer ships the latest textarea value here so the dismiss
-        // path doesn't depend on the debounced draft sync having run.
-        if (typeof payload.prompt === 'string' && mode === 'input') {
+        if (typeof payload.prompt === 'string' && inputOpen) {
             setDraftPrompt(payload.prompt);
         }
-        dismiss();
+        // Esc/explicit dismiss: collapse input first if open, otherwise
+        // clear the reply stack. Two presses → fully back to dot.
+        if (inputOpen) {
+            closeInput();
+        } else if (replies.length > 0) {
+            clearReplies();
+        }
         return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_DISMISS_REPLY', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        if (typeof payload.id !== 'string') {
+            return { success: false, error: 'invalid' };
+        }
+        const ok = dismissReplyById(payload.id);
+        return { success: ok };
     });
 
     ipcMain.handle('CURSOR_SHIFT_GESTURE', (event, payload = {}) => {
@@ -888,12 +929,32 @@ function registerIpcHandlers() {
         return { success: true };
     });
 
-    ipcMain.handle('CURSOR_BLUR_PARK', (event) => {
+    ipcMain.handle('CURSOR_DRAFT_FLUSH', (event, payload = {}) => {
+        // Synchronous draft flush before blur/dismiss races. Called by
+        // the renderer right before any path that could lose the draft.
         if (!isFromCursorWindow(event)) {
             return { success: false, error: 'unauthorized' };
         }
-        if (mode === 'input') {
+        if (typeof payload.prompt !== 'string') {
+            return { success: false, error: 'invalid' };
+        }
+        setDraftPrompt(payload.prompt);
+        return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_BLUR_PARK', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        // Synchronously persist the latest draft before parking, closing
+        // the gap between debounced CURSOR_DRAFT_UPDATE and a subsequent
+        // tray-side dismissal.
+        if (typeof payload.prompt === 'string') {
+            setDraftPrompt(payload.prompt);
+        }
+        if (inputOpen) {
             isParked = true;
+            broadcastState({ event: 'parked' });
         }
         return { success: true, parked: isParked };
     });
@@ -903,14 +964,29 @@ function registerIpcHandlers() {
             return { success: false, error: 'unauthorized' };
         }
         isParked = false;
+        broadcastState({ event: 'unparked' });
         return { success: true };
+    });
+
+    ipcMain.handle('CURSOR_GET_STATE', (event) => {
+        if (!isFromCursorWindow(event)) {
+            return { ok: false };
+        }
+        return {
+            ok: true,
+            loading: isLoading(),
+            inputOpen,
+            replies: replies.slice(),
+            isParked,
+            draftPrompt: getFreshDraft(),
+        };
     });
 
     ipcMain.handle('CURSOR_GET_PENDING', (event) => {
         if (!isFromCursorWindow(event)) {
             return { pending: false };
         }
-        return { pending: pending !== null, turnId: pending?.turnId || null, mode };
+        return { pending: pending !== null, turnId: pending?.turnId || null, mode: getMode() };
     });
 }
 
@@ -923,7 +999,9 @@ module.exports = {
     init,
     __test: {
         getPendingForTest: () => pending,
-        getModeForTest: () => mode,
+        getModeForTest: getMode,
+        getInputOpenForTest: () => inputOpen,
+        getRepliesForTest: () => replies.slice(),
         setShiftHeldForTest: (held) => { isShiftHeld = Boolean(held); },
         getShiftHeldForTest: () => isShiftHeld,
         setScreenForTest: (screen) => {
@@ -951,14 +1029,21 @@ module.exports = {
         resetGestureLockForTest: () => { gestureLockUntil = 0; },
         getParkedForTest: () => isParked,
         setParkedForTest: (next) => { isParked = Boolean(next); },
-        setModeForTest: (next) => { mode = next; },
+        setInputOpenForTest: (next) => { inputOpen = Boolean(next); },
+        setRepliesForTest: (next) => { replies = Array.isArray(next) ? next.slice() : []; },
+        setPendingForTest: (next) => { pending = next; },
         setGestureLockUntilForTest: (next) => { gestureLockUntil = Number(next) || 0; },
         runStopForTest: () => stop(),
+        pushReplyForTest: pushReply,
+        clearRepliesForTest: clearReplies,
         DRAFT_TTL_MS,
         LAST_REPLY_TTL_MS,
         GESTURE_LOCK_MS,
+        TERMINAL_GRACE_MS,
+        REPLY_STACK_CAP,
         CURSOR_LENS_CROP_W,
         CURSOR_LENS_CROP_H,
+        CURSOR_ATTACHMENT_TTL_MS,
         WIN_WIDTH,
         WIN_HEIGHT,
         ANCHOR_X,
