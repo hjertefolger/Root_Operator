@@ -61,7 +61,8 @@ const VALID_RECEIVE_CHANNELS = [
     'LOCAL_CHAT_EVENT',
     'LOCAL_CHAT_WINDOW_SHOWN',
     'CURSOR_REPLY',
-    'CURSOR_REPLY_TIMEOUT'
+    'CURSOR_REPLY_TIMEOUT',
+    'CURSOR_MODE'
 ];
 
 // Expose protected methods that only allow specific channels

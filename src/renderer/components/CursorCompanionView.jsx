@@ -1,0 +1,311 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { useElectron } from '../hooks/useElectron';
+
+/**
+ * Cursor companion: a single morphing element anchored to the system
+ * cursor. States: dot → input → loading → response → dot.
+ *
+ * The native window stays a fixed size (the renderer's canvas); shape
+ * morphs happen via CSS transitions on the inner pill element. The
+ * cursor pointer-arrow corresponds to (ANCHOR_X, ANCHOR_Y) in
+ * window-local coordinates — the same offset used in the main process
+ * positioning logic — so the pill's left edge sits right under the
+ * pointer.
+ */
+
+// Must match cursor-companion.js
+const ANCHOR_X = 16;
+const ANCHOR_Y = 16;
+
+const ACCENT = '#4B5AFF';
+const PILL_HEIGHT = 32;
+const PILL_MIN_WIDTH = 28;
+const PILL_MAX_WIDTH = 560;
+const PILL_PADDING_X = 14;
+const RESPONSE_MAX_WIDTH = 460;
+const RESPONSE_MAX_HEIGHT = 280;
+
+function CursorCompanionView() {
+  const { invoke, on } = useElectron();
+  const inputRef = useRef(null);
+  const measureRef = useRef(null);
+  const [mode, setMode] = useState('dot');
+  const [prompt, setPrompt] = useState('');
+  const [reply, setReply] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Subscribe to mode changes from the main process.
+  useEffect(() => {
+    const offMode = on('CURSOR_MODE', (payload) => {
+      if (!payload || typeof payload.mode !== 'string') return;
+      setMode(payload.mode);
+      if (payload.mode === 'input') {
+        setPrompt('');
+        setReply(null);
+        setError(null);
+      }
+      if (payload.mode === 'dot') {
+        setPrompt('');
+        setReply(null);
+        setError(null);
+      }
+    });
+    const offReply = on('CURSOR_REPLY', (payload) => {
+      if (!payload || typeof payload.content !== 'string') return;
+      setReply({ content: payload.content, ts: payload.ts || null });
+      setError(null);
+    });
+    const offTimeout = on('CURSOR_REPLY_TIMEOUT', () => {
+      setError('No response after 90 seconds.');
+    });
+    return () => {
+      offMode?.();
+      offReply?.();
+      offTimeout?.();
+    };
+  }, [on]);
+
+  // Auto-focus the input when entering input mode.
+  useEffect(() => {
+    if (mode === 'input' && inputRef.current) {
+      // requestAnimationFrame so focus lands after the window has
+      // become interactive (setIgnoreMouseEvents toggle).
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    }
+  }, [mode]);
+
+  const handleDismiss = useCallback(async () => {
+    try { await invoke('CURSOR_DISMISS'); } catch (_) {}
+  }, [invoke]);
+
+  const handleSubmit = useCallback(async () => {
+    const trimmed = prompt.trim();
+    if (trimmed.length === 0) return;
+    try {
+      const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed });
+      if (!result?.success) {
+        setError(result?.error || 'Failed to submit');
+      }
+    } catch (err) {
+      setError(err?.message || 'Failed to submit');
+    }
+  }, [invoke, prompt]);
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      handleDismiss();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  // Measure the prompt text width using a hidden span so the pill can
+  // grow to fit the typed content. The mirror element shares font
+  // metrics with the input; we read its scrollWidth and clamp.
+  const inputDisplayWidth = useInputWidth(measureRef, prompt);
+  const pillWidth = mode === 'input'
+    ? Math.min(PILL_MAX_WIDTH, Math.max(PILL_MIN_WIDTH, inputDisplayWidth + PILL_PADDING_X * 2))
+    : mode === 'loading'
+      ? 64
+      : mode === 'response'
+        ? RESPONSE_MAX_WIDTH
+        : 8;
+  const pillHeight = mode === 'response'
+    ? clampResponseHeight(reply?.content || '')
+    : PILL_HEIGHT;
+  const isPill = mode !== 'dot';
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'transparent',
+        // Default click-through. The main process toggles
+        // setIgnoreMouseEvents per-mode; this CSS belt is for the empty
+        // areas around the pill itself.
+        pointerEvents: 'none',
+        userSelect: 'none',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      }}
+      onKeyDown={handleKeyDown}
+    >
+      {/* The morphing element. Anchored so its left edge sits at the
+          cursor pointer position. */}
+      <div
+        style={{
+          position: 'absolute',
+          left: ANCHOR_X,
+          top: ANCHOR_Y - pillHeight / 2 + (mode === 'dot' ? pillHeight / 2 + 2 : 0),
+          width: isPill ? pillWidth : 8,
+          height: isPill ? pillHeight : 8,
+          borderRadius: isPill ? pillHeight / 2 : '50%',
+          background: mode === 'dot'
+            ? ACCENT
+            : mode === 'response'
+              ? 'rgba(10, 10, 12, 0.94)'
+              : 'rgba(15, 15, 18, 0.92)',
+          boxShadow: mode === 'dot'
+            ? `0 0 6px 1px rgba(75, 90, 255, 0.35)`
+            : `0 0 0 1px rgba(75, 90, 255, 0.3), 0 8px 24px rgba(0, 0, 0, 0.42)`,
+          backdropFilter: isPill ? 'blur(14px)' : 'none',
+          WebkitBackdropFilter: isPill ? 'blur(14px)' : 'none',
+          color: 'rgba(255, 255, 255, 0.95)',
+          display: 'flex',
+          alignItems: mode === 'response' ? 'flex-start' : 'center',
+          justifyContent: mode === 'loading' ? 'center' : 'flex-start',
+          paddingLeft: isPill ? PILL_PADDING_X : 0,
+          paddingRight: isPill ? PILL_PADDING_X : 0,
+          paddingTop: mode === 'response' ? 10 : 0,
+          paddingBottom: mode === 'response' ? 10 : 0,
+          pointerEvents: isPill ? 'auto' : 'none',
+          overflow: 'hidden',
+          transition:
+            'width 180ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+            'height 220ms cubic-bezier(0.22, 1, 0.36, 1), ' +
+            'border-radius 220ms ease, ' +
+            'background 200ms ease, ' +
+            'box-shadow 200ms ease, ' +
+            'padding 180ms ease',
+        }}
+      >
+        {mode === 'input' && (
+          <input
+            ref={inputRef}
+            type="text"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            spellCheck={false}
+            autoComplete="off"
+            style={{
+              flex: '1 1 auto',
+              minWidth: 0,
+              width: '100%',
+              background: 'transparent',
+              border: 'none',
+              outline: 'none',
+              padding: 0,
+              margin: 0,
+              color: 'rgba(255, 255, 255, 0.95)',
+              caretColor: ACCENT,
+              fontFamily: 'inherit',
+              fontSize: 13,
+              lineHeight: `${PILL_HEIGHT}px`,
+              opacity: 1,
+              transition: 'opacity 140ms ease',
+              userSelect: 'text',
+            }}
+          />
+        )}
+
+        {mode === 'loading' && <FourDotLoader />}
+
+        {mode === 'response' && reply && (
+          <div
+            style={{
+              flex: '1 1 auto',
+              maxHeight: RESPONSE_MAX_HEIGHT - 20,
+              overflowY: 'auto',
+              fontSize: 13,
+              lineHeight: 1.55,
+              color: 'rgba(255, 255, 255, 0.95)',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              userSelect: 'text',
+              opacity: 1,
+              animation: 'cursor-fade-in 200ms ease both',
+            }}
+          >
+            {reply.content}
+          </div>
+        )}
+
+        {mode === 'response' && error && !reply && (
+          <div
+            style={{
+              flex: '1 1 auto',
+              fontSize: 12,
+              color: 'rgba(255, 120, 120, 0.9)',
+            }}
+          >
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* Hidden mirror element to measure prompt text width with the
+          same font metrics as the input. */}
+      <span
+        ref={measureRef}
+        style={{
+          position: 'absolute',
+          visibility: 'hidden',
+          whiteSpace: 'pre',
+          fontFamily: 'inherit',
+          fontSize: 13,
+          lineHeight: `${PILL_HEIGHT}px`,
+          padding: 0,
+          margin: 0,
+        }}
+      >
+        {prompt || ' '}
+      </span>
+
+      <style>{`
+        @keyframes cursor-fade-in {
+          from { opacity: 0; transform: translateY(2px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes cursor-loader-bounce {
+          0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+          40% { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function FourDotLoader() {
+  const dot = (delayMs) => ({
+    width: 5,
+    height: 5,
+    borderRadius: '50%',
+    background: ACCENT,
+    animation: `cursor-loader-bounce 1.0s ${delayMs}ms ease-in-out infinite`,
+    display: 'inline-block',
+  });
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      <span style={dot(0)} />
+      <span style={dot(120)} />
+      <span style={dot(240)} />
+      <span style={dot(360)} />
+    </div>
+  );
+}
+
+function useInputWidth(measureRef, prompt) {
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    if (measureRef.current) {
+      setWidth(measureRef.current.scrollWidth);
+    }
+  }, [prompt, measureRef]);
+  return width;
+}
+
+function clampResponseHeight(content) {
+  if (!content) return PILL_HEIGHT;
+  // Rough estimate: 20px per line, ~50 chars per line at 13px mono.
+  const approxLines = Math.max(1, Math.ceil(content.length / 50));
+  const estHeight = 20 + approxLines * 20;
+  return Math.min(RESPONSE_MAX_HEIGHT, Math.max(40, estHeight));
+}
+
+export default CursorCompanionView;

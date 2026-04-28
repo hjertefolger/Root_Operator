@@ -4,18 +4,16 @@ import MainView from './components/MainView';
 import SettingsView from './components/SettingsView';
 import LocalChatView from './components/LocalChatView';
 import ViewerWindow from './components/ViewerWindow';
-import CursorDotView from './components/CursorDotView';
-import CursorBubbleView from './components/CursorBubbleView';
+import CursorCompanionView from './components/CursorCompanionView';
 
 const RENDERER_VIEW = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('view')
   : null;
 const IS_LOCAL_CHAT_VIEW = RENDERER_VIEW === 'chat';
 const IS_VIEWER_WINDOW = RENDERER_VIEW === 'viewer';
-const IS_CURSOR_DOT_VIEW = RENDERER_VIEW === 'cursor-dot';
-const IS_CURSOR_BUBBLE_VIEW = RENDERER_VIEW === 'cursor-bubble';
+const IS_CURSOR_COMPANION_VIEW = RENDERER_VIEW === 'cursor-companion';
 const IS_AUXILIARY_VIEW =
-  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_DOT_VIEW || IS_CURSOR_BUBBLE_VIEW;
+  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW;
 
 function App() {
   const { invoke, on } = useElectron();
@@ -80,7 +78,7 @@ function App() {
 
   // Load initial settings and sync tunnel state
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_DOT_VIEW || IS_CURSOR_BUBBLE_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW) {
       return undefined;
     }
 
@@ -118,7 +116,7 @@ function App() {
 
   // Listen for tunnel events
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_DOT_VIEW || IS_CURSOR_BUBBLE_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW) {
       return undefined;
     }
 
@@ -203,10 +201,8 @@ function App() {
 
   return (
     <div ref={containerRef} className="flex flex-col">
-      {IS_CURSOR_DOT_VIEW ? (
-        <CursorDotView />
-      ) : IS_CURSOR_BUBBLE_VIEW ? (
-        <CursorBubbleView />
+      {IS_CURSOR_COMPANION_VIEW ? (
+        <CursorCompanionView />
       ) : IS_VIEWER_WINDOW ? (
         <ViewerWindow />
       ) : IS_LOCAL_CHAT_VIEW ? (
