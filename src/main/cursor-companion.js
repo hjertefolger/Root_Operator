@@ -106,6 +106,12 @@ let replies = []; // array of { id, content, ts, role }
 let terminalGraceTimer = null;
 let terminalGraceTurnId = null;
 
+// Queued attachment from the annotation surface — null when no
+// annotation has been committed since the last submit/dismiss. Single
+// slot for v1; future iterations may stack multiple attachments.
+//   { path, name, size, rect: { w, h }, activeApp: { name, bundleId } }
+let pendingAttachment = null;
+
 // Half-written prompt persists across dismissals. Cleared on successful submit.
 let draftPrompt = '';
 let draftUpdatedAt = 0;
@@ -194,6 +200,8 @@ function getApi() {
         handleChannelActivity,
         toggleFromHotkey,
         notifyEnabledChanged,
+        adoptAnnotation,
+        getWindow: () => (isUsable(win) ? win : null),
         isPending: () => pending !== null,
         getMode,
     };
@@ -306,32 +314,48 @@ function handleShiftKeyUp(event) {
 }
 
 /**
- * Right-click anywhere dismisses the topmost reply. While the bubble
- * is following the cursor (the common case), the cursor is never over
- * the bubble itself, so hit-testing the click against the reply rect
- * would always fail by design. Parked mode can put the cursor over
- * the bubble, but the dismiss-on-right-click intent holds either way:
- * the user wants this reply gone.
+ * Right-click peels the topmost layer below the input, in spatial order:
+ *   1. Pending attachment pill (if any)
+ *   2. Latest reply
+ *   3. Older reply (next)
+ *
+ * Main owns the precedence — renderer renders optimistically but the
+ * authoritative dismissal happens here. The bubble follows the cursor
+ * (or is parked); either way the user's right-click intent reads as
+ * "peel the most recent thing I added/saw."
  *
  * Loading is intentionally still not click-dismissable.
  */
 function handleGlobalMouseDown(event) {
-    if (replies.length === 0) return;
     if (!event || event.button !== 2) return;
     if (!isUsable(win)) return;
+    if (pendingAttachment) {
+        clearPendingAttachment('right-click');
+        return;
+    }
+    if (replies.length === 0) return;
     try {
         win.webContents.send('CURSOR_RIGHT_CLICK', {});
     } catch (_) {}
 }
 
 /**
- * Esc dismisses layers in priority order: input first (preserve draft),
- * then the entire reply stack. Renderer's own keydown handles the
- * input-mode case; this handler only fires when input is closed.
+ * Esc peels one layer at a time, matching the right-click model:
+ *   input (renderer-handled, preserves draft)
+ *     → pending attachment
+ *     → reply stack (clears the whole deck — single Esc, all replies
+ *       gone, matches the long-standing behaviour pre-attachment).
+ *
+ * Renderer's own keydown handles the input-mode Esc; this handler only
+ * fires when input is closed.
  */
 function handleGlobalEscDown(event) {
     if (!event || event.keycode !== escKeyCode) return;
     if (inputOpen) return; // renderer handles the input-mode Esc
+    if (pendingAttachment) {
+        clearPendingAttachment('esc');
+        return;
+    }
     if (replies.length === 0) return;
     clearReplies();
 }
@@ -368,6 +392,10 @@ function stop() {
     isParked = false;
     isShiftHeld = false;
     activeAppProbe = null;
+    if (pendingAttachment) {
+        try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
+    }
+    pendingAttachment = null;
     lastWinPos = { x: -1, y: -1 };
     depsRef && depsRef.logDebug && depsRef.logDebug('[CURSOR] Companion stopped');
 }
@@ -476,8 +504,13 @@ function sweepStaleAttachments() {
         const dir = depsRef.getCursorAttachmentsDir();
         if (!fs.existsSync(dir)) return;
         const cutoff = Date.now() - CURSOR_ATTACHMENT_TTL_MS;
+        // Skip the live queued annotation — even if it's older than the
+        // TTL (user composed for >10min), it's still actively referenced
+        // by pendingAttachment and unlinking would lose data on submit.
+        const protectedPath = pendingAttachment ? pendingAttachment.path : null;
         for (const name of fs.readdirSync(dir)) {
             const filepath = path.join(dir, name);
+            if (protectedPath && filepath === protectedPath) continue;
             try {
                 const stat = fs.statSync(filepath);
                 if (stat.mtimeMs < cutoff) {
@@ -500,6 +533,7 @@ function broadcastState(extra = {}) {
             inputOpen,
             replies: replies.slice(),
             isParked,
+            pendingAttachment: pendingAttachment ? publicAttachment(pendingAttachment) : null,
             ...extra,
         });
     } catch (err) {
@@ -510,13 +544,54 @@ function broadcastState(extra = {}) {
 function applyInteractivity() {
     if (!isUsable(win)) return;
     // Window must accept mouse events whenever any focusable layer is
-    // visible: input pill OR any reply (right-click / scroll / hover).
-    const interactive = inputOpen || replies.length > 0;
+    // visible: input pill, any reply, OR a queued attachment pill.
+    const interactive = inputOpen || replies.length > 0 || pendingAttachment !== null;
     if (interactive) {
         win.setIgnoreMouseEvents(false);
     } else {
         win.setIgnoreMouseEvents(true, { forward: true });
     }
+}
+
+// Strip filesystem path before sending state to the renderer — the
+// renderer doesn't need it, and reduces accidental leakage.
+function publicAttachment(att) {
+    if (!att) return null;
+    return {
+        name: att.name,
+        size: att.size,
+        rect: att.rect ? { w: att.rect.w, h: att.rect.h } : null,
+    };
+}
+
+function setPendingAttachment(next) {
+    if (pendingAttachment && pendingAttachment.path && pendingAttachment.path !== next?.path) {
+        // Replace semantics: scrap old PNG before adopting new one.
+        try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
+    }
+    pendingAttachment = next;
+    applyInteractivity();
+    broadcastState({ event: 'pending_attachment_changed' });
+}
+
+function clearPendingAttachment(reason = '') {
+    if (!pendingAttachment) return;
+    try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
+    pendingAttachment = null;
+    applyInteractivity();
+    broadcastState({ event: 'pending_attachment_cleared', reason });
+}
+
+// External entry: cursor-annotation calls this when the user commits
+// an annotation. Queue the attachment, then open input pill so the
+// user can type the prompt.
+function adoptAnnotation({ path: filePath, name, size, rect, activeApp } = {}) {
+    if (!filePath || !name || typeof size !== 'number') {
+        depsRef.logDebug('[CURSOR] adoptAnnotation: invalid payload');
+        return;
+    }
+    setPendingAttachment({ path: filePath, name, size, rect, activeApp: activeApp || null });
+    openInput();
 }
 
 function getFreshDraft() {
@@ -625,6 +700,10 @@ function dismiss() {
     replies = [];
     isParked = false;
     activeAppProbe = null;
+    if (pendingAttachment) {
+        try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
+        pendingAttachment = null;
+    }
     applyInteractivity();
     broadcastState({ event: 'dismissed' });
 }
@@ -772,13 +851,20 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     applyInteractivity();
     broadcastState({ event: 'turn_submitted', turnId });
 
+    // Snapshot the queued annotation (if any). Captured at invocation
+    // time, so its activeApp is the host app the user opened the
+    // annotation surface from, NOT whatever's frontmost now.
+    const queuedAnnotation = pendingAttachment;
+
     // Await the active-app probe kicked off when input opened. Capture
     // and clear synchronously before await so a fast follow-up can't
     // null out the new invocation's probe when this submit resumes.
-    // Probe enforces its own 250ms total deadline.
+    // If we have a queued annotation, prefer ITS captured-at-invocation
+    // app context — it reflects the surface the user was annotating.
     const probe = activeAppProbe;
     activeAppProbe = null;
-    const activeApp = probe ? await probe : null;
+    const inputProbe = probe ? await probe : null;
+    const activeApp = (queuedAnnotation && queuedAnnotation.activeApp) || inputProbe;
 
     let capture = null;
     if (captureMode !== 'none') {
@@ -804,22 +890,37 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     const appContextLine = formatActiveAppLine(activeApp);
     const envelopeLines = [];
     envelopeLines.push(prompt.trim());
-    if (capture || appContextLine) {
+    const hasAnyContext = capture || queuedAnnotation || appContextLine;
+    if (hasAnyContext) {
         envelopeLines.push('', '<system-reminder>');
         envelopeLines.push(`This message arrives from the Cursor Presence surface.`);
         if (appContextLine) envelopeLines.push(appContextLine);
+        if (queuedAnnotation) {
+            const rectStr = queuedAnnotation.rect
+                ? `${queuedAnnotation.rect.w}×${queuedAnnotation.rect.h}`
+                : 'unspecified region';
+            envelopeLines.push(
+                `Attached: user-annotated capture (region ${rectStr}). Read the screenshot at ${queuedAnnotation.path}, then act on it naturally — the strokes are the user's emphasis on what to look at.`
+            );
+        }
         if (capture) {
             envelopeLines.push(
                 capture.mode === 'fullscreen'
                     ? `Attached: full-screen capture of the display (${capture.rect.w}×${capture.rect.h}). Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
                     : `Attached: ${CURSOR_LENS_CROP_W}×${CURSOR_LENS_CROP_H} crop centred on the cursor. Read the screenshot at ${capture.path}, then act on it naturally — notice what's important or interesting, answer what's asked. If there's nothing to act on, say nothing.`
             );
-        } else if (appContextLine) {
+        } else if (!queuedAnnotation && appContextLine) {
             envelopeLines.push(`Act on the prompt naturally — the active-app context is situational awareness, not a request.`);
         }
         envelopeLines.push('</system-reminder>');
     }
     const composedContent = envelopeLines.join('\n');
+
+    // Build the attachments array: queued annotation first, then any
+    // fresh capture from this turn.
+    const attachmentPaths = [];
+    if (queuedAnnotation) attachmentPaths.push(queuedAnnotation.path);
+    if (capture) attachmentPaths.push(capture.path);
 
     try {
         const result = await depsRef.submitChannelUserMessage(
@@ -829,7 +930,7 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
             {
                 echoToLocalChat: true,
                 displayContent: prompt.trim(),
-                attachments: capture ? [capture.path] : [],
+                attachments: attachmentPaths,
             },
         );
         if (!result || result.success === false) {
@@ -840,6 +941,13 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
             return { success: false, error: result?.error || 'Channel submission failed' };
         }
         clearDraftPrompt();
+        // Attachment was consumed by the channel pipeline; clear our
+        // queue without unlinking (channel-bridge owns the staged copy).
+        if (queuedAnnotation && pendingAttachment === queuedAnnotation) {
+            pendingAttachment = null;
+            applyInteractivity();
+            broadcastState({ event: 'pending_attachment_consumed' });
+        }
         return { success: true, turnId };
     } catch (err) {
         if (pending && pending.turnId === turnId) {
@@ -984,6 +1092,13 @@ function registerIpcHandlers() {
         if (typeof payload.id !== 'string') {
             return { success: false, error: 'invalid' };
         }
+        // Main owns dismissal precedence: while an attachment is queued,
+        // the topmost layer is the attachment, not a reply. Reject reply
+        // dismissals from a stale renderer (one that hasn't yet hydrated
+        // pendingAttachment) so the layered model stays consistent.
+        if (pendingAttachment) {
+            return { success: false, error: 'attachment-takes-precedence' };
+        }
         const ok = dismissReplyById(payload.id);
         return { success: ok };
     });
@@ -1043,8 +1158,18 @@ function registerIpcHandlers() {
             inputOpen,
             replies: replies.slice(),
             isParked,
+            pendingAttachment: pendingAttachment ? publicAttachment(pendingAttachment) : null,
             draftPrompt: getFreshDraft(),
         };
+    });
+
+    ipcMain.handle('CURSOR_DISMISS_ATTACHMENT', (event) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        if (!pendingAttachment) return { success: false, error: 'no-attachment' };
+        clearPendingAttachment('renderer');
+        return { success: true };
     });
 
 }

@@ -1,7 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { Paperclip } from 'lucide-react';
 import { useElectron } from '../hooks/useElectron';
+import { AttachmentPill } from '../../shared/AttachmentPill.jsx';
+
+function PaperclipIcon() {
+  return <Paperclip size={14} strokeWidth={2} />;
+}
 
 // Markdown renderer scoped to the cursor reply bubble only.
 const cursorRemarkPlugins = [remarkGfm];
@@ -133,6 +139,13 @@ function CursorCompanionView() {
   const [inputOpen, setInputOpen] = useState(false);
   const [replies, setReplies] = useState([]); // [{ id, content, ts, role }]
   const [isParked, setIsParked] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState(null);
+  // Latest pendingAttachment for the right-click suppression decision —
+  // refs avoid the stale-closure problem inside the global mousedown
+  // listener wired in main without re-binding the listener every state
+  // change.
+  const pendingAttachmentRef = useRef(null);
+  pendingAttachmentRef.current = pendingAttachment;
 
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState(null);
@@ -164,6 +177,7 @@ function CursorCompanionView() {
         setReplies(payload.replies);
       }
       if (typeof payload.isParked === 'boolean') setIsParked(payload.isParked);
+      if ('pendingAttachment' in payload) setPendingAttachment(payload.pendingAttachment || null);
 
       // Input just opened — restore draft.
       if (payload.event === 'input_opened') {
@@ -219,6 +233,7 @@ function CursorCompanionView() {
       if (typeof state.inputOpen === 'boolean') setInputOpen(state.inputOpen);
       if (Array.isArray(state.replies)) setReplies(state.replies);
       if (typeof state.isParked === 'boolean') setIsParked(state.isParked);
+      if ('pendingAttachment' in state) setPendingAttachment(state.pendingAttachment || null);
       if (state.inputOpen && typeof state.draftPrompt === 'string') {
         setPrompt(state.draftPrompt);
       }
@@ -373,6 +388,14 @@ function CursorCompanionView() {
     }
     if (e.key === 'Shift') {
       if (e.repeat) return;
+      // Alt-held Shift+Shift means annotation invocation — let the tray
+      // detector be the source of truth so we don't double-fire (the
+      // tray callback decides annotation-vs-input based on alt state;
+      // the renderer-side `CURSOR_SHIFT_GESTURE` IPC has no alt info).
+      if (e.altKey) {
+        shiftTapAtRef.current = 0;
+        return;
+      }
       const now = Date.now();
       if (now - shiftTapAtRef.current <= 320) {
         shiftTapAtRef.current = 0;
@@ -406,15 +429,19 @@ function CursorCompanionView() {
   };
 
   // Per-reply right-click handler — local so it identifies which reply.
+  // Suppressed when an attachment is queued: main's global mousedown
+  // owns the dismissal precedence (attachment first, then top reply).
   const handleReplyContextMenu = useCallback((replyId) => (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (pendingAttachmentRef.current) return;
     void invoke('CURSOR_DISMISS_REPLY', { id: replyId }).catch(() => {});
   }, [invoke]);
 
   // Compute which layers are active and their vertical offsets.
-  // Layer order top→bottom: loader, input, reply-stack.
-  const showDot = !loading && !inputOpen && replies.length === 0;
+  // Layer order top→bottom: loader, input, attachment-pill, reply-stack.
+  const showDot = !loading && !inputOpen && replies.length === 0 && !pendingAttachment;
+  const ATTACHMENT_PILL_HEIGHT = 32; // matches AttachmentPill padding+font
 
   // Measured stack heights for layout. Reply stack outer height = topmost
   // reply's measured height + (count-1)*peek.
@@ -438,6 +465,10 @@ function CursorCompanionView() {
   if (inputOpen) {
     positions.input = { left: STACK_LEFT, top: cursor };
     cursor += inputBox.height + LAYER_GAP;
+  }
+  if (pendingAttachment) {
+    positions.attachment = { left: STACK_LEFT, top: cursor };
+    cursor += ATTACHMENT_PILL_HEIGHT + LAYER_GAP;
   }
   if (replies.length > 0) {
     positions.replyStack = { left: STACK_LEFT, top: cursor };
@@ -571,6 +602,44 @@ function CursorCompanionView() {
                 userSelect: 'text',
               }}
             />
+          </div>
+        )}
+      </LayerWrapper>
+
+      {/* Pending attachment layer — shown between input and replies */}
+      <LayerWrapper visible={Boolean(pendingAttachment)} duration={220}>
+        {(state) => (
+          <div
+            style={{
+              position: 'absolute',
+              left: positions.attachment?.left ?? STACK_LEFT,
+              top: positions.attachment?.top ?? STACK_TOP,
+              width: PILL_MAX_WIDTH,
+              opacity: state === 'visible' ? 1 : 0,
+              transform: state === 'visible' ? 'scale(1)' : 'scale(0.85)',
+              transformOrigin: 'top left',
+              transition: 'opacity 200ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), top 240ms cubic-bezier(0.22, 1, 0.36, 1)',
+              pointerEvents: 'auto',
+              background: 'rgba(20, 20, 24, 0.92)',
+              borderRadius: PILL_RADIUS,
+              padding: '4px 4px',
+              backdropFilter: 'blur(14px)',
+              WebkitBackdropFilter: 'blur(14px)',
+              boxShadow: '0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.42)',
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void invoke('CURSOR_DISMISS_ATTACHMENT').catch(() => {});
+            }}
+          >
+            {pendingAttachment ? (
+              <AttachmentPill
+                name={pendingAttachment.name}
+                size={pendingAttachment.size}
+                icon={<PaperclipIcon />}
+              />
+            ) : null}
           </div>
         )}
       </LayerWrapper>

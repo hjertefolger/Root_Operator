@@ -23,6 +23,11 @@ function init(deps = {}) {
     const {
         getStore,
         cursorCompanion,
+        // Optional sibling — annotation surface that piggybacks on the
+        // companion's enabled state. When companion is disabled, any
+        // open annotation surface should also tear down so a stale
+        // panel doesn't survive a master-toggle-off.
+        cursorAnnotation = null,
         logDebug = () => {},
         broadcastEnabled = () => {},
     } = deps;
@@ -80,6 +85,11 @@ function init(deps = {}) {
 
     function stopCompanion(reason) {
         clearPendingExit();
+        // Stop annotation surface synchronously — no exit animation
+        // for a presence-feature-being-disabled scenario, just close.
+        if (cursorAnnotation && typeof cursorAnnotation.stop === 'function') {
+            try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
+        }
         // Tell the renderer to play its exit animation first, then close
         // the window after a delay long enough to cover that animation.
         try {
@@ -142,6 +152,9 @@ function init(deps = {}) {
      */
     function shutdown() {
         clearPendingExit();
+        if (cursorAnnotation && typeof cursorAnnotation.stop === 'function') {
+            try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
+        }
         try { cursorCompanion.stop(); } catch (_) { /* ignore */ }
         enabled = false;
     }

@@ -5,6 +5,7 @@ import SettingsView from './components/SettingsView';
 import LocalChatView from './components/LocalChatView';
 import ViewerWindow from './components/ViewerWindow';
 import CursorCompanionView from './components/CursorCompanionView';
+import CursorAnnotationView from './components/CursorAnnotationView';
 
 const RENDERER_VIEW = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('view')
@@ -12,8 +13,9 @@ const RENDERER_VIEW = typeof window !== 'undefined'
 const IS_LOCAL_CHAT_VIEW = RENDERER_VIEW === 'chat';
 const IS_VIEWER_WINDOW = RENDERER_VIEW === 'viewer';
 const IS_CURSOR_COMPANION_VIEW = RENDERER_VIEW === 'cursor-companion';
+const IS_CURSOR_ANNOTATION_VIEW = RENDERER_VIEW === 'cursor-annotation';
 const IS_AUXILIARY_VIEW =
-  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW;
+  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW;
 
 function App() {
   const { invoke, on } = useElectron();
@@ -78,7 +80,7 @@ function App() {
 
   // Load initial settings and sync tunnel state
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW) {
       return undefined;
     }
 
@@ -116,7 +118,7 @@ function App() {
 
   // Listen for tunnel events
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW) {
       return undefined;
     }
 
@@ -203,6 +205,8 @@ function App() {
     <div ref={containerRef} className="flex flex-col">
       {IS_CURSOR_COMPANION_VIEW ? (
         <CursorCompanionView />
+      ) : IS_CURSOR_ANNOTATION_VIEW ? (
+        <CursorAnnotationView />
       ) : IS_VIEWER_WINDOW ? (
         <ViewerWindow />
       ) : IS_LOCAL_CHAT_VIEW ? (

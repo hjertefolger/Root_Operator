@@ -34,12 +34,19 @@ function init(deps = {}) {
     let tray = null;
     let shortcutHook = null;
     let shiftKeyCodes = [];
+    let altKeyCodes = [];
     let shiftShortcutStarted = false;
     let shiftListenersAttached = false;
     let lastShiftKeyUpCode = null;
     let lastShiftKeyUpTime = 0;
     let hadOtherKeyBetweenShiftTaps = false;
     let shiftToggleCallback = null;
+    // Alt (Option) state — tracked separately from "other key between
+    // shift taps" because Alt held throughout the gesture is a valid
+    // modifier (selects annotation invocation), not a "different key
+    // pressed in the middle" that would invalidate the double-tap.
+    let isAltHeld = false;
+    let candidateAltHeldAtFirstShift = false;
     // Pending restart timer scheduled by restartDoubleShiftShortcut.
     // Captured here so a teardown via stopDoubleShiftShortcut can cancel
     // it before it fires — without this, a `resume` powerMonitor event
@@ -53,6 +60,12 @@ function init(deps = {}) {
         lastShiftKeyUpCode = null;
         lastShiftKeyUpTime = 0;
         hadOtherKeyBetweenShiftTaps = false;
+        isAltHeld = false;
+        candidateAltHeldAtFirstShift = false;
+    }
+
+    function isActiveAltCode(keycode) {
+        return altKeyCodes.includes(keycode);
     }
 
     function getTray() {
@@ -85,11 +98,29 @@ function init(deps = {}) {
             return;
         }
 
+        // Alt (Option) is a modifier we WANT to track during the gesture,
+        // not an "other key" that invalidates the double-tap. Update the
+        // held flag and stamp the first-shift candidate so we know
+        // whether Alt was already held when the first Shift was tapped.
+        if (isActiveAltCode(event.keycode)) {
+            isAltHeld = true;
+            return;
+        }
+
         hadOtherKeyBetweenShiftTaps = true;
     }
 
     function handleModifierShortcutKeyUp(event) {
-        if (!shiftShortcutStarted || !isActiveShiftCode(event.keycode)) {
+        if (!shiftShortcutStarted) {
+            return;
+        }
+
+        if (isActiveAltCode(event.keycode)) {
+            isAltHeld = false;
+            return;
+        }
+
+        if (!isActiveShiftCode(event.keycode)) {
             return;
         }
 
@@ -100,11 +131,13 @@ function init(deps = {}) {
             && isActiveShiftCode(lastShiftKeyUpCode)
             && now - lastShiftKeyUpTime <= doubleShiftWindowMs
         ) {
+            const withAlt = candidateAltHeldAtFirstShift && isAltHeld;
             lastShiftKeyUpCode = null;
             lastShiftKeyUpTime = 0;
             hadOtherKeyBetweenShiftTaps = false;
+            candidateAltHeldAtFirstShift = false;
             if (typeof shiftToggleCallback === 'function') {
-                shiftToggleCallback();
+                shiftToggleCallback({ withAlt });
             }
             return;
         }
@@ -112,6 +145,7 @@ function init(deps = {}) {
         lastShiftKeyUpCode = event.keycode;
         lastShiftKeyUpTime = now;
         hadOtherKeyBetweenShiftTaps = false;
+        candidateAltHeldAtFirstShift = isAltHeld;
     }
 
     function createTray() {
@@ -223,6 +257,7 @@ function init(deps = {}) {
             const { uIOhook, UiohookKey } = require('uiohook-napi');
             shortcutHook = uIOhook;
             shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight].filter((k) => k != null);
+            altKeyCodes = [UiohookKey.Alt, UiohookKey.AltRight].filter((k) => k != null);
             if (!shiftListenersAttached) {
                 shortcutHook.on('keydown', handleModifierShortcutKeyDown);
                 shortcutHook.on('keyup', handleModifierShortcutKeyUp);
@@ -246,6 +281,7 @@ function init(deps = {}) {
             }
             shortcutHook = null;
             shiftKeyCodes = [];
+            altKeyCodes = [];
             shiftShortcutStarted = false;
             shiftListenersAttached = false;
             logDebug(`[SHORTCUT] Failed to initialize Double-Shift shortcut: ${error.message}`);
@@ -363,6 +399,7 @@ function init(deps = {}) {
             shiftListenersAttached = false;
             shiftShortcutStarted = false;
             shiftKeyCodes = [];
+            altKeyCodes = [];
             shiftToggleCallback = null;
             resetShiftDetectorState();
             return;
@@ -382,6 +419,7 @@ function init(deps = {}) {
 
         shortcutHook = null;
         shiftKeyCodes = [];
+        altKeyCodes = [];
         shiftShortcutStarted = false;
         shiftListenersAttached = false;
         resetShiftDetectorState();

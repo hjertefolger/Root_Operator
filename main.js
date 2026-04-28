@@ -48,6 +48,7 @@ const { init: initTray } = require('./src/main/tray');
 const { init: initWindowManager } = require('./src/main/window-manager');
 const { init: initCursorCompanion } = require('./src/main/cursor-companion');
 const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
+const { init: initCursorAnnotation } = require('./src/main/cursor-annotation');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
 const { init: initLocalChat } = require('./src/main/local-chat');
@@ -396,6 +397,29 @@ const cursorCompanion = initCursorCompanion({
     submitChannelUserMessage,
     getOperatingMode: () => operatingMode,
     logDebug,
+});
+
+// Annotation surface — a sibling module to cursor-companion. Owns the
+// fullscreen annotation panel invoked via ⌥⇧⇧. On commit, calls back
+// into cursor-companion to queue the annotated PNG as a pending
+// attachment for the next prompt.
+const cursorAnnotation = initCursorAnnotation({
+    BrowserWindow,
+    ipcMain,
+    screen,
+    app,
+    loadRendererWindow,
+    getCursorAttachmentsDir: () => ensureCursorAttachmentsDir(),
+    getCursorCompanionWindow: () => cursorCompanion.getWindow(),
+    logDebug,
+    onCommit: (payload) => {
+        try {
+            cursorCompanion.adoptAnnotation(payload);
+        } catch (err) {
+            logDebug(`[CURSOR-ANN] adoptAnnotation failed: ${err && err.message}`);
+        }
+    },
+    onCancel: () => { /* no-op for now; companion stays unchanged */ },
 });
 
 // Bind cursor companion's loader/response transitions to the same
@@ -753,11 +777,17 @@ app.whenReady().then(async () => {
         createTray,
         registerGlobalShortcuts,
         initDoubleShiftShortcut,
-        onDoubleShift: () => {
+        onDoubleShift: ({ withAlt } = {}) => {
             // Gate the gesture on the persistent enabled flag. When OFF,
             // double-Shift is a no-op on our side — the keys fall through
             // to whatever else might claim them.
             if (!cursorCompanionController || !cursorCompanionController.isEnabled()) {
+                return;
+            }
+            if (withAlt) {
+                try { cursorAnnotation.openAnnotation(); } catch (err) {
+                    logDebug(`[CURSOR-ANN] openAnnotation failed: ${err && err.message}`);
+                }
                 return;
             }
             try { cursorCompanion.toggleFromHotkey(); } catch (_) { /* ignore */ }
@@ -773,6 +803,7 @@ app.whenReady().then(async () => {
     cursorCompanionController = initCursorCompanionController({
         getStore: () => store,
         cursorCompanion,
+        cursorAnnotation,
         logDebug,
         broadcastEnabled: (enabled) => {
             // Notify all open renderer windows so the Settings UI can
@@ -960,6 +991,7 @@ app.on('will-quit', () => {
             cursorCompanion.stop();
         }
     } catch (_) { /* ignore */ }
+    try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;
