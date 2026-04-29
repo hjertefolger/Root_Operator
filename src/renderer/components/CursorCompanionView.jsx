@@ -166,6 +166,8 @@ function CursorCompanionView() {
     textHeight: INPUT_LINE_HEIGHT,
   });
   const [replySizes, setReplySizes] = useState({}); // { [id]: { width, height } }
+  const lastPointerPointRef = useRef(null);
+  const mousePassthroughRef = useRef(true);
 
   // Presence for the whole companion (master toggle).
   const [presenceAnim, setPresenceAnim] = useState('enter');
@@ -452,6 +454,65 @@ function CursorCompanionView() {
     void invoke('CURSOR_DISMISS_REPLY', { id: replyId }).catch(() => {});
   }, [invoke]);
 
+  const interactiveActive = inputOpen || replies.length > 0 || Boolean(pendingAttachment);
+  const setMousePassthrough = useCallback((passthrough) => {
+    if (mousePassthroughRef.current === passthrough) return;
+    mousePassthroughRef.current = passthrough;
+    void invoke('CURSOR_SET_MOUSE_PASSTHROUGH', { passthrough }).catch(() => {
+      mousePassthroughRef.current = null;
+    });
+  }, [invoke]);
+
+  const pointHitsInteractiveRegion = useCallback((x, y) => {
+    const regions = document.querySelectorAll('[data-cursor-hit-region="true"]');
+    for (const region of regions) {
+      const rect = region.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const style = window.getComputedStyle(region);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (Number.parseFloat(style.opacity || '1') <= 0.02) continue;
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
+  const updateMousePassthroughAt = useCallback((x, y) => {
+    lastPointerPointRef.current = { x, y };
+    if (!interactiveActive) {
+      setMousePassthrough(true);
+      return;
+    }
+    setMousePassthrough(!pointHitsInteractiveRegion(x, y));
+  }, [interactiveActive, pointHitsInteractiveRegion, setMousePassthrough]);
+
+  useEffect(() => {
+    const handleMouseMove = (event) => {
+      updateMousePassthroughAt(event.clientX, event.clientY);
+    };
+    const handleMouseLeave = () => {
+      setMousePassthrough(true);
+    };
+    document.addEventListener('mousemove', handleMouseMove, { capture: true });
+    window.addEventListener('mouseleave', handleMouseLeave);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove, { capture: true });
+      window.removeEventListener('mouseleave', handleMouseLeave);
+    };
+  }, [setMousePassthrough, updateMousePassthroughAt]);
+
+  useLayoutEffect(() => {
+    const point = lastPointerPointRef.current;
+    if (!interactiveActive) {
+      setMousePassthrough(true);
+      return;
+    }
+    if (point) {
+      updateMousePassthroughAt(point.x, point.y);
+    }
+  }, [interactiveActive, inputBox, pendingAttachment, replies, replySizes, setMousePassthrough, updateMousePassthroughAt]);
+
   // Compute which layers are active and their vertical offsets.
   // Layer order top→bottom: loader, input, attachment-pill, reply-stack.
   const showDot = !loading && !inputOpen && replies.length === 0 && !pendingAttachment;
@@ -557,6 +618,7 @@ function CursorCompanionView() {
       <LayerWrapper visible={inputOpen} duration={220}>
         {(state) => (
           <div
+            data-cursor-hit-region="true"
             onMouseDown={handlePillMouseDown}
             style={{
               position: 'absolute',
@@ -624,6 +686,7 @@ function CursorCompanionView() {
       <LayerWrapper visible={Boolean(pendingAttachment)} duration={220}>
         {(state) => (
           <div
+            data-cursor-hit-region="true"
             style={{
               position: 'absolute',
               left: positions.attachment?.left ?? STACK_LEFT,
@@ -903,6 +966,7 @@ const ReplyBubble = memo(function ReplyBubble({
   return (
     <>
       <div
+        data-cursor-hit-region={isTop ? 'true' : undefined}
         onContextMenu={onContextMenu}
         style={{
           position: 'absolute',

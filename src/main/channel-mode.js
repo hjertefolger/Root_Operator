@@ -333,11 +333,11 @@ function init(deps = {}) {
 
             sendLocalChatEvent(buildTransportChannelMessage(message));
             notifyAssistantReply(message);
-            // Forward to cursor companion if there's a pending turn whose
-            // chat_id matches; the companion checks internally and is a
-            // no-op when nothing's pending. Order: AFTER persistence and
-            // notifications so the cursor bubble can't receive a reply
-            // before the chat history records it.
+            // Forward every reply to cursor companion. Presence is a
+            // fan-out surface; the companion decides internally whether
+            // a reply also belongs to its local pending-turn state.
+            // Order: AFTER persistence and notifications so the cursor
+            // bubble can't receive a reply before the chat history records it.
             if (forwardToCursorCompanion) {
                 try {
                     forwardToCursorCompanion({

@@ -7,6 +7,31 @@ const { __test } = cursorCompanion;
 // init() requires Electron deps; these tests exercise only pure helpers
 // exposed via __test.
 
+function createFakeWindow({ visible = true } = {}) {
+    const sent = [];
+    const ignoreCalls = [];
+    return {
+        visible,
+        destroyed: false,
+        showInactiveCalls: 0,
+        sent,
+        ignoreCalls,
+        isDestroyed() { return this.destroyed; },
+        isVisible() { return this.visible; },
+        showInactive() {
+            this.visible = true;
+            this.showInactiveCalls += 1;
+        },
+        close() { this.destroyed = true; },
+        setIgnoreMouseEvents(...args) { ignoreCalls.push(args); },
+        webContents: {
+            send(channel, payload) {
+                sent.push({ channel, payload });
+            },
+        },
+    };
+}
+
 test('CURSOR_LENS_CROP constants are sensible', () => {
     assert.ok(__test.CURSOR_LENS_CROP_W >= 320, 'crop width should be at least 320px');
     assert.ok(__test.CURSOR_LENS_CROP_H >= 240, 'crop height should be at least 240px');
@@ -143,6 +168,105 @@ test('input open and replies are independent layers', () => {
     // Mode reflects input as foreground but loading/response layers can co-exist.
     __test.setInputOpenForTest(false);
     __test.setRepliesForTest([]);
+});
+
+test('interactive layers do not force the full native window to catch mouse events', () => {
+    const fakeWindow = createFakeWindow();
+    __test.setWindowForTest(fakeWindow);
+    __test.setInputOpenForTest(false);
+    __test.setRepliesForTest([]);
+    __test.setPendingAttachmentForTest(null);
+
+    __test.setMousePassthroughForTest(false);
+    __test.applyInteractivityForTest();
+    assert.equal(__test.getMousePassthroughForTest(), true);
+    assert.deepEqual(fakeWindow.ignoreCalls.at(-1), [true, { forward: true }]);
+
+    fakeWindow.ignoreCalls.length = 0;
+    __test.setRepliesForTest([{ id: 'r1', content: 'reply', ts: null, role: 'assistant' }]);
+    __test.applyInteractivityForTest();
+    assert.equal(__test.getMousePassthroughForTest(), true);
+    assert.equal(fakeWindow.ignoreCalls.length, 0, 'renderer hit-test, not layer presence, disables pass-through');
+
+    __test.runStopForTest();
+});
+
+test('desktop/mobile replies append to cursor stack without completing a cursor pending turn', () => {
+    const fakeWindow = createFakeWindow();
+    __test.setWindowForTest(fakeWindow);
+    __test.setInputOpenForTest(false);
+    __test.setRepliesForTest([]);
+    __test.clearTerminalGraceForTest();
+    const cursorBaseline = __test.getCursorReplySequenceForTest();
+    __test.setPendingForTest({
+        turnId: 'cursor-turn',
+        startedAt: Date.now(),
+        attachmentPath: null,
+        cursorReplySequenceAtSubmit: cursorBaseline,
+    });
+
+    __test.handleChannelActivityForTest({ phase: 'finished' });
+    assert.equal(__test.getTerminalGraceActiveForTest(), true, 'cursor turn is waiting in grace');
+
+    const handled = __test.handleChannelReplyForTest({
+        content: 'reply from desktop chat',
+        ts: '2026-04-29T10:00:00Z',
+        role: 'assistant',
+        chatId: 'desktop-chat',
+    });
+
+    assert.equal(handled, true);
+    assert.equal(__test.getRepliesForTest().at(-1).content, 'reply from desktop chat');
+    assert.equal(__test.getPendingForTest()?.turnId, 'cursor-turn');
+    assert.equal(__test.getTerminalGraceActiveForTest(), true, 'external reply does not cancel cursor grace');
+    assert.equal(__test.getCursorReplySequenceForTest(), cursorBaseline);
+
+    __test.runStopForTest();
+});
+
+test('cursor replies still cancel terminal grace and complete the cursor pending turn', () => {
+    const fakeWindow = createFakeWindow();
+    __test.setWindowForTest(fakeWindow);
+    __test.setInputOpenForTest(false);
+    __test.setRepliesForTest([]);
+    __test.clearTerminalGraceForTest();
+    const cursorBaseline = __test.getCursorReplySequenceForTest();
+    __test.setPendingForTest({
+        turnId: 'cursor-turn',
+        startedAt: Date.now(),
+        attachmentPath: null,
+        cursorReplySequenceAtSubmit: cursorBaseline,
+    });
+
+    __test.handleChannelActivityForTest({ phase: 'finished' });
+    assert.equal(__test.getTerminalGraceActiveForTest(), true);
+
+    const handled = __test.handleChannelReplyForTest({
+        content: 'reply from cursor turn',
+        ts: '2026-04-29T10:00:01Z',
+        role: 'assistant',
+        chatId: 'cursor-companion',
+    });
+
+    assert.equal(handled, true);
+    assert.equal(__test.getPendingForTest(), null);
+    assert.equal(__test.getTerminalGraceActiveForTest(), false);
+    assert.equal(__test.getCursorReplySequenceForTest(), cursorBaseline + 1);
+
+    __test.runStopForTest();
+});
+
+test('hide restoration retries show a hidden cursor window', async () => {
+    const fakeWindow = createFakeWindow({ visible: false });
+    __test.setWindowForTest(fakeWindow);
+
+    __test.scheduleCursorVisibilityRestoreForTest('test-hide');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(fakeWindow.visible, true);
+    assert.ok(fakeWindow.showInactiveCalls >= 1);
+
+    __test.runStopForTest();
 });
 
 test('stop() clears mode, layers, parked, shift-held, gesture lock, and replies', () => {

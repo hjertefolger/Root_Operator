@@ -71,6 +71,11 @@ const TERMINAL_GRACE_MS = 750;
 
 const CURSOR_CHAT_ID = 'cursor-companion';
 
+// Cmd+H/app-hide restoration is racy on macOS: a single immediate
+// showInactive() can run before AppKit finishes hiding every window.
+// Retry briefly so the cursor panel wins after the hide cascade settles.
+const APP_HIDE_RESTORE_DELAYS_MS = [0, 50, 150, 350];
+
 // Suppression window after a Shift+Shift gesture is dispatched. Both
 // the renderer-side detector (textarea keydown) and the tray-side
 // uIOhook keyup detector observe the same physical double-tap. Whichever
@@ -99,15 +104,15 @@ let shiftKeyCodes = [];
 let escKeyCode = null;
 let mouseListenerAttached = false;
 let isShiftHeld = false;
+let mousePassthrough = true;
 
 // Layered visibility. Each is independent.
 let inputOpen = false;
 let replies = []; // array of { id, content, ts, role }
-// Monotonic counter incremented on every pushReply, even when the
-// stack evicts the oldest entry. Used by the activity-terminal path
-// to detect "did THIS turn produce a reply?" without being fooled by
-// REPLY_STACK_CAP eviction or manual dismissal during pending.
-let replySequence = 0;
+// Cursor-originated reply counter. External/mobile/desktop replies fan
+// out to the cursor stack, but must not complete the local cursor turn.
+// Monotonic across visible-stack eviction and manual reply dismissal.
+let cursorReplySequence = 0;
 let terminalGraceTimer = null;
 let terminalGraceTurnId = null;
 
@@ -119,8 +124,10 @@ let pendingAttachment = null;
 
 // app.on('hide') handler — macOS Cmd+H hides all windows in the app,
 // including our NSPanel. The user's intent is "hide chat", not "kill
-// the cursor dot." We re-show on next tick to ride past the cascade.
+// the cursor dot." We retry briefly to ride past the AppKit cascade.
 let appHideHandler = null;
+let cursorWindowHideHandler = null;
+let restoreVisibilityTimers = [];
 
 // Half-written prompt persists across dismissals. Cleared on successful submit.
 let draftPrompt = '';
@@ -388,15 +395,7 @@ function attachAppHideHandler() {
     const { app } = depsRef;
     if (!app || typeof app.on !== 'function') return;
     appHideHandler = () => {
-        // macOS Cmd+H → app.hide() → all windows hide. The cursor
-        // panel should stay alive when Cursor Presence is enabled, so
-        // re-show on the next tick (gives the OS a beat to finish its
-        // hide animation before we contradict it).
-        setImmediate(() => {
-            if (isUsable(win) && !win.isVisible()) {
-                try { win.showInactive(); } catch (_) {}
-            }
-        });
+        scheduleCursorVisibilityRestore('app-hide');
     };
     app.on('hide', appHideHandler);
 }
@@ -416,11 +415,81 @@ function detachAppHideHandler() {
     appHideHandler = null;
 }
 
+function attachCursorWindowHideHandler(w) {
+    if (!isUsable(w) || typeof w.on !== 'function') return;
+    cursorWindowHideHandler = () => {
+        // Cmd+H can manifest as the panel hiding even if the app-level
+        // event is missed. Only rescue while the app itself is hidden,
+        // so intentional capture/annotation hides stay hidden.
+        if (isAppHidden()) {
+            scheduleCursorVisibilityRestore('window-hide');
+        }
+    };
+    w.on('hide', cursorWindowHideHandler);
+}
+
+function detachCursorWindowHideHandler() {
+    if (!cursorWindowHideHandler || !win) {
+        cursorWindowHideHandler = null;
+        return;
+    }
+    try {
+        if (typeof win.off === 'function') {
+            win.off('hide', cursorWindowHideHandler);
+        } else if (typeof win.removeListener === 'function') {
+            win.removeListener('hide', cursorWindowHideHandler);
+        }
+    } catch (_) { /* best-effort detach */ }
+    cursorWindowHideHandler = null;
+}
+
+function isAppHidden() {
+    const { app } = depsRef || {};
+    if (!app || typeof app.isHidden !== 'function') return false;
+    try {
+        return app.isHidden();
+    } catch (_) {
+        return false;
+    }
+}
+
+function scheduleCursorVisibilityRestore(reason) {
+    clearRestoreVisibilityTimers();
+    restoreVisibilityTimers = APP_HIDE_RESTORE_DELAYS_MS.map((delay) => {
+        const timer = setTimeout(() => {
+            restoreVisibilityTimers = restoreVisibilityTimers.filter((t) => t !== timer);
+            restoreCursorVisibility(reason);
+        }, delay);
+        if (typeof timer.unref === 'function') timer.unref();
+        return timer;
+    });
+}
+
+function clearRestoreVisibilityTimers() {
+    for (const timer of restoreVisibilityTimers) {
+        clearTimeout(timer);
+    }
+    restoreVisibilityTimers = [];
+}
+
+function restoreCursorVisibility(reason) {
+    if (!isUsable(win)) return;
+    try {
+        if (isAppHidden() || !win.isVisible()) {
+            win.showInactive();
+        }
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] restore after ${reason || 'hide'} failed: ${err.message}`);
+    }
+}
+
 function stop() {
     stopCursorPoll();
     stopAttachmentSweep();
     detachInputListeners();
     detachAppHideHandler();
+    detachCursorWindowHideHandler();
+    clearRestoreVisibilityTimers();
     if (terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
         terminalGraceTimer = null;
@@ -431,6 +500,7 @@ function stop() {
     }
     win = null;
     pending = null;
+    mousePassthrough = true;
     inputOpen = false;
     replies = [];
     gestureLockUntil = 0;
@@ -485,6 +555,7 @@ function createWindow() {
         w.setHiddenInMissionControl(true);
     }
     w.setIgnoreMouseEvents(true, { forward: true });
+    mousePassthrough = true;
 
     loadRendererWindow(w, '?view=cursor-companion');
 
@@ -495,10 +566,14 @@ function createWindow() {
     });
 
     w.on('closed', () => {
+        if (win === w) {
+            cursorWindowHideHandler = null;
+        }
         if (win === w) win = null;
     });
 
     win = w;
+    attachCursorWindowHideHandler(w);
     return w;
 }
 
@@ -586,15 +661,33 @@ function broadcastState(extra = {}) {
     }
 }
 
+function hasInteractiveLayer() {
+    return inputOpen || replies.length > 0 || pendingAttachment !== null;
+}
+
+function setMousePassthrough(passThrough) {
+    if (!isUsable(win)) return;
+    const next = Boolean(passThrough);
+    if (mousePassthrough === next) return;
+    try {
+        if (next) {
+            win.setIgnoreMouseEvents(true, { forward: true });
+        } else {
+            win.setIgnoreMouseEvents(false);
+        }
+        mousePassthrough = next;
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] setIgnoreMouseEvents failed: ${err.message}`);
+    }
+}
+
 function applyInteractivity() {
     if (!isUsable(win)) return;
-    // Window must accept mouse events whenever any focusable layer is
-    // visible: input pill, any reply, OR a queued attachment pill.
-    const interactive = inputOpen || replies.length > 0 || pendingAttachment !== null;
-    if (interactive) {
-        win.setIgnoreMouseEvents(false);
-    } else {
-        win.setIgnoreMouseEvents(true, { forward: true });
+    // Keep the native window click-through by default. The renderer
+    // samples real UI hit regions and only disables pass-through while
+    // the pointer is actually over input/reply/attachment chrome.
+    if (!hasInteractiveLayer()) {
+        setMousePassthrough(true);
     }
 }
 
@@ -722,11 +815,11 @@ function dismissReplyById(id) {
     return true;
 }
 
-function pushReply({ content, ts, role = 'assistant' }) {
+function pushReply({ content, ts, role = 'assistant', cursorTurn = false }) {
     if (typeof content !== 'string' || content.trim().length === 0) return;
     replies.push({ id: newReplyId(), content, ts: ts || null, role });
     while (replies.length > REPLY_STACK_CAP) replies.shift();
-    replySequence += 1;
+    if (cursorTurn) cursorReplySequence += 1;
     setLastReply(content, ts);
     applyInteractivity();
     broadcastState({ event: 'reply_appended' });
@@ -890,7 +983,7 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
         // eviction and manual dismissals, unlike `replies.length`.
         // The activity-terminal path uses this to decide whether THIS
         // turn produced a reply.
-        replySequenceAtSubmit: replySequence,
+        cursorReplySequenceAtSubmit: cursorReplySequence,
     };
 
     if (terminalGraceTimer) {
@@ -1015,39 +1108,30 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
 }
 
 /**
- * Forward a channel reply to the renderer when its chat_id targets the
- * cursor surface. Each reply pushes onto the visible stack (cap
- * REPLY_STACK_CAP).
+ * Forward every channel reply to the renderer while Cursor Presence is
+ * enabled. Presence is a fan-out surface: desktop/mobile replies still
+ * appear in the cursor stack.
  *
- * The chat_id filter (set by the reply tool from the originating
- * channel message) is the source of truth — replies tagged for the
- * cursor surface always land here, even after `pending` clears.
- *
- * Why no `!pending` gate: the activity stream can emit `finished`
- * before the `claude_reply` socket message arrives. The grace timer
- * (TERMINAL_GRACE_MS) covers the typical race, but Claude can take
- * longer than that to actually call the reply tool. A reply tagged for
- * cursor must always reach the cursor stack; dropping it would mean
- * "your prompt is in chat history but invisible on the cursor surface
- * that asked the question."
- *
- * Cancels any in-flight terminal grace timer — the reply we were
- * waiting for has now arrived.
+ * Cursor-originated replies (chatId === CURSOR_CHAT_ID) are the only
+ * replies that interact with the local pending/grace state machine.
+ * External replies append visually but do not complete or cancel a
+ * cursor turn that happens to be in flight.
  */
 function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
-    // Strict surface correlation: reply must explicitly target the
-    // cursor surface. Replies from desktop chat / paired devices
-    // arrive with their own chat_id and must never bleed in here.
-    if (chatId !== CURSOR_CHAT_ID) return false;
     if (!isUsable(win)) return false;
 
-    if (terminalGraceTimer) {
+    const isCursorReply = chatId === CURSOR_CHAT_ID;
+
+    if (isCursorReply && terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
         terminalGraceTimer = null;
+        if (pending && pending.turnId === terminalGraceTurnId) {
+            pending = null;
+        }
         terminalGraceTurnId = null;
     }
 
-    pushReply({ content, ts, role });
+    pushReply({ content, ts, role, cursorTurn: isCursorReply });
     return true;
 }
 
@@ -1094,13 +1178,14 @@ function handleChannelActivity(activity = {}) {
     // start a grace timer: the reply socket message may be in flight
     // and arrive shortly after the activity stream goes idle.
     //
-    // Compare against the monotonic replySequence at submit. This
-    // survives REPLY_STACK_CAP eviction (which would freeze
-    // replies.length) and manual stack dismissal during pending.
-    const baseline = typeof pending.replySequenceAtSubmit === 'number'
-        ? pending.replySequenceAtSubmit
-        : 0;
-    const hasReplyForTurn = replySequence > baseline;
+    // Compare against the monotonic cursorReplySequence at submit.
+    // This survives REPLY_STACK_CAP eviction (which would freeze
+    // replies.length) and manual stack dismissal during pending, while
+    // ignoring desktop/mobile replies that merely fan out to Presence.
+    const baseline = typeof pending.cursorReplySequenceAtSubmit === 'number'
+        ? pending.cursorReplySequenceAtSubmit
+        : (typeof pending.replySequenceAtSubmit === 'number' ? pending.replySequenceAtSubmit : 0);
+    const hasReplyForTurn = cursorReplySequence > baseline;
     if (hasReplyForTurn) {
         pending = null;
         broadcastState({ event: 'turn_completed', turnId: turnIdAtEntry });
@@ -1225,6 +1310,19 @@ function registerIpcHandlers() {
         return { success: true };
     });
 
+    ipcMain.handle('CURSOR_SET_MOUSE_PASSTHROUGH', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        if (!hasInteractiveLayer()) {
+            setMousePassthrough(true);
+            return { success: true, passthrough: true };
+        }
+        const passthrough = payload && payload.passthrough === false ? false : true;
+        setMousePassthrough(passthrough);
+        return { success: true, passthrough };
+    });
+
     ipcMain.handle('CURSOR_GET_STATE', (event) => {
         if (!isFromCursorWindow(event)) {
             return { ok: false };
@@ -1293,6 +1391,21 @@ module.exports = {
         setInputOpenForTest: (next) => { inputOpen = Boolean(next); },
         setRepliesForTest: (next) => { replies = Array.isArray(next) ? next.slice() : []; },
         setPendingForTest: (next) => { pending = next; },
+        setPendingAttachmentForTest: (next) => { pendingAttachment = next || null; },
+        setWindowForTest: (next) => { win = next || null; },
+        getMousePassthroughForTest: () => mousePassthrough,
+        setMousePassthroughForTest: (next) => { mousePassthrough = Boolean(next); },
+        applyInteractivityForTest: applyInteractivity,
+        handleChannelReplyForTest: handleChannelReply,
+        handleChannelActivityForTest: handleChannelActivity,
+        getCursorReplySequenceForTest: () => cursorReplySequence,
+        getTerminalGraceActiveForTest: () => Boolean(terminalGraceTimer),
+        clearTerminalGraceForTest: () => {
+            if (terminalGraceTimer) clearTimeout(terminalGraceTimer);
+            terminalGraceTimer = null;
+            terminalGraceTurnId = null;
+        },
+        scheduleCursorVisibilityRestoreForTest: scheduleCursorVisibilityRestore,
         setGestureLockUntilForTest: (next) => { gestureLockUntil = Number(next) || 0; },
         runStopForTest: () => stop(),
         pushReplyForTest: pushReply,
