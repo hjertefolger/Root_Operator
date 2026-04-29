@@ -166,8 +166,6 @@ function CursorCompanionView() {
     textHeight: INPUT_LINE_HEIGHT,
   });
   const [replySizes, setReplySizes] = useState({}); // { [id]: { width, height } }
-  const lastPointerPointRef = useRef(null);
-  const mousePassthroughRef = useRef(true);
 
   // Presence for the whole companion (master toggle).
   const [presenceAnim, setPresenceAnim] = useState('enter');
@@ -455,63 +453,26 @@ function CursorCompanionView() {
   }, [invoke]);
 
   const interactiveActive = inputOpen || replies.length > 0 || Boolean(pendingAttachment);
-  const setMousePassthrough = useCallback((passthrough) => {
-    if (mousePassthroughRef.current === passthrough) return;
-    mousePassthroughRef.current = passthrough;
-    void invoke('CURSOR_SET_MOUSE_PASSTHROUGH', { passthrough }).catch(() => {
-      mousePassthroughRef.current = null;
-    });
-  }, [invoke]);
 
-  const pointHitsInteractiveRegion = useCallback((x, y) => {
-    const regions = document.querySelectorAll('[data-cursor-hit-region="true"]');
-    for (const region of regions) {
-      const rect = region.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) continue;
-      const style = window.getComputedStyle(region);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      if (Number.parseFloat(style.opacity || '1') <= 0.02) continue;
-      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-        return true;
+  // Report current hit-regions (window-local coords) to main on every
+  // layout-affecting change. Main's 60Hz cursor poll uses these to
+  // toggle setIgnoreMouseEvents synchronously — eliminates the
+  // mousemove → IPC roundtrip lag that let wheel events leak through.
+  useLayoutEffect(() => {
+    const regions = [];
+    if (interactiveActive) {
+      const nodes = document.querySelectorAll('[data-cursor-hit-region="true"]');
+      for (const node of nodes) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        if (Number.parseFloat(style.opacity || '1') <= 0.02) continue;
+        regions.push({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
       }
     }
-    return false;
-  }, []);
-
-  const updateMousePassthroughAt = useCallback((x, y) => {
-    lastPointerPointRef.current = { x, y };
-    if (!interactiveActive) {
-      setMousePassthrough(true);
-      return;
-    }
-    setMousePassthrough(!pointHitsInteractiveRegion(x, y));
-  }, [interactiveActive, pointHitsInteractiveRegion, setMousePassthrough]);
-
-  useEffect(() => {
-    const handleMouseMove = (event) => {
-      updateMousePassthroughAt(event.clientX, event.clientY);
-    };
-    const handleMouseLeave = () => {
-      setMousePassthrough(true);
-    };
-    document.addEventListener('mousemove', handleMouseMove, { capture: true });
-    window.addEventListener('mouseleave', handleMouseLeave);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove, { capture: true });
-      window.removeEventListener('mouseleave', handleMouseLeave);
-    };
-  }, [setMousePassthrough, updateMousePassthroughAt]);
-
-  useLayoutEffect(() => {
-    const point = lastPointerPointRef.current;
-    if (!interactiveActive) {
-      setMousePassthrough(true);
-      return;
-    }
-    if (point) {
-      updateMousePassthroughAt(point.x, point.y);
-    }
-  }, [interactiveActive, inputBox, pendingAttachment, replies, replySizes, setMousePassthrough, updateMousePassthroughAt]);
+    void invoke('CURSOR_REPORT_HIT_REGIONS', { regions }).catch(() => {});
+  }, [interactiveActive, inputBox, pendingAttachment, replies, replySizes, invoke]);
 
   // Compute which layers are active and their vertical offsets.
   // Layer order top→bottom: loader, input, attachment-pill, reply-stack.

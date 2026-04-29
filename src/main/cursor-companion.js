@@ -106,6 +106,12 @@ let mouseListenerAttached = false;
 let isShiftHeld = false;
 let mousePassthrough = true;
 
+// Hit-regions reported by the renderer in window-local coordinates.
+// Used by the 60Hz passthrough evaluator so wheel/right-click capture is
+// deterministic — the renderer-mousemove → IPC roundtrip lagged the OS
+// wheel routing, letting wheel events leak to the underlying app.
+let hitRegions = []; // [{ x, y, w, h }]
+
 // Layered visibility. Each is independent.
 let inputOpen = false;
 let replies = []; // array of { id, content, ts, role }
@@ -592,18 +598,51 @@ function stopCursorPoll() {
 
 function updateWindowPosition() {
     if (!isUsable(win)) return;
-    if (isParked) return;
 
     const point = depsRef.screen.getCursorScreenPoint();
-    const targetX = point.x - ANCHOR_X;
-    const targetY = point.y - ANCHOR_Y;
-    if (targetX === lastWinPos.x && targetY === lastWinPos.y) return;
-    lastWinPos = { x: targetX, y: targetY };
-    try {
-        win.setPosition(targetX, targetY, false);
-    } catch (err) {
-        depsRef.logDebug(`[CURSOR] setPosition failed: ${err.message}`);
+    if (!isParked) {
+        const targetX = point.x - ANCHOR_X;
+        const targetY = point.y - ANCHOR_Y;
+        if (targetX !== lastWinPos.x || targetY !== lastWinPos.y) {
+            lastWinPos = { x: targetX, y: targetY };
+            try {
+                win.setPosition(targetX, targetY, false);
+            } catch (err) {
+                depsRef.logDebug(`[CURSOR] setPosition failed: ${err.message}`);
+            }
+        }
     }
+    evaluatePassthroughForCursor(point);
+}
+
+// Deterministic passthrough toggle driven by the cursor poll. Renderer
+// reports current hit-regions in window-local coords on layout changes;
+// here we map the screen cursor back to window-local space and decide
+// whether to capture mouse events. Done in main rather than via a
+// renderer mousemove → IPC roundtrip so wheel and right-click hit the
+// correct routing on the very next OS event.
+function evaluatePassthroughForCursor(screenPoint) {
+    if (!isUsable(win)) return;
+    if (!hasInteractiveLayer()) {
+        setMousePassthrough(true);
+        return;
+    }
+    if (hitRegions.length === 0) {
+        setMousePassthrough(true);
+        return;
+    }
+    const winPos = lastWinPos;
+    const localX = screenPoint.x - winPos.x;
+    const localY = screenPoint.y - winPos.y;
+    let inside = false;
+    for (const r of hitRegions) {
+        if (localX >= r.x && localX <= r.x + r.w &&
+            localY >= r.y && localY <= r.y + r.h) {
+            inside = true;
+            break;
+        }
+    }
+    setMousePassthrough(!inside);
 }
 
 function startAttachmentSweep() {
@@ -683,10 +722,12 @@ function setMousePassthrough(passThrough) {
 
 function applyInteractivity() {
     if (!isUsable(win)) return;
-    // Keep the native window click-through by default. The renderer
-    // samples real UI hit regions and only disables pass-through while
-    // the pointer is actually over input/reply/attachment chrome.
+    // Pass-through stays on by default. When interactive layers exist,
+    // the 60Hz cursor poll evaluates hit-regions and toggles pass-through
+    // synchronously so wheel/right-click events are captured by the
+    // bubble window without an IPC roundtrip lag.
     if (!hasInteractiveLayer()) {
+        hitRegions = [];
         setMousePassthrough(true);
     }
 }
@@ -716,6 +757,7 @@ function clearPendingAttachment(reason = '') {
     if (!pendingAttachment) return;
     try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
     pendingAttachment = null;
+    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'pending_attachment_cleared', reason });
 }
@@ -784,7 +826,11 @@ function openInput() {
     // double-tapped Shift, not whatever happens to be frontmost at submit.
     activeAppProbe = getActiveApp().catch(() => null);
     inputOpen = true;
-    isParked = false;
+    // Park the bubble at the current position. Without this the window
+    // continues to follow the cursor and the user can never move their
+    // pointer onto the reply/input/attachment chrome to scroll or
+    // right-click — cursor and bubble stay in lockstep at the anchor.
+    isParked = true;
     try { win.focus(); } catch (_) {}
     applyInteractivity();
     broadcastState({ event: 'input_opened', draftPrompt: getFreshDraft() });
@@ -793,8 +839,10 @@ function openInput() {
 function closeInput() {
     if (!inputOpen) return;
     inputOpen = false;
-    isParked = false;
     activeAppProbe = null;
+    // Stay parked while replies/attachment remain; otherwise resume
+    // cursor-following so the dot tracks naturally in ambient state.
+    isParked = hasInteractiveLayer();
     applyInteractivity();
     broadcastState({ event: 'input_closed' });
 }
@@ -802,6 +850,7 @@ function closeInput() {
 function clearReplies() {
     if (replies.length === 0) return;
     replies = [];
+    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'replies_cleared' });
 }
@@ -810,6 +859,7 @@ function dismissReplyById(id) {
     const before = replies.length;
     replies = replies.filter((r) => r.id !== id);
     if (replies.length === before) return false;
+    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'reply_dismissed', dismissedId: id });
     return true;
@@ -821,6 +871,11 @@ function pushReply({ content, ts, role = 'assistant', cursorTurn = false }) {
     while (replies.length > REPLY_STACK_CAP) replies.shift();
     if (cursorTurn) cursorReplySequence += 1;
     setLastReply(content, ts);
+    // Park the bubble at its current position so the user can move the
+    // cursor onto the reply to scroll/right-click. Without this the
+    // bubble continues following the cursor and the reply stays at a
+    // fixed offset below the cursor — unreachable.
+    isParked = true;
     applyInteractivity();
     broadcastState({ event: 'reply_appended' });
 }
@@ -1321,6 +1376,29 @@ function registerIpcHandlers() {
         const passthrough = payload && payload.passthrough === false ? false : true;
         setMousePassthrough(passthrough);
         return { success: true, passthrough };
+    });
+
+    ipcMain.handle('CURSOR_REPORT_HIT_REGIONS', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        const list = Array.isArray(payload && payload.regions) ? payload.regions : [];
+        const cleaned = [];
+        for (const r of list) {
+            if (!r) continue;
+            const x = Number(r.x), y = Number(r.y), w = Number(r.w), h = Number(r.h);
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) continue;
+            if (w <= 0 || h <= 0) continue;
+            cleaned.push({ x, y, w, h });
+        }
+        hitRegions = cleaned;
+        // Re-evaluate immediately so a layout change between poll ticks
+        // doesn't leave passthrough stale for up to ~16ms.
+        try {
+            const point = depsRef.screen.getCursorScreenPoint();
+            evaluatePassthroughForCursor(point);
+        } catch (_) {}
+        return { success: true, count: cleaned.length };
     });
 
     ipcMain.handle('CURSOR_GET_STATE', (event) => {
