@@ -393,6 +393,7 @@ const cursorCompanion = initCursorCompanion({
     screen,
     app,
     getCursorAttachmentsDir: () => ensureCursorAttachmentsDir(),
+    getLocalChatWindow: () => localChatWindow,
     loadRendererWindow,
     submitChannelUserMessage,
     getOperatingMode: () => operatingMode,

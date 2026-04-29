@@ -148,14 +148,7 @@ function CursorCompanionView() {
   const [loading, setLoading] = useState(false);
   const [inputOpen, setInputOpen] = useState(false);
   const [replies, setReplies] = useState([]); // [{ id, content, ts, role }]
-  const [isParked, setIsParked] = useState(false);
   const [pendingAttachment, setPendingAttachment] = useState(null);
-  // Latest pendingAttachment for the right-click suppression decision —
-  // refs avoid the stale-closure problem inside the global mousedown
-  // listener wired in main without re-binding the listener every state
-  // change.
-  const pendingAttachmentRef = useRef(null);
-  pendingAttachmentRef.current = pendingAttachment;
 
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState(null);
@@ -166,6 +159,21 @@ function CursorCompanionView() {
     textHeight: INPUT_LINE_HEIGHT,
   });
   const [replySizes, setReplySizes] = useState({}); // { [id]: { width, height } }
+  const replyScrollRefs = useRef({}); // { [id]: HTMLElement }
+  const repliesRef = useRef([]);
+
+  useEffect(() => {
+    repliesRef.current = replies;
+  }, [replies]);
+
+  const scrollTopReplyByDelta = useCallback((deltaY) => {
+    const stack = repliesRef.current;
+    const top = stack[stack.length - 1];
+    if (!top) return;
+    const node = replyScrollRefs.current[top.id];
+    if (!node) return;
+    node.scrollTop += deltaY;
+  }, []);
 
   // Presence for the whole companion (master toggle).
   const [presenceAnim, setPresenceAnim] = useState('enter');
@@ -186,7 +194,6 @@ function CursorCompanionView() {
       if (Array.isArray(payload.replies)) {
         setReplies(payload.replies);
       }
-      if (typeof payload.isParked === 'boolean') setIsParked(payload.isParked);
       if ('pendingAttachment' in payload) setPendingAttachment(payload.pendingAttachment || null);
 
       // Input just opened — restore draft.
@@ -217,16 +224,12 @@ function CursorCompanionView() {
       setPresenceAnim(payload.enabled ? 'enter' : 'exit');
     });
 
-    const offRightClick = on('CURSOR_RIGHT_CLICK', () => {
-      // Right-click anywhere while replies are visible dismisses the
-      // topmost. The bubble travels with the cursor, so hit-testing
-      // the click against the bubble's rect would always fail by
-      // design — the cursor is never over the bubble it spawned.
-      setReplies((curr) => {
-        if (curr.length === 0) return curr;
-        const top = curr[curr.length - 1];
-        void invoke('CURSOR_DISMISS_REPLY', { id: top.id }).catch(() => {});
-        return curr;
+    const offFocusInput = on('CURSOR_FOCUS_INPUT', () => {
+      requestAnimationFrame(() => {
+        const live = textareaRef.current;
+        if (!live) return;
+        live.focus();
+        setIsBlurred(false);
       });
     });
 
@@ -242,7 +245,6 @@ function CursorCompanionView() {
       if (typeof state.loading === 'boolean') setLoading(state.loading);
       if (typeof state.inputOpen === 'boolean') setInputOpen(state.inputOpen);
       if (Array.isArray(state.replies)) setReplies(state.replies);
-      if (typeof state.isParked === 'boolean') setIsParked(state.isParked);
       if ('pendingAttachment' in state) setPendingAttachment(state.pendingAttachment || null);
       if (state.inputOpen && typeof state.draftPrompt === 'string') {
         setPrompt(state.draftPrompt);
@@ -258,7 +260,7 @@ function CursorCompanionView() {
       offState?.();
       offError?.();
       offEnabled?.();
-      offRightClick?.();
+      offFocusInput?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [on, invoke]);
@@ -291,24 +293,29 @@ function CursorCompanionView() {
     return () => clearTimeout(t);
   }, [prompt, inputOpen, invoke]);
 
-  // Global wheel capture while replies are visible — bubble travels
-  // with the cursor (when not parked) so we forward wheel into the
-  // topmost reply's scrollable pane.
-  const replyScrollRefs = useRef({}); // { [id]: HTMLElement }
+  // Global wheel capture while replies are visible. The native window stays
+  // left-click-through; main routes only wheel deltas from the pointer tap.
+  useEffect(() => {
+    const offWheel = on('CURSOR_WHEEL', (payload) => {
+      const deltaY = Number(payload?.deltaY || 0);
+      if (!Number.isFinite(deltaY) || deltaY === 0) return;
+      scrollTopReplyByDelta(deltaY);
+    });
+    return () => offWheel?.();
+  }, [on, scrollTopReplyByDelta]);
+
+  // Fallback for any wheel event that does arrive inside the renderer, such
+  // as dev builds before the native tap is ready.
   useEffect(() => {
     if (replies.length === 0) return undefined;
     const handler = (e) => {
-      const top = replies[replies.length - 1];
-      if (!top) return;
-      const node = replyScrollRefs.current[top.id];
-      if (!node) return;
       e.preventDefault();
       const delta = e.deltaMode === 1 ? e.deltaY * INPUT_LINE_HEIGHT : e.deltaY;
-      node.scrollTop += delta;
+      scrollTopReplyByDelta(delta);
     };
     document.addEventListener('wheel', handler, { passive: false, capture: true });
     return () => document.removeEventListener('wheel', handler, { capture: true });
-  }, [replies]);
+  }, [replies, scrollTopReplyByDelta]);
 
   // Measure prompt for input pill width/height.
   useLayoutEffect(() => {
@@ -362,16 +369,15 @@ function CursorCompanionView() {
 
   const handleBlur = useCallback(() => {
     setIsBlurred(true);
-    // Synchronously persist the draft before parking. Closes the gap
-    // between the debounced draft sync and a tray-side dismissal that
-    // could otherwise lose the most recent keystroke.
-    void invoke('CURSOR_BLUR_PARK', { prompt }).catch(() => {});
+    // Synchronously persist the draft on blur. Closes the gap between
+    // the debounced draft sync and a tray-side dismissal that could
+    // otherwise lose the most recent keystroke.
+    void invoke('CURSOR_DRAFT_UPDATE', { prompt }).catch(() => {});
   }, [invoke, prompt]);
 
   const handleFocus = useCallback(() => {
     setIsBlurred(false);
-    void invoke('CURSOR_FOCUS_RESUME').catch(() => {});
-  }, [invoke]);
+  }, []);
 
   const handlePillMouseDown = useCallback((e) => {
     if (!inputOpen) return;
@@ -442,22 +448,19 @@ function CursorCompanionView() {
     }
   };
 
-  // Per-reply right-click handler — local so it identifies which reply.
-  // Suppressed when an attachment is queued: main's global mousedown
-  // owns the dismissal precedence (attachment first, then top reply).
-  const handleReplyContextMenu = useCallback((replyId) => (e) => {
+  // Main owns physical right-click dismissal through the global mouse
+  // hook. The renderer only suppresses the default context menu so one
+  // gesture cannot peel two replies through both event paths.
+  const handleReplyContextMenu = useCallback(() => (e) => {
     e.preventDefault();
     e.stopPropagation();
-    if (pendingAttachmentRef.current) return;
-    void invoke('CURSOR_DISMISS_REPLY', { id: replyId }).catch(() => {});
-  }, [invoke]);
+  }, []);
 
   const interactiveActive = inputOpen || replies.length > 0 || Boolean(pendingAttachment);
 
-  // Report current hit-regions (window-local coords) to main on every
-  // layout-affecting change. Main's 60Hz cursor poll uses these to
-  // toggle setIgnoreMouseEvents synchronously — eliminates the
-  // mousemove → IPC roundtrip lag that let wheel events leak through.
+  // Report current hit-regions for compatibility/debug visibility.
+  // Main no longer gates cursor-anchored reply scrolling on pointer
+  // overlap with these rects.
   useLayoutEffect(() => {
     const regions = [];
     if (interactiveActive) {

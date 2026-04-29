@@ -17,9 +17,9 @@
  * single-flight rejection. The user may submit while a previous turn is
  * still in flight; both replies will land in the stack in arrival order.
  *
- * Mouse events are click-through except where a focusable layer is
- * visible (input or any reply). Keyboard input flows to the renderer
- * because the window is an NSPanel that can become key.
+ * Mouse left-clicks stay click-through. Reply layers own only wheel and
+ * right-click through a narrow macOS event tap so the active app remains
+ * usable while the cursor-anchored stack is visible.
  *
  * The capture + submission flow: on Option+Enter we hide the overlay,
  * run `screencapture -x -R`, restore, and submit through the existing
@@ -31,6 +31,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { getActiveApp } = require('./active-app');
+const { createPointerGestureTap } = require('./pointer-gesture-tap');
 
 // Window is sized large enough to host every layer combination without
 // resizing the native window mid-animation (which fights CSS transitions).
@@ -92,12 +93,21 @@ const DRAFT_TTL_MS = 12 * 60 * 60 * 1000;
 // can recall it.
 const LAST_REPLY_TTL_MS = 30 * 60 * 1000;
 
+// Native global mouse hooks, the macOS pointer tap, and Electron
+// contextmenu can all observe the same right-click. Main handles the
+// physical click; renderer IPC is briefly ignored to avoid peeling two
+// replies from one gesture.
+const RIGHT_CLICK_RENDERER_DEDUP_MS = 180;
+const RIGHT_CLICK_SOURCE_DEDUP_MS = 120;
+const INPUT_REFOCUS_AFTER_LEFT_CLICK_MS = 35;
+
 let depsRef = null;
 let win = null;
 let cursorPollTimer = null;
 let attachmentSweepTimer = null;
 let lastWinPos = { x: -1, y: -1 };
 let pending = null;
+let channelActive = false;
 let isInitialized = false;
 let uiohookRef = null;
 let shiftKeyCodes = [];
@@ -105,11 +115,16 @@ let escKeyCode = null;
 let mouseListenerAttached = false;
 let isShiftHeld = false;
 let mousePassthrough = true;
+let pointerGestureTap = null;
+let pointerGestureCapture = { right: false, wheel: false };
+let lastRightDismissAt = 0;
+let lastRightDismissSource = null;
+let inputRefocusTimer = null;
 
-// Hit-regions reported by the renderer in window-local coordinates.
-// Used by the 60Hz passthrough evaluator so wheel/right-click capture is
-// deterministic — the renderer-mousemove → IPC roundtrip lagged the OS
-// wheel routing, letting wheel events leak to the underlying app.
+// Hit-regions are still accepted from the renderer for compatibility,
+// but cursor-anchored replies are not hit-tested by pointer position:
+// the pointer intentionally stays at the anchor while the bubble sits
+// nearby. Main owns wheel/right-click while replies are present.
 let hitRegions = []; // [{ x, y, w, h }]
 
 // Layered visibility. Each is independent.
@@ -153,14 +168,22 @@ let lastReplyUpdatedAt = 0;
 // Gesture suppression: timestamp until which subsequent gesture
 // dispatches should be ignored.
 let gestureLockUntil = 0;
-
-// Cursor-following pause. While parked the window stays at its current
-// screen position so the user can move the system cursor onto a
-// reply/input layer to interact with it. Auto-cleared when input closes.
-let isParked = false;
+let rendererReplyDismissBlockedUntil = 0;
 
 function isUsable(w) {
     return Boolean(w && !w.isDestroyed());
+}
+
+function isOpenVisibleWindow(w) {
+    if (!isUsable(w)) return false;
+    if (typeof w.isVisible !== 'function') return false;
+    try {
+        if (!w.isVisible()) return false;
+        if (typeof w.isMinimized === 'function' && w.isMinimized()) return false;
+        return true;
+    } catch (_) {
+        return false;
+    }
 }
 
 function newTurnId() {
@@ -180,12 +203,12 @@ function newReplyId() {
 function getMode() {
     if (inputOpen) return 'input';
     if (replies.length > 0) return 'response';
-    if (pending !== null) return 'loading';
+    if (isLoading()) return 'loading';
     return 'dot';
 }
 
 function isLoading() {
-    return pending !== null;
+    return pending !== null || channelActive;
 }
 
 function init(deps) {
@@ -298,6 +321,7 @@ function attachInputListeners() {
         uiohookRef.on('keydown', handleGlobalEscDown);
         uiohookRef.on('keyup', handleShiftKeyUp);
         uiohookRef.on('mousedown', handleGlobalMouseDown);
+        uiohookRef.on('mouseup', handleGlobalMouseUp);
         mouseListenerAttached = true;
         depsRef.logDebug('[CURSOR] Shift + Esc + global click listeners attached');
     } catch (err) {
@@ -312,6 +336,7 @@ function detachInputListeners() {
         uiohookRef.off('keydown', handleGlobalEscDown);
         uiohookRef.off('keyup', handleShiftKeyUp);
         uiohookRef.off('mousedown', handleGlobalMouseDown);
+        uiohookRef.off('mouseup', handleGlobalMouseUp);
     } catch (err) {
         depsRef.logDebug(`[CURSOR] detach input listeners failed: ${err.message}`);
     }
@@ -320,6 +345,81 @@ function detachInputListeners() {
     shiftKeyCodes = [];
     escKeyCode = null;
     isShiftHeld = false;
+}
+
+function ensurePointerGestureTap() {
+    if (pointerGestureTap) return pointerGestureTap;
+    if (!depsRef) return null;
+    if (
+        typeof depsRef.createPointerGestureTap !== 'function' &&
+        (!depsRef.app || typeof depsRef.app.getAppPath !== 'function')
+    ) {
+        return null;
+    }
+
+    const factory = typeof depsRef.createPointerGestureTap === 'function'
+        ? depsRef.createPointerGestureTap
+        : createPointerGestureTap;
+    if (typeof factory !== 'function') return null;
+
+    try {
+        pointerGestureTap = factory({
+            app: depsRef.app,
+            logDebug: depsRef.logDebug,
+            onRightMouseDown: () => handleGlobalMouseDown({ button: 2, source: 'pointer-tap' }),
+            onWheel: handlePointerTapWheel,
+        });
+    } catch (err) {
+        depsRef.logDebug(`[CURSOR] pointer gesture tap init failed: ${err.message}`);
+        pointerGestureTap = null;
+    }
+    return pointerGestureTap;
+}
+
+function startPointerGestureTap() {
+    const tap = ensurePointerGestureTap();
+    if (!tap || typeof tap.start !== 'function') return;
+    try {
+        tap.start();
+        syncPointerGestureCapture(true);
+    } catch (err) {
+        depsRef.logDebug(`[CURSOR] pointer gesture tap start failed: ${err.message}`);
+    }
+}
+
+function stopPointerGestureTap() {
+    if (pointerGestureTap && typeof pointerGestureTap.stop === 'function') {
+        try { pointerGestureTap.stop(); } catch (_) {}
+    }
+    pointerGestureTap = null;
+    pointerGestureCapture = { right: false, wheel: false };
+}
+
+function wantedPointerGestureCapture() {
+    return {
+        right: replies.length > 0 || pendingAttachment !== null,
+        wheel: replies.length > 0,
+    };
+}
+
+function syncPointerGestureCapture(force = false) {
+    const next = wantedPointerGestureCapture();
+    if (
+        !force &&
+        pointerGestureCapture.right === next.right &&
+        pointerGestureCapture.wheel === next.wheel
+    ) {
+        return;
+    }
+
+    pointerGestureCapture = next;
+    const tap = ensurePointerGestureTap();
+    if (!tap || typeof tap.setCapture !== 'function') return;
+    try {
+        tap.setCapture(next);
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] pointer gesture tap capture failed: ${err.message}`);
+    }
 }
 
 function handleShiftKeyDown(event) {
@@ -336,38 +436,97 @@ function handleShiftKeyUp(event) {
     applyInteractivity();
 }
 
+function clearInputRefocusTimer() {
+    if (!inputRefocusTimer) return;
+    clearTimeout(inputRefocusTimer);
+    inputRefocusTimer = null;
+}
+
+function scheduleInputRefocusAfterPassthroughClick() {
+    if (!inputOpen || !isUsable(win)) return;
+    clearInputRefocusTimer();
+    inputRefocusTimer = setTimeout(() => {
+        inputRefocusTimer = null;
+        if (!inputOpen || !isUsable(win)) return;
+        try { win.focus(); } catch (_) {}
+        try {
+            win.webContents.send('CURSOR_FOCUS_INPUT', { reason: 'left-click-passthrough' });
+        } catch (err) {
+            depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] refocus input failed: ${err.message}`);
+        }
+    }, INPUT_REFOCUS_AFTER_LEFT_CLICK_MS);
+    if (typeof inputRefocusTimer.unref === 'function') inputRefocusTimer.unref();
+}
+
+function handleGlobalMouseUp(event) {
+    if (!event || event.button !== 1) return;
+    scheduleInputRefocusAfterPassthroughClick();
+}
+
 /**
  * Right-click peels the topmost layer below the input, in spatial order:
  *   1. Pending attachment pill (if any)
  *   2. Latest reply
  *   3. Older reply (next)
  *
- * Main owns the precedence — renderer renders optimistically but the
- * authoritative dismissal happens here. The bubble follows the cursor
- * (or is parked); either way the user's right-click intent reads as
- * "peel the most recent thing I added/saw."
+ * Main owns the precedence. While replies or a pending attachment are
+ * visible, the macOS pointer tap consumes right-click and peels the
+ * latest layer. After the last layer clears, capture turns off so the
+ * next right-click belongs to the active app.
  *
  * Loading is intentionally still not click-dismissable.
  */
 function handleGlobalMouseDown(event) {
-    if (!event || event.button !== 2) return;
+    if (!event) return;
+    if (event.button !== 2) return;
     if (!isUsable(win)) return;
+    const now = Date.now();
+    const source = typeof event.source === 'string' ? event.source : 'uiohook';
+    if (
+        lastRightDismissSource &&
+        lastRightDismissSource !== source &&
+        now - lastRightDismissAt < RIGHT_CLICK_SOURCE_DEDUP_MS
+    ) {
+        return;
+    }
     if (pendingAttachment) {
+        lastRightDismissAt = now;
+        lastRightDismissSource = source;
         clearPendingAttachment('right-click');
         return;
     }
     if (replies.length === 0) return;
+    if (dismissTopReply()) {
+        lastRightDismissAt = now;
+        lastRightDismissSource = source;
+        rendererReplyDismissBlockedUntil = now + RIGHT_CLICK_RENDERER_DEDUP_MS;
+    }
+}
+
+function handlePointerTapWheel(payload = {}) {
+    if (!isUsable(win)) return;
+    if (replies.length === 0) return;
+    const deltaX = Number(payload.deltaX || 0);
+    const deltaY = Number(payload.deltaY || 0);
+    if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return;
+    if (deltaX === 0 && deltaY === 0) return;
     try {
-        win.webContents.send('CURSOR_RIGHT_CLICK', {});
-    } catch (_) {}
+        win.webContents.send('CURSOR_WHEEL', {
+            deltaX,
+            deltaY,
+            source: payload.source || 'pointer-tap',
+        });
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] wheel dispatch failed: ${err.message}`);
+    }
 }
 
 /**
  * Esc peels one layer at a time, matching the right-click model:
  *   input (renderer-handled, preserves draft)
  *     → pending attachment
- *     → reply stack (clears the whole deck — single Esc, all replies
- *       gone, matches the long-standing behaviour pre-attachment).
+ *     → latest reply
+ *     → older reply (next)
  *
  * Renderer's own keydown handles the input-mode Esc; this handler only
  * fires when input is closed.
@@ -380,7 +539,7 @@ function handleGlobalEscDown(event) {
         return;
     }
     if (replies.length === 0) return;
-    clearReplies();
+    dismissTopReply();
 }
 
 function start() {
@@ -391,6 +550,7 @@ function start() {
     createWindow();
     startCursorPoll();
     attachInputListeners();
+    startPointerGestureTap();
     startAttachmentSweep();
     attachAppHideHandler();
     depsRef.logDebug('[CURSOR] Companion started');
@@ -493,6 +653,8 @@ function stop() {
     stopCursorPoll();
     stopAttachmentSweep();
     detachInputListeners();
+    stopPointerGestureTap();
+    clearInputRefocusTimer();
     detachAppHideHandler();
     detachCursorWindowHideHandler();
     clearRestoreVisibilityTimers();
@@ -506,11 +668,15 @@ function stop() {
     }
     win = null;
     pending = null;
+    channelActive = false;
     mousePassthrough = true;
+    pointerGestureCapture = { right: false, wheel: false };
+    lastRightDismissAt = 0;
+    lastRightDismissSource = null;
     inputOpen = false;
     replies = [];
     gestureLockUntil = 0;
-    isParked = false;
+    rendererReplyDismissBlockedUntil = 0;
     isShiftHeld = false;
     activeAppProbe = null;
     if (pendingAttachment) {
@@ -518,6 +684,7 @@ function stop() {
     }
     pendingAttachment = null;
     lastWinPos = { x: -1, y: -1 };
+    hitRegions = [];
     depsRef && depsRef.logDebug && depsRef.logDebug('[CURSOR] Companion stopped');
 }
 
@@ -574,6 +741,7 @@ function createWindow() {
     w.on('closed', () => {
         if (win === w) {
             cursorWindowHideHandler = null;
+            stopPointerGestureTap();
         }
         if (win === w) win = null;
     });
@@ -600,16 +768,14 @@ function updateWindowPosition() {
     if (!isUsable(win)) return;
 
     const point = depsRef.screen.getCursorScreenPoint();
-    if (!isParked) {
-        const targetX = point.x - ANCHOR_X;
-        const targetY = point.y - ANCHOR_Y;
-        if (targetX !== lastWinPos.x || targetY !== lastWinPos.y) {
-            lastWinPos = { x: targetX, y: targetY };
-            try {
-                win.setPosition(targetX, targetY, false);
-            } catch (err) {
-                depsRef.logDebug(`[CURSOR] setPosition failed: ${err.message}`);
-            }
+    const targetX = point.x - ANCHOR_X;
+    const targetY = point.y - ANCHOR_Y;
+    if (targetX !== lastWinPos.x || targetY !== lastWinPos.y) {
+        lastWinPos = { x: targetX, y: targetY };
+        try {
+            win.setPosition(targetX, targetY, false);
+        } catch (err) {
+            depsRef.logDebug(`[CURSOR] setPosition failed: ${err.message}`);
         }
     }
     evaluatePassthroughForCursor(point);
@@ -621,28 +787,11 @@ function updateWindowPosition() {
 // whether to capture mouse events. Done in main rather than via a
 // renderer mousemove → IPC roundtrip so wheel and right-click hit the
 // correct routing on the very next OS event.
-function evaluatePassthroughForCursor(screenPoint) {
+function evaluatePassthroughForCursor(screenPoint, winPos = null) {
     if (!isUsable(win)) return;
-    if (!hasInteractiveLayer()) {
-        setMousePassthrough(true);
-        return;
-    }
-    if (hitRegions.length === 0) {
-        setMousePassthrough(true);
-        return;
-    }
-    const winPos = lastWinPos;
-    const localX = screenPoint.x - winPos.x;
-    const localY = screenPoint.y - winPos.y;
-    let inside = false;
-    for (const r of hitRegions) {
-        if (localX >= r.x && localX <= r.x + r.w &&
-            localY >= r.y && localY <= r.y + r.h) {
-            inside = true;
-            break;
-        }
-    }
-    setMousePassthrough(!inside);
+    void screenPoint;
+    void winPos;
+    applyInteractivity();
 }
 
 function startAttachmentSweep() {
@@ -691,17 +840,12 @@ function broadcastState(extra = {}) {
             loading: isLoading(),
             inputOpen,
             replies: replies.slice(),
-            isParked,
             pendingAttachment: pendingAttachment ? publicAttachment(pendingAttachment) : null,
             ...extra,
         });
     } catch (err) {
         depsRef.logDebug(`[CURSOR] broadcastState failed: ${err.message}`);
     }
-}
-
-function hasInteractiveLayer() {
-    return inputOpen || replies.length > 0 || pendingAttachment !== null;
 }
 
 function setMousePassthrough(passThrough) {
@@ -722,14 +866,12 @@ function setMousePassthrough(passThrough) {
 
 function applyInteractivity() {
     if (!isUsable(win)) return;
-    // Pass-through stays on by default. When interactive layers exist,
-    // the 60Hz cursor poll evaluates hit-regions and toggles pass-through
-    // synchronously so wheel/right-click events are captured by the
-    // bubble window without an IPC roundtrip lag.
-    if (!hasInteractiveLayer()) {
-        hitRegions = [];
-        setMousePassthrough(true);
-    }
+    // Keep the native overlay left-click-through even while replies are
+    // anchored beside the cursor. Wheel/right-click ownership is handled
+    // by the narrow pointer tap, not by making the whole window clickable.
+    hitRegions = [];
+    setMousePassthrough(true);
+    syncPointerGestureCapture();
 }
 
 // Strip filesystem path before sending state to the renderer — the
@@ -757,7 +899,6 @@ function clearPendingAttachment(reason = '') {
     if (!pendingAttachment) return;
     try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
     pendingAttachment = null;
-    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'pending_attachment_cleared', reason });
 }
@@ -826,11 +967,6 @@ function openInput() {
     // double-tapped Shift, not whatever happens to be frontmost at submit.
     activeAppProbe = getActiveApp().catch(() => null);
     inputOpen = true;
-    // Park the bubble at the current position. Without this the window
-    // continues to follow the cursor and the user can never move their
-    // pointer onto the reply/input/attachment chrome to scroll or
-    // right-click — cursor and bubble stay in lockstep at the anchor.
-    isParked = true;
     try { win.focus(); } catch (_) {}
     applyInteractivity();
     broadcastState({ event: 'input_opened', draftPrompt: getFreshDraft() });
@@ -839,10 +975,8 @@ function openInput() {
 function closeInput() {
     if (!inputOpen) return;
     inputOpen = false;
+    clearInputRefocusTimer();
     activeAppProbe = null;
-    // Stay parked while replies/attachment remain; otherwise resume
-    // cursor-following so the dot tracks naturally in ambient state.
-    isParked = hasInteractiveLayer();
     applyInteractivity();
     broadcastState({ event: 'input_closed' });
 }
@@ -850,7 +984,6 @@ function closeInput() {
 function clearReplies() {
     if (replies.length === 0) return;
     replies = [];
-    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'replies_cleared' });
 }
@@ -859,10 +992,14 @@ function dismissReplyById(id) {
     const before = replies.length;
     replies = replies.filter((r) => r.id !== id);
     if (replies.length === before) return false;
-    if (!hasInteractiveLayer()) isParked = false;
     applyInteractivity();
     broadcastState({ event: 'reply_dismissed', dismissedId: id });
     return true;
+}
+
+function dismissTopReply() {
+    if (replies.length === 0) return false;
+    return dismissReplyById(replies[replies.length - 1].id);
 }
 
 function pushReply({ content, ts, role = 'assistant', cursorTurn = false }) {
@@ -871,11 +1008,6 @@ function pushReply({ content, ts, role = 'assistant', cursorTurn = false }) {
     while (replies.length > REPLY_STACK_CAP) replies.shift();
     if (cursorTurn) cursorReplySequence += 1;
     setLastReply(content, ts);
-    // Park the bubble at its current position so the user can move the
-    // cursor onto the reply to scroll/right-click. Without this the
-    // bubble continues following the cursor and the reply stays at a
-    // fixed offset below the cursor — unreachable.
-    isParked = true;
     applyInteractivity();
     broadcastState({ event: 'reply_appended' });
 }
@@ -892,7 +1024,6 @@ function dismiss() {
     if (!isInitialized) return;
     inputOpen = false;
     replies = [];
-    isParked = false;
     activeAppProbe = null;
     if (pendingAttachment) {
         try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
@@ -1050,7 +1181,6 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     // Closing input is part of the submit gesture — replies smoothly
     // shift up into the freed slot in the renderer.
     inputOpen = false;
-    isParked = false;
     applyInteractivity();
     broadcastState({ event: 'turn_submitted', turnId });
 
@@ -1163,9 +1293,9 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
 }
 
 /**
- * Forward every channel reply to the renderer while Cursor Presence is
- * enabled. Presence is a fan-out surface: desktop/mobile replies still
- * appear in the cursor stack.
+ * Forward channel replies to the renderer while Cursor Presence is
+ * enabled. Desktop-chat replies are suppressed while the desktop chat
+ * itself is open, because that would duplicate the visible chat reply.
  *
  * Cursor-originated replies (chatId === CURSOR_CHAT_ID) are the only
  * replies that interact with the local pending/grace state machine.
@@ -1176,6 +1306,12 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
     if (!isUsable(win)) return false;
 
     const isCursorReply = chatId === CURSOR_CHAT_ID;
+    const desktopChatWindow = depsRef && typeof depsRef.getLocalChatWindow === 'function'
+        ? depsRef.getLocalChatWindow()
+        : null;
+    if (!isCursorReply && isOpenVisibleWindow(desktopChatWindow)) {
+        return false;
+    }
 
     if (isCursorReply && terminalGraceTimer) {
         clearTimeout(terminalGraceTimer);
@@ -1195,8 +1331,13 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
  * terminal phases.
  */
 function handleChannelActivity(activity = {}) {
-    if (!pending) return;
     const phase = typeof activity.phase === 'string' ? activity.phase : '';
+    const nextChannelActive = Boolean(activity && !activity.reset && (
+        activity.active === true
+        || (phase && !isTerminalPhase(phase))
+    ));
+    const activityChanged = channelActive !== nextChannelActive;
+    channelActive = nextChannelActive;
 
     if (activity.reset === true) {
         pending = null;
@@ -1206,6 +1347,13 @@ function handleChannelActivity(activity = {}) {
             terminalGraceTurnId = null;
         }
         broadcastState({ event: 'activity_reset' });
+        return;
+    }
+
+    if (!pending) {
+        if (activityChanged) {
+            broadcastState({ event: channelActive ? 'activity_active' : 'activity_idle' });
+        }
         return;
     }
 
@@ -1292,12 +1440,14 @@ function registerIpcHandlers() {
         if (typeof payload.prompt === 'string' && inputOpen) {
             setDraftPrompt(payload.prompt);
         }
-        // Esc/explicit dismiss: collapse input first if open, otherwise
-        // clear the reply stack. Two presses → fully back to dot.
+        // Esc/explicit dismiss peels the visible stack one layer at a
+        // time. Repeated presses eventually return to the ambient dot.
         if (inputOpen) {
             closeInput();
+        } else if (pendingAttachment) {
+            clearPendingAttachment('dismiss');
         } else if (replies.length > 0) {
-            clearReplies();
+            dismissTopReply();
         }
         return { success: true };
     });
@@ -1308,6 +1458,9 @@ function registerIpcHandlers() {
         }
         if (typeof payload.id !== 'string') {
             return { success: false, error: 'invalid' };
+        }
+        if (Date.now() < rendererReplyDismissBlockedUntil) {
+            return { success: false, error: 'right-click-already-handled' };
         }
         // Main owns dismissal precedence: while an attachment is queued,
         // the topmost layer is the attachment, not a reply. Reject reply
@@ -1337,45 +1490,6 @@ function registerIpcHandlers() {
         }
         setDraftPrompt(payload.prompt);
         return { success: true };
-    });
-
-    ipcMain.handle('CURSOR_BLUR_PARK', (event, payload = {}) => {
-        if (!isFromCursorWindow(event)) {
-            return { success: false, error: 'unauthorized' };
-        }
-        // Synchronously persist the latest draft before parking, closing
-        // the gap between debounced CURSOR_DRAFT_UPDATE and a subsequent
-        // tray-side dismissal.
-        if (typeof payload.prompt === 'string') {
-            setDraftPrompt(payload.prompt);
-        }
-        if (inputOpen) {
-            isParked = true;
-            broadcastState({ event: 'parked' });
-        }
-        return { success: true, parked: isParked };
-    });
-
-    ipcMain.handle('CURSOR_FOCUS_RESUME', (event) => {
-        if (!isFromCursorWindow(event)) {
-            return { success: false, error: 'unauthorized' };
-        }
-        isParked = false;
-        broadcastState({ event: 'unparked' });
-        return { success: true };
-    });
-
-    ipcMain.handle('CURSOR_SET_MOUSE_PASSTHROUGH', (event, payload = {}) => {
-        if (!isFromCursorWindow(event)) {
-            return { success: false, error: 'unauthorized' };
-        }
-        if (!hasInteractiveLayer()) {
-            setMousePassthrough(true);
-            return { success: true, passthrough: true };
-        }
-        const passthrough = payload && payload.passthrough === false ? false : true;
-        setMousePassthrough(passthrough);
-        return { success: true, passthrough };
     });
 
     ipcMain.handle('CURSOR_REPORT_HIT_REGIONS', (event, payload = {}) => {
@@ -1410,7 +1524,6 @@ function registerIpcHandlers() {
             loading: isLoading(),
             inputOpen,
             replies: replies.slice(),
-            isParked,
             pendingAttachment: pendingAttachment ? publicAttachment(pendingAttachment) : null,
             draftPrompt: getFreshDraft(),
         };
@@ -1464,15 +1577,28 @@ module.exports = {
         getFreshLastReplyForTest: getFreshLastReply,
         getGestureLockUntilForTest: () => gestureLockUntil,
         resetGestureLockForTest: () => { gestureLockUntil = 0; },
-        getParkedForTest: () => isParked,
-        setParkedForTest: (next) => { isParked = Boolean(next); },
         setInputOpenForTest: (next) => { inputOpen = Boolean(next); },
         setRepliesForTest: (next) => { replies = Array.isArray(next) ? next.slice() : []; },
         setPendingForTest: (next) => { pending = next; },
+        setChannelActiveForTest: (next) => { channelActive = Boolean(next); },
+        getChannelActiveForTest: () => channelActive,
         setPendingAttachmentForTest: (next) => { pendingAttachment = next || null; },
         setWindowForTest: (next) => { win = next || null; },
+        setLocalChatWindowForTest: (next) => {
+            depsRef = depsRef || {};
+            depsRef.getLocalChatWindow = () => next || null;
+        },
+        setHitRegionsForTest: (next) => { hitRegions = Array.isArray(next) ? next.slice() : []; },
         getMousePassthroughForTest: () => mousePassthrough,
         setMousePassthroughForTest: (next) => { mousePassthrough = Boolean(next); },
+        setPointerGestureTapForTest: (tap) => { pointerGestureTap = tap || null; },
+        getPointerGestureCaptureForTest: () => ({ ...pointerGestureCapture }),
+        syncPointerGestureCaptureForTest: syncPointerGestureCapture,
+        handlePointerTapWheelForTest: handlePointerTapWheel,
+        scheduleInputRefocusAfterPassthroughClickForTest: scheduleInputRefocusAfterPassthroughClick,
+        updateWindowPositionForTest: updateWindowPosition,
+        handleGlobalMouseDownForTest: handleGlobalMouseDown,
+        handleGlobalMouseUpForTest: handleGlobalMouseUp,
         applyInteractivityForTest: applyInteractivity,
         handleChannelReplyForTest: handleChannelReply,
         handleChannelActivityForTest: handleChannelActivity,
@@ -1487,10 +1613,12 @@ module.exports = {
         setGestureLockUntilForTest: (next) => { gestureLockUntil = Number(next) || 0; },
         runStopForTest: () => stop(),
         pushReplyForTest: pushReply,
+        dismissTopReplyForTest: dismissTopReply,
         clearRepliesForTest: clearReplies,
         DRAFT_TTL_MS,
         LAST_REPLY_TTL_MS,
         GESTURE_LOCK_MS,
+        INPUT_REFOCUS_AFTER_LEFT_CLICK_MS,
         TERMINAL_GRACE_MS,
         REPLY_STACK_CAP,
         CURSOR_LENS_CROP_W,

@@ -29,6 +29,7 @@ worker/wrangler.toml
 
 # Electron
 *.asar
+build/native/cursor-pointer-tap
 
 # Source images (working files)
 *_source.jpg

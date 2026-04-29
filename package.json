@@ -7,12 +7,13 @@
   "scripts": {
     "dev:client": "vite --config vite.client.config.js",
     "dev:renderer": "vite --config vite.renderer.config.js",
-    "dev:app": "concurrently -k \"npm run dev:renderer\" \"npm run dev:client\" \"wait-on http://localhost:5174/renderer.html && electron .\"",
+    "dev:app": "npm run build:native && concurrently -k \"npm run dev:renderer\" \"npm run dev:client\" \"wait-on http://localhost:5174/renderer.html && electron .\"",
     "build:runtime-config": "node scripts/build-runtime-config.js",
+    "build:native": "node scripts/build-native-helpers.js",
     "build:client": "vite build --config vite.client.config.js",
     "build:renderer": "vite build --config vite.renderer.config.js",
     "build:bridge": "npx esbuild channel-bridge.cjs --bundle --platform=node --target=node18 --outfile=channel-bridge.bundle.cjs --format=cjs --external:net --external:fs",
-    "build:all": "npm run build:runtime-config && npm run build:client && npm run build:renderer && npm run build:bridge",
+    "build:all": "npm run build:runtime-config && npm run build:native && npm run build:client && npm run build:renderer && npm run build:bridge",
     "prebuild": "npm run security:audit && npm run build:all",
     "prebuild:unsigned": "npm run security:audit && npm run build:all",
     "prerelease": "npm run security:audit && npm run build:all",
@@ -174,6 +175,10 @@
       "node_modules/onnxruntime-node/**/*"
     ],
     "extraResources": [
+      {
+        "from": "build/native/cursor-pointer-tap",
+        "to": "cursor-pointer-tap"
+      },
       {
         "from": "models/nomic-embed-text-v1.5",
         "to": "nomic-embed-text-v1.5",
