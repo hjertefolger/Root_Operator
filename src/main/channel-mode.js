@@ -144,6 +144,13 @@ function init(deps = {}) {
         ? deps.forwardToCursorCompanion
         : null;
 
+    // Agent action handler — optional. If provided, agent_* MCP tools
+    // (motion + AX read/write) are dispatched here. Optional so tests
+    // and Linux/Win builds keep working without it.
+    const agentActionsHandler = (deps.agentActions && typeof deps.agentActions.handle === 'function')
+        ? deps.agentActions
+        : null;
+
     const outboundAttachmentsDir = requireDependency('outboundAttachmentsDir', deps.outboundAttachmentsDir);
 
     const operatingModeState = createStateAccessors(
@@ -471,7 +478,24 @@ function init(deps = {}) {
         manager.on('memory_request', (req) => {
             handleMemoryRequest(req);
         });
+        manager.on('agent_request', (req) => {
+            handleAgentRequest(req);
+        });
         return manager;
+    }
+
+    async function handleAgentRequest(req) {
+        const channelManager = getChannelManager();
+        if (!agentActionsHandler) {
+            channelManager?.sendAgentResponse(req.callId, 'Agent actions are not available on this build.', true);
+            return;
+        }
+        try {
+            const { result, isError } = await agentActionsHandler.handle(req);
+            channelManager?.sendAgentResponse(req.callId, result || '(no result)', !!isError);
+        } catch (error) {
+            channelManager?.sendAgentResponse(req.callId, `Agent action error: ${error.message}`, true);
+        }
     }
 
     function initChannelMode() {

@@ -1,0 +1,128 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { init } = require('./main/agent-actions');
+
+function fakeAvatar() {
+    const calls = { moveTo: [], moveToCursor: [], park: 0 };
+    return {
+        instance: {
+            moveTo: (x, y) => { calls.moveTo.push({ x, y }); return { to: { x, y } }; },
+            moveToCursor: (ox, oy) => {
+                calls.moveToCursor.push({ ox, oy });
+                return { to: { x: 500 + (ox || 30), y: 400 + (oy || 0) } };
+            },
+            park: () => { calls.park += 1; return { to: { x: 16, y: 800 } }; },
+        },
+        calls,
+    };
+}
+
+function fakeScreen(cursor = { x: 500, y: 400 }) {
+    return { getCursorScreenPoint: () => ({ ...cursor }) };
+}
+
+function makeDeps(avatar, opts = {}) {
+    return {
+        screen: fakeScreen(opts.cursor),
+        appPath: opts.appPath || '/nonexistent/app',
+        getAgentAvatar: () => avatar,
+        logDebug: () => {},
+    };
+}
+
+test('agent_move_to_cursor calls avatar.moveToCursor and returns target', async () => {
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance));
+    const r = await handler.handle({ tool: 'agent_move_to_cursor', args: {} });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Moving to cursor → \(530, 400\)/);
+    assert.equal(avatar.calls.moveToCursor.length, 1);
+});
+
+test('agent_move_to_cursor honors offset_x / offset_y', async () => {
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance));
+    await handler.handle({ tool: 'agent_move_to_cursor', args: { offset_x: 50, offset_y: -10 } });
+    const last = avatar.calls.moveToCursor[avatar.calls.moveToCursor.length - 1];
+    assert.equal(last.ox, 50);
+    assert.equal(last.oy, -10);
+});
+
+test('agent_move_to requires numeric x and y', async () => {
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance));
+    const bad = await handler.handle({ tool: 'agent_move_to', args: { x: 'foo', y: 200 } });
+    assert.equal(bad.isError, true);
+    assert.match(bad.result, /numeric x and y/);
+
+    const good = await handler.handle({ tool: 'agent_move_to', args: { x: 100, y: 200 } });
+    assert.equal(good.isError, false);
+    assert.equal(avatar.calls.moveTo.length, 1);
+    assert.deepEqual(avatar.calls.moveTo[0], { x: 100, y: 200 });
+});
+
+test('agent_park calls avatar.park', async () => {
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance));
+    const r = await handler.handle({ tool: 'agent_park', args: {} });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Parking at \(16, 800\)/);
+    assert.equal(avatar.calls.park, 1);
+});
+
+test('motion calls without an avatar return a soft error', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_move_to_cursor', args: {} });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /Agent avatar not available/);
+});
+
+test('agent_check_ax returns either trusted state or helper-missing', async () => {
+    // The handler's helper resolver looks in resourcesPath, appPath/build/native,
+    // and finally the source tree. In CI we may or may not have a built binary,
+    // so we accept either outcome here — what matters is that the response is
+    // structured (no thrown errors) and reports a reasonable shape.
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/definitely-not-here',
+        resourcesPath: '/also-not-here',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_check_ax', args: {} });
+    assert.match(
+        r.result,
+        /helper_missing|AX permission (?:granted|NOT granted)/,
+        `unexpected result: ${r.result}`,
+    );
+});
+
+test('agent_write_selection rejects empty text', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_write_selection', args: { text: '' } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty text/);
+});
+
+test('unknown agent tool returns a structured error', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_nonsense', args: {} });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /Unknown agent tool/);
+});

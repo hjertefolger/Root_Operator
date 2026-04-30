@@ -49,6 +49,7 @@ const { init: initWindowManager } = require('./src/main/window-manager');
 const { init: initCursorCompanion } = require('./src/main/cursor-companion');
 const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
 const { init: initAgentAvatar } = require('./src/main/agent-avatar');
+const { init: initAgentActions } = require('./src/main/agent-actions');
 const { init: initCursorAnnotation } = require('./src/main/cursor-annotation');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
@@ -400,18 +401,6 @@ const cursorCompanion = initCursorCompanion({
     submitChannelUserMessage,
     getOperatingMode: () => operatingMode,
     logDebug,
-    // Co-presence v0.5 wiring: when a cursor turn starts, the agent
-    // body travels from its parked anchor to the user's cursor; when
-    // a reply arrives, it heads back to park. Optional — if the
-    // avatar failed to init, these are silently no-op.
-    onCursorTurnStart: () => {
-        try { if (agentAvatar) agentAvatar.summon(); }
-        catch (err) { logDebug(`[AGENT-AVATAR] summon failed: ${err && err.message}`); }
-    },
-    onCursorTurnEnd: () => {
-        try { if (agentAvatar) agentAvatar.dismiss(); }
-        catch (err) { logDebug(`[AGENT-AVATAR] dismiss failed: ${err && err.message}`); }
-    },
 });
 
 // Annotation surface — a sibling module to cursor-companion. Owns the
@@ -512,6 +501,18 @@ const {
     killClaudeCode,
 } = claudeLifecycle;
 
+// Agent actions — handles agent_* MCP tools (motion + AX read/write).
+// Initialized once and passed into channel-mode. Reads agentAvatar
+// lazily via the getter so its window can come up later in
+// app.whenReady() without delaying channel-mode boot.
+const agentActions = initAgentActions({
+    screen,
+    appPath: __dirname,
+    resourcesPath: process.resourcesPath,
+    getAgentAvatar: () => agentAvatar,
+    logDebug,
+});
+
 const channelMode = initChannelModeModule({
     crypto,
     fs,
@@ -558,6 +559,7 @@ const channelMode = initChannelModeModule({
     sendLocalChatEvent,
     notifyAssistantReply,
     forwardToCursorCompanion: (payload) => cursorCompanion.handleChannelReply(payload),
+    agentActions,
     outboundAttachmentsDir: OUTBOUND_ATTACHMENTS_DIR,
     initialOperatingMode: operatingMode,
     getOperatingMode: () => operatingMode,

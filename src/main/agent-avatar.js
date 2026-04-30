@@ -1,22 +1,19 @@
 /**
- * ROOT OPERATOR — AGENT AVATAR (v0.5)
+ * ROOT OPERATOR — AGENT AVATAR (v1.5)
  *
- * The agent's body in the user's desktop. Lives parked at the top-left
- * of the primary display (20px from edge, 20px below the menu bar).
- * On `summon()` it travels to a position 30px right of the user's
- * cursor and dwells there with smooth spring-follow + a subtle breath.
- * On `dismiss()` it travels back to the anchor and parks.
+ * The agent's body in the user's desktop. Lives parked near the Dock
+ * (anchor side detected from the workArea / bounds delta). On an
+ * intentional moveTo() the body travels to a target point and stays
+ * there — no spring-follow, no auto-tracking. On park() it travels
+ * back to the anchor.
  *
- * v0   = parked dot only (shipped, ce-presence-v0).
- * v0.5 = travel-on-summon + spring-follow + breath (this version).
- * v1   = AX-mediated dwelling (future).
- * v2   = consent-gated independent action (future research).
+ * Motion is INTENTIONAL: the LLM calls it via the agent_* MCP tools.
+ * Nothing in this module is wired to cursor-companion turns anymore.
  *
  * State machine:
  *   idle_parked          — at anchor, no motion, tick stopped
- *   traveling_to_cursor  — eased interpolation from current to cursor target
- *   active               — at cursor + offset, spring-follow + breath
- *   traveling_to_anchor  — eased interpolation back to anchor
+ *   traveling            — eased interpolation from current to target
+ *   active               — at target, breath only, no follow
  *
  * Implementation pattern follows `cursor-companion.js`: a transparent
  * NSPanel `BrowserWindow` with always-on-top floating level, visible
@@ -25,16 +22,12 @@
  */
 const path = require('path');
 
-// Window dimensions chosen to give the dot a small breathable canvas
-// without taking visual space. The dot is centered in this window.
 const WIN_WIDTH = 32;
 const WIN_HEIGHT = 32;
 
-// Park anchor — measured from the primary display's workArea (which
-// already excludes the menu bar). 20px right of the workArea origin
-// horizontally, 20px below the workArea origin vertically.
-const ANCHOR_OFFSET_X = 20;
-const ANCHOR_OFFSET_Y = 20;
+// Margin from the screen edge when parking. Keeps the dot off the
+// bezel without crowding the Dock corner.
+const ANCHOR_EDGE_MARGIN = 16;
 
 // Cmd+H / app-hide restoration delays. macOS hides every window owned
 // by the process, including transparent NSPanels, when the user issues
@@ -43,39 +36,31 @@ const ANCHOR_OFFSET_Y = 20;
 // cascade. Retry briefly so the avatar wins after the cascade settles.
 const APP_HIDE_RESTORE_DELAYS_MS = [0, 50, 150, 350];
 
-// v0.5 motion engine constants.
+// Motion engine constants.
 const TICK_HZ = 60;
 const TICK_INTERVAL_MS = Math.round(1000 / TICK_HZ);
 
-// How far to the right of the user's cursor the agent dot dwells in
-// active state. 30px chosen by Tom — close enough to read as "next to
-// you," not so close it overlaps with cursor-companion's own dot.
-const CURSOR_OFFSET_X = 30;
-const CURSOR_OFFSET_Y = 0;
+// Travel duration. 800ms with cubic-out reads as walking-over rather
+// than teleporting. Tunable via deps.travelDurationMs for tests.
+const DEFAULT_TRAVEL_DURATION_MS = 800;
 
-// Travel animation duration (idle → cursor, or cursor → anchor).
-// 500ms matches design-study target. Eased with cubic-out so it
-// accelerates fast then settles in — feels intentional, not robotic.
-const TRAVEL_DURATION_MS = 500;
-
-// Spring-follow strength while active. Each tick the position moves
-// SPRING_K of the way toward the target. 0.18 reads as natural lag —
-// the dot is alive, not magnetically attached. Lower = more lag.
-const SPRING_K = 0.18;
+// Default offset from a cursor target — used when the LLM asks
+// agent_move_to_cursor without explicit offsets. 30px right of the
+// cursor, vertically aligned. Close enough to read as "next to you,"
+// not so close it overlaps with cursor-companion's own dot.
+const DEFAULT_CURSOR_OFFSET_X = 30;
+const DEFAULT_CURSOR_OFFSET_Y = 0;
 
 // Breath oscillation while active. ±1.5px sinusoidal y-offset over a
 // 2.4s period gives a subtle hover that reads as alive without ever
-// becoming distracting. The amplitude is small enough that someone
-// not specifically watching the dot won't notice — but stillness on
-// idle would feel pinned, so this matters.
+// becoming distracting.
 const BREATH_PERIOD_MS = 2400;
 const BREATH_AMPLITUDE_PX = 1.5;
 
 const STATE = Object.freeze({
     IDLE_PARKED: 'idle_parked',
-    TRAVELING_TO_CURSOR: 'traveling_to_cursor',
+    TRAVELING: 'traveling',
     ACTIVE: 'active',
-    TRAVELING_TO_ANCHOR: 'traveling_to_anchor',
 });
 
 function easeOutCubic(t) {
@@ -87,22 +72,24 @@ function init(deps) {
         throw new Error('agent-avatar.init requires BrowserWindow, screen, app, loadRendererWindow');
     }
 
-    // Injected clock for deterministic tests; defaults to Date.now.
     const clock = deps.clock && typeof deps.clock.now === 'function'
         ? deps.clock
         : { now: () => Date.now() };
+
+    const travelDurationMs = Number.isFinite(deps.travelDurationMs)
+        ? deps.travelDurationMs
+        : DEFAULT_TRAVEL_DURATION_MS;
 
     let win = null;
     let displayHandlers = null;
     let appHideHandler = null;
     let restoreTimers = [];
 
-    // v0.5 motion engine state
     let state = STATE.IDLE_PARKED;
-    let position = { x: 0, y: 0 }; // sub-pixel internal
-    let travel = null; // { from, to, startedAt }
+    let position = { x: 0, y: 0 };
+    let travel = null; // { from, to, startedAt, settleState }
     let tickTimer = null;
-    const tickT0 = clock.now(); // breath reference time
+    const tickT0 = clock.now();
 
     function logDebug(message) {
         if (typeof deps.logDebug === 'function') {
@@ -114,21 +101,61 @@ function init(deps) {
         return w && !w.isDestroyed();
     }
 
+    // Detect which edge the Dock occupies. macOS exposes this via the
+    // delta between display.bounds (the full pixel area) and
+    // display.workArea (excludes menu bar + Dock). When the Dock is
+    // hidden or absent we fall back to bottom — the most common config.
+    function detectDockSide(display) {
+        const { bounds, workArea } = display;
+        if (workArea.x > bounds.x) return 'left';
+        if ((workArea.x + workArea.width) < (bounds.x + bounds.width)) return 'right';
+        if ((workArea.y + workArea.height) < (bounds.y + bounds.height)) return 'bottom';
+        return 'bottom';
+    }
+
+    // Compute the parked position. Sits just outside the Dock corner
+    // closest to the start of the icon strip, with a margin off the
+    // screen edge so the dot doesn't visually fuse into the Dock.
     function computeParkedPosition() {
         const display = deps.screen.getPrimaryDisplay();
         const { workArea } = display;
+        const side = detectDockSide(display);
+
+        if (side === 'bottom') {
+            // Park at the workArea bottom-left, which sits just above
+            // the Dock corner where the first icon (Finder) begins.
+            return {
+                x: workArea.x + ANCHOR_EDGE_MARGIN,
+                y: workArea.y + workArea.height - WIN_HEIGHT - ANCHOR_EDGE_MARGIN,
+            };
+        }
+        if (side === 'left') {
+            // Dock on the left — park at the top-left of the workArea
+            // (above where the first Dock icon would sit).
+            return {
+                x: workArea.x + ANCHOR_EDGE_MARGIN,
+                y: workArea.y + ANCHOR_EDGE_MARGIN,
+            };
+        }
+        if (side === 'right') {
+            // Mirror of the left case.
+            return {
+                x: workArea.x + workArea.width - WIN_WIDTH - ANCHOR_EDGE_MARGIN,
+                y: workArea.y + ANCHOR_EDGE_MARGIN,
+            };
+        }
+        // Fallback: top-left of workArea.
         return {
-            x: workArea.x + ANCHOR_OFFSET_X,
-            y: workArea.y + ANCHOR_OFFSET_Y,
+            x: workArea.x + ANCHOR_EDGE_MARGIN,
+            y: workArea.y + ANCHOR_EDGE_MARGIN,
         };
     }
 
-    function computeCursorTarget() {
+    function computeCursorTarget(offsetX, offsetY) {
         const cursor = deps.screen.getCursorScreenPoint();
-        return {
-            x: cursor.x + CURSOR_OFFSET_X,
-            y: cursor.y + CURSOR_OFFSET_Y,
-        };
+        const ox = Number.isFinite(offsetX) ? offsetX : DEFAULT_CURSOR_OFFSET_X;
+        const oy = Number.isFinite(offsetY) ? offsetY : DEFAULT_CURSOR_OFFSET_Y;
+        return { x: cursor.x + ox, y: cursor.y + oy };
     }
 
     function applyBoundsAt(x, y) {
@@ -164,47 +191,39 @@ function init(deps) {
     function tick() {
         const now = clock.now();
 
-        if (state === STATE.TRAVELING_TO_CURSOR || state === STATE.TRAVELING_TO_ANCHOR) {
+        if (state === STATE.TRAVELING) {
             if (!travel) {
-                // Defensive: traveling state without a travel descriptor
-                // means we were torn down mid-flight. Snap to anchor.
                 state = STATE.IDLE_PARKED;
                 stopTick();
                 applyParkedPosition();
                 return;
             }
             const elapsed = now - travel.startedAt;
-            const progress = Math.min(1, elapsed / TRAVEL_DURATION_MS);
+            const progress = Math.min(1, elapsed / travelDurationMs);
             const eased = easeOutCubic(progress);
             position.x = travel.from.x + (travel.to.x - travel.from.x) * eased;
             position.y = travel.from.y + (travel.to.y - travel.from.y) * eased;
 
             if (progress >= 1) {
-                if (state === STATE.TRAVELING_TO_CURSOR) {
-                    state = STATE.ACTIVE;
-                } else {
+                const settleState = travel.settleState;
+                travel = null;
+                if (settleState === STATE.IDLE_PARKED) {
                     state = STATE.IDLE_PARKED;
-                    travel = null;
                     applyBoundsAt(position.x, position.y);
                     stopTick();
                     return;
                 }
-                travel = null;
+                state = STATE.ACTIVE;
             }
         } else if (state === STATE.ACTIVE) {
-            // Spring-follow the cursor.
-            const target = computeCursorTarget();
-            position.x += (target.x - position.x) * SPRING_K;
-            position.y += (target.y - position.y) * SPRING_K;
+            // Stay put. Only breath modulates the rendered y. The base
+            // position never moves until another moveTo / park call.
         } else {
             // IDLE_PARKED — tick should not be running, but be defensive.
             stopTick();
             return;
         }
 
-        // Apply breath only while active. During travel, the dot is
-        // already in motion; an additional sine wave on top reads as
-        // jittery rather than alive.
         let renderY = position.y;
         if (state === STATE.ACTIVE) {
             const phase = ((now - tickT0) / BREATH_PERIOD_MS) * 2 * Math.PI;
@@ -214,53 +233,76 @@ function init(deps) {
         applyBoundsAt(position.x, renderY);
     }
 
-    function summon() {
-        if (state === STATE.TRAVELING_TO_CURSOR || state === STATE.ACTIVE) {
-            return; // already on the way or arrived
+    // If we're mid-travel when a new motion is requested, sample the
+    // current eased position first so the new travel starts from where
+    // the dot ACTUALLY is, not from the last persisted base position.
+    // Without this, a re-target before the next 60Hz tick would jump
+    // backward and re-traverse the missed delta.
+    function sampleCurrentPosition() {
+        if (state === STATE.TRAVELING && travel) {
+            const elapsed = clock.now() - travel.startedAt;
+            const progress = Math.min(1, elapsed / travelDurationMs);
+            const eased = easeOutCubic(progress);
+            position.x = travel.from.x + (travel.to.x - travel.from.x) * eased;
+            position.y = travel.from.y + (travel.to.y - travel.from.y) * eased;
         }
-        const target = computeCursorTarget();
-        travel = {
-            from: { x: position.x, y: position.y },
-            to: target,
-            startedAt: clock.now(),
-        };
-        state = STATE.TRAVELING_TO_CURSOR;
-        startTick();
-        logDebug('[AGENT-AVATAR] summoned');
     }
 
-    function dismiss() {
-        if (state === STATE.IDLE_PARKED || state === STATE.TRAVELING_TO_ANCHOR) {
-            return; // already parked or on the way back
+    function startTravelTo(target, settleState) {
+        sampleCurrentPosition();
+        travel = {
+            from: { x: position.x, y: position.y },
+            to: { x: target.x, y: target.y },
+            startedAt: clock.now(),
+            settleState,
+        };
+        state = STATE.TRAVELING;
+        startTick();
+    }
+
+    // Move the agent to an explicit screen-space point and dwell there.
+    function moveTo(x, y) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+            throw new Error('moveTo requires numeric x, y');
         }
+        startTravelTo({ x, y }, STATE.ACTIVE);
+        logDebug(`[AGENT-AVATAR] moveTo (${Math.round(x)}, ${Math.round(y)})`);
+        return { from: { x: position.x, y: position.y }, to: { x, y } };
+    }
+
+    // Move the agent to the user's cursor (with optional offset) and dwell.
+    function moveToCursor(offsetX, offsetY) {
+        const target = computeCursorTarget(offsetX, offsetY);
+        startTravelTo(target, STATE.ACTIVE);
+        logDebug(`[AGENT-AVATAR] moveToCursor → (${Math.round(target.x)}, ${Math.round(target.y)})`);
+        return { to: target };
+    }
+
+    // Travel back to the parked anchor.
+    function park() {
         const target = computeParkedPosition();
-        travel = {
-            from: { x: position.x, y: position.y },
-            to: target,
-            startedAt: clock.now(),
-        };
-        state = STATE.TRAVELING_TO_ANCHOR;
-        startTick();
-        logDebug('[AGENT-AVATAR] dismissed');
+        if (state === STATE.IDLE_PARKED) {
+            // Already parked — snap to the current anchor in case the
+            // display geometry changed and refresh.
+            position.x = target.x;
+            position.y = target.y;
+            applyBoundsAt(target.x, target.y);
+            return { to: target };
+        }
+        startTravelTo(target, STATE.IDLE_PARKED);
+        logDebug('[AGENT-AVATAR] park');
+        return { to: target };
     }
 
-    function getStateForTest() {
-        return state;
-    }
-
-    function getPositionForTest() {
-        return { x: position.x, y: position.y };
-    }
-
-    function tickForTest() {
-        tick();
-    }
+    // Tests / reset utilities.
+    function getStateForTest() { return state; }
+    function getPositionForTest() { return { x: position.x, y: position.y }; }
+    function tickForTest() { tick(); }
 
     function createWindow() {
         const { BrowserWindow, app, loadRendererWindow } = deps;
         const { x, y } = computeParkedPosition();
 
-        // Initialize position for the motion engine.
         position.x = x;
         position.y = y;
 
@@ -279,8 +321,6 @@ function init(deps) {
             maximizable: false,
             fullscreenable: false,
             skipTaskbar: true,
-            // NSPanel on macOS — overlay above all apps without stealing
-            // focus or activating our process icon in the Dock.
             type: process.platform === 'darwin' ? 'panel' : undefined,
             focusable: false,
             hasShadow: false,
@@ -301,8 +341,6 @@ function init(deps) {
         if (typeof w.setHiddenInMissionControl === 'function') {
             w.setHiddenInMissionControl(true);
         }
-        // Click-through. v0.5 still has no interaction; future versions
-        // can flip this when the avatar enters an interactive state.
         w.setIgnoreMouseEvents(true, { forward: false });
 
         loadRendererWindow(w, '?view=agent-avatar');
@@ -366,8 +404,6 @@ function init(deps) {
 
     function attachDisplayListeners() {
         const handler = () => {
-            // Only re-anchor if currently parked. While active or
-            // traveling, the motion engine owns position.
             if (state === STATE.IDLE_PARKED) {
                 applyParkedPosition();
             }
@@ -407,9 +443,7 @@ function init(deps) {
         if (isUsable(win)) {
             try {
                 win.close();
-            } catch (_) {
-                /* ignore */
-            }
+            } catch (_) { /* ignore */ }
         }
         win = null;
         logDebug('[AGENT-AVATAR] stopped');
@@ -418,8 +452,9 @@ function init(deps) {
     return {
         start,
         stop,
-        summon,
-        dismiss,
+        moveTo,
+        moveToCursor,
+        park,
         getWindow: () => (isUsable(win) ? win : null),
         // Test seams.
         repositionForTest: applyParkedPosition,
@@ -434,16 +469,15 @@ function init(deps) {
 
 module.exports = {
     init,
-    // Exposed for tests.
     __test: {
         WIN_WIDTH,
         WIN_HEIGHT,
-        ANCHOR_OFFSET_X,
-        ANCHOR_OFFSET_Y,
-        TRAVEL_DURATION_MS,
-        CURSOR_OFFSET_X,
-        CURSOR_OFFSET_Y,
-        SPRING_K,
+        ANCHOR_EDGE_MARGIN,
+        DEFAULT_TRAVEL_DURATION_MS,
+        DEFAULT_CURSOR_OFFSET_X,
+        DEFAULT_CURSOR_OFFSET_Y,
+        BREATH_PERIOD_MS,
+        BREATH_AMPLITUDE_PX,
         STATE,
     },
 };

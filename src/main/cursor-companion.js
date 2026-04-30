@@ -1005,15 +1005,6 @@ function dismissTopReply() {
 function recordCursorReplyArrival() {
     cursorReplySequence += 1;
 
-    // Fire the cursor-turn-end callback for every cursor reply. The
-    // agent-avatar consumer treats this as idempotent ("the turn is
-    // wrapping up — head back to the anchor"). Multi-message turns
-    // simply call dismiss() multiple times; subsequent calls are no-ops.
-    if (depsRef && typeof depsRef.onCursorTurnEnd === 'function') {
-        try { depsRef.onCursorTurnEnd(); }
-        catch (err) { depsRef.logDebug && depsRef.logDebug(`[CURSOR] onCursorTurnEnd threw: ${err && err.message}`); }
-    }
-
     if (!terminalGraceTimer) return null;
 
     clearTimeout(terminalGraceTimer);
@@ -1306,14 +1297,6 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
             pendingAttachment = null;
             applyInteractivity();
             broadcastState({ event: 'pending_attachment_consumed' });
-        }
-        // Cursor turn officially in flight — invite the agent body to
-        // travel from its parked position toward the user's cursor.
-        // Idempotent on the consumer side: summon() is a no-op if the
-        // avatar is already traveling or active.
-        if (depsRef && typeof depsRef.onCursorTurnStart === 'function') {
-            try { depsRef.onCursorTurnStart({ turnId }); }
-            catch (err) { depsRef.logDebug && depsRef.logDebug(`[CURSOR] onCursorTurnStart threw: ${err && err.message}`); }
         }
         return { success: true, turnId };
     } catch (err) {

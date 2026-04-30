@@ -178,6 +178,61 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_move_to_cursor',
+      description: 'Move your agent body (the blue dot) to the user\'s cursor and dwell there. The dot travels smoothly from its current position. After arrival it stays put — it does NOT track the cursor. Call this when you want to be physically present in the user\'s area of interest. Pass optional offsets if you want to land a specific number of pixels away from the cursor (defaults: 30 right, 0 down).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          offset_x: { type: 'number', description: 'Horizontal offset from the cursor in pixels. Default 30 (right of cursor).' },
+          offset_y: { type: 'number', description: 'Vertical offset from the cursor in pixels. Default 0.' },
+        },
+      },
+    },
+    {
+      name: 'agent_move_to',
+      description: 'Move your agent body (the blue dot) to an explicit screen-space point and dwell there. Used when you want to look at a specific element you already know the coordinates of (e.g. resolved via agent_read_at_cursor).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Target x coordinate in screen pixels.' },
+          y: { type: 'number', description: 'Target y coordinate in screen pixels.' },
+        },
+        required: ['x', 'y'],
+      },
+    },
+    {
+      name: 'agent_park',
+      description: 'Travel back to the parked anchor (Dock corner). Call this when you are done with the active conversation and want to step out of the user\'s active area.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_read_at_cursor',
+      description: 'Read the text under the user\'s current cursor via macOS accessibility. Returns the full element value, the selected portion (if any), the element role, and its frame. Use this when the user asks you to look at, rewrite, or summarize text they\'re pointing at. Does NOT move the cursor or any UI.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_read_focused',
+      description: 'Read text from the currently focused UI element via macOS accessibility. Useful when the user is composing in a text field and the cursor isn\'t hovering it. Returns the same shape as agent_read_at_cursor.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_write_selection',
+      description: 'Replace the user\'s current text selection with new text via the macOS accessibility channel. NEVER call without explicit user approval — your job is to show the proposed text in the bubble first, then call this only after the user confirms. Default: requires a non-empty selection (refuses to overwrite a whole field). To overwrite the entire focused field (rare, ask first), pass replace_all=true. Refuses sensitive roles (passwords, secure inputs). Capped at 8000 chars and rate-limited to one write per 750ms.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'The text to write. Must be non-empty.' },
+          replace_all: { type: 'boolean', description: 'If true, replace the entire focused field even with no selection. Default false. Use only when the user has explicitly asked to replace the whole field.' },
+        },
+        required: ['text'],
+      },
+    },
+    {
+      name: 'agent_check_ax',
+      description: 'Check whether the macOS Accessibility permission is granted for Root Operator. Returns {trusted: true|false}. Call this once at the start of any AX-using flow so you can give the user an actionable error if the permission is missing.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
       name: '_ping',
       description: 'Internal health check. Call this when asked to verify spawn.',
       inputSchema: { type: 'object', properties: {} },
@@ -243,6 +298,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     return handleMemoryTool(toolName, request.params.arguments || {});
   }
 
+  const agentTools = [
+    'agent_move_to_cursor',
+    'agent_move_to',
+    'agent_park',
+    'agent_read_at_cursor',
+    'agent_read_focused',
+    'agent_write_selection',
+    'agent_check_ax',
+  ];
+  if (agentTools.includes(toolName)) {
+    return handleAgentTool(toolName, request.params.arguments || {});
+  }
+
   return {
     content: [
       {
@@ -280,6 +348,43 @@ function handleSchedulerTool(toolName, args) {
 
     emitToElectron({
       type: 'scheduler_request',
+      callId,
+      tool: toolName,
+      args,
+      ts: new Date().toISOString(),
+    });
+  });
+}
+
+let agentCallbacks = new Map();
+let agentCallId = 0;
+
+function handleAgentTool(toolName, args) {
+  return new Promise((resolve) => {
+    if (!electronSocket || electronSocket.destroyed) {
+      resolve({
+        content: [{ type: 'text', text: 'Error: No Electron connection available' }],
+        isError: true,
+      });
+      return;
+    }
+
+    const callId = ++agentCallId;
+    // Agent AX calls may shell out to the Swift helper. The helper is
+    // fast (<200ms typical), but TCC permission prompts on first use
+    // can stall. Give it generous headroom.
+    const timeout = setTimeout(() => {
+      agentCallbacks.delete(callId);
+      resolve({
+        content: [{ type: 'text', text: 'Error: Agent action timed out' }],
+        isError: true,
+      });
+    }, 12000);
+
+    agentCallbacks.set(callId, { resolve, timeout });
+
+    emitToElectron({
+      type: 'agent_request',
       callId,
       tool: toolName,
       args,
@@ -389,6 +494,14 @@ function startIPCServer() {
         });
       }
       memoryCallbacks.clear();
+      for (const [, cb] of agentCallbacks) {
+        clearTimeout(cb.timeout);
+        cb.resolve({
+          content: [{ type: 'text', text: 'Error: Electron bridge disconnected' }],
+          isError: true,
+        });
+      }
+      agentCallbacks.clear();
     });
 
     socket.on('error', (error) => {
@@ -452,6 +565,19 @@ async function handleElectronMessage(msg) {
     if (cb) {
       clearTimeout(cb.timeout);
       memoryCallbacks.delete(msg.callId);
+      cb.resolve({
+        content: [{ type: 'text', text: msg.result }],
+        isError: msg.isError || false,
+      });
+    }
+    return;
+  }
+
+  if (msg.type === 'agent_response') {
+    const cb = agentCallbacks.get(msg.callId);
+    if (cb) {
+      clearTimeout(cb.timeout);
+      agentCallbacks.delete(msg.callId);
       cb.resolve({
         content: [{ type: 'text', text: msg.result }],
         isError: msg.isError || false,
