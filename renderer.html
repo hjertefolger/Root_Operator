@@ -5,18 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Root Operator</title>
     <script>
-      // Cursor companion view runs in a transparent BrowserWindow. Stamp
+      // Transparent overlay views (cursor-companion, agent-avatar). Stamp
       // the html element BEFORE React mounts so Tailwind's body background
-      // never paints opaque in this window.
-      if (new URLSearchParams(location.search).get('view') === 'cursor-companion') {
-        document.documentElement.classList.add('dark', 'cursor-companion-view');
-      }
+      // never paints opaque in these windows.
+      (function () {
+        var view = new URLSearchParams(location.search).get('view');
+        if (view === 'cursor-companion' || view === 'agent-avatar') {
+          document.documentElement.classList.add('dark', 'transparent-overlay-view');
+        }
+      })();
     </script>
     <style>
-      html.cursor-companion-view,
-      html.cursor-companion-view body,
-      html.cursor-companion-view #root { background: transparent !important; }
-      html.cursor-companion-view body { margin: 0; overflow: hidden; }
+      html.transparent-overlay-view,
+      html.transparent-overlay-view body,
+      html.transparent-overlay-view #root { background: transparent !important; }
+      html.transparent-overlay-view body { margin: 0; overflow: hidden; }
     </style>
   </head>
   <body>

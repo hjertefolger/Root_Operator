@@ -48,6 +48,7 @@ const { init: initTray } = require('./src/main/tray');
 const { init: initWindowManager } = require('./src/main/window-manager');
 const { init: initCursorCompanion } = require('./src/main/cursor-companion');
 const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
+const { init: initAgentAvatar } = require('./src/main/agent-avatar');
 const { init: initCursorAnnotation } = require('./src/main/cursor-annotation');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
@@ -142,6 +143,7 @@ const setAppQuittingState = (value) => (isAppQuitting = Boolean(value));
 // module is initialized later in this file. We bind through this ref so
 // the Cmd+Shift+L hotkey resolves the live toggle when fired.
 let cursorCompanionController = null;
+let agentAvatar = null;
 function toggleCursorCompanionEnabledFromHotkey() {
     if (!cursorCompanionController) return;
     try {
@@ -816,6 +818,29 @@ app.whenReady().then(async () => {
     });
     cursorCompanionController.bootstrap();
 
+    // Agent Avatar (v0) — the parked dot at the top-left of the primary
+    // display. The agent's body lives here when idle. Pure visual
+    // presence in this version: no motion, no interaction, no AX. Future
+    // versions add travel-on-summon and AX-mediated dwelling.
+    //
+    // Init/start are wrapped — the avatar is decorative; if its window
+    // creation fails for any reason (renderer entry missing, BrowserWindow
+    // throws, screen API unavailable), the rest of app.whenReady() —
+    // powerMonitor setup, tunnel auto-start, etc. — must still complete.
+    try {
+        agentAvatar = initAgentAvatar({
+            BrowserWindow,
+            screen,
+            app,
+            loadRendererWindow,
+            logDebug,
+        });
+        agentAvatar.start();
+    } catch (err) {
+        logDebug(`[AGENT-AVATAR] init/start failed: ${err && err.message}`);
+        agentAvatar = null;
+    }
+
     // powerMonitor lifecycle — the macOS CGEvent tap that uIOhook sits
     // on can be silently invalidated when the screen locks, the user
     // switches sessions, or the machine sleeps/resumes. We rebuild it on
@@ -993,6 +1018,7 @@ app.on('will-quit', () => {
         }
     } catch (_) { /* ignore */ }
     try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
+    try { if (agentAvatar) agentAvatar.stop(); } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;
