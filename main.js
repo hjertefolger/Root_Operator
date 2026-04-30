@@ -400,6 +400,18 @@ const cursorCompanion = initCursorCompanion({
     submitChannelUserMessage,
     getOperatingMode: () => operatingMode,
     logDebug,
+    // Co-presence v0.5 wiring: when a cursor turn starts, the agent
+    // body travels from its parked anchor to the user's cursor; when
+    // a reply arrives, it heads back to park. Optional — if the
+    // avatar failed to init, these are silently no-op.
+    onCursorTurnStart: () => {
+        try { if (agentAvatar) agentAvatar.summon(); }
+        catch (err) { logDebug(`[AGENT-AVATAR] summon failed: ${err && err.message}`); }
+    },
+    onCursorTurnEnd: () => {
+        try { if (agentAvatar) agentAvatar.dismiss(); }
+        catch (err) { logDebug(`[AGENT-AVATAR] dismiss failed: ${err && err.message}`); }
+    },
 });
 
 // Annotation surface — a sibling module to cursor-companion. Owns the
