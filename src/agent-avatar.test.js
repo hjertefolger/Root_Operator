@@ -40,13 +40,20 @@ function createFakeBrowserWindow() {
     };
 }
 
-function createDeps({ workArea = { x: 0, y: 24, width: 1440, height: 876 } } = {}) {
+function createDeps({
+    workArea = { x: 0, y: 24, width: 1440, height: 876 },
+    cursor = { x: 500, y: 400 },
+    initialNow = 1_000_000,
+} = {}) {
     const fake = createFakeBrowserWindow();
     const screenListeners = new Map();
     const appListeners = new Map();
     const calls = { loadRendererWindow: [], constructorOpts: [] };
+    const cursorRef = { value: { ...cursor } };
+    const clockRef = { now: initialNow };
     const screen = {
         getPrimaryDisplay: () => ({ workArea }),
+        getCursorScreenPoint: () => ({ ...cursorRef.value }),
         on: (evt, cb) => {
             const list = screenListeners.get(evt) || [];
             list.push(cb);
@@ -82,12 +89,16 @@ function createDeps({ workArea = { x: 0, y: 24, width: 1440, height: 876 } } = {
     const loadRendererWindow = (win, search) => {
         calls.loadRendererWindow.push({ win, search });
     };
+    const clock = { now: () => clockRef.now };
     return {
-        deps: { BrowserWindow, screen, app, loadRendererWindow, logDebug: () => {} },
+        deps: { BrowserWindow, screen, app, loadRendererWindow, logDebug: () => {}, clock },
         fake,
         screen,
         app,
         calls,
+        cursorRef,
+        advanceClock: (ms) => { clockRef.now += ms; },
+        setCursor: (x, y) => { cursorRef.value = { x, y }; },
     };
 }
 
@@ -234,4 +245,138 @@ test('stop clears restore timers so they do not fire later', async () => {
     // Wait past all APP_HIDE_RESTORE_DELAYS_MS values (max 350ms).
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert.equal(fake.calls.showInactive, before);
+});
+
+// ─────────────────────────────────────────────────────────────────
+// v0.5 — Motion engine
+// ─────────────────────────────────────────────────────────────────
+
+test('initial state is idle_parked', () => {
+    const { deps } = createDeps();
+    const avatar = init(deps);
+    avatar.start();
+    assert.equal(avatar.getStateForTest(), __test.STATE.IDLE_PARKED);
+});
+
+test('summon transitions to traveling_to_cursor and starts ticking', () => {
+    const { deps } = createDeps();
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+    assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING_TO_CURSOR);
+});
+
+test('summon → tick over TRAVEL_DURATION_MS reaches active state at cursor + offset', () => {
+    const { deps, advanceClock } = createDeps({ cursor: { x: 500, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+
+    // Advance past the travel duration.
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+
+    assert.equal(avatar.getStateForTest(), __test.STATE.ACTIVE);
+    const pos = avatar.getPositionForTest();
+    // Eased cubic at t=1 lands exactly on target.
+    assert.equal(Math.round(pos.x), 500 + __test.CURSOR_OFFSET_X);
+    assert.equal(Math.round(pos.y), 400 + __test.CURSOR_OFFSET_Y);
+});
+
+test('travel midway is between from and to (eased)', () => {
+    const { deps, advanceClock } = createDeps({ cursor: { x: 1000, y: 500 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+
+    advanceClock(Math.floor(__test.TRAVEL_DURATION_MS / 2));
+    avatar.tickForTest();
+
+    const pos = avatar.getPositionForTest();
+    // Anchor was (20, 44). Target is (1030, 500). Eased halfway should
+    // be PAST 50% of the way (cubic-out front-loads movement).
+    assert.ok(pos.x > 20 + (1030 - 20) * 0.5, `x progressed past 50%: ${pos.x}`);
+    assert.ok(pos.x < 1030, `x did not overshoot: ${pos.x}`);
+    assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING_TO_CURSOR);
+});
+
+test('summon while already traveling/active is a no-op', () => {
+    const { deps, advanceClock } = createDeps({ cursor: { x: 600, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+    assert.equal(avatar.getStateForTest(), __test.STATE.ACTIVE);
+
+    // Move cursor and summon again — should not reset state.
+    avatar.summon();
+    assert.equal(avatar.getStateForTest(), __test.STATE.ACTIVE);
+});
+
+test('active state spring-follows the cursor', () => {
+    const { deps, advanceClock, setCursor } = createDeps({ cursor: { x: 500, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+    // Now active at (530, 400)
+    const startPos = avatar.getPositionForTest();
+    assert.equal(Math.round(startPos.x), 530);
+
+    // Move the cursor and tick — position should move toward the new
+    // target but not arrive instantly (spring-K applies).
+    setCursor(800, 400);
+    avatar.tickForTest();
+    const afterPos = avatar.getPositionForTest();
+    assert.ok(afterPos.x > startPos.x, 'x moved toward new target');
+    assert.ok(afterPos.x < 800 + __test.CURSOR_OFFSET_X, 'x did not snap to target instantly');
+});
+
+test('dismiss transitions through traveling_to_anchor back to idle_parked', () => {
+    const { deps, advanceClock } = createDeps({ cursor: { x: 500, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+    assert.equal(avatar.getStateForTest(), __test.STATE.ACTIVE);
+
+    avatar.dismiss();
+    assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING_TO_ANCHOR);
+
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+    assert.equal(avatar.getStateForTest(), __test.STATE.IDLE_PARKED);
+
+    const pos = avatar.getPositionForTest();
+    assert.equal(Math.round(pos.x), __test.ANCHOR_OFFSET_X);
+    assert.equal(Math.round(pos.y), 24 + __test.ANCHOR_OFFSET_Y);
+});
+
+test('dismiss when already parked is a no-op', () => {
+    const { deps } = createDeps();
+    const avatar = init(deps);
+    avatar.start();
+    assert.equal(avatar.getStateForTest(), __test.STATE.IDLE_PARKED);
+    avatar.dismiss();
+    assert.equal(avatar.getStateForTest(), __test.STATE.IDLE_PARKED);
+});
+
+test('display-metrics-changed while active does NOT pull the dot to the anchor', () => {
+    const { deps, advanceClock, screen } = createDeps({ cursor: { x: 500, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    avatar.summon();
+    advanceClock(__test.TRAVEL_DURATION_MS + 1);
+    avatar.tickForTest();
+    assert.equal(avatar.getStateForTest(), __test.STATE.ACTIVE);
+
+    // Simulate a display change. While active, the motion engine owns
+    // position — the change must not snap us to the anchor.
+    screen.emit('display-metrics-changed');
+    const pos = avatar.getPositionForTest();
+    // Still near the cursor, not at anchor.
+    assert.ok(pos.x > 100, `position not snapped to anchor: ${pos.x}`);
 });
