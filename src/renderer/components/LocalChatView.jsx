@@ -42,6 +42,7 @@ function mergeMessages(prev, incoming) {
 function LocalChatView({ tunnelState }) {
   const { invoke, on } = useElectron();
   const [messages, setMessages] = useState([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const [activities, setActivities] = useState([]);
   const [waiting, setWaiting] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
@@ -104,16 +105,21 @@ function LocalChatView({ tunnelState }) {
     async function loadInitialState() {
       try {
         const state = await invoke('GET_LOCAL_CHAT_STATE');
-        if (!mounted || !state) {
+        if (!mounted) {
           return;
         }
-
-        setMessages((prev) => mergeMessages(prev, state.messages || []));
-        setWaiting(Boolean(state.waiting));
-        setActivities(state.activities || []);
-        setAlwaysOnTop(Boolean(state.alwaysOnTop));
+        if (state) {
+          setMessages((prev) => mergeMessages(prev, state.messages || []));
+          setWaiting(Boolean(state.waiting));
+          setActivities(state.activities || []);
+          setAlwaysOnTop(Boolean(state.alwaysOnTop));
+        }
       } catch (error) {
         console.error('Failed to load local chat state:', error);
+      } finally {
+        if (mounted) {
+          setHistoryLoaded(true);
+        }
       }
     }
 
@@ -274,6 +280,7 @@ function LocalChatView({ tunnelState }) {
         focusInputKey={focusInputKey}
         messages={messages}
         setMessages={setMessages}
+        historyLoaded={historyLoaded}
         activities={activities}
         setActivities={setActivities}
         waiting={waiting}
