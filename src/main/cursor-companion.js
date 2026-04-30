@@ -1002,11 +1002,28 @@ function dismissTopReply() {
     return dismissReplyById(replies[replies.length - 1].id);
 }
 
+function recordCursorReplyArrival() {
+    cursorReplySequence += 1;
+
+    if (!terminalGraceTimer) return null;
+
+    clearTimeout(terminalGraceTimer);
+    terminalGraceTimer = null;
+
+    let completedTurnId = null;
+    if (pending && pending.turnId === terminalGraceTurnId) {
+        completedTurnId = pending.turnId;
+        pending = null;
+    }
+    terminalGraceTurnId = null;
+    return completedTurnId;
+}
+
 function pushReply({ content, ts, role = 'assistant', cursorTurn = false }) {
     if (typeof content !== 'string' || content.trim().length === 0) return;
     replies.push({ id: newReplyId(), content, ts: ts || null, role });
     while (replies.length > REPLY_STACK_CAP) replies.shift();
-    if (cursorTurn) cursorReplySequence += 1;
+    if (cursorTurn) recordCursorReplyArrival();
     setLastReply(content, ts);
     applyInteractivity();
     broadcastState({ event: 'reply_appended' });
@@ -1309,17 +1326,13 @@ function handleChannelReply({ content, ts, role = 'assistant', chatId } = {}) {
     const desktopChatWindow = depsRef && typeof depsRef.getLocalChatWindow === 'function'
         ? depsRef.getLocalChatWindow()
         : null;
-    if (!isCursorReply && isOpenVisibleWindow(desktopChatWindow)) {
-        return false;
-    }
-
-    if (isCursorReply && terminalGraceTimer) {
-        clearTimeout(terminalGraceTimer);
-        terminalGraceTimer = null;
-        if (pending && pending.turnId === terminalGraceTurnId) {
-            pending = null;
+    const desktopChatOpen = isOpenVisibleWindow(desktopChatWindow);
+    if (desktopChatOpen) {
+        const completedTurnId = isCursorReply ? recordCursorReplyArrival() : null;
+        if (completedTurnId) {
+            broadcastState({ event: 'reply_suppressed_desktop_chat', turnId: completedTurnId });
         }
-        terminalGraceTurnId = null;
+        return false;
     }
 
     pushReply({ content, ts, role, cursorTurn: isCursorReply });

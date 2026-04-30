@@ -377,6 +377,42 @@ test('desktop/mobile replies skip cursor stack while desktop chat is open', () =
     __test.setLocalChatWindowForTest(null);
 });
 
+test('cursor replies also skip cursor stack while desktop chat is open but still complete the pending turn', () => {
+    const fakeWindow = createFakeWindow();
+    __test.setWindowForTest(fakeWindow);
+    __test.setLocalChatWindowForTest(createFakeWindow({ visible: true, focused: true }));
+    __test.setInputOpenForTest(false);
+    __test.setRepliesForTest([]);
+    __test.clearTerminalGraceForTest();
+    const cursorBaseline = __test.getCursorReplySequenceForTest();
+    __test.setPendingForTest({
+        turnId: 'cursor-turn',
+        startedAt: Date.now(),
+        attachmentPath: null,
+        cursorReplySequenceAtSubmit: cursorBaseline,
+    });
+
+    __test.handleChannelActivityForTest({ phase: 'finished' });
+    assert.equal(__test.getTerminalGraceActiveForTest(), true);
+
+    const handled = __test.handleChannelReplyForTest({
+        content: 'reply from cursor turn',
+        ts: '2026-04-29T10:00:01Z',
+        role: 'assistant',
+        chatId: 'cursor-companion',
+    });
+
+    assert.equal(handled, false);
+    assert.equal(__test.getRepliesForTest().length, 0);
+    assert.equal(__test.getPendingForTest(), null);
+    assert.equal(__test.getTerminalGraceActiveForTest(), false);
+    assert.equal(__test.getCursorReplySequenceForTest(), cursorBaseline + 1);
+    assert.equal(fakeWindow.sent.at(-1).payload.event, 'reply_suppressed_desktop_chat');
+
+    __test.runStopForTest();
+    __test.setLocalChatWindowForTest(null);
+});
+
 test('desktop/mobile replies append to cursor stack while desktop chat is hidden or minimized', () => {
     const fakeWindow = createFakeWindow();
     const desktopWindow = createFakeWindow({ visible: false, focused: false, minimized: false });
