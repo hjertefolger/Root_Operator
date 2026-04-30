@@ -27,16 +27,46 @@ function init(deps = {}) {
         getTunnelProcess = () => null,
         logDebug = () => {},
         doubleShiftWindowMs = 300,
+        toggleLocalChatWindow = () => {},
+        toggleCursorCompanionEnabled = () => {},
     } = deps;
 
     let tray = null;
     let shortcutHook = null;
     let shiftKeyCodes = [];
+    let altKeyCodes = [];
     let shiftShortcutStarted = false;
+    let shiftListenersAttached = false;
     let lastShiftKeyUpCode = null;
     let lastShiftKeyUpTime = 0;
     let hadOtherKeyBetweenShiftTaps = false;
     let shiftToggleCallback = null;
+    // Alt (Option) state — tracked separately from "other key between
+    // shift taps" because Alt held throughout the gesture is a valid
+    // modifier (selects annotation invocation), not a "different key
+    // pressed in the middle" that would invalidate the double-tap.
+    let isAltHeld = false;
+    let candidateAltHeldAtFirstShift = false;
+    // Pending restart timer scheduled by restartDoubleShiftShortcut.
+    // Captured here so a teardown via stopDoubleShiftShortcut can cancel
+    // it before it fires — without this, a `resume` powerMonitor event
+    // arriving moments before app quit can re-start uIOhook after we've
+    // torn it down.
+    let pendingResumeTimer = null;
+    let resumeRetryAttempt = 0;
+    const RESUME_RETRY_BACKOFF_MS = [200, 500, 1500, 3000];
+
+    function resetShiftDetectorState() {
+        lastShiftKeyUpCode = null;
+        lastShiftKeyUpTime = 0;
+        hadOtherKeyBetweenShiftTaps = false;
+        isAltHeld = false;
+        candidateAltHeldAtFirstShift = false;
+    }
+
+    function isActiveAltCode(keycode) {
+        return altKeyCodes.includes(keycode);
+    }
 
     function getTray() {
         return tray;
@@ -68,11 +98,29 @@ function init(deps = {}) {
             return;
         }
 
+        // Alt (Option) is a modifier we WANT to track during the gesture,
+        // not an "other key" that invalidates the double-tap. Update the
+        // held flag and stamp the first-shift candidate so we know
+        // whether Alt was already held when the first Shift was tapped.
+        if (isActiveAltCode(event.keycode)) {
+            isAltHeld = true;
+            return;
+        }
+
         hadOtherKeyBetweenShiftTaps = true;
     }
 
     function handleModifierShortcutKeyUp(event) {
-        if (!shiftShortcutStarted || !isActiveShiftCode(event.keycode)) {
+        if (!shiftShortcutStarted) {
+            return;
+        }
+
+        if (isActiveAltCode(event.keycode)) {
+            isAltHeld = false;
+            return;
+        }
+
+        if (!isActiveShiftCode(event.keycode)) {
             return;
         }
 
@@ -83,11 +131,13 @@ function init(deps = {}) {
             && isActiveShiftCode(lastShiftKeyUpCode)
             && now - lastShiftKeyUpTime <= doubleShiftWindowMs
         ) {
+            const withAlt = candidateAltHeldAtFirstShift && isAltHeld;
             lastShiftKeyUpCode = null;
             lastShiftKeyUpTime = 0;
             hadOtherKeyBetweenShiftTaps = false;
+            candidateAltHeldAtFirstShift = false;
             if (typeof shiftToggleCallback === 'function') {
-                shiftToggleCallback();
+                shiftToggleCallback({ withAlt });
             }
             return;
         }
@@ -95,6 +145,7 @@ function init(deps = {}) {
         lastShiftKeyUpCode = event.keycode;
         lastShiftKeyUpTime = now;
         hadOtherKeyBetweenShiftTaps = false;
+        candidateAltHeldAtFirstShift = isAltHeld;
     }
 
     function createTray() {
@@ -181,45 +232,197 @@ function init(deps = {}) {
         syncStateWithRenderer();
     }
 
+    // Double-Shift gesture lifecycle
+    //
+    // The macOS CGEvent tap that uIOhook sits on can be invalidated by
+    // the OS when the user locks the screen, switches sessions, or the
+    // machine sleeps/resumes. libuiohook (the underlying lib) does not
+    // automatically re-arm the tap; if we leave it alone, the gesture
+    // silently stops working until the app is restarted. The init/stop
+    // pair below now expose suspend/resume/restart so that lifecycle
+    // events from `powerMonitor` (wired in main.js) can rebuild the tap
+    // without tearing down our JS listeners or the toggle callback.
     function initDoubleShiftShortcut(callback) {
-        shiftToggleCallback = callback;
-
-        try {
-            const { uIOhook, UiohookKey } = require('uiohook-napi');
-            shortcutHook = uIOhook;
-            shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight];
-            shortcutHook.on('keydown', handleModifierShortcutKeyDown);
-            shortcutHook.on('keyup', handleModifierShortcutKeyUp);
-            shortcutHook.start();
-            shiftShortcutStarted = true;
-            logDebug('[SHORTCUT] Double-Shift shortcut active');
-        } catch (error) {
-            shortcutHook = null;
-            shiftKeyCodes = [];
-            shiftShortcutStarted = false;
-            logDebug(`[SHORTCUT] Failed to initialize Double-Shift shortcut: ${error.message}`);
+        if (typeof callback === 'function') {
+            shiftToggleCallback = callback;
         }
-    }
 
-    function stopDoubleShiftShortcut() {
-        if (!shortcutHook || !shiftShortcutStarted) {
+        // Idempotent: if a hook is already running just refresh state.
+        if (shortcutHook && shiftShortcutStarted) {
+            resetShiftDetectorState();
             return;
         }
 
         try {
-            shortcutHook.off('keydown', handleModifierShortcutKeyDown);
-            shortcutHook.off('keyup', handleModifierShortcutKeyUp);
+            const { uIOhook, UiohookKey } = require('uiohook-napi');
+            shortcutHook = uIOhook;
+            shiftKeyCodes = [UiohookKey.Shift, UiohookKey.ShiftRight].filter((k) => k != null);
+            altKeyCodes = [UiohookKey.Alt, UiohookKey.AltRight].filter((k) => k != null);
+            if (!shiftListenersAttached) {
+                shortcutHook.on('keydown', handleModifierShortcutKeyDown);
+                shortcutHook.on('keyup', handleModifierShortcutKeyUp);
+                shiftListenersAttached = true;
+            }
+            shortcutHook.start();
+            shiftShortcutStarted = true;
+            resetShiftDetectorState();
+            logDebug('[SHORTCUT] Double-Shift shortcut active');
+        } catch (error) {
+            // If start() threw, listeners may already be attached. Detach
+            // them before clearing the bookkeeping flag so a future retry
+            // can attach a fresh pair without doubling up — duplicate
+            // keyup handlers turn one Shift release into two and would
+            // make the gesture detector see a single tap as a double-tap.
+            if (shiftListenersAttached && shortcutHook) {
+                try {
+                    shortcutHook.off('keydown', handleModifierShortcutKeyDown);
+                    shortcutHook.off('keyup', handleModifierShortcutKeyUp);
+                } catch (_) { /* best effort */ }
+            }
+            shortcutHook = null;
+            shiftKeyCodes = [];
+            altKeyCodes = [];
+            shiftShortcutStarted = false;
+            shiftListenersAttached = false;
+            logDebug(`[SHORTCUT] Failed to initialize Double-Shift shortcut: ${error.message}`);
+        }
+    }
+
+    // Suspend the native tap without removing our JS listeners or the
+    // callback. Used when the OS is about to invalidate the tap (lock,
+    // resign-active) so we can resume cleanly afterwards.
+    function suspendDoubleShiftShortcut(reason = '') {
+        // Cancel any deferred resume the previous unlock/resume queued.
+        // Without this, an unlock→quick-lock sequence can leave a 200ms
+        // restart timer alive that fires while the system is now locked
+        // again, re-arming uIOhook in the wrong state.
+        if (pendingResumeTimer) {
+            clearTimeout(pendingResumeTimer);
+            pendingResumeTimer = null;
+        }
+        // Suspending invalidates any in-flight retry chain.
+        resumeRetryAttempt = 0;
+        if (!shortcutHook || !shiftShortcutStarted) {
+            return;
+        }
+        try {
             shortcutHook.stop();
+        } catch (error) {
+            logDebug(`[SHORTCUT] Suspend failed (${reason}): ${error.message}`);
+        }
+        shiftShortcutStarted = false;
+        resetShiftDetectorState();
+        logDebug(`[SHORTCUT] Double-Shift suspended (${reason || 'no reason'})`);
+    }
+
+    // Resume the native tap. Listeners and callback are preserved.
+    // On failure, schedule bounded exponential-backoff retries — macOS
+    // can refuse uIOhook.start() briefly during slow unlock/login
+    // animations or fast user switching transitions, and a single
+    // 200ms attempt is not enough to ride that out.
+    function resumeDoubleShiftShortcut(reason = '') {
+        if (shiftShortcutStarted) {
+            resumeRetryAttempt = 0;
+            return;
+        }
+        if (!shortcutHook) {
+            initDoubleShiftShortcut(shiftToggleCallback);
+            if (shiftShortcutStarted) {
+                resumeRetryAttempt = 0;
+            } else {
+                scheduleResumeRetry(reason);
+            }
+            return;
+        }
+        try {
+            shortcutHook.start();
+            shiftShortcutStarted = true;
+            resetShiftDetectorState();
+            resumeRetryAttempt = 0;
+            logDebug(`[SHORTCUT] Double-Shift resumed (${reason || 'no reason'})`);
+        } catch (error) {
+            logDebug(`[SHORTCUT] Resume failed (${reason}, attempt ${resumeRetryAttempt + 1}): ${error.message}`);
+            scheduleResumeRetry(reason);
+        }
+    }
+
+    function scheduleResumeRetry(reason) {
+        if (resumeRetryAttempt >= RESUME_RETRY_BACKOFF_MS.length) {
+            logDebug(`[SHORTCUT] Resume gave up after ${resumeRetryAttempt} attempts (${reason})`);
+            resumeRetryAttempt = 0;
+            return;
+        }
+        const delay = RESUME_RETRY_BACKOFF_MS[resumeRetryAttempt];
+        resumeRetryAttempt += 1;
+        if (pendingResumeTimer) {
+            clearTimeout(pendingResumeTimer);
+        }
+        pendingResumeTimer = setTimeout(() => {
+            pendingResumeTimer = null;
+            resumeDoubleShiftShortcut(`${reason}-retry-${resumeRetryAttempt}`);
+        }, delay);
+    }
+
+    // Restart the native tap. macOS finishes its own auth/animation
+    // before we re-arm — a small delay avoids racing the loginwindow
+    // tap-disable on unlock.
+    function restartDoubleShiftShortcut(reason = '', delayMs = 200) {
+        // Cancel any prior pending restart so back-to-back calls don't
+        // queue multiple deferred resumes.
+        if (pendingResumeTimer) {
+            clearTimeout(pendingResumeTimer);
+            pendingResumeTimer = null;
+        }
+        suspendDoubleShiftShortcut(reason);
+        const safeDelay = Math.max(0, Number.isFinite(delayMs) ? delayMs : 0);
+        if (safeDelay === 0) {
+            resumeDoubleShiftShortcut(reason);
+            return;
+        }
+        pendingResumeTimer = setTimeout(() => {
+            pendingResumeTimer = null;
+            resumeDoubleShiftShortcut(reason);
+        }, safeDelay);
+    }
+
+    function stopDoubleShiftShortcut() {
+        // Always cancel any pending deferred resume — without this, an
+        // unlock-screen / resume that scheduled a restart could fire
+        // after teardown and re-arm uIOhook on a hook we just dropped.
+        if (pendingResumeTimer) {
+            clearTimeout(pendingResumeTimer);
+            pendingResumeTimer = null;
+        }
+        resumeRetryAttempt = 0;
+
+        if (!shortcutHook) {
+            shiftListenersAttached = false;
+            shiftShortcutStarted = false;
+            shiftKeyCodes = [];
+            altKeyCodes = [];
+            shiftToggleCallback = null;
+            resetShiftDetectorState();
+            return;
+        }
+
+        try {
+            if (shiftListenersAttached) {
+                shortcutHook.off('keydown', handleModifierShortcutKeyDown);
+                shortcutHook.off('keyup', handleModifierShortcutKeyUp);
+            }
+            if (shiftShortcutStarted) {
+                shortcutHook.stop();
+            }
         } catch (error) {
             logDebug(`[SHORTCUT] Failed to stop Double-Shift shortcut: ${error.message}`);
         }
 
         shortcutHook = null;
         shiftKeyCodes = [];
+        altKeyCodes = [];
         shiftShortcutStarted = false;
-        lastShiftKeyUpCode = null;
-        lastShiftKeyUpTime = 0;
-        hadOtherKeyBetweenShiftTaps = false;
+        shiftListenersAttached = false;
+        resetShiftDetectorState();
         shiftToggleCallback = null;
     }
 
@@ -241,6 +444,30 @@ function init(deps = {}) {
 
         if (!startTunnelRegistered) {
             logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+J');
+        }
+
+        const desktopChatRegistered = globalShortcut.register('CommandOrControl+Shift+K', () => {
+            try {
+                toggleLocalChatWindow();
+            } catch (error) {
+                logDebug(`[SHORTCUT] Failed to toggle desktop chat: ${error.message}`);
+            }
+        });
+
+        if (!desktopChatRegistered) {
+            logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+K');
+        }
+
+        const cursorCompanionRegistered = globalShortcut.register('CommandOrControl+Shift+L', () => {
+            try {
+                toggleCursorCompanionEnabled();
+            } catch (error) {
+                logDebug(`[SHORTCUT] Failed to toggle cursor companion: ${error.message}`);
+            }
+        });
+
+        if (!cursorCompanionRegistered) {
+            logDebug('[SHORTCUT] Failed to register CommandOrControl+Shift+L');
         }
     }
 
@@ -306,6 +533,9 @@ function init(deps = {}) {
         toggleWindow,
         showWindow,
         initDoubleShiftShortcut,
+        suspendDoubleShiftShortcut,
+        resumeDoubleShiftShortcut,
+        restartDoubleShiftShortcut,
         stopDoubleShiftShortcut,
         registerGlobalShortcuts,
         buildTrayMenu,

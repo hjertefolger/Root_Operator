@@ -36,6 +36,25 @@ function init(deps = {}) {
     const channelActivityIdleMs = Number.isFinite(deps.channelActivityIdleMs)
         ? deps.channelActivityIdleMs
         : DEFAULT_CHANNEL_ACTIVITY_IDLE_MS;
+    // Optional listener invoked after every normalized channel-activity
+    // change (and on reset). Used by the cursor companion to bind its
+    // loader/response transitions to the same authoritative signal that
+    // drives desktop chat indicators — single source of truth for "is
+    // Claude working?". Late-bindable so init order doesn't matter.
+    let onChannelActivityChanged = typeof deps.onChannelActivityChanged === 'function'
+        ? deps.onChannelActivityChanged
+        : null;
+    function setChannelActivityListener(fn) {
+        onChannelActivityChanged = typeof fn === 'function' ? fn : null;
+    }
+    function emitChannelActivityChanged(activity) {
+        if (!onChannelActivityChanged) return;
+        try {
+            onChannelActivityChanged(activity);
+        } catch (err) {
+            logDebug(`[ACTIVITY] onChannelActivityChanged listener error: ${err && err.message}`);
+        }
+    }
     const claudeDebugPollIntervalMs = Number.isFinite(deps.claudeDebugPollIntervalMs)
         ? deps.claudeDebugPollIntervalMs
         : DEFAULT_CLAUDE_DEBUG_POLL_INTERVAL_MS;
@@ -395,7 +414,13 @@ function init(deps = {}) {
         lastChannelActivityAt = activityNow;
         latestChannelActivity = normalized.active ? normalized : null;
 
-        if (normalized.phase !== 'idle') {
+        // Only ACTIVE phases cancel the idle countdown. Inactive
+        // signals (tool_complete, tool_failed) describe the end of an
+        // action — they shouldn't extend an already-scheduled idle
+        // timer, otherwise a missed/delayed Stop hook can strand the
+        // cursor loader in `loading` forever (no terminal event ever
+        // arrives). Codex flagged this in review.
+        if (normalized.active) {
             clearChannelIdleTimer();
         }
 
@@ -412,6 +437,7 @@ function init(deps = {}) {
         });
 
         syncStateWithRenderer();
+        emitChannelActivityChanged(normalized);
         return normalized;
     }
 
@@ -422,6 +448,23 @@ function init(deps = {}) {
         lastChannelActivityKey = '';
         lastChannelActivityAt = 0;
         syncStateWithRenderer();
+        // Synthesize a reset event so subscribers (cursor companion)
+        // can release stuck pending state without treating the reset
+        // as a successful turn. The `reset: true` flag distinguishes
+        // an admin teardown from a real terminal idle so a partial
+        // captured reply isn't presented as the final response.
+        emitChannelActivityChanged({
+            phase: 'idle',
+            label: 'Idle',
+            detail: '',
+            toolName: '',
+            toolUseId: '',
+            filePath: '',
+            fileLabel: '',
+            ts: now().toISOString(),
+            active: false,
+            reset: true,
+        });
     }
 
     function scheduleChannelIdle(detail = `${getActivityAssistantName()} is ready for the next message.`) {
@@ -681,6 +724,7 @@ function init(deps = {}) {
         resetChannelActivity,
         scheduleChannelIdle,
         applyChannelManagerActivity,
+        setChannelActivityListener,
         startClaudeDebugWatcher,
         stopClaudeDebugWatcher,
         startClaudeHookWatcher,

@@ -136,6 +136,13 @@ function init(deps = {}) {
     const sendEncryptedOutput = requireFunction('sendEncryptedOutput', deps.sendEncryptedOutput);
     const sendLocalChatEvent = requireFunction('sendLocalChatEvent', deps.sendLocalChatEvent);
     const notifyAssistantReply = requireFunction('notifyAssistantReply', deps.notifyAssistantReply);
+    // Cursor companion routing — optional. If provided, replies whose
+    // chat_id matches the companion's pending turn get forwarded to the
+    // bubble window. Optional so existing tests + non-cursor builds keep
+    // working without rewiring.
+    const forwardToCursorCompanion = typeof deps.forwardToCursorCompanion === 'function'
+        ? deps.forwardToCursorCompanion
+        : null;
 
     const outboundAttachmentsDir = requireDependency('outboundAttachmentsDir', deps.outboundAttachmentsDir);
 
@@ -326,6 +333,23 @@ function init(deps = {}) {
 
             sendLocalChatEvent(buildTransportChannelMessage(message));
             notifyAssistantReply(message);
+            // Forward every reply to cursor companion. Presence is a
+            // fan-out surface; the companion decides internally whether
+            // a reply also belongs to its local pending-turn state.
+            // Order: AFTER persistence and notifications so the cursor
+            // bubble can't receive a reply before the chat history records it.
+            if (forwardToCursorCompanion) {
+                try {
+                    forwardToCursorCompanion({
+                        content: message.content,
+                        ts: message.ts,
+                        role: message.role,
+                        chatId: replyChatId,
+                    });
+                } catch (error) {
+                    logDebug(`[CHANNEL] forwardToCursorCompanion failed: ${error.message}`);
+                }
+            }
             scheduleChannelIdle();
         } catch (error) {
             for (const attachment of stagedAttachments) {

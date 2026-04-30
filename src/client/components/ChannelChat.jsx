@@ -3,6 +3,7 @@ import { Check, ArrowUp, ChevronDown, Eye, Loader, MessageSquare, Plus, X } from
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import AttachmentViewerOverlay from './AttachmentViewerOverlay';
+import { AttachmentPill, formatFileSize, splitFileNameExt } from '../../shared/AttachmentPill.jsx';
 
 const isMobileChatInput = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 const AUTO_SCROLL_BOTTOM_THRESHOLD = 24;
@@ -222,12 +223,6 @@ const MessageMarkdown = memo(function MessageMarkdown({ content }) {
   );
 });
 
-function splitFileNameExt(name) {
-  const dot = name.lastIndexOf('.');
-  if (dot <= 0) return { stem: name, ext: '' };
-  return { stem: name.slice(0, dot), ext: name.slice(dot + 1).toUpperCase() };
-}
-
 function parseFileAttachments(content) {
   const lines = content.split('\n');
   const textLines = [];
@@ -259,65 +254,6 @@ function getAttachmentPreviewSrc(attachment) {
   return `data:${attachment.mime};base64,${attachment.bytesBase64}`;
 }
 
-function AttachmentPill({ name, size, icon, onClick, disabled }) {
-  const { stem, ext } = splitFileNameExt(name);
-  const isButton = typeof onClick === 'function';
-  const sharedInner = (
-    <>
-      <span style={{ display: 'inline-flex', flexShrink: 0, color: '#4B5AFF' }}>{icon}</span>
-      <span style={{
-        fontSize: 13,
-        color: 'rgba(255,255,255,0.55)',
-        fontFamily: MONO,
-        whiteSpace: 'nowrap',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        minWidth: 0,
-        flex: 1,
-      }}>
-        {stem}
-      </span>
-      {ext && (
-        <span style={{ fontSize: 13, color: '#4B5AFF', fontFamily: MONO, fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0 }}>
-          {ext}
-        </span>
-      )}
-      {size != null && (
-        <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.25)', fontFamily: MONO, flexShrink: 0 }}>
-          {formatFileSize(size)}
-        </span>
-      )}
-    </>
-  );
-
-  const sharedStyle = {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 7,
-    padding: '6px 12px',
-    borderRadius: 999,
-    border: '1px solid rgba(255,255,255,0.12)',
-    background: 'transparent',
-    textAlign: 'left',
-    width: '100%',
-    minWidth: 0,
-  };
-
-  if (isButton) {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        disabled={disabled}
-        style={{ ...sharedStyle, color: 'inherit', cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.72 : 1 }}
-      >
-        {sharedInner}
-      </button>
-    );
-  }
-
-  return <div style={sharedStyle}>{sharedInner}</div>;
-}
 
 const AssistantAttachmentList = memo(function AssistantAttachmentList({
   attachments,
@@ -371,7 +307,9 @@ const ChatMessageItem = memo(function ChatMessageItem({
 }) {
   const isUser = role === 'user';
   const { text, files } = isUser ? parseFileAttachments(content) : { text: content, files: [] };
-  const assistantAttachments = isUser ? [] : (Array.isArray(attachments) ? attachments : []);
+  const structuredAttachments = Array.isArray(attachments) ? attachments : [];
+  const assistantAttachments = isUser ? [] : structuredAttachments;
+  const userAttachments = isUser ? structuredAttachments : [];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start', gap: 4 }}>
@@ -405,6 +343,15 @@ const ChatMessageItem = memo(function ChatMessageItem({
       {!isUser && assistantAttachments.length > 0 && (
         <AssistantAttachmentList
           attachments={assistantAttachments}
+          externalRef={externalRef}
+          attachmentCache={attachmentCache}
+          attachmentFetchState={attachmentFetchState}
+          onOpenAttachmentViewer={onOpenAttachmentViewer}
+        />
+      )}
+      {isUser && userAttachments.length > 0 && (
+        <AssistantAttachmentList
+          attachments={userAttachments}
           externalRef={externalRef}
           attachmentCache={attachmentCache}
           attachmentFetchState={attachmentFetchState}
@@ -519,12 +466,6 @@ const ChatMessages = memo(function ChatMessages({
 const ACCEPTED_FILE_TYPES = 'image/*,video/mp4,video/quicktime,video/webm,.pdf,.txt,.md,.csv,.json,.py,.js,.ts,.jsx,.tsx,.html,.css,.svg,.xml,.yaml,.yml,.toml,.env,.log,.sql,.rb,.go,.rs,.swift,.kt,.java,.c,.cpp,.h,.hpp';
 const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 const MAX_VIDEO_SIZE_BYTES = 100 * 1024 * 1024;
-
-function formatFileSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 const ChatComposer = memo(function ChatComposer({
   canSend,

@@ -3,7 +3,7 @@
  */
 const path = require('path');
 const { spawn } = require('child_process');
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, globalShortcut, nativeImage, Notification, safeStorage, screen, powerMonitor } = require('electron');
 const fs = require('fs');
 const fixPath = async () => {
     const { default: fp } = await import('fix-path');
@@ -26,8 +26,10 @@ const {
     ensureWorkspaceChatHistory,
     ensureAttachmentsDir,
     ensureOutboundAttachmentsDir,
+    ensureCursorAttachmentsDir,
     ATTACHMENTS_DIR,
     OUTBOUND_ATTACHMENTS_DIR,
+    CURSOR_ATTACHMENTS_DIR,
     WORKSPACE_DIR,
 } = require('./src/workspace');
 const {
@@ -44,6 +46,9 @@ const { killOrphanClaudeIfAny, recordPid, clearPid } = require('./src/orphan-kil
 const { init: initLogging } = require('./src/main/logging');
 const { init: initTray } = require('./src/main/tray');
 const { init: initWindowManager } = require('./src/main/window-manager');
+const { init: initCursorCompanion } = require('./src/main/cursor-companion');
+const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
+const { init: initCursorAnnotation } = require('./src/main/cursor-annotation');
 const { init: initNotifications } = require('./src/main/notifications');
 const { init: initActivityTracker } = require('./src/main/activity-tracker');
 const { init: initLocalChat } = require('./src/main/local-chat');
@@ -130,6 +135,22 @@ const setWebSocketServer = (value) => (wss = value);
 const setTunnelProcessState = (value) => (tunnelProcess = value);
 const setWakeLock = (value) => (wakeLock = value);
 const setAppQuittingState = (value) => (isAppQuitting = Boolean(value));
+
+// Forward-reference for the cursor-companion controller. The tray
+// module needs `toggleCursorCompanionEnabled` injected at construction
+// time, but the controller can only be built after the cursor-companion
+// module is initialized later in this file. We bind through this ref so
+// the Cmd+Shift+L hotkey resolves the live toggle when fired.
+let cursorCompanionController = null;
+function toggleCursorCompanionEnabledFromHotkey() {
+    if (!cursorCompanionController) return;
+    try {
+        cursorCompanionController.toggle('hotkey');
+    } catch (error) {
+        logDebug(`[CURSOR_CTL] toggle from hotkey failed: ${error.message}`);
+    }
+}
+
 const trayModule = initTray({
     app,
     Tray,
@@ -152,12 +173,17 @@ const trayModule = initTray({
     getServer: () => server,
     getTunnelProcess: () => tunnelProcess,
     logDebug,
+    toggleLocalChatWindow: (...args) => windowManager.toggleLocalChatWindow(...args),
+    toggleCursorCompanionEnabled: toggleCursorCompanionEnabledFromHotkey,
 });
 const {
     formatTrayTooltip,
     setTrayIconState,
     createTray,
     initDoubleShiftShortcut,
+    suspendDoubleShiftShortcut,
+    resumeDoubleShiftShortcut,
+    restartDoubleShiftShortcut,
     stopDoubleShiftShortcut,
     registerGlobalShortcuts,
 } = trayModule;
@@ -212,6 +238,7 @@ const {
     initializeDesktopShell,
     registerAppShellEvents,
     showAboutWindow,
+    loadRendererWindow,
 } = windowManager;
 registerAppShellEvents();
 const notifications = initNotifications({
@@ -312,6 +339,7 @@ const localChat = initLocalChat({
     OUTBOUND_ATTACHMENT_SWEEP_INTERVAL_MS,
     getStagedAttachmentPath,
     loadStagedAttachmentBytes,
+    stageOutboundAttachments,
     stripAttachmentBytes,
     touchAttachmentForGc,
     logDebug,
@@ -352,6 +380,63 @@ const {
 } = localChat;
 sendLocalChatEventRef = sendLocalChatEvent;
 let channelRuntime = createInitialChannelRuntime(DEFAULT_ACTIVITY_ASSISTANT_NAME);
+
+// Cursor companion — small dot follows the cursor; Option+Option opens
+// a bubble for text input; on Enter, the prompt + a screenshot of the
+// cursor area are sent through the existing channel pipeline to Claude
+// Code, and the response renders back in the bubble. Initialised here
+// so we can pass it into channel-mode for reply forwarding; started
+// later in whenReady after the desktop shell comes up.
+const cursorCompanion = initCursorCompanion({
+    BrowserWindow,
+    ipcMain,
+    screen,
+    app,
+    getCursorAttachmentsDir: () => ensureCursorAttachmentsDir(),
+    getLocalChatWindow: () => localChatWindow,
+    loadRendererWindow,
+    submitChannelUserMessage,
+    getOperatingMode: () => operatingMode,
+    logDebug,
+});
+
+// Annotation surface — a sibling module to cursor-companion. Owns the
+// fullscreen annotation panel invoked via ⌥⇧⇧. On commit, calls back
+// into cursor-companion to queue the annotated PNG as a pending
+// attachment for the next prompt.
+const cursorAnnotation = initCursorAnnotation({
+    BrowserWindow,
+    ipcMain,
+    screen,
+    app,
+    loadRendererWindow,
+    getCursorAttachmentsDir: () => ensureCursorAttachmentsDir(),
+    getCursorCompanionWindow: () => cursorCompanion.getWindow(),
+    logDebug,
+    onCommit: (payload) => {
+        try {
+            cursorCompanion.adoptAnnotation(payload);
+        } catch (err) {
+            logDebug(`[CURSOR-ANN] adoptAnnotation failed: ${err && err.message}`);
+        }
+    },
+    onCancel: () => { /* no-op for now; companion stays unchanged */ },
+});
+
+// Bind cursor companion's loader/response transitions to the same
+// authoritative activity stream that drives desktop chat indicators.
+// Single source of truth for "is Claude working?" — cursor stays in
+// loading until the activity stream reaches a terminal phase
+// (finished/idle/failed/error). Without this, the cursor surface
+// collapsed to response on the first assistant message even when
+// Claude was still mid-tool-loop.
+activityTracker.setChannelActivityListener((activity) => {
+    try {
+        cursorCompanion.handleChannelActivity(activity);
+    } catch (err) {
+        logDebug(`[CURSOR] handleChannelActivity error: ${err && err.message}`);
+    }
+});
 
 function sendEncryptedChannelPayload(payload) {
     const body = JSON.stringify(payload);
@@ -458,6 +543,7 @@ const channelMode = initChannelModeModule({
     sendEncryptedOutput: (...args) => sendEncryptedOutput(...args),
     sendLocalChatEvent,
     notifyAssistantReply,
+    forwardToCursorCompanion: (payload) => cursorCompanion.handleChannelReply(payload),
     outboundAttachmentsDir: OUTBOUND_ATTACHMENTS_DIR,
     initialOperatingMode: operatingMode,
     getOperatingMode: () => operatingMode,
@@ -692,10 +778,70 @@ app.whenReady().then(async () => {
         createTray,
         registerGlobalShortcuts,
         initDoubleShiftShortcut,
-        toggleLocalChatWindow,
+        onDoubleShift: ({ withAlt } = {}) => {
+            // Gate the gesture on the persistent enabled flag. When OFF,
+            // double-Shift is a no-op on our side — the keys fall through
+            // to whatever else might claim them.
+            if (!cursorCompanionController || !cursorCompanionController.isEnabled()) {
+                return;
+            }
+            if (withAlt) {
+                try { cursorAnnotation.openAnnotation(); } catch (err) {
+                    logDebug(`[CURSOR-ANN] openAnnotation failed: ${err && err.message}`);
+                }
+                return;
+            }
+            try { cursorCompanion.toggleFromHotkey(); } catch (_) { /* ignore */ }
+        },
         setTray: (value) => { tray = value; },
     });
     updater.start();
+
+    // Build the cursor-companion controller now that the desktop shell
+    // is up. It owns the persistent enabled flag and the start/stop
+    // lifecycle. bootstrap() reads the flag and starts the companion
+    // if the user previously enabled it.
+    cursorCompanionController = initCursorCompanionController({
+        getStore: () => store,
+        cursorCompanion,
+        cursorAnnotation,
+        logDebug,
+        broadcastEnabled: (enabled) => {
+            // Notify all open renderer windows so the Settings UI can
+            // reflect the new state without a re-fetch.
+            for (const w of BrowserWindow.getAllWindows()) {
+                try { w.webContents.send('CURSOR_COMPANION_ENABLED_CHANGED', { enabled }); } catch (_) {}
+            }
+        },
+    });
+    cursorCompanionController.bootstrap();
+
+    // powerMonitor lifecycle — the macOS CGEvent tap that uIOhook sits
+    // on can be silently invalidated when the screen locks, the user
+    // switches sessions, or the machine sleeps/resumes. We rebuild it on
+    // unlock/resume so Shift+Shift stays reliable across the day.
+    try {
+        powerMonitor.on('lock-screen', () => {
+            suspendDoubleShiftShortcut('lock-screen');
+        });
+        powerMonitor.on('unlock-screen', () => {
+            // 200 ms gives macOS time to finish its own loginwindow
+            // tap-disable before we re-arm.
+            restartDoubleShiftShortcut('unlock-screen', 200);
+        });
+        powerMonitor.on('suspend', () => {
+            suspendDoubleShiftShortcut('suspend');
+        });
+        powerMonitor.on('resume', () => {
+            restartDoubleShiftShortcut('resume', 200);
+        });
+        // Mac-specific resign/become-active are noisy (fire on cmd-tab),
+        // so we only listen on darwin and only treat them as informational
+        // — we don't suspend on resign-active because cmd-tabbing should
+        // not break the gesture for casual app-switching.
+    } catch (error) {
+        logDebug(`[POWER] Failed to attach powerMonitor listeners: ${error.message}`);
+    }
 
     // Auto-start priority gate. Three paths can fire on launch; only the
     // highest-priority one runs, the others are suppressed:
@@ -839,6 +985,14 @@ app.on('will-quit', () => {
     globalShortcut.unregisterAll();
     stopDoubleShiftShortcut();
     stopOutboundAttachmentSweep();
+    try {
+        if (cursorCompanionController) {
+            cursorCompanionController.shutdown();
+        } else {
+            cursorCompanion.stop();
+        }
+    } catch (_) { /* ignore */ }
+    try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;
@@ -879,6 +1033,7 @@ initIpcHandlers({
     getMainWindow: () => mainWindow,
     dismissUpdateBanner,
     getDynamicMemory: () => dynamicMemory,
+    getCursorCompanionController: () => cursorCompanionController,
     setOperatingMode,
     getOperatingMode: () => operatingMode,
     setAppQuitting: setAppQuittingState,

@@ -21,8 +21,35 @@ const MAX_ASSISTANT_NAME_LENGTH = 24;
 // Worker domain from environment (must be set in .env file)
 const WORKER_DOMAIN = import.meta.env.VITE_WORKER_DOMAIN;
 
+function ShortcutList({ groups }) {
+  return (
+    <div className="flex flex-col gap-4">
+      {groups.map((group) => (
+        <div key={group.label} className="flex flex-col">
+          <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/60 mb-1.5">
+            {group.label}
+          </span>
+          <div className="flex flex-col">
+            {group.items.map((item) => (
+              <div
+                key={`${group.label}-${item.description}`}
+                className="flex items-center justify-between gap-3 py-1.5"
+              >
+                <span className="text-xs text-foreground">{item.description}</span>
+                <span className="font-mono text-[11px] text-muted-foreground rounded-md bg-muted/40 px-2 py-0.5">
+                  {item.shortcut}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SettingsView({ onBack, tunnelState }) {
-  const { invoke } = useElectron();
+  const { invoke, on } = useElectron();
 
   // Form state
   const [debugLogging, setDebugLogging] = useState(false);
@@ -35,6 +62,8 @@ function SettingsView({ onBack, tunnelState }) {
   const [dynamicIndexingBusy, setDynamicIndexingBusy] = useState(false);
   const [autoStartTunnel, setAutoStartTunnel] = useState(true);
   const [autoStartTunnelBusy, setAutoStartTunnelBusy] = useState(false);
+  const [cursorCompanionEnabled, setCursorCompanionEnabled] = useState(false);
+  const [cursorCompanionBusy, setCursorCompanionBusy] = useState(false);
 
   // Initial values for dirty checking
   const initialValues = useRef({});
@@ -50,12 +79,13 @@ function SettingsView({ onBack, tunnelState }) {
   useEffect(() => {
     async function loadSettings() {
       try {
-        const [settings, currentSubdomain, devices, indexingEnabled, autoStartStored] = await Promise.all([
+        const [settings, currentSubdomain, devices, indexingEnabled, autoStartStored, cursorEnabledStored] = await Promise.all([
           invoke('GET_STORE', 'cfSettings'),
           invoke('GET_SUBDOMAIN'),
           invoke('GET_PAIRED_DEVICES'),
           invoke('GET_DYNAMIC_INDEXING_ENABLED').catch(() => false),
           invoke('GET_STORE', 'autoStartTunnelOnLaunch').catch(() => true),
+          invoke('GET_CURSOR_COMPANION_ENABLED').catch(() => false),
         ]);
 
         const loadedDebug = (settings && settings.debugLogging) || false;
@@ -69,6 +99,7 @@ function SettingsView({ onBack, tunnelState }) {
         setPairedDevices(devices || []);
         setDynamicIndexingEnabled(Boolean(indexingEnabled));
         setAutoStartTunnel(autoStartStored !== false); // default ON if undefined/null
+        setCursorCompanionEnabled(Boolean(cursorEnabledStored));
 
         // Store initial values for dirty checking
         initialValues.current = {
@@ -123,6 +154,37 @@ function SettingsView({ onBack, tunnelState }) {
       setPairedDevices(prev => prev.filter(d => d.kid !== kid));
     } catch (e) {
       console.error('Failed to remove device:', e);
+    }
+  };
+
+  // Track external toggles (Cmd+Shift+L hotkey or other windows) so the
+  // Settings switch reflects the live state without a re-fetch.
+  useEffect(() => {
+    if (typeof on !== 'function') return undefined;
+    const off = on('CURSOR_COMPANION_ENABLED_CHANGED', (payload) => {
+      if (!payload || typeof payload.enabled !== 'boolean') return;
+      setCursorCompanionEnabled(payload.enabled);
+    });
+    return () => { off?.(); };
+  }, [on]);
+
+  const handleCursorCompanionToggle = async (nextValue) => {
+    const next = Boolean(nextValue);
+    const previous = cursorCompanionEnabled;
+    setCursorCompanionEnabled(next); // optimistic
+    setCursorCompanionBusy(true);
+    try {
+      const result = await invoke('SET_CURSOR_COMPANION_ENABLED', next);
+      if (result && result.success === false) {
+        setCursorCompanionEnabled(previous);
+      } else if (result && typeof result.enabled === 'boolean') {
+        setCursorCompanionEnabled(result.enabled);
+      }
+    } catch (e) {
+      console.error('Failed to toggle cursor companion:', e);
+      setCursorCompanionEnabled(previous);
+    } finally {
+      setCursorCompanionBusy(false);
     }
   };
 
@@ -430,6 +492,59 @@ function SettingsView({ onBack, tunnelState }) {
                   onCheckedChange={handleAutoStartTunnelToggle}
                 />
               </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Cursor Presence master toggle */}
+          <AccordionItem value="cursor-presence" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Cursor Presence
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <div className="flex justify-between items-center gap-3">
+                <span className="text-xs text-muted-foreground">
+                  A small dot follows your cursor.
+                  Double-tap Shift to ask anything from anywhere.
+                </span>
+                <Switch
+                  id="cursor-presence"
+                  checked={cursorCompanionEnabled}
+                  disabled={cursorCompanionBusy}
+                  onCheckedChange={handleCursorCompanionToggle}
+                />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Keyboard Shortcuts */}
+          <AccordionItem value="keyboard-shortcuts" className="border-none">
+            <AccordionTrigger className="text-sm font-medium hover:no-underline py-3">
+              Keyboard Shortcuts
+            </AccordionTrigger>
+            <AccordionContent className="pb-4">
+              <ShortcutList
+                groups={[
+                  {
+                    label: 'Main',
+                    items: [
+                      { description: 'Toggle tunnel', shortcut: '⌘ ⇧ J' },
+                      { description: 'Toggle desktop chat', shortcut: '⌘ ⇧ K' },
+                      { description: 'Toggle Cursor Presence', shortcut: '⌘ ⇧ L' },
+                    ],
+                  },
+                  {
+                    label: 'Cursor Presence',
+                    items: [
+                      { description: 'Open prompt from anywhere', shortcut: '⇧ ⇧' },
+                      { description: 'Send', shortcut: '↵' },
+                      { description: 'Send with cursor screenshot', shortcut: '⌥ ↵' },
+                      { description: 'Send with full screenshot', shortcut: '⌥ ⇧ ↵' },
+                      { description: 'Dismiss reply', shortcut: 'Right-click / Esc' },
+                      { description: 'Continue conversation from reply', shortcut: '⇧ ⇧' },
+                    ],
+                  },
+                ]}
+              />
             </AccordionContent>
           </AccordionItem>
 

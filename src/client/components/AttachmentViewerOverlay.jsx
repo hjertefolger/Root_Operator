@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { ArrowDownToLine, ArrowUp, ChevronLeft, ChevronRight, Highlighter, Loader, Maximize2, Pause, Play, Plus, Redo2, Trash, Trash2, Undo2, Volume2, VolumeX, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { ANNOTATION_COLORS, STROKE_WIDTHS, drawStroke } from '../../shared/annotation-constants';
 
 const docRemarkPlugins = [remarkGfm];
 
@@ -81,20 +82,6 @@ const SWIPE_NAV_VELOCITY = 0.35;
 const SWIPE_NAV_VERTICAL_DRIFT = 48;
 const EMPTY_ANNOTATIONS = { strokes: [], redo: [] };
 const EMPTY_DOC_QUEUE = Object.freeze([]);
-const ANNOTATION_COLORS = [
-  { value: '#0a84ff', label: 'Blue' },
-  { value: '#ff453a', label: 'Red' },
-  { value: '#ffd60a', label: 'Yellow' },
-  { value: '#32d74b', label: 'Green' },
-  { value: '#ffffff', label: 'White' },
-  { value: '#111111', label: 'Black' },
-];
-const STROKE_WIDTHS = [
-  { value: 2, label: 'Thin' },
-  { value: 4, label: 'Medium' },
-  { value: 8, label: 'Thick' },
-  { value: 12, label: 'Bold' },
-];
 const EMPTY_VIEWPORT_RECT = { width: 0, height: 0, left: 0, top: 0 };
 
 function clamp(value, min, max) {
@@ -221,35 +208,6 @@ function getImagePointFromClient({
     x: baseX * (naturalWidth / stageRect.width),
     y: baseY * (naturalHeight / stageRect.height),
   };
-}
-
-function drawStroke(ctx, stroke, displayScale) {
-  if (!stroke || !Array.isArray(stroke.points) || stroke.points.length === 0) {
-    return;
-  }
-
-  const previewWidth = stroke.width * displayScale;
-  ctx.strokeStyle = stroke.color;
-  ctx.fillStyle = stroke.color;
-  ctx.lineWidth = previewWidth;
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-
-  if (stroke.points.length === 1) {
-    const point = stroke.points[0];
-    ctx.beginPath();
-    ctx.arc(point.x * displayScale, point.y * displayScale, previewWidth / 2, 0, Math.PI * 2);
-    ctx.fill();
-    return;
-  }
-
-  ctx.beginPath();
-  ctx.moveTo(stroke.points[0].x * displayScale, stroke.points[0].y * displayScale);
-  for (let index = 1; index < stroke.points.length; index += 1) {
-    const point = stroke.points[index];
-    ctx.lineTo(point.x * displayScale, point.y * displayScale);
-  }
-  ctx.stroke();
 }
 
 function buildAnnotatedFileName(name) {

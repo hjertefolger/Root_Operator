@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 const DEFAULT_ACTIVITY_ASSISTANT_NAME = 'Operator';
 
 function requireDependency(name, value) {
@@ -40,6 +42,7 @@ function init(deps = {}) {
     const ensureOutboundAttachmentsDir = requireFunction('ensureOutboundAttachmentsDir', deps.ensureOutboundAttachmentsDir);
     const getStagedAttachmentPath = requireFunction('getStagedAttachmentPath', deps.getStagedAttachmentPath);
     const loadStagedAttachmentBytes = requireFunction('loadStagedAttachmentBytes', deps.loadStagedAttachmentBytes);
+    const stageOutboundAttachments = requireFunction('stageOutboundAttachments', deps.stageOutboundAttachments);
     const stripAttachmentBytes = requireFunction('stripAttachmentBytes', deps.stripAttachmentBytes);
     const touchAttachmentForGc = requireFunction('touchAttachmentForGc', deps.touchAttachmentForGc);
     const OUTBOUND_ATTACHMENTS_DIR = requireDependency('OUTBOUND_ATTACHMENTS_DIR', deps.OUTBOUND_ATTACHMENTS_DIR);
@@ -522,7 +525,22 @@ function init(deps = {}) {
     }
 
     async function submitChannelUserMessage(chatId, content, userId, options = {}) {
-        const { echoToLocalChat = false, senderWs = null } = options;
+        const {
+            echoToLocalChat = false,
+            senderWs = null,
+            // Optional clean version for chat surfaces and memory. Use when
+            // the agent-facing `content` carries technical noise (file paths,
+            // structured prefixes) that shouldn't appear in the conversation
+            // memory or in human-facing chat views. Defaults to `content`,
+            // preserving existing behaviour for callers that don't pass it.
+            displayContent = null,
+            // Optional array of absolute source paths to stage as
+            // user-side attachments. Mirrors the assistant attachment
+            // staging pipeline so cursor-companion screenshots and any
+            // future user-side file shares land in chat surfaces with
+            // the same envelope shape as assistant attachments.
+            attachments = null,
+        } = options;
         const assistantName = getActivityAssistantName();
         const channelManager = getChannelManager();
 
@@ -532,6 +550,29 @@ function init(deps = {}) {
 
         const ts = getNowDate().toISOString();
         const dynamicMemory = getDynamicMemory();
+        const displayBody = (typeof displayContent === 'string' && displayContent.length > 0)
+            ? displayContent
+            : content;
+
+        let stagedAttachments = [];
+        let externalRef = null;
+        if (Array.isArray(attachments) && attachments.length > 0) {
+            try {
+                ensureOutboundAttachmentsDir();
+                externalRef = `user-${crypto.randomUUID()}`;
+                stagedAttachments = stageOutboundAttachments({
+                    outboundDir: OUTBOUND_ATTACHMENTS_DIR,
+                    effectId: externalRef,
+                    attachments,
+                });
+            } catch (err) {
+                logDebug(`[CHAT] Staging user attachments failed: ${err.message}`);
+                return { success: false, error: `Could not stage attachments: ${err.message}` };
+            }
+        }
+        const strippedAttachments = stagedAttachments.length > 0
+            ? stripAttachmentBytes(stagedAttachments)
+            : undefined;
 
         // Per-turn enrichment is gone. Channel-history tail lives in the
         // appended system prompt, and agent-facing recall of older memories
@@ -542,7 +583,7 @@ function init(deps = {}) {
         const sentToBridge = channelManager.sendToChannel(chatId, content, userId || chatId);
 
         if (isDynamicMemoryReady(dynamicMemory)) {
-            dynamicMemory.indexMessage('user', content, chatId).catch((error) => {
+            dynamicMemory.indexMessage('user', displayBody, chatId).catch((error) => {
                 logDebug(`[MEMORY] Index (user) error: ${error.message}`);
             });
         }
@@ -558,22 +599,38 @@ function init(deps = {}) {
             detail: `Waiting for the ${assistantName} chat bridge to reconnect.`,
         }, { force: true });
 
-        const userWrite = chatStore.addMessage({ role: 'user', content, ts });
+        const userMsg = { role: 'user', content: displayBody, ts };
+        if (strippedAttachments) userMsg.attachments = strippedAttachments;
+        const userWrite = chatStore.addMessage(
+            userMsg,
+            externalRef ? { externalRef } : undefined,
+        );
         markOutboundAttachmentsForGc(userWrite.evicted);
 
+        const transportSource = {
+            role: 'user',
+            content: displayBody,
+            ts,
+        };
+        if (strippedAttachments) transportSource.attachments = strippedAttachments;
+        if (externalRef) transportSource.external_ref = externalRef;
+
         if (echoToLocalChat) {
-            sendLocalChatEvent({
-                type: 'channel_message',
-                role: 'user',
-                content,
-                ts,
-            });
+            // Local desktop chat is always on the latest renderer code,
+            // so it always supports attachments — pass them through.
+            sendLocalChatEvent(buildTransportChannelMessage(transportSource));
         }
 
-        const body = JSON.stringify({ type: 'channel_message', role: 'user', content, ts });
         for (const client of getActiveClients()) {
             if (client !== senderWs && client.readyState === WebSocket.OPEN) {
-                sendEncryptedOutput(client, body);
+                // Older PWA clients without the supportsAttachments
+                // capability bit get a fallback text representation
+                // synthesised by buildTransportChannelMessage so they
+                // still see something readable for the user message.
+                const transportMessage = buildTransportChannelMessage(transportSource, {
+                    supportsAttachments: client.supportsAttachments === true,
+                });
+                sendEncryptedOutput(client, JSON.stringify(transportMessage));
             }
         }
 
