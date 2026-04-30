@@ -232,9 +232,16 @@ function init(deps) {
                         };
                     }
                     lastWriteAt = now;
+                    // Resolve the target via the user's cursor position
+                    // rather than system focus. The Presence bubble owns
+                    // focus while the user is typing into it, so writing
+                    // through `write-focused` reliably fails. The Swift
+                    // helper now restores focus on the cursor-resolved
+                    // element before the write.
+                    const cursor = deps.screen.getCursorScreenPoint();
                     const helperArgs = replaceAll
-                        ? ['write-focused', '--replace-all', text]
-                        : ['write-focused', text];
+                        ? ['write-at', String(cursor.x), String(cursor.y), '--replace-all', text]
+                        : ['write-at', String(cursor.x), String(cursor.y), text];
                     const r = await runHelper(deps, helperArgs);
                     return { result: formatWrite(r), isError: !r.ok };
                 }

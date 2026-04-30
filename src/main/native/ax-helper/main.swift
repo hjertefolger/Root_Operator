@@ -210,6 +210,19 @@ func writeToElement(
         exit(0)
     }
 
+    // Best-effort focus restore: when the agent writes via cursor
+    // resolution, the user's last interaction was the Presence bubble,
+    // which steals focus from the target app. Setting kAXFocusedAttribute
+    // on the resolved element returns the caret without moving the
+    // hardware cursor or keyboard. Failure here is non-fatal — the
+    // subsequent value/selection write may still succeed for some apps,
+    // and where it doesn't, the user gets the existing structured error.
+    _ = AXUIElementSetAttributeValue(
+        element,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    )
+
     // Look at the selection first.
     let selectedText = axCopyString(element, kAXSelectedTextAttribute as String)
     let hasSelection = (selectedText != nil) && !(selectedText!.isEmpty)
