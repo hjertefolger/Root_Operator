@@ -310,6 +310,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_run_chain',
+      description: 'Execute an atomic native macOS action chain in one ax-helper process. Use this for cold-start computer-use flows where focus may not survive MCP round trips. Steps can launch apps, wait for app windows, press named AX controls, resolve target elements, focus, set or insert text, select ranges, invoke menus, read, and verify values. Captures cursor position before and after and fails honestly if the helper reports an error.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          cursor_tolerance: { type: 'number', description: 'Allowed cursor delta in screen points. Default 1.' },
+          steps: {
+            type: 'array',
+            description: 'Ordered native chain steps. Each step is an object with op plus op-specific fields.',
+            items: { type: 'object' },
+          },
+        },
+        required: ['steps'],
+      },
+    },
+    {
       name: 'agent_press_named',
       description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Same disambiguation as agent_find_element: pass `index` or `near_x`/`near_y` when the label matches multiple elements. Prefer to confirm with the user first for any destructive action.',
       inputSchema: {
@@ -597,6 +613,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_focus_at',
     'agent_press_named',
     'agent_press_at',
+    'agent_run_chain',
     'agent_click_at',
     'agent_drag',
     'agent_scroll_at',

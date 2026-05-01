@@ -1651,7 +1651,7 @@ func tryTextFocusPressFallback(_ element: AXUIElement, tx: inout FocusTransactio
     return pressStatus == .success
 }
 
-func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> Never {
+func focusElementPayload(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> [String: Any] {
     var tx = prepareFocusTransaction(target: element, window: knownWindow)
     var status = AXUIElementSetAttributeValue(
         element,
@@ -1697,7 +1697,21 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
             if let snapshot = verified.snapshot {
                 extras["fresh_focused"] = snapshot
             }
-            emitElementActionResult(ok: true, action: "focus", element: element, extras: extras)
+            var result: [String: Any] = [
+                "ok": true,
+                "action": "focus",
+                "role": roleString(element),
+            ]
+            if let label = displayLabel(element) {
+                result["label"] = label
+            }
+            if let frame = frameOf(element) {
+                result["frame"] = frame
+            }
+            for (k, v) in extras {
+                result[k] = v
+            }
+            return result
         }
         var result: [String: Any] = [
             "error": "focus_not_sticky",
@@ -1734,8 +1748,7 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
         if let diagnostics = freshFocusDiagnostics() {
             result["diagnostics"] = diagnostics
         }
-        emit(result)
-        exit(0)
+        return result
     }
     if status == .attributeUnsupported || status == .notImplemented {
         var result: [String: Any] = [
@@ -1744,8 +1757,7 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
             "detail": "target does not accept kAXFocusedAttribute",
         ]
         if let frame = frameOf(element) { result["frame"] = frame }
-        emit(result)
-        exit(0)
+        return result
     }
     var result: [String: Any] = [
         "error": "focus_failed",
@@ -1753,6 +1765,11 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
         "detail": "ax_status=\(status.rawValue)",
     ]
     if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> Never {
+    let result = focusElementPayload(element, window: knownWindow)
     emit(result)
     exit(0)
 }
@@ -2219,6 +2236,67 @@ func pointFramePayload(_ p: CGPoint, size: Double = 12) -> [String: Any] {
     ]
 }
 
+func currentCursorLocation() -> CGPoint? {
+    if let event = CGEvent(source: nil) {
+        return event.location
+    }
+    return nil
+}
+
+func pointPayload(_ p: CGPoint) -> [String: Any] {
+    return [
+        "x": Double(p.x),
+        "y": Double(p.y),
+    ]
+}
+
+func cursorRestorePayload(before: CGPoint?, tolerance: Double = 1.0) -> [String: Any] {
+    guard let before = before else {
+        return ["cursor_restored": false, "cursor_error": "cursor_unavailable"]
+    }
+    CGWarpMouseCursorPosition(before)
+    CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+    Thread.sleep(forTimeInterval: 0.01)
+    let after = currentCursorLocation() ?? before
+    let dx = Double(after.x - before.x)
+    let dy = Double(after.y - before.y)
+    let distance = (dx * dx + dy * dy).squareRoot()
+    return [
+        "cursor_before": pointPayload(before),
+        "cursor_after": pointPayload(after),
+        "cursor_delta": distance,
+        "cursor_restored": distance <= tolerance,
+    ]
+}
+
+func cursorInvariantPayload(before: CGPoint?, tolerance: Double = 1.0) -> [String: Any] {
+    guard let before = before else {
+        return ["cursor_unchanged": false, "cursor_error": "cursor_unavailable"]
+    }
+    let after = currentCursorLocation() ?? before
+    let dx = Double(after.x - before.x)
+    let dy = Double(after.y - before.y)
+    let distance = (dx * dx + dy * dy).squareRoot()
+    return [
+        "cursor_before": pointPayload(before),
+        "cursor_after": pointPayload(after),
+        "cursor_delta": distance,
+        "cursor_unchanged": distance <= tolerance,
+    ]
+}
+
+func cmdCursorPosition() -> Never {
+    guard let point = currentCursorLocation() else {
+        emitError("cursor_unavailable")
+    }
+    emit([
+        "ok": true,
+        "x": Double(point.x),
+        "y": Double(point.y),
+    ])
+    exit(0)
+}
+
 struct MouseButtonSpec {
     let name: String
     let button: CGMouseButton
@@ -2298,6 +2376,7 @@ func cmdClickAt(_ args: [String]) -> Never {
     guard let src = makeEventSource() else {
         emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
     }
+    let cursorBefore = currentCursorLocation()
     let clamped = clampRequired(rawPoint)
     postMouseMove(src, clamped.point)
     Thread.sleep(forTimeInterval: 0.025)
@@ -2307,7 +2386,7 @@ func cmdClickAt(_ args: [String]) -> Never {
         postMouse(src, button.up, clamped.point, button.button, clickState: Int64(click))
         if click < count { Thread.sleep(forTimeInterval: 0.08) }
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "action": "click",
         "button": button.name,
@@ -2316,7 +2395,11 @@ func cmdClickAt(_ args: [String]) -> Never {
         "y": Double(clamped.point.y),
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
-    ])
+    ]
+    for (k, v) in cursorRestorePayload(before: cursorBefore) {
+        result[k] = v
+    }
+    emit(result)
     exit(0)
 }
 
@@ -2339,19 +2422,24 @@ func cmdHoverAt(_ args: [String]) -> Never {
     guard let src = makeEventSource() else {
         emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
     }
+    let cursorBefore = currentCursorLocation()
     let clamped = clampRequired(rawPoint)
     postMouseMove(src, clamped.point)
     if durationMs > 0 {
         Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "action": "hover",
         "x": Double(clamped.point.x),
         "y": Double(clamped.point.y),
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
-    ])
+    ]
+    for (k, v) in cursorRestorePayload(before: cursorBefore) {
+        result[k] = v
+    }
+    emit(result)
     exit(0)
 }
 
@@ -2383,6 +2471,7 @@ func cmdDrag(_ args: [String]) -> Never {
     guard let src = makeEventSource() else {
         emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
     }
+    let cursorBefore = currentCursorLocation()
     let from = clampRequired(fromRaw)
     let to = clampRequired(toRaw)
     postMouseMove(src, from.point)
@@ -2398,7 +2487,7 @@ func cmdDrag(_ args: [String]) -> Never {
         Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0 / Double(steps))
     }
     postMouse(src, button.up, to.point, button.button)
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "action": "drag",
         "button": button.name,
@@ -2407,7 +2496,11 @@ func cmdDrag(_ args: [String]) -> Never {
         "to": ["x": Double(to.point.x), "y": Double(to.point.y)],
         "frame": pointFramePayload(to.point),
         "display": displayFramePayload(to.display),
-    ])
+    ]
+    for (k, v) in cursorRestorePayload(before: cursorBefore) {
+        result[k] = v
+    }
+    emit(result)
     exit(0)
 }
 
@@ -2431,6 +2524,7 @@ func cmdScrollAt(_ args: [String]) -> Never {
     guard let src = makeEventSource() else {
         emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
     }
+    let cursorBefore = currentCursorLocation()
     let clamped = clampRequired(rawPoint)
     postMouseMove(src, clamped.point)
     guard let event = CGEvent(
@@ -2445,7 +2539,7 @@ func cmdScrollAt(_ args: [String]) -> Never {
     }
     event.location = clamped.point
     event.post(tap: .cghidEventTap)
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "action": "scroll",
         "dx": dx,
@@ -2454,7 +2548,11 @@ func cmdScrollAt(_ args: [String]) -> Never {
         "y": Double(clamped.point.y),
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
-    ])
+    ]
+    for (k, v) in cursorRestorePayload(before: cursorBefore) {
+        result[k] = v
+    }
+    emit(result)
     exit(0)
 }
 
@@ -2984,11 +3082,765 @@ func cmdMenuCommand(_ args: [String]) -> Never {
     emitInternalError("menu-command: unreachable")
 }
 
+// MARK: - Single-process action chains
+
+final class ChainContext {
+    var targets: [String: AXUIElement] = [:]
+}
+
+func stringValue(_ value: Any?) -> String? {
+    if let s = value as? String { return s }
+    return nil
+}
+
+func boolValue(_ value: Any?, default fallback: Bool = false) -> Bool {
+    if let b = value as? Bool { return b }
+    if let n = value as? NSNumber { return n.boolValue }
+    if let s = value as? String {
+        let lower = s.lowercased()
+        if lower == "true" || lower == "1" || lower == "yes" { return true }
+        if lower == "false" || lower == "0" || lower == "no" { return false }
+    }
+    return fallback
+}
+
+func intValue(_ value: Any?) -> Int? {
+    if let i = value as? Int { return i }
+    if let n = value as? NSNumber { return n.intValue }
+    if let s = value as? String { return Int(s) }
+    return nil
+}
+
+func doubleValue(_ value: Any?) -> Double? {
+    if let d = value as? Double, d.isFinite { return d }
+    if let n = value as? NSNumber {
+        let d = n.doubleValue
+        return d.isFinite ? d : nil
+    }
+    if let s = value as? String, let d = Double(s), d.isFinite { return d }
+    return nil
+}
+
+func stringArrayValue(_ value: Any?) -> [String] {
+    guard let arr = value as? [Any] else { return [] }
+    return arr.compactMap { $0 as? String }.filter { !$0.isEmpty }
+}
+
+func normalizedRole(_ raw: String?) -> String? {
+    guard let raw = raw, !raw.isEmpty else { return nil }
+    return raw.lowercased().hasPrefix("ax") ? raw : "AX" + raw
+}
+
+func runningApplication(bundleID: String) -> NSRunningApplication? {
+    return NSWorkspace.shared.runningApplications.first {
+        ($0.bundleIdentifier ?? "") == bundleID && !$0.isTerminated
+    }
+}
+
+func applicationElement(bundleID: String) -> (app: NSRunningApplication, element: AXUIElement)? {
+    guard let app = runningApplication(bundleID: bundleID) else { return nil }
+    return (app, AXUIElementCreateApplication(app.processIdentifier))
+}
+
+func resolveWindowForApp(bundleID: String?) -> AXUIElement? {
+    let appElem: AXUIElement
+    if let bundleID = bundleID {
+        guard let pair = applicationElement(bundleID: bundleID) else { return nil }
+        appElem = pair.element
+    } else {
+        guard let (_, elem) = resolveActiveAppElement() else { return nil }
+        appElem = elem
+    }
+
+    if let focused = axCopyElement(appElem, kAXFocusedWindowAttribute as String) {
+        return focused
+    }
+    if let main = axCopyElement(appElem, kAXMainWindowAttribute as String) {
+        return main
+    }
+    let windows = axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String).array
+    return windows.first
+}
+
+func waitForAppWindow(bundleID: String, timeoutMs: Int) -> [String: Any] {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    repeat {
+        if let pair = applicationElement(bundleID: bundleID),
+           let window = resolveWindowForApp(bundleID: bundleID) {
+            var result: [String: Any] = [
+                "ok": true,
+                "bundle_id": bundleID,
+                "pid": Int(pair.app.processIdentifier),
+                "app": pair.app.localizedName ?? "",
+                "window": windowDiagnosticsPayload(window),
+            ]
+            if let frame = frameOf(window) { result["frame"] = frame }
+            return result
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return [
+        "error": "no_window",
+        "detail": "No AX window for \(bundleID) within \(timeoutMs)ms",
+    ]
+}
+
+func launchAppPayload(bundleID: String, activate: Bool, timeoutMs: Int) -> [String: Any] {
+    if let app = runningApplication(bundleID: bundleID) {
+        if activate {
+            if #available(macOS 14.0, *) {
+                _ = app.activate(options: [.activateAllWindows])
+            } else {
+                _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            }
+            _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: timeoutMs)
+        }
+        return [
+            "ok": true,
+            "bundle_id": bundleID,
+            "pid": Int(app.processIdentifier),
+            "app": app.localizedName ?? "",
+            "already_running": true,
+        ]
+    }
+
+    guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil else {
+        return ["error": "app_not_found", "detail": "No application for bundle id \(bundleID)"]
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    process.arguments = activate ? ["-b", bundleID] : ["-g", "-b", bundleID]
+    let stderr = Pipe()
+    process.standardError = stderr
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return ["error": "launch_failed", "detail": error.localizedDescription]
+    }
+    if process.terminationStatus != 0 {
+        let data = stderr.fileHandleForReading.readDataToEndOfFile()
+        let detail = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ["error": "launch_failed", "detail": detail]
+    }
+
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    var launched: NSRunningApplication?
+    repeat {
+        if let app = runningApplication(bundleID: bundleID) {
+            launched = app
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+
+    guard let app = launched else {
+        return ["error": "launch_timeout", "detail": "Opening \(bundleID) exceeded \(timeoutMs)ms"]
+    }
+    if activate {
+        _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: timeoutMs)
+    }
+    return [
+        "ok": true,
+        "bundle_id": bundleID,
+        "pid": Int(app.processIdentifier),
+        "app": app.localizedName ?? "",
+        "already_running": false,
+    ]
+}
+
+func stepElementArgs(_ step: [String: Any]) -> ElementArgs {
+    let nearX = doubleValue(step["near_x"])
+    let nearY = doubleValue(step["near_y"])
+    let near = nearX != nil && nearY != nil ? CGPoint(x: nearX!, y: nearY!) : nil
+    let skipRoles = Set(stringArrayValue(step["skip_roles"]).compactMap { normalizedRole($0) })
+    let preferRoles = Set(stringArrayValue(step["prefer_roles"]).compactMap { normalizedRole($0) })
+    return ElementArgs(
+        label: stringValue(step["label"]),
+        role: normalizedRole(stringValue(step["role"])),
+        index: intValue(step["index"]) ?? 0,
+        near: near,
+        skipRoles: skipRoles,
+        preferRoles: preferRoles
+    )
+}
+
+func resolveElementPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
+    guard let name = stringValue(step["as"]), !name.isEmpty else {
+        return ["error": "bad_step", "detail": "resolve requires non-empty 'as'"]
+    }
+    let parsed = stepElementArgs(step)
+    if (parsed.label == nil || parsed.label!.isEmpty) && (parsed.role == nil || parsed.role!.isEmpty) {
+        return ["error": "bad_step", "detail": "resolve requires label or role"]
+    }
+    let bundleID = stringValue(step["bundle_id"])
+    guard let window = resolveWindowForApp(bundleID: bundleID) else {
+        return ["error": "no_window", "detail": bundleID ?? "frontmost app"]
+    }
+    let visited = NodeCounter()
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    collectElementCandidates(
+        in: window,
+        role: parsed.role,
+        label: parsed.label,
+        depth: 0,
+        visited: visited,
+        preferRoles: parsed.preferRoles,
+        out: &matches
+    )
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        return [
+            "error": "not_found",
+            "searched": visited.count,
+            "match_count": matches.count,
+        ]
+    }
+    context.targets[name] = pick.elem
+    var result: [String: Any] = [
+        "ok": true,
+        "as": name,
+        "role": roleString(pick.elem),
+        "match_count": pick.total,
+        "match_index": pick.rank,
+    ]
+    if let label = displayLabel(pick.elem) { result["label"] = label }
+    if let frame = frameOf(pick.elem) { result["frame"] = frame }
+    return result
+}
+
+func targetElement(_ step: [String: Any], context: ChainContext) -> (name: String, element: AXUIElement)? {
+    let name = stringValue(step["target"]) ?? "target"
+    guard let element = context.targets[name] else { return nil }
+    return (name, element)
+}
+
+func pressNamedPayload(step: [String: Any]) -> [String: Any] {
+    guard let label = stringValue(step["label"]), !label.isEmpty else {
+        return ["error": "bad_step", "detail": "press_named requires label"]
+    }
+    let bundleID = stringValue(step["bundle_id"])
+    let role = normalizedRole(stringValue(step["role"]))
+    let nearX = doubleValue(step["near_x"])
+    let nearY = doubleValue(step["near_y"])
+    let near = nearX != nil && nearY != nil ? CGPoint(x: nearX!, y: nearY!) : nil
+    let index = intValue(step["index"]) ?? 0
+
+    var lastFailure: [String: Any] = ["error": "press_failed", "detail": "not attempted"]
+    for attempt in 0..<16 {
+        guard let window = resolveWindowForApp(bundleID: bundleID) else {
+            lastFailure = ["error": "no_window", "detail": bundleID ?? "frontmost app"]
+            Thread.sleep(forTimeInterval: 0.25)
+            continue
+        }
+        let visited = NodeCounter()
+        var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+        collectMatches(in: window, role: role, label: label, depth: 0, visited: visited, out: &matches)
+        guard let pick = resolveMatch(matches: matches, near: near, index: index) else {
+            lastFailure = [
+                "error": "not_found",
+                "searched": visited.count,
+                "match_count": matches.count,
+            ]
+            Thread.sleep(forTimeInterval: 0.25)
+            continue
+        }
+        let elemRole = roleString(pick.elem)
+        if !PRESS_ALLOWED_ROLES.contains(elemRole) {
+            return [
+                "error": "unsupported_role",
+                "role": elemRole,
+                "match_count": pick.total,
+                "match_index": pick.rank,
+                "detail": "AX press is restricted to button-like roles.",
+            ]
+        }
+        let status = AXUIElementPerformAction(pick.elem, kAXPressAction as CFString)
+        if status == .success {
+            var result: [String: Any] = [
+                "ok": true,
+                "action": "press",
+                "role": elemRole,
+                "match_count": pick.total,
+                "match_index": pick.rank,
+                "attempt": attempt + 1,
+            ]
+            if let foundLabel = displayLabel(pick.elem) { result["label"] = foundLabel }
+            if let frame = frameOf(pick.elem) { result["frame"] = frame }
+            return result
+        }
+        lastFailure = [
+            "error": "press_failed",
+            "role": elemRole,
+            "detail": "ax_status=\(status.rawValue)",
+            "attempt": attempt + 1,
+        ]
+        Thread.sleep(forTimeInterval: 0.25)
+    }
+    return lastFailure
+}
+
+func setValuePayload(element: AXUIElement, text: String) -> [String: Any] {
+    let role = roleString(element)
+    if WRITE_BLOCKED_ROLES.contains(role) {
+        return ["error": "blocked_role", "role": role]
+    }
+    if !WRITE_ALLOWED_ROLES.contains(role) {
+        return ["error": "unsupported_role", "role": role]
+    }
+    let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFTypeRef)
+    if status != .success {
+        return ["error": "value_write_failed", "role": role, "detail": "ax_status=\(status.rawValue)"]
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "set_value",
+        "role": role,
+        "length": (text as NSString).length,
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func selectRangePayload(element: AXUIElement, location: Int, length: Int) -> [String: Any] {
+    if location < 0 || length < 0 {
+        return ["error": "bad_range", "detail": "negative values not allowed"]
+    }
+    let total = axNumberOfCharacters(element) ?? 0
+    if location > total {
+        return ["error": "out_of_range", "detail": "location \(location) > length \(total)"]
+    }
+    let capped = min(length, total - location)
+    let status = setSelectedRange(element, location: location, length: capped)
+    if status != .success {
+        return ["error": "set_failed", "detail": "ax_status=\(status.rawValue)"]
+    }
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "select_range",
+        "location": location,
+        "length": capped,
+        "total_chars": total,
+        "role": roleString(element),
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func insertTextPayload(element: AXUIElement, text: String, location: Int?) -> [String: Any] {
+    if let loc = location {
+        let selected = selectRangePayload(element: element, location: loc, length: 0)
+        if selected["error"] != nil { return selected }
+    }
+    let status = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
+    if status != .success {
+        return ["error": "insert_failed", "role": roleString(element), "detail": "ax_status=\(status.rawValue)"]
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "insert_text",
+        "role": roleString(element),
+        "length": (text as NSString).length,
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func readTargetPayload(element: AXUIElement) -> [String: Any] {
+    let (value, selected) = readElementText(element)
+    var result: [String: Any] = [
+        "ok": true,
+        "role": roleString(element),
+        "value": value as Any? ?? NSNull(),
+        "selectedText": selected as Any? ?? NSNull(),
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func verifyValuePayload(element: AXUIElement, equals: String?, contains: String?) -> [String: Any] {
+    let value = axCopyString(element, kAXValueAttribute as String) ?? ""
+    if let expected = equals, value != expected {
+        return [
+            "error": "value_mismatch",
+            "detail": "value did not equal expected",
+            "expected": expected,
+            "actual": value,
+        ]
+    }
+    if let needle = contains, !value.contains(needle) {
+        return [
+            "error": "value_missing",
+            "detail": "value did not contain expected text",
+            "expected": needle,
+            "actual": value,
+        ]
+    }
+    return [
+        "ok": true,
+        "action": "verify_value",
+        "length": (value as NSString).length,
+        "value": value,
+    ]
+}
+
+func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activate: Bool = true) -> [String: Any] {
+    if args.isEmpty {
+        return ["error": "bad_step", "detail": "menu requires non-empty path"]
+    }
+
+    let app: NSRunningApplication
+    if let bundleID = bundleID {
+        guard let found = runningApplication(bundleID: bundleID) else {
+            return ["error": "app_not_running", "detail": bundleID]
+        }
+        app = found
+    } else {
+        guard let front = NSWorkspace.shared.frontmostApplication else {
+            return ["error": "no_app", "detail": "no frontmost application"]
+        }
+        app = front
+    }
+
+    if activate {
+        if #available(macOS 14.0, *) {
+            _ = app.activate(options: [.activateAllWindows])
+        } else {
+            _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        }
+        _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: 800)
+    }
+
+    let appElem = AXUIElementCreateApplication(app.processIdentifier)
+    var menuBar: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(appElem, kAXMenuBarAttribute as CFString, &menuBar)
+    guard status == .success, let bar = menuBar else {
+        return ["error": "no_menu_bar", "detail": "target app exposes no AXMenuBar"]
+    }
+
+    func childrenOf(_ element: AXUIElement) -> [AXUIElement] {
+        var raw: CFTypeRef?
+        let s = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw)
+        if s != .success { return [] }
+        return (raw as? [AXUIElement]) ?? []
+    }
+
+    func childrenAfterOpen(_ element: AXUIElement) -> [AXUIElement] {
+        for delayMs in [0, 30, 70, 130] {
+            if delayMs > 0 { Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0) }
+            let kids = childrenOf(element)
+            if !kids.isEmpty { return kids }
+        }
+        return []
+    }
+
+    func unwrapAXMenu(_ kids: [AXUIElement]) -> [AXUIElement] {
+        if kids.count == 1, roleString(kids[0]) == "AXMenu" {
+            return childrenOf(kids[0])
+        }
+        return kids
+    }
+
+    func openMenuNode(_ element: AXUIElement) -> Bool {
+        let actions = actionNames(element)
+        if actions.contains(kAXShowMenuAction as String),
+           AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success {
+            return true
+        }
+        return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+    }
+
+    func pickChild(_ kids: [AXUIElement], segment: String) -> (match: AXUIElement?, err: String?) {
+        let needle = segment.lowercased()
+        var exact: AXUIElement?
+        var prefixMatches: [AXUIElement] = []
+        for k in kids {
+            let title = (axCopyString(k, kAXTitleAttribute as String) ?? "").lowercased()
+            if title == needle {
+                exact = k
+                break
+            }
+            if title.hasPrefix(needle) {
+                prefixMatches.append(k)
+            }
+        }
+        if let e = exact { return (e, nil) }
+        if prefixMatches.count == 1 { return (prefixMatches[0], nil) }
+        if prefixMatches.count > 1 {
+            let titles = prefixMatches.compactMap { axCopyString($0, kAXTitleAttribute as String) }.joined(separator: ", ")
+            return (nil, "ambiguous segment '\(segment)' - multiple prefix matches: [\(titles)]")
+        }
+        return (nil, nil)
+    }
+
+    var kids = unwrapAXMenu(childrenOf(bar as! AXUIElement))
+    for (idx, segment) in args.enumerated() {
+        if kids.isEmpty {
+            return ["error": "menu_walk_failed", "detail": "no children at depth \(idx)"]
+        }
+        let pick = pickChild(kids, segment: segment)
+        if let err = pick.err {
+            return ["error": "ambiguous_menu_segment", "detail": err]
+        }
+        guard let next = pick.match else {
+            return ["error": "menu_segment_not_found", "detail": "no menu item matching '\(segment)' at depth \(idx)"]
+        }
+        if idx == args.count - 1 {
+            let press = AXUIElementPerformAction(next, kAXPressAction as CFString)
+            if press != .success {
+                return ["error": "press_failed", "detail": "ax_status=\(press.rawValue)"]
+            }
+            var result: [String: Any] = [
+                "ok": true,
+                "action": "menu",
+                "path": args,
+                "leaf": axCopyString(next, kAXTitleAttribute as String) ?? segment,
+                "role": roleString(next),
+                "bundle_id": app.bundleIdentifier ?? "",
+                "app": app.localizedName ?? "",
+            ]
+            if let frame = frameOf(next) { result["frame"] = frame }
+            return result
+        }
+        if !openMenuNode(next) {
+            return ["error": "menu_open_failed", "detail": "could not open '\(segment)'"]
+        }
+        kids = unwrapAXMenu(childrenAfterOpen(next))
+    }
+    return ["error": "internal", "detail": "unreachable menu walk"]
+}
+
+func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: Any] {
+    guard let op = stringValue(step["op"]), !op.isEmpty else {
+        return ["error": "bad_step", "detail": "step missing op"]
+    }
+
+    switch op {
+    case "launch_app":
+        guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
+            return ["error": "bad_step", "detail": "launch_app requires bundle_id"]
+        }
+        return launchAppPayload(
+            bundleID: bundleID,
+            activate: boolValue(step["activate"], default: true),
+            timeoutMs: intValue(step["timeout_ms"]) ?? 8000
+        )
+
+    case "wait_for_app_window":
+        guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
+            return ["error": "bad_step", "detail": "wait_for_app_window requires bundle_id"]
+        }
+        return waitForAppWindow(bundleID: bundleID, timeoutMs: intValue(step["timeout_ms"]) ?? 8000)
+
+    case "sleep":
+        let durationMs = max(0, min(10000, intValue(step["duration_ms"]) ?? 0))
+        if durationMs > 0 {
+            Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+        }
+        return ["ok": true, "duration_ms": durationMs]
+
+    case "press_named":
+        return pressNamedPayload(step: step)
+
+    case "resolve":
+        return resolveElementPayload(step: step, context: context)
+
+    case "focus":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        let result = focusElementPayload(target.element, window: resolveContainingWindow(target.element))
+        if result["error"] as? String == "focus_not_sticky",
+           boolValue(step["allow_unstable"], default: false),
+           let focused = resolveFocusedElement(),
+           focusMatches(target: target.element, focused: focused) {
+            var ok: [String: Any] = [
+                "ok": true,
+                "action": "focus",
+                "target": target.name,
+                "warning": "fresh_process_focus_unavailable",
+                "focus_result": result,
+                "role": roleString(target.element),
+            ]
+            if let frame = frameOf(target.element) { ok["frame"] = frame }
+            return ok
+        }
+        return result
+
+    case "set_value":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let text = stringValue(step["text"]) else {
+            return ["error": "bad_step", "detail": "set_value requires text"]
+        }
+        return setValuePayload(element: target.element, text: text)
+
+    case "insert_text":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let text = stringValue(step["text"]) else {
+            return ["error": "bad_step", "detail": "insert_text requires text"]
+        }
+        return insertTextPayload(element: target.element, text: text, location: intValue(step["location"]))
+
+    case "select_all":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        let total = axNumberOfCharacters(target.element) ?? 0
+        return selectRangePayload(element: target.element, location: 0, length: total)
+
+    case "select_range":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let location = intValue(step["location"]), let length = intValue(step["length"]) else {
+            return ["error": "bad_step", "detail": "select_range requires location and length"]
+        }
+        return selectRangePayload(element: target.element, location: location, length: length)
+
+    case "select_substring":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let needle = stringValue(step["needle"]), !needle.isEmpty else {
+            return ["error": "bad_step", "detail": "select_substring requires needle"]
+        }
+        let occurrence = intValue(step["occurrence"]) ?? 0
+        let value = axCopyString(target.element, kAXValueAttribute as String) ?? ""
+        let ns = value as NSString
+        var searchStart = 0
+        var found = NSNotFound
+        var hits = 0
+        while searchStart < ns.length {
+            let range = ns.range(of: needle, options: [], range: NSRange(location: searchStart, length: ns.length - searchStart))
+            if range.location == NSNotFound { break }
+            if hits == occurrence {
+                found = range.location
+                break
+            }
+            hits += 1
+            searchStart = range.location + max(1, range.length)
+        }
+        if found == NSNotFound {
+            return ["error": "not_found", "detail": "needle not found at occurrence \(occurrence)"]
+        }
+        return selectRangePayload(element: target.element, location: found, length: (needle as NSString).length)
+
+    case "menu":
+        let path = stringArrayValue(step["path"])
+        return performMenuCommandPayload(
+            path,
+            bundleID: stringValue(step["bundle_id"]),
+            activate: boolValue(step["activate"], default: true)
+        )
+
+    case "read":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        return readTargetPayload(element: target.element)
+
+    case "verify_value":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        return verifyValuePayload(
+            element: target.element,
+            equals: stringValue(step["equals"]),
+            contains: stringValue(step["contains"])
+        )
+
+    default:
+        return ["error": "unknown_chain_op", "detail": op]
+    }
+}
+
+func parseChainPayload(_ args: [String]) -> [String: Any] {
+    let raw: String
+    if args.count >= 2 && args[0] == "--file" {
+        do {
+            raw = try String(contentsOfFile: args[1], encoding: .utf8)
+        } catch {
+            emitInternalError("run-chain: failed reading file: \(error.localizedDescription)")
+        }
+    } else if !args.isEmpty {
+        raw = args.joined(separator: " ")
+    } else {
+        emitInternalError("run-chain requires JSON payload or --file <path>")
+    }
+    guard let data = raw.data(using: .utf8) else {
+        emitInternalError("run-chain: payload is not UTF-8")
+    }
+    do {
+        let obj = try JSONSerialization.jsonObject(with: data, options: [])
+        guard let dict = obj as? [String: Any] else {
+            emitInternalError("run-chain: payload must be a JSON object")
+        }
+        return dict
+    } catch {
+        emitInternalError("run-chain: bad JSON: \(error.localizedDescription)")
+    }
+}
+
+func cmdRunChain(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let payload = parseChainPayload(args)
+    guard let rawSteps = payload["steps"] as? [Any], !rawSteps.isEmpty else {
+        emitError("bad_chain", "payload requires non-empty steps array")
+    }
+    let steps = rawSteps.compactMap { $0 as? [String: Any] }
+    if steps.count != rawSteps.count {
+        emitError("bad_chain", "every step must be an object")
+    }
+
+    let context = ChainContext()
+    let cursorBefore = currentCursorLocation()
+    let tolerance = doubleValue(payload["cursor_tolerance"]) ?? 1.0
+    var results: [[String: Any]] = []
+
+    for (idx, step) in steps.enumerated() {
+        let op = stringValue(step["op"]) ?? "unknown"
+        var result = performChainStep(step, context: context)
+        result["index"] = idx
+        result["op"] = op
+        results.append(result)
+        if result["error"] != nil {
+            var out: [String: Any] = [
+                "ok": false,
+                "error": "chain_step_failed",
+                "failed_step": idx,
+                "failed_op": op,
+                "steps": results,
+            ]
+            for (k, v) in cursorInvariantPayload(before: cursorBefore, tolerance: tolerance) {
+                out[k] = v
+            }
+            emit(out)
+            exit(0)
+        }
+    }
+
+    var out: [String: Any] = [
+        "ok": true,
+        "steps": results,
+    ]
+    for (k, v) in cursorInvariantPayload(before: cursorBefore, tolerance: tolerance) {
+        out[k] = v
+    }
+    emit(out)
+    exit(0)
+}
+
 // MARK: — Entry point
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|run-chain|cursor-position|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -3021,6 +3873,8 @@ case "select-range":      cmdSelectRange(rest)
 case "select-all":        cmdSelectAll()
 case "select-substring":  cmdSelectSubstring(rest)
 case "menu-command":      cmdMenuCommand(rest)
+case "run-chain":         cmdRunChain(rest)
+case "cursor-position":   cmdCursorPosition()
 case "subscribe":         cmdSubscribe()
 default:                  emitInternalError("unknown command: \(cmd)")
 }

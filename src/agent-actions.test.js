@@ -499,6 +499,60 @@ test('agent_recent_events surfaces when events not wired', async () => {
     assert.match(r.result, /not wired/);
 });
 
+test('agent_run_chain sends JSON payload to helper and reports cursor invariant', async () => {
+    const argvPath = path.join(os.tmpdir(), `chain-argv-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+const payload = JSON.parse(argv[1]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({ ok: true, index, op: step.op, frame: index === payload.steps.length - 1 ? { x: 10, y: 20, w: 30, h: 40 } : undefined }))
+}));
+`);
+    const avatar = fakeAvatar();
+    const releaseCalls = [];
+    const handler = init(makeDeps(avatar.instance, {
+        helperPath,
+        releaseKeyboardFocus: (reason) => releaseCalls.push(reason),
+    }));
+    const r = await handler.handle({
+        tool: 'agent_run_chain',
+        args: {
+            cursor_tolerance: 1,
+            steps: [
+                { op: 'launch_app', bundle_id: 'com.apple.Notes' },
+                { op: 'read', target: 'editor' },
+            ],
+        },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Run chain completed 2 steps/);
+    assert.match(r.result, /Cursor unchanged/);
+    assert.deepEqual(releaseCalls, ['agent_run_chain']);
+    assert.equal(avatar.calls.moveTo.length, 1);
+    const argv = JSON.parse(fs.readFileSync(argvPath, 'utf8'));
+    assert.equal(argv[0], 'run-chain');
+    const payload = JSON.parse(argv[1]);
+    assert.equal(payload.cursor_tolerance, 1);
+    assert.equal(payload.steps[0].op, 'launch_app');
+});
+
+test('agent_run_chain validates step array before spawning helper', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        helperPath: null,
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_run_chain', args: { steps: [] } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty steps array/);
+});
+
 test('formatEventLine renders ts/event/app/role/value compactly', () => {
     const out = __test.formatEventLine({
         event: 'AXValueChanged',

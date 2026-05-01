@@ -41,6 +41,8 @@ const FOCUS_INTERVAL_MIN_MS = 250;
 // app key handlers, and behaves less like natural typing for long
 // payloads. Keep this short until chunked-typing semantics ship.
 const MAX_TYPE_TEXT_LENGTH = 2000;
+const MAX_CHAIN_STEPS = 80;
+const MAX_CHAIN_JSON_LENGTH = 120000;
 
 // User-activity guard window. Before posting a keystroke or typing
 // text we look at the AX subscribe ring buffer. If we see a recent
@@ -561,6 +563,26 @@ function formatKeyboardAction(result, verb) {
     return `${verb} returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
+function formatRunChain(result) {
+    if (result.error) {
+        const failed = result.failed_step !== undefined
+            ? ` at step ${result.failed_step}${result.failed_op ? ` (${result.failed_op})` : ''}`
+            : '';
+        const cursor = result.cursor_unchanged === false
+            ? ` Cursor moved by ${Math.round(Number(result.cursor_delta) || 0)} point(s).`
+            : '';
+        return `Run chain failed${failed}: ${result.error}${result.detail ? ` (${result.detail})` : ''}.${cursor}`;
+    }
+    if (result.ok) {
+        const count = Array.isArray(result.steps) ? result.steps.length : 0;
+        const cursor = result.cursor_unchanged === true
+            ? ` Cursor unchanged (delta=${Number(result.cursor_delta || 0).toFixed(2)}).`
+            : '';
+        return `Run chain completed ${count} step${count === 1 ? '' : 's'}.${cursor}`;
+    }
+    return `Run chain returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
 function formatEventLine(evt) {
     if (!evt || typeof evt !== 'object') return '';
     const tsIso = Number.isFinite(evt.ts)
@@ -949,6 +971,37 @@ function init(deps) {
                         since_ms: Number.isFinite(sinceMs) ? sinceMs : undefined,
                     });
                     return { result: formatEvents(list), isError: false };
+                }
+
+                case 'agent_run_chain': {
+                    const steps = Array.isArray(args.steps) ? args.steps : null;
+                    if (!steps || steps.length === 0) {
+                        return { result: 'agent_run_chain requires a non-empty steps array.', isError: true };
+                    }
+                    if (steps.length > MAX_CHAIN_STEPS) {
+                        return { result: `agent_run_chain refuses more than ${MAX_CHAIN_STEPS} steps.`, isError: true };
+                    }
+                    const payload = {
+                        cursor_tolerance: args.cursor_tolerance,
+                        steps,
+                    };
+                    const json = JSON.stringify(payload);
+                    if (json.length > MAX_CHAIN_JSON_LENGTH) {
+                        return {
+                            result: `agent_run_chain payload length ${json.length} exceeds ${MAX_CHAIN_JSON_LENGTH}.`,
+                            isError: true,
+                        };
+                    }
+                    releaseHostKeyboardFocus('agent_run_chain');
+                    const r = await runHelper(deps, ['run-chain', json]);
+                    if (r.ok) {
+                        bumpSelfActionAt();
+                        const lastWithFrame = Array.isArray(r.steps)
+                            ? [...r.steps].reverse().find((step) => step && step.frame)
+                            : null;
+                        if (lastWithFrame) showActionAt(avatar, lastWithFrame);
+                    }
+                    return { result: formatRunChain(r), isError: !r.ok };
                 }
 
                 case 'agent_press_named': {
@@ -1412,6 +1465,7 @@ module.exports = {
         formatPress,
         formatFocus,
         formatFocusDiagnostics,
+        formatRunChain,
         formatEventLine,
         formatEvents,
         runHelper,
