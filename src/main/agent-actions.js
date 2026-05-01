@@ -1004,6 +1004,40 @@ function init(deps) {
                     return { result: formatRunChain(r), isError: !r.ok };
                 }
 
+                case 'agent_act': {
+                    const steps = Array.isArray(args.steps) ? args.steps : null;
+                    if (!steps || steps.length === 0) {
+                        return { result: 'agent_act requires a non-empty steps array.', isError: true };
+                    }
+                    if (steps.length > MAX_CHAIN_STEPS) {
+                        return { result: `agent_act refuses more than ${MAX_CHAIN_STEPS} steps.`, isError: true };
+                    }
+                    const payload = {
+                        cursor_tolerance: args.cursor_tolerance,
+                        steps,
+                    };
+                    const json = JSON.stringify(payload);
+                    if (json.length > MAX_CHAIN_JSON_LENGTH) {
+                        return {
+                            result: `agent_act payload length ${json.length} exceeds ${MAX_CHAIN_JSON_LENGTH}.`,
+                            isError: true,
+                        };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused generic action');
+                    if (refused) return refused;
+                    releaseHostKeyboardFocus('agent_act');
+                    const r = await runHelper(deps, ['act', json]);
+                    if (r.ok) {
+                        bumpSelfActionAt();
+                        const lastWithFrame = Array.isArray(r.steps)
+                            ? [...r.steps].reverse().find((step) => step && step.frame)
+                            : null;
+                        if (lastWithFrame) showActionAt(avatar, lastWithFrame);
+                    }
+                    return { result: formatRunChain(r).replace(/^Run chain/, 'Generic action'), isError: !r.ok };
+                }
+
                 case 'agent_press_named': {
                     const label = String(args.label || '').trim();
                     if (!label) {

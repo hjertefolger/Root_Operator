@@ -553,6 +553,60 @@ test('agent_run_chain validates step array before spawning helper', async () => 
     assert.match(r.result, /non-empty steps array/);
 });
 
+test('agent_act sends generic steps through act helper command', async () => {
+    const argvPath = path.join(os.tmpdir(), `act-argv-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+const payload = JSON.parse(argv[1]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({ ok: true, index, op: step.op, frame: index === 1 ? { x: 10, y: 20, w: 30, h: 40 } : undefined }))
+}));
+`);
+    const avatar = fakeAvatar();
+    const releaseCalls = [];
+    const handler = init(makeDeps(avatar.instance, {
+        helperPath,
+        releaseKeyboardFocus: (reason) => releaseCalls.push(reason),
+    }));
+    const r = await handler.handle({
+        tool: 'agent_act',
+        args: {
+            cursor_tolerance: 1,
+            force: true,
+            steps: [
+                { op: 'resolve', as: 'delete_item', scope: 'system', role: 'AXMenuItem', label: 'Delete' },
+                { op: 'perform_action', target: 'delete_item', action: 'AXPress' },
+            ],
+        },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Generic action completed 2 steps/);
+    assert.deepEqual(releaseCalls, ['agent_act']);
+    assert.equal(avatar.calls.moveTo.length, 1);
+    const argv = JSON.parse(fs.readFileSync(argvPath, 'utf8'));
+    assert.equal(argv[0], 'act');
+    const payload = JSON.parse(argv[1]);
+    assert.equal(payload.steps[0].scope, 'system');
+    assert.equal(payload.steps[1].action, 'AXPress');
+});
+
+test('agent_act validates step array before spawning helper', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        helperPath: null,
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_act', args: { steps: [] } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty steps array/);
+});
+
 test('formatEventLine renders ts/event/app/role/value compactly', () => {
     const out = __test.formatEventLine({
         event: 'AXValueChanged',

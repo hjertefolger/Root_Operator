@@ -326,6 +326,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_act',
+      description: 'Execute an atomic generic macOS computer-use action list in one ax-helper process. Prefer this over adding new named tools. Generic steps include launch/wait_window, resolve by app/window/system scope, inspect, perform_action for any AX action exposed by the element (AXPress, AXShowMenu, AXIncrement, custom actions), set_attribute for settable AX attributes (AXValue, AXSelected, AXFocused, AXSelectedText), cursor-invariant HID fallback, read, and verify_present/verify_absent. Existing agent_run_chain steps are still accepted for compatibility.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          cursor_tolerance: { type: 'number', description: 'Allowed hardware cursor delta in screen points. Default 1.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+          steps: {
+            type: 'array',
+            description: 'Ordered generic native steps. Each step is an object with op plus op-specific fields.',
+            items: { type: 'object' },
+          },
+        },
+        required: ['steps'],
+      },
+    },
+    {
       name: 'agent_press_named',
       description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Same disambiguation as agent_find_element: pass `index` or `near_x`/`near_y` when the label matches multiple elements. Prefer to confirm with the user first for any destructive action.',
       inputSchema: {
@@ -614,6 +631,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_press_named',
     'agent_press_at',
     'agent_run_chain',
+    'agent_act',
     'agent_click_at',
     'agent_drag',
     'agent_scroll_at',

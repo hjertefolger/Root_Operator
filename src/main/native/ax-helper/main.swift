@@ -581,6 +581,48 @@ func actionNames(_ element: AXUIElement) -> Set<String> {
     return Set(names)
 }
 
+func attributeNames(_ element: AXUIElement) -> [String] {
+    var raw: CFArray?
+    guard AXUIElementCopyAttributeNames(element, &raw) == .success,
+          let names = raw as? [String] else { return [] }
+    return names
+}
+
+func settableAttributeNames(_ element: AXUIElement) -> [String] {
+    return attributeNames(element).filter { name in
+        var settable: DarwinBoolean = false
+        return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
+            && settable.boolValue
+    }.sorted()
+}
+
+func normalizeAXActionName(_ raw: String?) -> String? {
+    guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return nil
+    }
+    let lower = raw.lowercased()
+    switch lower {
+    case "press", "axpress", "kaxpressaction":
+        return kAXPressAction as String
+    case "show_menu", "showmenu", "axshowmenu", "kaxshowmenuaction", "context_menu", "contextmenu":
+        return kAXShowMenuAction as String
+    case "increment", "axincrement", "kaxincrementaction":
+        return kAXIncrementAction as String
+    case "decrement", "axdecrement", "kaxdecrementaction":
+        return kAXDecrementAction as String
+    case "confirm", "axconfirm", "kaxconfirmaction":
+        return "AXConfirm"
+    case "cancel", "axcancel", "kaxcancelaction":
+        return "AXCancel"
+    case "pick", "axpick", "kaxpickaction":
+        return "AXPick"
+    case "raise", "axraise", "kaxraiseaction":
+        return kAXRaiseAction as String
+    default:
+        return raw
+    }
+}
+
 func emitElementActionResult(
     ok: Bool,
     action: String,
@@ -822,9 +864,10 @@ func cmdWriteFocused(_ args: [String]) -> Never {
 // (Safari with many tabs, Slack with many threads) can fan out
 // into thousands of nodes; the LLM doesn't need that fidelity to
 // "see the room."
-let TREE_MAX_DEPTH = 8
-let TREE_MAX_NODES = 500
+let TREE_MAX_DEPTH = 12
+let TREE_MAX_NODES = 2000
 let TREE_VALUE_TRUNC = 200
+let TREE_MAX_CHILDREN_PER_ELEMENT: CFIndex = 250
 
 func resolveActiveAppElement() -> (pid: pid_t, element: AXUIElement)? {
     guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
@@ -851,6 +894,29 @@ func resolveFocusedWindow() -> AXUIElement? {
 }
 
 func axCopyChildren(_ element: AXUIElement) -> [AXUIElement] {
+    // Inspired by mediar-ai/MacosUseSDK's bounded/ranged child retrieval
+    // pattern (MIT). Full AXChildren reads can block on large containers.
+    var childCount: CFIndex = 0
+    let countStatus = AXUIElementGetAttributeValueCount(
+        element,
+        kAXChildrenAttribute as CFString,
+        &childCount
+    )
+    if countStatus == .success && childCount > 0 {
+        var raw: CFArray?
+        let fetchCount = min(TREE_MAX_CHILDREN_PER_ELEMENT, childCount)
+        let status = AXUIElementCopyAttributeValues(
+            element,
+            kAXChildrenAttribute as CFString,
+            0,
+            fetchCount,
+            &raw
+        )
+        if status == .success, let arr = raw as? [AXUIElement] {
+            return arr
+        }
+    }
+
     guard let raw = axCopyAttribute(element, kAXChildrenAttribute as String) else { return [] }
     if CFGetTypeID(raw) == CFArrayGetTypeID() {
         return (raw as! [AXUIElement])
@@ -1330,12 +1396,15 @@ func collectElementCandidates(
     label: String?,
     depth: Int,
     visited: NodeCounter,
+    skipRoles: Set<String>,
     preferRoles: Set<String>,
     out: inout [(elem: AXUIElement, score: Int, ordinal: Int)]
 ) {
     visited.count += 1
     if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return }
-    let roleOk = role == nil || role!.isEmpty || roleMatches(element, role!)
+    let currentRole = roleString(element)
+    let roleOk = !skipRoles.contains(currentRole)
+        && (role == nil || role!.isEmpty || roleMatches(element, role!))
     var score: Int? = nil
     if let label = label, !label.isEmpty {
         score = labelScore(element, label)
@@ -1352,6 +1421,7 @@ func collectElementCandidates(
             label: label,
             depth: depth + 1,
             visited: visited,
+            skipRoles: skipRoles,
             preferRoles: preferRoles,
             out: &out
         )
@@ -1788,6 +1858,7 @@ func cmdFocusElement(_ args: [String]) -> Never {
         label: parsed.label,
         depth: 0,
         visited: visited,
+        skipRoles: parsed.skipRoles,
         preferRoles: parsed.preferRoles,
         out: &matches
     )
@@ -1863,6 +1934,7 @@ func cmdReadSubtree(_ args: [String]) -> Never {
         label: parsed.label,
         depth: 0,
         visited: visited,
+        skipRoles: parsed.skipRoles,
         preferRoles: parsed.preferRoles,
         out: &matches
     )
@@ -2285,6 +2357,27 @@ func cursorInvariantPayload(before: CGPoint?, tolerance: Double = 1.0) -> [Strin
     ]
 }
 
+func hidResultWithCursorRestore(
+    _ result: [String: Any],
+    before: CGPoint?,
+    tolerance: Double = 1.0
+) -> [String: Any] {
+    let restore = cursorRestorePayload(before: before, tolerance: tolerance)
+    guard (restore["cursor_restored"] as? Bool) == true else {
+        var failed = restore
+        failed["error"] = "cursor_restore_failed"
+        failed["detail"] = restore["cursor_error"] as? String ?? "hardware cursor did not return within tolerance"
+        if let action = result["action"] { failed["action"] = action }
+        if let frame = result["frame"] { failed["frame"] = frame }
+        return failed
+    }
+    var out = result
+    for (k, v) in restore {
+        out[k] = v
+    }
+    return out
+}
+
 func cmdCursorPosition() -> Never {
     guard let point = currentCursorLocation() else {
         emitError("cursor_unavailable")
@@ -2386,7 +2479,7 @@ func cmdClickAt(_ args: [String]) -> Never {
         postMouse(src, button.up, clamped.point, button.button, clickState: Int64(click))
         if click < count { Thread.sleep(forTimeInterval: 0.08) }
     }
-    var result: [String: Any] = [
+    let result: [String: Any] = [
         "ok": true,
         "action": "click",
         "button": button.name,
@@ -2396,10 +2489,7 @@ func cmdClickAt(_ args: [String]) -> Never {
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
     ]
-    for (k, v) in cursorRestorePayload(before: cursorBefore) {
-        result[k] = v
-    }
-    emit(result)
+    emit(hidResultWithCursorRestore(result, before: cursorBefore))
     exit(0)
 }
 
@@ -2428,7 +2518,7 @@ func cmdHoverAt(_ args: [String]) -> Never {
     if durationMs > 0 {
         Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
     }
-    var result: [String: Any] = [
+    let result: [String: Any] = [
         "ok": true,
         "action": "hover",
         "x": Double(clamped.point.x),
@@ -2436,10 +2526,7 @@ func cmdHoverAt(_ args: [String]) -> Never {
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
     ]
-    for (k, v) in cursorRestorePayload(before: cursorBefore) {
-        result[k] = v
-    }
-    emit(result)
+    emit(hidResultWithCursorRestore(result, before: cursorBefore))
     exit(0)
 }
 
@@ -2487,7 +2574,7 @@ func cmdDrag(_ args: [String]) -> Never {
         Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0 / Double(steps))
     }
     postMouse(src, button.up, to.point, button.button)
-    var result: [String: Any] = [
+    let result: [String: Any] = [
         "ok": true,
         "action": "drag",
         "button": button.name,
@@ -2497,10 +2584,7 @@ func cmdDrag(_ args: [String]) -> Never {
         "frame": pointFramePayload(to.point),
         "display": displayFramePayload(to.display),
     ]
-    for (k, v) in cursorRestorePayload(before: cursorBefore) {
-        result[k] = v
-    }
-    emit(result)
+    emit(hidResultWithCursorRestore(result, before: cursorBefore))
     exit(0)
 }
 
@@ -2539,7 +2623,7 @@ func cmdScrollAt(_ args: [String]) -> Never {
     }
     event.location = clamped.point
     event.post(tap: .cghidEventTap)
-    var result: [String: Any] = [
+    let result: [String: Any] = [
         "ok": true,
         "action": "scroll",
         "dx": dx,
@@ -2549,10 +2633,7 @@ func cmdScrollAt(_ args: [String]) -> Never {
         "frame": pointFramePayload(clamped.point),
         "display": displayFramePayload(clamped.display),
     ]
-    for (k, v) in cursorRestorePayload(before: cursorBefore) {
-        result[k] = v
-    }
-    emit(result)
+    emit(hidResultWithCursorRestore(result, before: cursorBefore))
     exit(0)
 }
 
@@ -3086,6 +3167,7 @@ func cmdMenuCommand(_ args: [String]) -> Never {
 
 final class ChainContext {
     var targets: [String: AXUIElement] = [:]
+    var missingTargets: Set<String> = []
 }
 
 func stringValue(_ value: Any?) -> String? {
@@ -3270,42 +3352,34 @@ func resolveElementPayload(step: [String: Any], context: ChainContext) -> [Strin
     guard let name = stringValue(step["as"]), !name.isEmpty else {
         return ["error": "bad_step", "detail": "resolve requires non-empty 'as'"]
     }
-    let parsed = stepElementArgs(step)
-    if (parsed.label == nil || parsed.label!.isEmpty) && (parsed.role == nil || parsed.role!.isEmpty) {
-        return ["error": "bad_step", "detail": "resolve requires label or role"]
-    }
-    let bundleID = stringValue(step["bundle_id"])
-    guard let window = resolveWindowForApp(bundleID: bundleID) else {
-        return ["error": "no_window", "detail": bundleID ?? "frontmost app"]
-    }
-    let visited = NodeCounter()
-    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
-    collectElementCandidates(
-        in: window,
-        role: parsed.role,
-        label: parsed.label,
-        depth: 0,
-        visited: visited,
-        preferRoles: parsed.preferRoles,
-        out: &matches
-    )
-    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+    guard let resolved = resolveElementFromStep(step: step, context: context) else {
+        if boolValue(step["optional"], default: false) {
+            context.targets.removeValue(forKey: name)
+            context.missingTargets.insert(name)
+            return [
+                "ok": true,
+                "as": name,
+                "found": false,
+                "optional": true,
+            ]
+        }
         return [
             "error": "not_found",
-            "searched": visited.count,
-            "match_count": matches.count,
+            "searched": 0,
+            "match_count": 0,
         ]
     }
-    context.targets[name] = pick.elem
-    var result: [String: Any] = [
+    context.targets[name] = resolved.element
+    context.missingTargets.remove(name)
+    var result = elementPayload(resolved.element)
+    result.merge([
         "ok": true,
         "as": name,
-        "role": roleString(pick.elem),
-        "match_count": pick.total,
-        "match_index": pick.rank,
-    ]
-    if let label = displayLabel(pick.elem) { result["label"] = label }
-    if let frame = frameOf(pick.elem) { result["frame"] = frame }
+        "found": true,
+        "searched": resolved.searched,
+        "match_count": resolved.matchCount,
+        "match_index": resolved.matchIndex,
+    ]) { _, new in new }
     return result
 }
 
@@ -3313,6 +3387,250 @@ func targetElement(_ step: [String: Any], context: ChainContext) -> (name: Strin
     let name = stringValue(step["target"]) ?? "target"
     guard let element = context.targets[name] else { return nil }
     return (name, element)
+}
+
+func stepPoint(_ step: [String: Any]) -> CGPoint? {
+    if let point = step["point"] as? [String: Any],
+       let x = doubleValue(point["x"]),
+       let y = doubleValue(point["y"]) {
+        return CGPoint(x: x, y: y)
+    }
+    if let x = doubleValue(step["x"]),
+       let y = doubleValue(step["y"]) {
+        return CGPoint(x: x, y: y)
+    }
+    return nil
+}
+
+func appendUniqueElement(_ element: AXUIElement?, to out: inout [AXUIElement]) {
+    guard let element = element else { return }
+    if out.contains(where: { elementIdentityMatches($0, element) }) { return }
+    out.append(element)
+}
+
+func chainRootElements(step: [String: Any], context: ChainContext) -> [AXUIElement] {
+    var roots: [AXUIElement] = []
+    if let within = stringValue(step["within"]),
+       let target = context.targets[within] {
+        appendUniqueElement(target, to: &roots)
+        return roots
+    }
+
+    let scope = (stringValue(step["scope"]) ?? "window").lowercased()
+    let bundleID = stringValue(step["bundle_id"])
+
+    switch scope {
+    case "app", "application":
+        if let bundleID = bundleID {
+            appendUniqueElement(applicationElement(bundleID: bundleID)?.element, to: &roots)
+        } else if let (_, elem) = resolveActiveAppElement() {
+            appendUniqueElement(elem, to: &roots)
+        }
+    case "focused", "focus":
+        appendUniqueElement(resolveFocusedElement(), to: &roots)
+    case "system", "global", "menu", "menus":
+        appendUniqueElement(resolveFocusedElement(), to: &roots)
+        let system = AXUIElementCreateSystemWide()
+        appendUniqueElement(axCopyElement(system, kAXFocusedUIElementAttribute as String), to: &roots)
+        if let focusedApp = axCopyElement(system, kAXFocusedApplicationAttribute as String) {
+            appendUniqueElement(focusedApp, to: &roots)
+            if let pid = pidOf(focusedApp) {
+                let appElem = AXUIElementCreateApplication(pid)
+                appendUniqueElement(axCopyElement(appElem, kAXFocusedWindowAttribute as String), to: &roots)
+                appendUniqueElement(axCopyElement(appElem, kAXMainWindowAttribute as String), to: &roots)
+                appendUniqueElement(appElem, to: &roots)
+            }
+        }
+        if let bundleID = bundleID {
+            appendUniqueElement(applicationElement(bundleID: bundleID)?.element, to: &roots)
+        } else if let (_, elem) = resolveActiveAppElement() {
+            appendUniqueElement(elem, to: &roots)
+        }
+        appendUniqueElement(system, to: &roots)
+    case "target":
+        if let target = targetElement(step, context: context) {
+            appendUniqueElement(target.element, to: &roots)
+        }
+    case "window", "focused_window", "frontmost_window":
+        fallthrough
+    default:
+        appendUniqueElement(resolveWindowForApp(bundleID: bundleID), to: &roots)
+    }
+
+    return roots
+}
+
+func findSmallestElementContainingPoint(
+    in root: AXUIElement,
+    point: CGPoint,
+    skipRoles: Set<String>,
+    preferredRoles: Set<String>,
+    maxNodes: Int = TREE_MAX_NODES
+) -> AXUIElement? {
+    // Based on mediar-ai/MacosUseSDK's point tree-walk fallback (MIT):
+    // hit-test does not reliably pierce Catalyst/list rows, but frames in
+    // the AX tree still identify the smallest actionable containing node.
+    var queue: [AXUIElement] = [root]
+    var readIndex = 0
+    var visited = 0
+    var bestPreferred: (element: AXUIElement, area: Double)?
+    var bestAny: (element: AXUIElement, area: Double)?
+    while readIndex < queue.count && visited < maxNodes {
+        let current = queue[readIndex]
+        readIndex += 1
+        visited += 1
+        if let frame = frameOf(current),
+           let x = frame["x"] as? Double,
+           let y = frame["y"] as? Double,
+           let w = frame["w"] as? Double,
+           let h = frame["h"] as? Double,
+           CGRect(x: x, y: y, width: w, height: h).contains(point) {
+            let currentRole = roleString(current)
+            let area = max(0, w) * max(0, h)
+            if skipRoles.contains(currentRole) {
+                // Keep walking through skipped containers, but don't choose
+                // them as the hit target.
+            } else if preferredRoles.contains(currentRole) {
+                if bestPreferred == nil || area < bestPreferred!.area {
+                    bestPreferred = (current, area)
+                }
+            } else if bestAny == nil || area < bestAny!.area {
+                bestAny = (current, area)
+            }
+        }
+        queue.append(contentsOf: axCopyChildrenForWalk(current, preferRoles: preferredRoles))
+    }
+    return bestPreferred?.element ?? bestAny?.element
+}
+
+func resolveElementFromStep(
+    step: [String: Any],
+    context: ChainContext
+) -> (element: AXUIElement, searched: Int, matchCount: Int, matchIndex: Int)? {
+    let parsed = stepElementArgs(step)
+    if let point = stepPoint(step) {
+        let roots = chainRootElements(step: step, context: context)
+        for root in roots {
+            if let found = findSmallestElementContainingPoint(
+                in: root,
+                point: point,
+                skipRoles: parsed.skipRoles,
+                preferredRoles: parsed.preferRoles
+            ) {
+                return (found, 1, 1, 0)
+            }
+        }
+        if let bundleID = stringValue(step["bundle_id"]),
+           let pair = applicationElement(bundleID: bundleID) {
+            var hit: AXUIElement?
+            let status = AXUIElementCopyElementAtPosition(pair.element, Float(point.x), Float(point.y), &hit)
+            if status == .success, let hit = hit {
+                return (hit, 1, 1, 0)
+            }
+        } else if let hit = resolveElementAtPoint(Float(point.x), Float(point.y)) {
+            return (hit, 1, 1, 0)
+        }
+        return nil
+    }
+
+    if (parsed.label == nil || parsed.label!.isEmpty) && (parsed.role == nil || parsed.role!.isEmpty) {
+        return nil
+    }
+    let roots = chainRootElements(step: step, context: context)
+    let visited = NodeCounter()
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    for root in roots {
+        collectElementCandidates(
+            in: root,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: parsed.skipRoles,
+            preferRoles: parsed.preferRoles,
+            out: &matches
+        )
+    }
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        return nil
+    }
+    return (pick.elem, visited.count, pick.total, pick.rank)
+}
+
+func elementPayload(_ element: AXUIElement) -> [String: Any] {
+    var result: [String: Any] = [
+        "role": roleString(element),
+        "actions": actionNames(element).sorted(),
+        "settable_attributes": settableAttributeNames(element),
+    ]
+    if let label = displayLabel(element) { result["label"] = label }
+    if let frame = frameOf(element) { result["frame"] = frame }
+    if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
+        result["value"] = truncate(value, TREE_VALUE_TRUNC)
+    }
+    return result
+}
+
+func elementOrAncestorSupportingAction(_ element: AXUIElement, action: String, maxDepth: Int = 12) -> AXUIElement {
+    if actionNames(element).contains(action) { return element }
+    var current = element
+    for _ in 0..<maxDepth {
+        guard let parent = axCopyElement(current, kAXParentAttribute as String) else { break }
+        if actionNames(parent).contains(action) { return parent }
+        current = parent
+    }
+    return element
+}
+
+func elementOrAncestorSettable(_ element: AXUIElement, attribute: String, maxDepth: Int = 12) -> AXUIElement {
+    if settableAttributeNames(element).contains(attribute) { return element }
+    var current = element
+    for _ in 0..<maxDepth {
+        guard let parent = axCopyElement(current, kAXParentAttribute as String) else { break }
+        if settableAttributeNames(parent).contains(attribute) { return parent }
+        current = parent
+    }
+    return element
+}
+
+func centerPointOf(_ element: AXUIElement) -> CGPoint? {
+    guard let frame = frameOf(element),
+          let x = frame["x"] as? Double,
+          let y = frame["y"] as? Double,
+          let w = frame["w"] as? Double,
+          let h = frame["h"] as? Double else { return nil }
+    return CGPoint(x: x + w / 2.0, y: y + h / 2.0)
+}
+
+func hidClickPayload(point rawPoint: CGPoint, button: String, count: Int = 1) -> [String: Any] {
+    let mouseButton = parseMouseButton(button)
+    guard count >= 1 && count <= 3 else {
+        return ["error": "bad_count", "detail": "click count must be 1, 2, or 3"]
+    }
+    guard let src = makeEventSource() else {
+        return ["error": "event_source_private_failed", "detail": "CGEventSource(.privateState) returned nil"]
+    }
+    let cursorBefore = currentCursorLocation()
+    let clamped = clampRequired(rawPoint)
+    postMouseMove(src, clamped.point)
+    Thread.sleep(forTimeInterval: 0.025)
+    for click in 1...count {
+        postMouse(src, mouseButton.down, clamped.point, mouseButton.button, clickState: Int64(click))
+        Thread.sleep(forTimeInterval: 0.025)
+        postMouse(src, mouseButton.up, clamped.point, mouseButton.button, clickState: Int64(click))
+        if click < count { Thread.sleep(forTimeInterval: 0.08) }
+    }
+    let result: [String: Any] = [
+        "ok": true,
+        "action": "hid_click",
+        "button": mouseButton.name,
+        "count": count,
+        "x": Double(clamped.point.x),
+        "y": Double(clamped.point.y),
+        "frame": pointFramePayload(clamped.point),
+        "display": displayFramePayload(clamped.display),
+    ]
+    return hidResultWithCursorRestore(result, before: cursorBefore)
 }
 
 func pressNamedPayload(step: [String: Any]) -> [String: Any] {
@@ -3612,13 +3930,189 @@ func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activa
     return ["error": "internal", "detail": "unreachable menu walk"]
 }
 
+func performGenericActionPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
+    let targetName = stringValue(step["target"]) ?? "target"
+    if context.missingTargets.contains(targetName), boolValue(step["optional"], default: false) {
+        return ["ok": true, "action": "perform_action", "target": targetName, "skipped": true, "reason": "optional_target_missing"]
+    }
+    guard let target = targetElement(step, context: context) else {
+        if boolValue(step["optional"], default: false) {
+            return ["ok": true, "action": "perform_action", "target": targetName, "skipped": true, "reason": "optional_target_missing"]
+        }
+        return ["error": "unknown_target", "detail": targetName]
+    }
+    guard let action = normalizeAXActionName(stringValue(step["action"])) else {
+        return ["error": "bad_step", "detail": "perform_action requires action"]
+    }
+
+    let actionTarget = elementOrAncestorSupportingAction(target.element, action: action)
+    let available = actionNames(actionTarget)
+    let status = AXUIElementPerformAction(actionTarget, action as CFString)
+    if status == .success {
+        var result = elementPayload(actionTarget)
+        result.merge([
+            "ok": true,
+            "action": "perform_action",
+            "performed": action,
+            "target": target.name,
+        ]) { _, new in new }
+        return result
+    }
+
+    if action == (kAXShowMenuAction as String),
+       boolValue(step["fallback_right_click"], default: true),
+       let point = centerPointOf(actionTarget) ?? centerPointOf(target.element) {
+        var result = hidClickPayload(point: point, button: "right", count: 1)
+        if result["error"] == nil {
+            result["fallback"] = "right_click"
+            result["performed"] = action
+            result["target"] = target.name
+        }
+        return result
+    }
+
+    var result: [String: Any] = [
+        "error": "action_failed",
+        "target": target.name,
+        "requested_action": action,
+        "role": roleString(actionTarget),
+        "available_actions": available.sorted(),
+        "detail": "ax_status=\(status.rawValue)",
+    ]
+    if let frame = frameOf(actionTarget) { result["frame"] = frame }
+    return result
+}
+
+func normalizedAXAttributeName(_ raw: String?) -> String? {
+    guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return nil
+    }
+    let lower = raw.lowercased()
+    switch lower {
+    case "value", "axvalue", "kaxvalueattribute":
+        return kAXValueAttribute as String
+    case "selected", "axselected", "kaxselectedattribute":
+        return kAXSelectedAttribute as String
+    case "focused", "focus", "axfocused", "kaxfocusedattribute":
+        return kAXFocusedAttribute as String
+    case "selected_text", "selectedtext", "axselectedtext", "kaxselectedtextattribute":
+        return kAXSelectedTextAttribute as String
+    default:
+        return raw
+    }
+}
+
+func cfValueForAX(_ value: Any?) -> CFTypeRef? {
+    if value is NSNull { return nil }
+    if let s = value as? String { return s as CFString }
+    if let b = value as? Bool { return (b ? kCFBooleanTrue : kCFBooleanFalse) }
+    if let n = value as? NSNumber { return n }
+    if let i = value as? Int { return NSNumber(value: i) }
+    if let d = value as? Double { return NSNumber(value: d) }
+    return nil
+}
+
+func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [String: Any] {
+    let targetName = stringValue(step["target"]) ?? "target"
+    guard let target = targetElement(step, context: context) else {
+        return ["error": "unknown_target", "detail": targetName]
+    }
+    guard let attribute = normalizedAXAttributeName(stringValue(step["attribute"])) else {
+        return ["error": "bad_step", "detail": "set_attribute requires attribute"]
+    }
+
+    let attrTarget = elementOrAncestorSettable(target.element, attribute: attribute)
+    if attribute == kAXSelectedTextRangeAttribute as String {
+        guard let location = intValue(step["location"]),
+              let length = intValue(step["length"]) else {
+            return ["error": "bad_step", "detail": "AXSelectedTextRange requires location and length"]
+        }
+        return selectRangePayload(element: attrTarget, location: location, length: length)
+    }
+
+    let rawValue = step.keys.contains("value") ? step["value"] : step["text"]
+    guard let cfValue = cfValueForAX(rawValue) else {
+        return ["error": "bad_step", "detail": "set_attribute requires value"]
+    }
+    let status = AXUIElementSetAttributeValue(attrTarget, attribute as CFString, cfValue)
+    if status != .success {
+        var result: [String: Any] = [
+            "error": "set_attribute_failed",
+            "target": target.name,
+            "attribute": attribute,
+            "role": roleString(attrTarget),
+            "settable_attributes": settableAttributeNames(attrTarget),
+            "detail": "ax_status=\(status.rawValue)",
+        ]
+        if let frame = frameOf(attrTarget) { result["frame"] = frame }
+        return result
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+    var result = elementPayload(attrTarget)
+    result.merge([
+        "ok": true,
+        "action": "set_attribute",
+        "target": target.name,
+        "attribute": attribute,
+    ]) { _, new in new }
+    return result
+}
+
+func verifyPresencePayload(step: [String: Any], context: ChainContext, expectPresent: Bool) -> [String: Any] {
+    let found = resolveElementFromStep(step: step, context: context)
+    if expectPresent, let found = found {
+        var result = elementPayload(found.element)
+        result.merge([
+            "ok": true,
+            "action": "verify_present",
+            "found": true,
+        ]) { _, new in new }
+        return result
+    }
+    if expectPresent {
+        return ["error": "verify_present_failed", "detail": "target was not found"]
+    }
+    if found != nil {
+        return ["error": "verify_absent_failed", "detail": "target still exists"]
+    }
+    return ["ok": true, "action": "verify_absent", "found": false]
+}
+
+func hidStepPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
+    let kind = (stringValue(step["kind"]) ?? stringValue(step["action"]) ?? "click").lowercased()
+    let point: CGPoint?
+    if let p = stepPoint(step) {
+        point = p
+    } else if let target = targetElement(step, context: context) {
+        point = centerPointOf(target.element)
+    } else {
+        point = nil
+    }
+    guard let point = point else {
+        return ["error": "bad_step", "detail": "hid step requires x/y or target with frame"]
+    }
+    switch kind {
+    case "click", "right_click", "rightclick", "context_menu", "contextmenu":
+        let defaultButton = kind == "right_click" || kind == "rightclick" || kind == "context_menu" || kind == "contextmenu"
+            ? "right"
+            : "left"
+        return hidClickPayload(
+            point: point,
+            button: stringValue(step["button"]) ?? defaultButton,
+            count: intValue(step["count"]) ?? 1
+        )
+    default:
+        return ["error": "unsupported_hid_kind", "detail": kind]
+    }
+}
+
 func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: Any] {
     guard let op = stringValue(step["op"]), !op.isEmpty else {
         return ["error": "bad_step", "detail": "step missing op"]
     }
 
     switch op {
-    case "launch_app":
+    case "launch_app", "launch":
         guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
             return ["error": "bad_step", "detail": "launch_app requires bundle_id"]
         }
@@ -3628,7 +4122,7 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
             timeoutMs: intValue(step["timeout_ms"]) ?? 8000
         )
 
-    case "wait_for_app_window":
+    case "wait_for_app_window", "wait_window":
         guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
             return ["error": "bad_step", "detail": "wait_for_app_window requires bundle_id"]
         }
@@ -3646,6 +4140,25 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
 
     case "resolve":
         return resolveElementPayload(step: step, context: context)
+
+    case "inspect":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        var result = elementPayload(target.element)
+        result["ok"] = true
+        result["action"] = "inspect"
+        result["target"] = target.name
+        return result
+
+    case "perform_action", "action":
+        return performGenericActionPayload(step: step, context: context)
+
+    case "set_attribute":
+        return setGenericAttributePayload(step: step, context: context)
+
+    case "hid":
+        return hidStepPayload(step: step, context: context)
 
     case "focus":
         guard let target = targetElement(step, context: context) else {
@@ -3755,6 +4268,12 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
             contains: stringValue(step["contains"])
         )
 
+    case "verify_absent":
+        return verifyPresencePayload(step: step, context: context, expectPresent: false)
+
+    case "verify_present":
+        return verifyPresencePayload(step: step, context: context, expectPresent: true)
+
     default:
         return ["error": "unknown_chain_op", "detail": op]
     }
@@ -3840,7 +4359,7 @@ func cmdRunChain(_ args: [String]) -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|run-chain|cursor-position|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|run-chain|act|cursor-position|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -3874,6 +4393,7 @@ case "select-all":        cmdSelectAll()
 case "select-substring":  cmdSelectSubstring(rest)
 case "menu-command":      cmdMenuCommand(rest)
 case "run-chain":         cmdRunChain(rest)
+case "act":               cmdRunChain(rest)
 case "cursor-position":   cmdCursorPosition()
 case "subscribe":         cmdSubscribe()
 default:                  emitInternalError("unknown command: \(cmd)")
