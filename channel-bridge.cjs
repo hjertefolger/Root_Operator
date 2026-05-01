@@ -179,7 +179,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_move_to_cursor',
-      description: 'Move your agent body (the blue dot) to the user\'s cursor and dwell there. The dot travels smoothly from its current position. After arrival it stays put — it does NOT track the cursor. Call this when you want to be physically present in the user\'s area of interest. Pass optional offsets if you want to land a specific number of pixels away from the cursor (defaults: 30 right, 0 down).',
+      description: 'Travel your agent body (the blue dot) to the user\'s cursor and dwell there in ACTIVE mode (slightly larger, with a soft accent halo). By default the dot is already attached to the user\'s cursor in AMBIENT mode (small, spring-following) — call this when you want to visibly arrive in the user\'s area of interest, e.g. when transitioning into a focused task or after you\'ve been off in another app. Pass optional offsets if you want to land a specific number of pixels away from the cursor (defaults: 30 right, 0 down).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -202,7 +202,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_park',
-      description: 'Travel back to the parked anchor (Dock corner). Call this when you are done with the active conversation and want to step out of the user\'s active area.',
+      description: 'Return your agent body to the user\'s cursor and resume the AMBIENT spring-follow (small, attached to cursor). Call this when you finish a task — it signals "I\'m back beside you, idle." The cursor is home; there is no Dock anchor in this model.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -231,6 +231,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'agent_check_ax',
       description: 'Check whether the macOS Accessibility permission is granted for Root Operator. Returns {trusted: true|false}. Call this once at the start of any AX-using flow so you can give the user an actionable error if the permission is missing.',
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_read_window',
+      description: 'Read the structured AX tree of the active app\'s focused window. Returns role/label/frame/value for each node up to 8 levels deep, capped at 500 nodes. Use this when you need spatial + semantic awareness of the surrounding UI — to know what buttons, fields, panels, and rows exist in the room you\'re operating in. Does NOT move the cursor.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_find_element',
+      description: 'Find a UI element in the active app\'s focused window by label substring (case-insensitive) and optionally by role. Returns the element\'s role, label, and screen-space frame so you can know where it is. Useful before pressing or moving to it. Returns the first match.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Substring to match against the element\'s title, description, or value (case-insensitive).' },
+          role: { type: 'string', description: 'Optional AX role to constrain the search (e.g. "AXButton", "AXLink", "Button" — "AX" prefix optional).' },
+        },
+        required: ['label'],
+      },
+    },
+    {
+      name: 'agent_press_named',
+      description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Like agent_write_selection, prefer to confirm with the user first for any destructive action.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Substring to match against the element\'s title or description (case-insensitive).' },
+          role: { type: 'string', description: 'Optional AX role to constrain the search (e.g. "AXButton", "AXLink").' },
+        },
+        required: ['label'],
+      },
     },
     {
       name: '_ping',
@@ -306,6 +335,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_read_focused',
     'agent_write_selection',
     'agent_check_ax',
+    'agent_read_window',
+    'agent_find_element',
+    'agent_press_named',
   ];
   if (agentTools.includes(toolName)) {
     return handleAgentTool(toolName, request.params.arguments || {});

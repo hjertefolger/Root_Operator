@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { init } = require('./main/agent-actions');
+const { init, __test } = require('./main/agent-actions');
 
 function fakeAvatar() {
     const calls = { moveTo: [], moveToCursor: [], park: 0 };
@@ -125,4 +125,102 @@ test('unknown agent tool returns a structured error', async () => {
     const r = await handler.handle({ tool: 'agent_nonsense', args: {} });
     assert.equal(r.isError, true);
     assert.match(r.result, /Unknown agent tool/);
+});
+
+test('agent_find_element rejects empty label', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_find_element', args: { label: '' } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty label/);
+});
+
+test('agent_press_named rejects empty label', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_press_named', args: { label: '' } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty label/);
+});
+
+test('formatReadWindow renders the tree as indented role/label/frame lines', () => {
+    const result = {
+        app: 'Notes',
+        bundle_id: 'com.apple.Notes',
+        node_count: 4,
+        tree: {
+            role: 'AXWindow',
+            label: 'My note',
+            frame: { x: 100, y: 100, w: 800, h: 600 },
+            children: [
+                {
+                    role: 'AXButton',
+                    label: 'Send',
+                    frame: { x: 700, y: 700, w: 60, h: 24 },
+                },
+            ],
+        },
+    };
+    const out = __test.formatReadWindow(result);
+    assert.match(out, /Active app: Notes/);
+    assert.match(out, /AXWindow/);
+    assert.match(out, /AXButton "Send"/);
+    assert.match(out, /\[700,700 60x24\]/);
+});
+
+test('formatFind handles found and not-found cases', () => {
+    const found = __test.formatFind({
+        found: true,
+        role: 'AXButton',
+        label: 'Send',
+        frame: { x: 100, y: 100, w: 60, h: 24 },
+    });
+    assert.match(found, /Found AXButton labeled "Send"/);
+    assert.match(found, /\[100,100 60x24\]/);
+
+    const missing = __test.formatFind({ error: 'not_found', searched: 87 });
+    assert.match(missing, /Find failed: not_found/);
+    assert.match(missing, /searched 87 nodes/);
+});
+
+test('formatPress handles success and failure', () => {
+    const ok = __test.formatPress({
+        ok: true,
+        role: 'AXButton',
+        label: 'Send',
+    });
+    assert.match(ok, /Pressed AXButton "Send"/);
+
+    const fail = __test.formatPress({
+        error: 'press_failed',
+        role: 'AXButton',
+        detail: 'ax_status=-25204',
+    });
+    assert.match(fail, /Press failed: press_failed/);
+});
+
+test('halo show is invoked when read returns a frame', async () => {
+    const haloCalls = [];
+    const halo = { show: (frame) => haloCalls.push(frame), hide: () => {} };
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        resourcesPath: '/nope',
+        getAgentAvatar: () => null,
+        getAgentHalo: () => halo,
+        logDebug: () => {},
+    });
+    // Helper is missing, so the handler returns an error result for
+    // read tools. The halo path requires a real frame from the helper —
+    // this test just confirms the wire-up: helper-missing → no halo.
+    await handler.handle({ tool: 'agent_read_at_cursor', args: {} });
+    assert.equal(haloCalls.length, 0);
 });

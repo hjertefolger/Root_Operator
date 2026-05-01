@@ -135,6 +135,66 @@ function formatWrite(result) {
     return `Write returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
+function formatTree(node, depth, lines) {
+    if (depth > 8) return;
+    const indent = '  '.repeat(depth);
+    const parts = [node.role];
+    if (node.subrole) parts.push(`(${node.subrole})`);
+    if (node.label) parts.push(`"${node.label}"`);
+    if (node.value && (!node.label || node.value !== node.label)) {
+        parts.push(`= ${JSON.stringify(node.value).slice(0, 80)}`);
+    }
+    if (node.frame) {
+        parts.push(`[${Math.round(node.frame.x)},${Math.round(node.frame.y)} ${Math.round(node.frame.w)}x${Math.round(node.frame.h)}]`);
+    }
+    lines.push(`${indent}${parts.join(' ')}`);
+    if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+            formatTree(child, depth + 1, lines);
+        }
+    }
+    if (node.truncated) {
+        lines.push(`${indent}  …(truncated)`);
+    }
+}
+
+function formatReadWindow(result) {
+    if (result.error) {
+        return `Read window failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    const header = result.app
+        ? `Active app: ${result.app}${result.bundle_id ? ` (${result.bundle_id})` : ''} — ${result.node_count} nodes\n`
+        : `${result.node_count} nodes\n`;
+    const lines = [];
+    if (result.tree) formatTree(result.tree, 0, lines);
+    return header + lines.join('\n');
+}
+
+function formatFind(result) {
+    if (result.error) {
+        return `Find failed: ${result.error}${result.searched ? ` (searched ${result.searched} nodes)` : ''}`;
+    }
+    if (result.found) {
+        const label = result.label ? ` labeled "${result.label}"` : '';
+        const where = result.frame
+            ? ` at [${Math.round(result.frame.x)},${Math.round(result.frame.y)} ${Math.round(result.frame.w)}x${Math.round(result.frame.h)}]`
+            : '';
+        return `Found ${result.role}${label}${where}`;
+    }
+    return `Find returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
+function formatPress(result) {
+    if (result.error) {
+        return `Press failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    if (result.ok) {
+        const label = result.label ? ` "${result.label}"` : '';
+        return `Pressed ${result.role}${label}.`;
+    }
+    return `Press returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
 function init(deps) {
     if (!deps || !deps.getAgentAvatar || !deps.screen) {
         throw new Error('agent-actions.init requires getAgentAvatar, screen');
@@ -267,6 +327,41 @@ function init(deps) {
                     return { result: formatWrite(r), isError: !r.ok };
                 }
 
+                case 'agent_read_window': {
+                    const r = await runHelper(deps, ['read-window']);
+                    return { result: formatReadWindow(r), isError: !!r.error };
+                }
+
+                case 'agent_find_element': {
+                    const label = String(args.label || '').trim();
+                    if (!label) {
+                        return { result: 'agent_find_element requires a non-empty label.', isError: true };
+                    }
+                    const helperArgs = ['find-element'];
+                    if (args.role) {
+                        helperArgs.push('--role', String(args.role));
+                    }
+                    helperArgs.push(label);
+                    const r = await runHelper(deps, helperArgs);
+                    if (r.found) maybeHalo(r);
+                    return { result: formatFind(r), isError: !!r.error };
+                }
+
+                case 'agent_press_named': {
+                    const label = String(args.label || '').trim();
+                    if (!label) {
+                        return { result: 'agent_press_named requires a non-empty label.', isError: true };
+                    }
+                    const helperArgs = ['press-named'];
+                    if (args.role) {
+                        helperArgs.push('--role', String(args.role));
+                    }
+                    helperArgs.push(label);
+                    const r = await runHelper(deps, helperArgs);
+                    if (r.ok) maybeHalo(r);
+                    return { result: formatPress(r), isError: !r.ok };
+                }
+
                 default:
                     return { result: `Unknown agent tool: ${tool}`, isError: true };
             }
@@ -281,5 +376,13 @@ function init(deps) {
 module.exports = {
     init,
     // Exposed for tests.
-    __test: { resolveHelperPath, formatRead, formatWrite, runHelper },
+    __test: {
+        resolveHelperPath,
+        formatRead,
+        formatWrite,
+        formatReadWindow,
+        formatFind,
+        formatPress,
+        runHelper,
+    },
 };

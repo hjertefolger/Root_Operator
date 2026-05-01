@@ -320,6 +320,262 @@ func cmdWriteFocused(_ args: [String]) -> Never {
     writeToElement(element, text, allowFullValue: allowFull)
 }
 
+// MARK: — Window tree (Layer 1)
+
+// Hard caps to keep payloads bounded. AX trees in a heavy app
+// (Safari with many tabs, Slack with many threads) can fan out
+// into thousands of nodes; the LLM doesn't need that fidelity to
+// "see the room."
+let TREE_MAX_DEPTH = 8
+let TREE_MAX_NODES = 500
+let TREE_VALUE_TRUNC = 200
+
+func resolveActiveAppElement() -> (pid: pid_t, element: AXUIElement)? {
+    guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
+    let pid = frontApp.processIdentifier
+    let appElem = AXUIElementCreateApplication(pid)
+    return (pid, appElem)
+}
+
+func resolveFocusedWindow() -> AXUIElement? {
+    guard let (_, appElem) = resolveActiveAppElement() else { return nil }
+    if let raw = axCopyAttribute(appElem, kAXFocusedWindowAttribute as String) {
+        if CFGetTypeID(raw) == AXUIElementGetTypeID() {
+            return (raw as! AXUIElement)
+        }
+    }
+    // Fallback: first window in kAXWindowsAttribute.
+    if let raw = axCopyAttribute(appElem, kAXWindowsAttribute as String) {
+        if CFGetTypeID(raw) == CFArrayGetTypeID() {
+            let arr = raw as! [AXUIElement]
+            if let first = arr.first { return first }
+        }
+    }
+    return nil
+}
+
+func axCopyChildren(_ element: AXUIElement) -> [AXUIElement] {
+    guard let raw = axCopyAttribute(element, kAXChildrenAttribute as String) else { return [] }
+    if CFGetTypeID(raw) == CFArrayGetTypeID() {
+        return (raw as! [AXUIElement])
+    }
+    return []
+}
+
+func truncate(_ s: String, _ n: Int) -> String {
+    if s.count <= n { return s }
+    let end = s.index(s.startIndex, offsetBy: n)
+    return String(s[..<end]) + "…"
+}
+
+func nodeSummary(_ element: AXUIElement) -> [String: Any] {
+    var node: [String: Any] = ["role": roleString(element)]
+    if let subrole = axCopyString(element, kAXSubroleAttribute as String) {
+        node["subrole"] = subrole
+    }
+    if let title = axCopyString(element, kAXTitleAttribute as String), !title.isEmpty {
+        node["label"] = truncate(title, TREE_VALUE_TRUNC)
+    } else if let desc = axCopyString(element, kAXDescriptionAttribute as String), !desc.isEmpty {
+        node["label"] = truncate(desc, TREE_VALUE_TRUNC)
+    }
+    if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
+        node["value"] = truncate(value, TREE_VALUE_TRUNC)
+    }
+    if let frame = frameOf(element) {
+        node["frame"] = frame
+    }
+    return node
+}
+
+// Counter passed by reference so depth-first walk can stop globally
+// at TREE_MAX_NODES. (Swift inout in a closure isn't ergonomic; box
+// it instead.)
+final class NodeCounter { var count = 0 }
+
+func walkTree(_ element: AXUIElement, depth: Int, counter: NodeCounter) -> [String: Any] {
+    var node = nodeSummary(element)
+    counter.count += 1
+    if depth >= TREE_MAX_DEPTH || counter.count >= TREE_MAX_NODES {
+        return node
+    }
+    let children = axCopyChildren(element)
+    if !children.isEmpty {
+        var kids: [[String: Any]] = []
+        for child in children {
+            if counter.count >= TREE_MAX_NODES {
+                node["truncated"] = true
+                break
+            }
+            kids.append(walkTree(child, depth: depth + 1, counter: counter))
+        }
+        if !kids.isEmpty {
+            node["children"] = kids
+        }
+    }
+    return node
+}
+
+func cmdReadWindow() -> Never {
+    guard let window = resolveFocusedWindow() else {
+        emitError("no_window")
+    }
+    let counter = NodeCounter()
+    let tree = walkTree(window, depth: 0, counter: counter)
+    var result: [String: Any] = [
+        "tree": tree,
+        "node_count": counter.count,
+        "max_depth": TREE_MAX_DEPTH,
+        "max_nodes": TREE_MAX_NODES,
+    ]
+    if let frontApp = NSWorkspace.shared.frontmostApplication {
+        result["app"] = frontApp.localizedName ?? ""
+        result["bundle_id"] = frontApp.bundleIdentifier ?? ""
+    }
+    emit(result)
+    exit(0)
+}
+
+// MARK: — Find / press by role + label (Layer 2)
+
+func roleMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
+    let role = roleString(element)
+    if role.caseInsensitiveCompare(wanted) == .orderedSame { return true }
+    // Allow "Button" → "AXButton" shorthand.
+    let withPrefix = "AX" + wanted
+    return role.caseInsensitiveCompare(withPrefix) == .orderedSame
+}
+
+func labelMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
+    let needle = wanted.lowercased()
+    if let title = axCopyString(element, kAXTitleAttribute as String) {
+        if title.lowercased().contains(needle) { return true }
+    }
+    if let desc = axCopyString(element, kAXDescriptionAttribute as String) {
+        if desc.lowercased().contains(needle) { return true }
+    }
+    if let value = axCopyString(element, kAXValueAttribute as String) {
+        if value.lowercased().contains(needle) { return true }
+    }
+    return false
+}
+
+// Depth-first search for the first element matching role + label.
+// Returns nil if not found within search caps.
+func findElement(
+    in element: AXUIElement,
+    role: String?,
+    label: String,
+    depth: Int,
+    visited: NodeCounter
+) -> AXUIElement? {
+    visited.count += 1
+    if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return nil }
+    let roleOk = role == nil || role!.isEmpty || roleMatches(element, role!)
+    if roleOk && labelMatches(element, label) {
+        return element
+    }
+    for child in axCopyChildren(element) {
+        if let m = findElement(in: child, role: role, label: label, depth: depth + 1, visited: visited) {
+            return m
+        }
+    }
+    return nil
+}
+
+func cmdFindElement(_ args: [String]) -> Never {
+    guard !args.isEmpty else {
+        emitInternalError("find-element requires <label> [--role <role>]")
+    }
+    var label = ""
+    var role: String? = nil
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--role", i + 1 < args.count {
+            role = args[i + 1]
+            i += 2
+        } else {
+            label = label.isEmpty ? a : label + " " + a
+            i += 1
+        }
+    }
+    if label.isEmpty {
+        emitInternalError("find-element requires a label substring")
+    }
+    guard let window = resolveFocusedWindow() else {
+        emitError("no_window")
+    }
+    let visited = NodeCounter()
+    guard let elem = findElement(in: window, role: role, label: label, depth: 0, visited: visited) else {
+        emit(["error": "not_found", "searched": visited.count])
+        exit(0)
+    }
+    var result: [String: Any] = [
+        "found": true,
+        "role": roleString(elem),
+    ]
+    if let title = axCopyString(elem, kAXTitleAttribute as String) {
+        result["label"] = title
+    }
+    if let frame = frameOf(elem) {
+        result["frame"] = frame
+    }
+    emit(result)
+    exit(0)
+}
+
+func cmdPressNamed(_ args: [String]) -> Never {
+    guard !args.isEmpty else {
+        emitInternalError("press-named requires <label> [--role <role>]")
+    }
+    var label = ""
+    var role: String? = nil
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--role", i + 1 < args.count {
+            role = args[i + 1]
+            i += 2
+        } else {
+            label = label.isEmpty ? a : label + " " + a
+            i += 1
+        }
+    }
+    if label.isEmpty {
+        emitInternalError("press-named requires a label substring")
+    }
+    guard let window = resolveFocusedWindow() else {
+        emitError("no_window")
+    }
+    let visited = NodeCounter()
+    guard let elem = findElement(in: window, role: role, label: label, depth: 0, visited: visited) else {
+        emit(["error": "not_found", "searched": visited.count])
+        exit(0)
+    }
+    let status = AXUIElementPerformAction(elem, kAXPressAction as CFString)
+    if status == .success {
+        var ok: [String: Any] = [
+            "ok": true,
+            "action": "press",
+            "role": roleString(elem),
+        ]
+        if let title = axCopyString(elem, kAXTitleAttribute as String) {
+            ok["label"] = title
+        }
+        if let frame = frameOf(elem) {
+            ok["frame"] = frame
+        }
+        emit(ok)
+        exit(0)
+    }
+    emit([
+        "error": "press_failed",
+        "role": roleString(elem),
+        "detail": "ax_status=\(status.rawValue)",
+    ])
+    exit(0)
+}
+
 // MARK: — Permission check
 
 func cmdCheck() -> Never {
@@ -332,7 +588,7 @@ func cmdCheck() -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|check> [args]")
 }
 
 let cmd = argv[1]
@@ -344,5 +600,8 @@ case "read-at":         cmdReadAt(rest)
 case "read-focused":    cmdReadFocused()
 case "write-at":        cmdWriteAt(rest)
 case "write-focused":   cmdWriteFocused(rest)
+case "read-window":     cmdReadWindow()
+case "find-element":    cmdFindElement(rest)
+case "press-named":     cmdPressNamed(rest)
 default:                emitInternalError("unknown command: \(cmd)")
 }
