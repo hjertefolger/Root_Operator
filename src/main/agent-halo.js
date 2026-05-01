@@ -33,6 +33,10 @@ function init(deps) {
 
     let win = null;
     let autoHideTimer = null;
+    // The renderer may not be ready when the first show() lands. Stage
+    // the most-recent payload and replay on did-finish-load.
+    let pendingShow = null;
+    let rendererReady = false;
 
     function logDebug(message) {
         if (typeof deps.logDebug === 'function') {
@@ -91,6 +95,17 @@ function init(deps) {
         w.once('ready-to-show', () => {
             if (isUsable(w)) w.showInactive();
         });
+        try {
+            w.webContents.on('did-finish-load', () => {
+                rendererReady = true;
+                if (pendingShow && isUsable(w)) {
+                    try {
+                        w.webContents.send('AGENT_HALO_SHOW', pendingShow);
+                    } catch (_) { /* ignore */ }
+                    pendingShow = null;
+                }
+            });
+        } catch (_) { /* ignore */ }
         win = w;
         return w;
     }
@@ -113,9 +128,14 @@ function init(deps) {
 
         try {
             w.setBounds({ x, y, width, height });
-            try {
-                w.webContents.send('AGENT_HALO_SHOW', { width, height });
-            } catch (_) { /* renderer not ready; show on next ready-to-show */ }
+            const payload = { width, height };
+            if (rendererReady) {
+                try {
+                    w.webContents.send('AGENT_HALO_SHOW', payload);
+                } catch (_) { /* ignore */ }
+            } else {
+                pendingShow = payload;
+            }
             if (!w.isVisible()) {
                 w.showInactive();
             }
@@ -145,6 +165,8 @@ function init(deps) {
             try { win.close(); } catch (_) { /* ignore */ }
         }
         win = null;
+        rendererReady = false;
+        pendingShow = null;
     }
 
     return {

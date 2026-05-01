@@ -123,11 +123,35 @@ function init(deps) {
         });
     }
 
+    // Clamp a logical screen-space center so the WIN_WIDTH/HEIGHT canvas
+    // stays inside the display the cursor is on. Without this, an offset
+    // applied near a screen edge can park the dot off-screen entirely.
+    function clampToDisplay(x, y) {
+        let display;
+        try {
+            display = typeof deps.screen.getDisplayNearestPoint === 'function'
+                ? deps.screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) })
+                : deps.screen.getPrimaryDisplay();
+        } catch (_) {
+            display = deps.screen.getPrimaryDisplay();
+        }
+        const wa = display && display.workArea ? display.workArea : null;
+        if (!wa) return { x, y };
+        const minX = wa.x + WIN_WIDTH / 2;
+        const maxX = wa.x + wa.width - WIN_WIDTH / 2;
+        const minY = wa.y + WIN_HEIGHT / 2;
+        const maxY = wa.y + wa.height - WIN_HEIGHT / 2;
+        return {
+            x: Math.max(minX, Math.min(maxX, x)),
+            y: Math.max(minY, Math.min(maxY, y)),
+        };
+    }
+
     function computeCursorTarget(offsetX, offsetY) {
         const cursor = deps.screen.getCursorScreenPoint();
         const ox = Number.isFinite(offsetX) ? offsetX : DEFAULT_CURSOR_OFFSET_X;
         const oy = Number.isFinite(offsetY) ? offsetY : DEFAULT_CURSOR_OFFSET_Y;
-        return { x: cursor.x + ox, y: cursor.y + oy };
+        return clampToDisplay(cursor.x + ox, cursor.y + oy);
     }
 
     function broadcastState() {
