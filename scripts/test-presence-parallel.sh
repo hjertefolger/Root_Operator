@@ -41,17 +41,14 @@ if (o.trusted !== true) {
 }
 NODE
 
-osascript -e 'tell application "Notes" to quit' >/dev/null 2>&1 || true
-sleep 1.2
-
-"$HELPER" diagnostics > "$OUT_DIR/01-after-quit-diagnostics.json"
-node - "$OUT_DIR/01-after-quit-diagnostics.json" <<'NODE'
+"$HELPER" run-chain '{"steps":[{"op":"launch_app","bundle":"com.apple.Notes","activate":true,"timeout_ms":20000},{"op":"wait_for_app_window","app":"Notes","timeout_ms":20000}]}' \
+  > "$OUT_DIR/01-warm-notes.json"
+node - "$OUT_DIR/01-warm-notes.json" <<'NODE'
 const fs = require('fs');
-const diag = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const notes = (diag.running_applications || []).find((app) => app.bundle_id === 'com.apple.Notes');
-if (notes && Array.isArray(notes.windows) && notes.windows.length > 0) {
-  console.error('Notes still has AX windows after quit.');
-  console.error(JSON.stringify(notes.windows, null, 2));
+const o = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (o.ok !== true) {
+  console.error('Bridge launch/wait for Notes failed.');
+  console.error(JSON.stringify(o, null, 2));
   process.exit(1);
 }
 NODE

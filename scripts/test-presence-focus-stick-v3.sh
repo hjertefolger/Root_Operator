@@ -24,10 +24,20 @@ if (o.trusted !== true) {
 }
 ' "$OUT_DIR/00-check.json"
 
-osascript -e 'tell application "Notes" to activate'
+"$HELPER" run-chain '{"steps":[{"op":"launch_app","bundle":"com.apple.Notes","activate":true,"timeout_ms":20000},{"op":"wait_for_app_window","app":"Notes","timeout_ms":20000}]}' \
+  | tee "$OUT_DIR/01-launch-notes.json" >/dev/null
+node -e '
+const fs = require("fs");
+const o = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+if (o.ok !== true) {
+  console.error("Bridge launch/wait for Notes failed.");
+  console.error(JSON.stringify(o, null, 2));
+  process.exit(1);
+}
+' "$OUT_DIR/01-launch-notes.json"
 sleep 0.8
 
-"$HELPER" diagnostics | tee "$OUT_DIR/01-before-diagnostics.json" >/dev/null
+"$HELPER" diagnostics | tee "$OUT_DIR/02-before-diagnostics.json" >/dev/null
 
 "$HELPER" read-subtree \
   --role AXTextArea \
@@ -36,7 +46,7 @@ sleep 0.8
   --skip-role AXOutline \
   --skip-role AXTable \
   --skip-role AXList \
-  | tee "$OUT_DIR/02-read-subtree.json"
+  | tee "$OUT_DIR/03-read-subtree.json"
 
 node -e '
 const fs = require("fs");
@@ -46,13 +56,13 @@ if (o.error || !o.tree || o.tree.role !== "AXTextArea") {
   console.error(JSON.stringify(o, null, 2));
   process.exit(1);
 }
-' "$OUT_DIR/02-read-subtree.json"
+' "$OUT_DIR/03-read-subtree.json"
 
 "$HELPER" focus-element \
   --role AXTextArea \
   --prefer-role AXTextArea \
   --prefer-role AXScrollArea \
-  | tee "$OUT_DIR/03-focus-element.json"
+  | tee "$OUT_DIR/04-focus-element.json"
 
 node -e '
 const fs = require("fs");
@@ -75,9 +85,9 @@ if (o.role !== "AXTextArea") {
   console.error(JSON.stringify(o, null, 2));
   process.exit(1);
 }
-' "$OUT_DIR/03-focus-element.json"
+' "$OUT_DIR/04-focus-element.json"
 
-"$HELPER" read-focused | tee "$OUT_DIR/04-read-focused.json"
+"$HELPER" read-focused | tee "$OUT_DIR/05-read-focused.json"
 node -e '
 const fs = require("fs");
 const o = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -86,9 +96,9 @@ if (o.error || o.role !== "AXTextArea") {
   console.error(JSON.stringify(o, null, 2));
   process.exit(1);
 }
-' "$OUT_DIR/04-read-focused.json"
+' "$OUT_DIR/05-read-focused.json"
 
-"$HELPER" select-all | tee "$OUT_DIR/05-select-all.json"
+"$HELPER" select-all | tee "$OUT_DIR/06-select-all.json"
 node -e '
 const fs = require("fs");
 const o = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -97,8 +107,8 @@ if (o.ok !== true || o.role !== "AXTextArea") {
   console.error(JSON.stringify(o, null, 2));
   process.exit(1);
 }
-' "$OUT_DIR/05-select-all.json"
+' "$OUT_DIR/06-select-all.json"
 
-"$HELPER" diagnostics | tee "$OUT_DIR/06-after-diagnostics.json" >/dev/null
+"$HELPER" diagnostics | tee "$OUT_DIR/07-after-diagnostics.json" >/dev/null
 
 echo "PASS: Notes AXTextArea focus stuck, read-focused returned it, and select-all succeeded."
