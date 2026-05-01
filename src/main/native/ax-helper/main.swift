@@ -508,57 +508,155 @@ func roleMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
     return role.caseInsensitiveCompare(withPrefix) == .orderedSame
 }
 
-func labelMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
-    let needle = wanted.lowercased()
-    if let title = axCopyString(element, kAXTitleAttribute as String) {
-        if title.lowercased().contains(needle) { return true }
-    }
-    if let desc = axCopyString(element, kAXDescriptionAttribute as String) {
-        if desc.lowercased().contains(needle) { return true }
-    }
-    if let help = axCopyString(element, kAXHelpAttribute as String) {
-        if help.lowercased().contains(needle) { return true }
-    }
-    if let value = axCopyString(element, kAXValueAttribute as String) {
-        if value.lowercased().contains(needle) { return true }
-    }
-    return false
+// Score a single attribute against the needle. Higher = stronger match.
+// Returns nil if the haystack doesn't contain the needle.
+func attrScore(_ haystack: String?, _ needle: String, exact: Int, prefix: Int, substr: Int) -> Int? {
+    guard let raw = haystack else { return nil }
+    let h = raw.lowercased()
+    if h.isEmpty { return nil }
+    if h == needle { return exact }
+    if h.hasPrefix(needle) { return prefix }
+    if h.contains(needle) { return substr }
+    return nil
 }
 
-// Depth-first search for the first element matching role + label.
-// Returns nil if not found within search caps.
-func findElement(
+// Score how well `wanted` matches this element's labels. Title is
+// strongly preferred over description / help so e.g. "More" matches the
+// real "More" button rather than Media's help text "More media options."
+// Value is a weak signal — many text-bearing roles will substring-hit
+// the needle as content rather than identity.
+//
+// Score bands (highest first):
+//   1000 / 800 / 600   title  (exact / prefix / substr)
+//    300 / 250 / 200   description
+//    150 / 120 / 100   help
+//     50 /  40 /  30   value
+// Returns nil if no field contains the needle.
+func labelScore(_ element: AXUIElement, _ wanted: String) -> Int? {
+    let needle = wanted.lowercased()
+    if needle.isEmpty { return nil }
+    var best: Int? = nil
+    func consider(_ s: Int?) {
+        guard let s = s else { return }
+        if best == nil || s > best! { best = s }
+    }
+    consider(attrScore(axCopyString(element, kAXTitleAttribute as String), needle,
+                       exact: 1000, prefix: 800, substr: 600))
+    consider(attrScore(axCopyString(element, kAXDescriptionAttribute as String), needle,
+                       exact: 300, prefix: 250, substr: 200))
+    consider(attrScore(axCopyString(element, kAXHelpAttribute as String), needle,
+                       exact: 150, prefix: 120, substr: 100))
+    consider(attrScore(axCopyString(element, kAXValueAttribute as String), needle,
+                       exact: 50, prefix: 40, substr: 30))
+    return best
+}
+
+// Walk the tree once and collect every (element, score, ordinal) match.
+// `ordinal` is the traversal order (0, 1, 2 …) used as a deterministic
+// tie-breaker since Swift's `sort` is not guaranteed stable. Bounded by
+// TREE_MAX_DEPTH / TREE_MAX_NODES same as the read-window walker.
+func collectMatches(
     in element: AXUIElement,
     role: String?,
     label: String,
     depth: Int,
-    visited: NodeCounter
-) -> AXUIElement? {
+    visited: NodeCounter,
+    out: inout [(elem: AXUIElement, score: Int, ordinal: Int)]
+) {
     visited.count += 1
-    if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return nil }
+    if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return }
     let roleOk = role == nil || role!.isEmpty || roleMatches(element, role!)
-    if roleOk && labelMatches(element, label) {
-        return element
+    if roleOk, let s = labelScore(element, label) {
+        out.append((element, s, out.count))
     }
     for child in axCopyChildrenForWalk(element) {
-        if let m = findElement(in: child, role: role, label: label, depth: depth + 1, visited: visited) {
-            return m
-        }
+        collectMatches(in: child, role: role, label: label, depth: depth + 1, visited: visited, out: &out)
     }
-    return nil
 }
 
-func cmdFindElement(_ args: [String]) -> Never {
-    guard !args.isEmpty else {
-        emitInternalError("find-element requires <label> [--role <role>]")
+// Distance from frame center to a given screen point. Used as the
+// primary sort when --near is supplied. Elements without a frame sort
+// last via Double.infinity.
+func frameDistance(_ element: AXUIElement, _ point: CGPoint) -> Double {
+    guard let f = frameOf(element),
+          let fx = f["x"] as? Double,
+          let fy = f["y"] as? Double,
+          let fw = f["w"] as? Double,
+          let fh = f["h"] as? Double else { return .infinity }
+    let cx = fx + fw / 2.0
+    let cy = fy + fh / 2.0
+    let dx = cx - Double(point.x)
+    let dy = cy - Double(point.y)
+    return (dx * dx + dy * dy).squareRoot()
+}
+
+// Resolve the desired match from the collected list given optional
+// disambiguation hints. Sort order:
+//   - if `near` is supplied: by distance ascending, score descending
+//     as tiebreaker — "the X closest to (px,py), best lexical match
+//     among ties wins."
+//   - otherwise: by score descending — "the best lexical match."
+// `index` then picks the Nth entry (0-based) from the sorted list.
+func resolveMatch(
+    matches: [(elem: AXUIElement, score: Int, ordinal: Int)],
+    near: CGPoint?,
+    index: Int
+) -> (elem: AXUIElement, rank: Int, total: Int)? {
+    if matches.isEmpty { return nil }
+    var sorted = matches
+    if let p = near {
+        sorted.sort { a, b in
+            let aDist = frameDistance(a.elem, p)
+            let bDist = frameDistance(b.elem, p)
+            if aDist != bDist { return aDist < bDist }
+            if a.score != b.score { return a.score > b.score }
+            return a.ordinal < b.ordinal
+        }
+    } else {
+        sorted.sort { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.ordinal < b.ordinal
+        }
     }
+    if index < 0 || index >= sorted.count { return nil }
+    return (sorted[index].elem, index, sorted.count)
+}
+
+// Parse the shared find/press argv: [<label tokens...>] with optional
+// `--role <r>`, `--index <n>`, `--near <x,y>`. Label tokens are joined
+// with spaces. Returns nil-or-error if any flag is malformed.
+struct FindArgs {
+    var label: String
+    var role: String?
+    var index: Int
+    var near: CGPoint?
+}
+
+func parseFindArgs(_ args: [String], cmd: String) -> FindArgs {
     var label = ""
     var role: String? = nil
+    var index: Int = 0
+    var near: CGPoint? = nil
     var i = 0
     while i < args.count {
         let a = args[i]
         if a == "--role", i + 1 < args.count {
             role = args[i + 1]
+            i += 2
+        } else if a == "--index", i + 1 < args.count {
+            guard let n = Int(args[i + 1]) else {
+                emitInternalError("\(cmd): --index requires an integer")
+            }
+            index = n
+            i += 2
+        } else if a == "--near", i + 1 < args.count {
+            let parts = args[i + 1].split(separator: ",")
+            guard parts.count == 2,
+                  let x = Double(parts[0]),
+                  let y = Double(parts[1]) else {
+                emitInternalError("\(cmd): --near requires <x,y>")
+            }
+            near = CGPoint(x: x, y: y)
             i += 2
         } else {
             label = label.isEmpty ? a : label + " " + a
@@ -566,31 +664,56 @@ func cmdFindElement(_ args: [String]) -> Never {
         }
     }
     if label.isEmpty {
-        emitInternalError("find-element requires a label substring")
+        emitInternalError("\(cmd) requires a label substring")
     }
+    return FindArgs(label: label, role: role, index: index, near: near)
+}
+
+// Pick a "label" for response payloads using the same priority used by
+// labelScore: title > description > help. Returns nil if every field
+// is empty.
+func displayLabel(_ element: AXUIElement) -> String? {
+    if let title = axCopyString(element, kAXTitleAttribute as String), !title.isEmpty {
+        return title
+    }
+    if let desc = axCopyString(element, kAXDescriptionAttribute as String), !desc.isEmpty {
+        return desc
+    }
+    if let help = axCopyString(element, kAXHelpAttribute as String), !help.isEmpty {
+        return help
+    }
+    return nil
+}
+
+func cmdFindElement(_ args: [String]) -> Never {
+    guard !args.isEmpty else {
+        emitInternalError("find-element requires <label> [--role <role>] [--index <n>] [--near <x,y>]")
+    }
+    let parsed = parseFindArgs(args, cmd: "find-element")
     guard let window = resolveFocusedWindow() else {
         emitError("no_window")
     }
     let visited = NodeCounter()
-    guard let elem = findElement(in: window, role: role, label: label, depth: 0, visited: visited) else {
-        emit(["error": "not_found", "searched": visited.count])
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    collectMatches(in: window, role: parsed.role, label: parsed.label, depth: 0, visited: visited, out: &matches)
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        emit([
+            "error": "not_found",
+            "searched": visited.count,
+            "match_count": matches.count,
+        ])
         exit(0)
     }
     var result: [String: Any] = [
         "found": true,
-        "role": roleString(elem),
+        "role": roleString(pick.elem),
+        "match_count": pick.total,
+        "match_index": pick.rank,
     ]
-    // Toolbar buttons usually have an empty title and carry their human
-    // label on AXDescription (or AXHelp for tooltip). Prefer title when
-    // present, fall back so the user sees what we matched.
-    if let title = axCopyString(elem, kAXTitleAttribute as String), !title.isEmpty {
-        result["label"] = title
-    } else if let desc = axCopyString(elem, kAXDescriptionAttribute as String), !desc.isEmpty {
-        result["label"] = desc
-    } else if let help = axCopyString(elem, kAXHelpAttribute as String), !help.isEmpty {
-        result["label"] = help
+    if let label = displayLabel(pick.elem) {
+        result["label"] = label
     }
-    if let frame = frameOf(elem) {
+    if let frame = frameOf(pick.elem) {
         result["frame"] = frame
     }
     emit(result)
@@ -599,56 +722,47 @@ func cmdFindElement(_ args: [String]) -> Never {
 
 func cmdPressNamed(_ args: [String]) -> Never {
     guard !args.isEmpty else {
-        emitInternalError("press-named requires <label> [--role <role>]")
+        emitInternalError("press-named requires <label> [--role <role>] [--index <n>] [--near <x,y>]")
     }
-    var label = ""
-    var role: String? = nil
-    var i = 0
-    while i < args.count {
-        let a = args[i]
-        if a == "--role", i + 1 < args.count {
-            role = args[i + 1]
-            i += 2
-        } else {
-            label = label.isEmpty ? a : label + " " + a
-            i += 1
-        }
-    }
-    if label.isEmpty {
-        emitInternalError("press-named requires a label substring")
-    }
+    let parsed = parseFindArgs(args, cmd: "press-named")
     guard let window = resolveFocusedWindow() else {
         emitError("no_window")
     }
     let visited = NodeCounter()
-    guard let elem = findElement(in: window, role: role, label: label, depth: 0, visited: visited) else {
-        emit(["error": "not_found", "searched": visited.count])
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    collectMatches(in: window, role: parsed.role, label: parsed.label, depth: 0, visited: visited, out: &matches)
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        emit([
+            "error": "not_found",
+            "searched": visited.count,
+            "match_count": matches.count,
+        ])
         exit(0)
     }
-    let elemRole = roleString(elem)
+    let elemRole = roleString(pick.elem)
     if !PRESS_ALLOWED_ROLES.contains(elemRole) {
         emit([
             "error": "unsupported_role",
             "role": elemRole,
+            "match_count": pick.total,
+            "match_index": pick.rank,
             "detail": "AX press is restricted to button-like roles. Found a non-pressable role; refuse.",
         ])
         exit(0)
     }
-    let status = AXUIElementPerformAction(elem, kAXPressAction as CFString)
+    let status = AXUIElementPerformAction(pick.elem, kAXPressAction as CFString)
     if status == .success {
         var ok: [String: Any] = [
             "ok": true,
             "action": "press",
-            "role": roleString(elem),
+            "role": elemRole,
+            "match_count": pick.total,
+            "match_index": pick.rank,
         ]
-        if let title = axCopyString(elem, kAXTitleAttribute as String), !title.isEmpty {
-            ok["label"] = title
-        } else if let desc = axCopyString(elem, kAXDescriptionAttribute as String), !desc.isEmpty {
-            ok["label"] = desc
-        } else if let help = axCopyString(elem, kAXHelpAttribute as String), !help.isEmpty {
-            ok["label"] = help
+        if let label = displayLabel(pick.elem) {
+            ok["label"] = label
         }
-        if let frame = frameOf(elem) {
+        if let frame = frameOf(pick.elem) {
             ok["frame"] = frame
         }
         emit(ok)
@@ -656,7 +770,9 @@ func cmdPressNamed(_ args: [String]) -> Never {
     }
     emit([
         "error": "press_failed",
-        "role": roleString(elem),
+        "role": elemRole,
+        "match_count": pick.total,
+        "match_index": pick.rank,
         "detail": "ax_status=\(status.rawValue)",
     ])
     exit(0)

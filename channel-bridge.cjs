@@ -239,12 +239,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_find_element',
-      description: 'Find a UI element in the active app\'s focused window by label substring (case-insensitive) and optionally by role. Returns the element\'s role, label, and screen-space frame so you can know where it is. Useful before pressing or moving to it. Returns the first match.',
+      description: 'Find a UI element in the active app\'s focused window by label substring (case-insensitive) and optionally by role. Returns the element\'s role, label, screen-space frame, total match count and selected match index. By default returns the best lexical match (title > description > help > value). When labels collide ("More" matching multiple toolbar items), use `index` to pick the Nth-best match (0-based) or `near` to bias toward proximity to a screen point.',
       inputSchema: {
         type: 'object',
         properties: {
-          label: { type: 'string', description: 'Substring to match against the element\'s title, description, or value (case-insensitive).' },
+          label: { type: 'string', description: 'Substring to match against the element\'s title, description, help, or value (case-insensitive).' },
           role: { type: 'string', description: 'Optional AX role to constrain the search (e.g. "AXButton", "AXLink", "Button" — "AX" prefix optional).' },
+          index: { type: 'number', description: 'Optional 0-based index into the sorted match list. 0 = best match (default). Use to disambiguate when several elements match.' },
+          near_x: { type: 'number', description: 'Optional screen-x; when paired with near_y, sorts matches by distance ascending (closest first). Useful for "the More button at x≈1010".' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
         },
         required: ['label'],
       },
@@ -262,12 +265,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_press_named',
-      description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Like agent_write_selection, prefer to confirm with the user first for any destructive action.',
+      description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Same disambiguation as agent_find_element: pass `index` or `near_x`/`near_y` when the label matches multiple elements. Prefer to confirm with the user first for any destructive action.',
       inputSchema: {
         type: 'object',
         properties: {
-          label: { type: 'string', description: 'Substring to match against the element\'s title or description (case-insensitive).' },
+          label: { type: 'string', description: 'Substring to match against the element\'s title, description, or help (case-insensitive).' },
           role: { type: 'string', description: 'Optional AX role to constrain the search (e.g. "AXButton", "AXLink").' },
+          index: { type: 'number', description: 'Optional 0-based index into the sorted match list. 0 = best match (default).' },
+          near_x: { type: 'number', description: 'Optional screen-x; when paired with near_y, sorts matches by distance to (near_x, near_y) ascending.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
         },
         required: ['label'],
       },

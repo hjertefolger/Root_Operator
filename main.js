@@ -854,6 +854,24 @@ app.whenReady().then(async () => {
             app,
             loadRendererWindow,
             logDebug,
+            // When cursor-companion's two-dot loader is showing, the
+            // ambient avatar yields the cursor slot so they don't
+            // visually compete. cursorCompanion may be undefined if
+            // the user disabled it — guard accordingly.
+            isCursorCompanionLoading: () => {
+                // Only treat the loader as "active" when cursor-companion
+                // actually has a visible window. Without this guard the
+                // ambient avatar would hide on background channelActive
+                // updates even when the companion is disabled and there
+                // is no two-dot loader on screen to yield to.
+                try {
+                    if (!cursorCompanion || typeof cursorCompanion.isLoading !== 'function') return false;
+                    if (typeof cursorCompanion.getWindow !== 'function' || !cursorCompanion.getWindow()) return false;
+                    return Boolean(cursorCompanion.isLoading());
+                } catch (_) {
+                    return false;
+                }
+            },
         });
         agentAvatar.start();
     } catch (err) {

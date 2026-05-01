@@ -249,6 +249,10 @@ function getApi() {
         adoptAnnotation,
         getWindow: () => (isUsable(win) ? win : null),
         isPending: () => pending !== null,
+        // Whether the two-dot loader layer is currently visible. The
+        // agent-avatar reads this so the ambient dot can yield the slot
+        // when a turn is in flight.
+        isLoading,
         getMode,
     };
 }

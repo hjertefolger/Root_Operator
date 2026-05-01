@@ -207,6 +207,74 @@ test('formatPress handles success and failure', () => {
     assert.match(fail, /Press failed: press_failed/);
 });
 
+test('buildDisambiguationArgs accepts valid index and near pair', () => {
+    const ok = __test.buildDisambiguationArgs({ index: 2, near_x: 100, near_y: 200 }, 'find');
+    assert.equal(ok.error, undefined);
+    assert.deepEqual(ok.args, ['--index', '2', '--near', '100,200']);
+});
+
+test('buildDisambiguationArgs rejects fractional or negative index', () => {
+    const frac = __test.buildDisambiguationArgs({ index: 1.5 }, 'find');
+    assert.match(frac.error, /non-negative integer/);
+    const neg = __test.buildDisambiguationArgs({ index: -1 }, 'find');
+    assert.match(neg.error, /non-negative integer/);
+});
+
+test('buildDisambiguationArgs rejects half-specified near pair', () => {
+    const halfX = __test.buildDisambiguationArgs({ near_x: 100 }, 'find');
+    assert.match(halfX.error, /near_x and near_y must be provided together/);
+    const halfY = __test.buildDisambiguationArgs({ near_y: 200 }, 'find');
+    assert.match(halfY.error, /near_x and near_y must be provided together/);
+});
+
+test('buildDisambiguationArgs rejects non-finite near coordinates', () => {
+    const bad = __test.buildDisambiguationArgs({ near_x: 'abc', near_y: 200 }, 'find');
+    assert.match(bad.error, /finite numbers/);
+});
+
+test('buildDisambiguationArgs returns empty argv when no disambiguation provided', () => {
+    const empty = __test.buildDisambiguationArgs({}, 'find');
+    assert.equal(empty.error, undefined);
+    assert.deepEqual(empty.args, []);
+});
+
+test('agent_find_element returns structured error on malformed index', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({
+        tool: 'agent_find_element',
+        args: { label: 'Send', index: 1.5 },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /agent_find_element: index/);
+});
+
+test('formatFind / formatPress include disambiguation hint when match_count > 1', () => {
+    const out = __test.formatFind({
+        found: true,
+        role: 'AXButton',
+        label: 'More',
+        frame: { x: 1010, y: 160, w: 28, h: 28 },
+        match_count: 3,
+        match_index: 0,
+    });
+    assert.match(out, /match 1 of 3/);
+    assert.match(out, /near_x\/near_y/);
+
+    const single = __test.formatFind({
+        found: true,
+        role: 'AXButton',
+        label: 'Send',
+        frame: { x: 100, y: 100, w: 60, h: 24 },
+        match_count: 1,
+    });
+    assert.doesNotMatch(single, /match \d of/);
+});
+
 test('agent_recent_events returns formatted lines from getAgentEvents', async () => {
     const ts = 1717800000;
     const handler = init({

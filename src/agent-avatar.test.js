@@ -12,6 +12,7 @@ function createFakeBrowserWindow() {
         setHiddenInMissionControl: [],
         setIgnoreMouseEvents: [],
         showInactive: 0,
+        hide: 0,
         close: 0,
         loaded: null,
     };
@@ -24,6 +25,7 @@ function createFakeBrowserWindow() {
             setHiddenInMissionControl: (...args) => calls.setHiddenInMissionControl.push(args),
             setIgnoreMouseEvents: (...args) => calls.setIgnoreMouseEvents.push(args),
             showInactive: () => { calls.showInactive += 1; },
+            hide: () => { calls.hide += 1; },
             close: () => { calls.close += 1; destroyed = true; },
             once: (evt, cb) => {
                 const list = events.get(evt) || [];
@@ -60,6 +62,7 @@ function createDeps({
     initialNow = 1_000_000,
     travelDurationMs,
     ambientSpringK,
+    loadingRef = null,
 } = {}) {
     const fake = createFakeBrowserWindow();
     const screenListeners = new Map();
@@ -113,6 +116,7 @@ function createDeps({
             logDebug: () => {}, clock,
             ...(travelDurationMs ? { travelDurationMs } : {}),
             ...(ambientSpringK !== undefined ? { ambientSpringK } : {}),
+            ...(loadingRef ? { isCursorCompanionLoading: () => loadingRef.value } : {}),
         },
         fake, screen, app, calls, cursorRef, displayRef,
         advanceClock: (ms) => { clockRef.now += ms; },
@@ -409,4 +413,89 @@ test('stop clears restore timers so they do not fire later', async () => {
     const before = fake.calls.showInactive;
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert.equal(fake.calls.showInactive, before);
+});
+
+// ─── Loader coordination ────────────────────────────────────────────────
+//
+// When cursor-companion's two-dot loader is showing, the ambient dot
+// should yield the cursor slot. On the next intentional motion call the
+// avatar reappears at the cursor anchor and travels from there.
+
+test('ambient hides while cursor-companion loader is active', () => {
+    const loadingRef = { value: false };
+    const { deps, fake, advanceClock } = createDeps({
+        cursor: { x: 500, y: 400 },
+        loadingRef,
+    });
+    const avatar = init(deps);
+    avatar.start();
+    fake.emit('ready-to-show');
+    const showsBefore = fake.calls.showInactive;
+    const hidesBefore = fake.calls.hide;
+
+    loadingRef.value = true;
+    advanceClock(20);
+    avatar.tickForTest();
+    assert.ok(fake.calls.hide > hidesBefore, 'window.hide should be called when loader becomes active');
+    assert.equal(avatar.getStateForTest(), __test.STATE.AMBIENT);
+
+    loadingRef.value = false;
+    advanceClock(20);
+    avatar.tickForTest();
+    assert.ok(fake.calls.showInactive > showsBefore, 'showInactive should be called once loader clears');
+});
+
+test('moveTo while hiddenForLoader starts travel from cursor anchor (not stale position)', () => {
+    const loadingRef = { value: false };
+    const { deps, fake, advanceClock, setCursor } = createDeps({
+        cursor: { x: 500, y: 400 },
+        loadingRef,
+    });
+    const avatar = init(deps);
+    avatar.start();
+    fake.emit('ready-to-show');
+
+    // Loader starts → ambient hides at cursor anchor.
+    loadingRef.value = true;
+    advanceClock(20);
+    avatar.tickForTest();
+
+    // Cursor moves while we're hidden.
+    setCursor(900, 600);
+    advanceClock(20);
+    avatar.tickForTest();
+
+    // Now move to an explicit point. Travel should start from the
+    // current cursor anchor (around 900,600 + offsets), not the
+    // pre-loader position (~500,400).
+    avatar.moveTo(1200, 800);
+    assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING);
+
+    // After a tiny bit of travel, position should still be near the
+    // anchor (just left it), nowhere near the stale pre-loader spot.
+    advanceClock(10);
+    avatar.tickForTest();
+    const pos = avatar.getPositionForTest();
+    const anchorX = 900 + __test.DEFAULT_CURSOR_OFFSET_X;
+    const anchorY = 600 + __test.DEFAULT_CURSOR_OFFSET_Y;
+    assert.ok(Math.abs(pos.x - anchorX) < 200, `started near anchor x: ${pos.x} vs ${anchorX}`);
+    assert.ok(Math.abs(pos.y - anchorY) < 200, `started near anchor y: ${pos.y} vs ${anchorY}`);
+
+    // And it should have re-shown the window for travel.
+    assert.ok(fake.calls.showInactive >= 1);
+});
+
+test('isCursorCompanionLoading missing or throwing is treated as not-loading', () => {
+    // Throwing impl
+    const { deps, fake, advanceClock } = createDeps({
+        cursor: { x: 500, y: 400 },
+    });
+    deps.isCursorCompanionLoading = () => { throw new Error('boom'); };
+    const avatar = init(deps);
+    avatar.start();
+    fake.emit('ready-to-show');
+    advanceClock(20);
+    avatar.tickForTest();
+    // Should not have hidden; ambient continues normally.
+    assert.equal(fake.calls.hide, 0);
 });

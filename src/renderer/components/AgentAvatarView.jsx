@@ -35,7 +35,9 @@ export default function AgentAvatarView() {
     }, []);
 
     const isActive = agentState === 'active';
-    const dotSize = isActive ? 10 : 6;
+    // Ambient = 5px to match the legacy cursor-companion dot.
+    // Active = 10px so the "engaged" state still reads bigger than rest.
+    const dotSize = isActive ? 10 : 5;
     const ringSize = isActive ? 22 : 0;
 
     return (

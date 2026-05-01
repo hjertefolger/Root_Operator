@@ -44,11 +44,11 @@ const DEFAULT_TRAVEL_DURATION_MS = 800;
 
 // Default offset from a cursor target — used both as the ambient
 // resting offset (spring-follow target) and when the LLM asks
-// agent_move_to_cursor without explicit offsets. 30px right of the
-// cursor, vertically aligned. Close enough to read as "next to you,"
-// not so close it overlaps with cursor-companion's own dot.
-const DEFAULT_CURSOR_OFFSET_X = 30;
-const DEFAULT_CURSOR_OFFSET_Y = 0;
+// agent_move_to_cursor without explicit offsets. Mirrors the legacy
+// cursor-companion ambient dot: top-left at cursor + (14, 18) with a
+// 5px dot (centre cursor + (16.5, 20.5)). Rounded for parity.
+const DEFAULT_CURSOR_OFFSET_X = 16;
+const DEFAULT_CURSOR_OFFSET_Y = 20;
 
 // Spring constant for ambient cursor-follow. 0.18 gives a soft trailing
 // lag that reads as alive without feeling heavy. Higher = snappier,
@@ -99,6 +99,23 @@ function init(deps) {
     let tickTimer = null;
     let lastBroadcastState = null;
     const tickT0 = clock.now();
+
+    // True while ambient is suppressed because cursor-companion is
+    // showing its loader. We hide the avatar window so the two-dot
+    // loader and the ambient dot don't visually compete in the same
+    // slot. On the next motion call (moveTo/moveToCursor) we treat
+    // this as "starting from the cursor anchor" so the dot reads as
+    // appearing-and-leaving rather than teleporting.
+    let hiddenForLoader = false;
+
+    function isLoaderActive() {
+        if (typeof deps.isCursorCompanionLoading !== 'function') return false;
+        try {
+            return Boolean(deps.isCursorCompanionLoading());
+        } catch (_) {
+            return false;
+        }
+    }
 
     function logDebug(message) {
         if (typeof deps.logDebug === 'function') {
@@ -180,7 +197,29 @@ function init(deps) {
         const now = clock.now();
 
         if (state === STATE.AMBIENT) {
+            // While ambient and the loader is showing, hide the dot so
+            // it doesn't co-occupy the cursor slot with the two-dot
+            // loader. Snap position to the live cursor target so a
+            // following moveTo can travel from the natural anchor.
             const target = computeCursorTarget();
+            const loader = isLoaderActive();
+            if (loader) {
+                position.x = target.x;
+                position.y = target.y;
+                if (!hiddenForLoader) {
+                    hiddenForLoader = true;
+                    if (isUsable(win) && typeof win.hide === 'function') {
+                        try { win.hide(); } catch (_) { /* best-effort */ }
+                    }
+                }
+                return;
+            }
+            if (hiddenForLoader) {
+                hiddenForLoader = false;
+                if (isUsable(win) && typeof win.showInactive === 'function') {
+                    try { win.showInactive(); } catch (_) { /* best-effort */ }
+                }
+            }
             position.x += (target.x - position.x) * springK;
             position.y += (target.y - position.y) * springK;
             applyBoundsCentered(position.x, position.y);
@@ -236,6 +275,20 @@ function init(deps) {
 
     function startTravelTo(target, settleState) {
         sampleCurrentPosition();
+        // If we were hidden by the cursor-companion loader, re-anchor
+        // to the live cursor before traveling so the dot reads as
+        // departing from "home" rather than teleporting from a stale
+        // pre-loader position. The loader keeps running unaffected —
+        // both surfaces simply share the cursor slot at travel start.
+        if (hiddenForLoader) {
+            const anchor = computeCursorTarget();
+            position.x = anchor.x;
+            position.y = anchor.y;
+            hiddenForLoader = false;
+            if (isUsable(win) && typeof win.showInactive === 'function') {
+                try { win.showInactive(); } catch (_) { /* best-effort */ }
+            }
+        }
         travel = {
             from: { x: position.x, y: position.y },
             to: { x: target.x, y: target.y },
@@ -352,6 +405,12 @@ function init(deps) {
 
     function restoreVisibility() {
         if (!isUsable(win)) return;
+        // Don't re-show while we're deliberately hidden behind the
+        // cursor-companion loader. App-hide → restore can otherwise
+        // race the loader-yield logic and bring the ambient dot back
+        // into the cursor slot mid-turn. The next ambient tick after
+        // the loader clears will showInactive() naturally.
+        if (hiddenForLoader || isLoaderActive()) return;
         try {
             if (typeof win.isVisible === 'function' && win.isVisible()) return;
             win.showInactive();

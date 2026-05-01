@@ -175,27 +175,82 @@ function formatReadWindow(result) {
     return header + lines.join('\n');
 }
 
+// Validate the optional disambiguation args (`index`, `near_x`, `near_y`)
+// shared by agent_find_element and agent_press_named, and turn them
+// into the corresponding ax-helper argv tail. Codex flagged the silent
+// coercion paths (fractional index, half-specified near, null → 0) as
+// MED — explicit validation here returns a structured error to the
+// caller instead of letting a malformed arg silently default the press.
+function buildDisambiguationArgs(args, toolName) {
+    const out = [];
+
+    if (args.index !== undefined && args.index !== null) {
+        const idxRaw = args.index;
+        const idx = typeof idxRaw === 'number' ? idxRaw : Number(idxRaw);
+        if (!Number.isFinite(idx) || !Number.isInteger(idx) || idx < 0) {
+            return {
+                error: `${toolName}: index must be a non-negative integer (got ${JSON.stringify(idxRaw)}).`,
+                args: out,
+            };
+        }
+        out.push('--index', String(idx));
+    }
+
+    const nxProvided = args.near_x !== undefined && args.near_x !== null;
+    const nyProvided = args.near_y !== undefined && args.near_y !== null;
+    if (nxProvided !== nyProvided) {
+        return {
+            error: `${toolName}: near_x and near_y must be provided together.`,
+            args: out,
+        };
+    }
+    if (nxProvided && nyProvided) {
+        const nx = typeof args.near_x === 'number' ? args.near_x : Number(args.near_x);
+        const ny = typeof args.near_y === 'number' ? args.near_y : Number(args.near_y);
+        if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+            return {
+                error: `${toolName}: near_x and near_y must be finite numbers.`,
+                args: out,
+            };
+        }
+        out.push('--near', `${nx},${ny}`);
+    }
+
+    return { args: out };
+}
+
+function formatMatchSuffix(result) {
+    const total = Number(result.match_count);
+    if (!Number.isFinite(total) || total <= 1) return '';
+    const idx = Number.isFinite(Number(result.match_index)) ? Number(result.match_index) : 0;
+    return ` (match ${idx + 1} of ${total} — pass index or near_x/near_y to pick a different one)`;
+}
+
 function formatFind(result) {
     if (result.error) {
-        return `Find failed: ${result.error}${result.searched ? ` (searched ${result.searched} nodes)` : ''}`;
+        const searched = result.searched ? ` (searched ${result.searched} nodes)` : '';
+        const matched = Number.isFinite(Number(result.match_count)) && Number(result.match_count) > 0
+            ? ` — ${result.match_count} match(es) but index out of range`
+            : '';
+        return `Find failed: ${result.error}${searched}${matched}`;
     }
     if (result.found) {
         const label = result.label ? ` labeled "${result.label}"` : '';
         const where = result.frame
             ? ` at [${Math.round(result.frame.x)},${Math.round(result.frame.y)} ${Math.round(result.frame.w)}x${Math.round(result.frame.h)}]`
             : '';
-        return `Found ${result.role}${label}${where}`;
+        return `Found ${result.role}${label}${where}${formatMatchSuffix(result)}`;
     }
     return `Find returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
 function formatPress(result) {
     if (result.error) {
-        return `Press failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+        return `Press failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}${formatMatchSuffix(result)}`;
     }
     if (result.ok) {
         const label = result.label ? ` "${result.label}"` : '';
-        return `Pressed ${result.role}${label}.`;
+        return `Pressed ${result.role}${label}.${formatMatchSuffix(result)}`;
     }
     return `Press returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
@@ -367,10 +422,15 @@ function init(deps) {
                     if (!label) {
                         return { result: 'agent_find_element requires a non-empty label.', isError: true };
                     }
+                    const disambig = buildDisambiguationArgs(args, 'agent_find_element');
+                    if (disambig.error) {
+                        return { result: disambig.error, isError: true };
+                    }
                     const helperArgs = ['find-element'];
                     if (args.role) {
                         helperArgs.push('--role', String(args.role));
                     }
+                    helperArgs.push(...disambig.args);
                     helperArgs.push(label);
                     const r = await runHelper(deps, helperArgs);
                     if (r.found) maybeHalo(r);
@@ -407,11 +467,16 @@ function init(deps) {
                             isError: true,
                         };
                     }
+                    const disambig = buildDisambiguationArgs(args, 'agent_press_named');
+                    if (disambig.error) {
+                        return { result: disambig.error, isError: true };
+                    }
                     lastPressAt = now;
                     const helperArgs = ['press-named'];
                     if (args.role) {
                         helperArgs.push('--role', String(args.role));
                     }
+                    helperArgs.push(...disambig.args);
                     helperArgs.push(label);
                     const r = await runHelper(deps, helperArgs);
                     if (r.ok) maybeHalo(r);
@@ -442,5 +507,6 @@ module.exports = {
         formatEventLine,
         formatEvents,
         runHelper,
+        buildDisambiguationArgs,
     },
 };
