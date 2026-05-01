@@ -293,11 +293,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_type_text',
-      description: 'Type Unicode text via macOS CGEvent into the focused element — exercises real key handling (paragraph styling, autocomplete, IME, app key handlers) unlike AX value-write. Use this for natural-typing flows where character-by-character behavior matters; use agent_write_selection when you want a clean AX replacement that bypasses key handlers. Requires focused element. Same user-activity guard and rate limit as keystroke (one per 750ms). Hard-capped at 8000 characters.',
+      description: 'Type Unicode text via macOS CGEvent into the focused element — exercises real key handling (paragraph styling, autocomplete, IME, app key handlers) unlike AX value-write. Use this for natural-typing flows where character-by-character behavior matters; use agent_write_selection when you want a clean AX replacement that bypasses key handlers. Requires focused element. Same user-activity guard and rate limit as keystroke (one per 750ms). Hard-capped at 2000 UTF-16 code units (more conservative than AX writes since this is a real keyboard-synthesis path).',
       inputSchema: {
         type: 'object',
         properties: {
-          text: { type: 'string', description: 'Text to type. Must be non-empty, max 8000 chars.' },
+          text: { type: 'string', description: 'Text to type. Must be non-empty, max 2000 UTF-16 code units.' },
           force: { type: 'boolean', description: 'Override the user-activity guard.' },
         },
         required: ['text'],
@@ -334,7 +334,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_menu_command',
-      description: 'Invoke a menu item in the frontmost app by walking the AXMenuBar with a path of titles (e.g. ["Format","Body"], ["Edit","Find","Find…"]). Pure AX — no keystrokes, no menu visually flashing open. Path segments match by case-insensitive prefix to tolerate "..." suffixes and ellipses. Prefer this over keystroke-based shortcuts whenever the menu path is known: it\'s decoupled from focus, doesn\'t race with the user\'s typing, and is reflectable through agent_read_window.',
+      description: 'Invoke a menu item in the frontmost app by walking the AXMenuBar with a path of titles (e.g. ["Format","Body"], ["Edit","Find","Find…"]). Pure AX — no keystrokes, no menu visually flashing open. Match strategy: exact title match first, then unique case-insensitive prefix; ambiguous prefix matches return ambiguous_menu_segment. Descends through any AXMenu intermediate container automatically and polls briefly for child population after opening a non-leaf. Same user-activity guard as keystroke / type-text — refused if the user just switched apps or opened a menu (override with force=true after explicit consent).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -343,6 +343,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Menu path as an array of titles, top-level first. E.g. ["Format","Body"].',
             items: { type: 'string' },
           },
+          force: { type: 'boolean', description: 'Override the user-activity guard.' },
         },
         required: ['path'],
       },

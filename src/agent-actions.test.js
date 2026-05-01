@@ -400,9 +400,30 @@ test('agent_type_text rejects empty text and over-cap text', async () => {
     assert.equal(empty.isError, true);
     assert.match(empty.result, /non-empty/);
 
-    const tooLong = await handler.handle({ tool: 'agent_type_text', args: { text: 'a'.repeat(9000) } });
+    const tooLong = await handler.handle({ tool: 'agent_type_text', args: { text: 'a'.repeat(2500) } });
     assert.equal(tooLong.isError, true);
     assert.match(tooLong.result, /exceeds limit/);
+});
+
+test('agent_menu_command refuses on user activity (no force)', async () => {
+    const recentTs = Date.now() / 1000 - 0.2;
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        getAgentEvents: () => ({
+            getEvents: () => [
+                { event: 'AXFocusedUIElementChanged', ts: recentTs, app: 'Safari' },
+            ],
+        }),
+        logDebug: () => {},
+    });
+    const r = await handler.handle({
+        tool: 'agent_menu_command',
+        args: { path: ['Format', 'Body'] },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /Refused menu command/);
 });
 
 test('agent_select_range rejects non-integer or negative bounds', async () => {

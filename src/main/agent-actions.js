@@ -34,7 +34,11 @@ const PRESS_INTERVAL_MIN_MS = 750;
 // a single helper call so it gets the same window as a write.
 const KEYSTROKE_INTERVAL_MIN_MS = 200;
 const TYPE_TEXT_INTERVAL_MIN_MS = 750;
-const MAX_TYPE_TEXT_LENGTH = 8000;
+// Keyboard-synthesis path is more conservative than AX value-write
+// because a single CGEvent unicode string types into focus, exercises
+// app key handlers, and behaves less like natural typing for long
+// payloads. Keep this short until chunked-typing semantics ship.
+const MAX_TYPE_TEXT_LENGTH = 2000;
 
 // User-activity guard window. Before posting a keystroke or typing
 // text we look at the AX subscribe ring buffer. If we see a recent
@@ -766,6 +770,21 @@ function init(deps) {
                     if (now - lastPressAt < PRESS_INTERVAL_MIN_MS) {
                         const wait = PRESS_INTERVAL_MIN_MS - (now - lastPressAt);
                         return { result: `Rate limited: menu command allowed in ${wait}ms.`, isError: true };
+                    }
+                    // User-activity guard: a menu command in the frontmost
+                    // app can trigger destructive or state-changing actions.
+                    // If Tom switched apps or opened a menu just before this
+                    // call, the path walks the WRONG app's menu bar. Same
+                    // override semantics as keystroke / type-text.
+                    const force = args.force === true;
+                    if (!force) {
+                        const offending = detectUserActivity();
+                        if (offending) {
+                            return {
+                                result: `Refused menu command: user activity detected (${offending.event}${offending.app ? ' in ' + offending.app : ''}). Pass force=true to override.`,
+                                isError: true,
+                            };
+                        }
                     }
                     lastPressAt = now;
                     const r = await runHelper(deps, ['menu-command', ...path]);

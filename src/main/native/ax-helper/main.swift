@@ -1047,12 +1047,14 @@ func ensureFocusedElement() -> AXUIElement {
     return raw as! AXUIElement
 }
 
-// Build a CGEventSource. Apple recommends `.privateState` for posted
-// events that should not merge with stale modifier state from the
-// hardware keyboard (e.g. user holds Shift while we post Cmd+J).
+// Build a CGEventSource using `.privateState` so posted modifier
+// flags don't merge with stale hardware-keyboard state (Apple docs
+// describe private state as an independent event-state table). Codex
+// flagged the previous .hidSystemState fallback as a safety hole —
+// if private creation fails we fail closed rather than silently
+// reintroducing the hardware-state coupling we're trying to avoid.
 func makeEventSource() -> CGEventSource? {
     return CGEventSource(stateID: .privateState)
-        ?? CGEventSource(stateID: .hidSystemState)
 }
 
 func cmdKeystroke(_ args: [String]) -> Never {
@@ -1074,7 +1076,9 @@ func cmdKeystroke(_ args: [String]) -> Never {
 
     let key = parseKey(k)
     let flags = parseModifierFlags(modCsv)
-    guard let src = makeEventSource() else { emitError("event_source_failed") }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
 
     guard
         let down = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true),
@@ -1109,15 +1113,26 @@ func cmdTypeText(_ args: [String]) -> Never {
         text = a; i += 1
     }
     guard let t = text, !t.isEmpty else { emitInternalError("type-text: missing text arg") }
-    if t.count > 8000 { emitError("text_too_long", "max 8000 chars; got \(t.count)") }
+
+    // Cap on UTF-16 code units, not Swift's grapheme-count Character
+    // count. AX selection ranges and CGEvent's Unicode buffer are
+    // both UTF-16-unit measured; emoji or composed characters can
+    // expand to many UTF-16 units per Character. Lower default cap
+    // for keyboard synthesis (this is a real key-event path, not the
+    // AX value-write blast radius).
+    let utf16 = Array(t.utf16)
+    if utf16.count > 2000 {
+        emitError("text_too_long", "max 2000 UTF-16 code units; got \(utf16.count)")
+    }
 
     if requireFocus { _ = ensureFocusedElement() }
-    guard let src = makeEventSource() else { emitError("event_source_failed") }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
 
     // Use CGEvent.keyboardSetUnicodeString — types each Unicode scalar
     // through a single keyDown event, no per-key dispatch. Cheaper and
     // more reliable for plain text than per-character keystroke loops.
-    let utf16 = Array(t.utf16)
     guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else {
         emitError("event_create_failed")
     }
@@ -1134,7 +1149,7 @@ func cmdTypeText(_ args: [String]) -> Never {
     }
     emit([
         "ok": true,
-        "length": t.count,
+        "length": utf16.count,
     ])
     exit(0)
 }
@@ -1279,22 +1294,99 @@ func cmdMenuCommand(_ args: [String]) -> Never {
     guard s == .success, let bar = menuBar else {
         emitError("no_menu_bar", "frontmost app exposes no AXMenuBar")
     }
-    var current = bar as! AXUIElement
-    for (idx, segment) in args.enumerated() {
-        var children: CFTypeRef?
-        AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &children)
-        guard let kids = children as? [AXUIElement], !kids.isEmpty else {
-            emitError("menu_walk_failed", "no children at depth \(idx)")
+
+    // Real macOS AX menu trees nest as: AXMenuBar → AXMenuBarItem →
+    // AXMenu → AXMenuItem (and submenus add another AXMenu container
+    // under each non-leaf AXMenuItem). The previous walk assumed
+    // direct child relationships and silently tripped on the AXMenu
+    // intermediate. Hardened version: descend through any single
+    // AXMenu container automatically before matching the next segment.
+    func childrenOf(_ element: AXUIElement) -> [AXUIElement] {
+        var raw: CFTypeRef?
+        let s = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw)
+        if s != .success { return [] }
+        return (raw as? [AXUIElement]) ?? []
+    }
+
+    func actionNames(_ element: AXUIElement) -> Set<String> {
+        var raw: CFArray?
+        guard AXUIElementCopyActionNames(element, &raw) == .success,
+              let names = raw as? [String] else { return [] }
+        return Set(names)
+    }
+
+    // After AXPress/AXShowMenu, AX child list can be empty for a few
+    // dozen ms while the menu populates. Poll briefly so menu_command
+    // doesn't race the population window.
+    func childrenAfterOpen(_ element: AXUIElement) -> [AXUIElement] {
+        for delayMs in [0, 30, 70, 130] {
+            if delayMs > 0 { Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0) }
+            let kids = childrenOf(element)
+            if !kids.isEmpty { return kids }
         }
-        var match: AXUIElement?
-        for k in kids {
-            let title = axCopyString(k, kAXTitleAttribute as String) ?? ""
-            if title.lowercased() == segment.lowercased()
-                || title.lowercased().hasPrefix(segment.lowercased()) {
-                match = k; break
+        return []
+    }
+
+    // Skip past a single AXMenu intermediate to the actual menu items.
+    func unwrapAXMenu(_ kids: [AXUIElement]) -> [AXUIElement] {
+        if kids.count == 1, roleString(kids[0]) == "AXMenu" {
+            return childrenOf(kids[0])
+        }
+        return kids
+    }
+
+    // Open a non-leaf menu node. Prefer kAXShowMenuAction when
+    // exposed (the action name Apple defines for opening menus), fall
+    // back to kAXPressAction. Returns true on success.
+    func openMenuNode(_ element: AXUIElement) -> Bool {
+        let actions = actionNames(element)
+        if actions.contains(kAXShowMenuAction as String) {
+            if AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success {
+                return true
             }
         }
-        guard let next = match else {
+        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+            return true
+        }
+        return false
+    }
+
+    // Pick a child by exact title match, falling back to a unique
+    // prefix match. Ambiguous prefix matches return nil + an error
+    // string so the caller can emit ambiguous_menu_segment.
+    func pickChild(_ kids: [AXUIElement], segment: String) -> (match: AXUIElement?, err: String?) {
+        let needle = segment.lowercased()
+        var exact: AXUIElement?
+        var prefixMatches: [AXUIElement] = []
+        for k in kids {
+            let title = (axCopyString(k, kAXTitleAttribute as String) ?? "").lowercased()
+            if title == needle {
+                exact = k; break
+            }
+            if title.hasPrefix(needle) {
+                prefixMatches.append(k)
+            }
+        }
+        if let e = exact { return (e, nil) }
+        if prefixMatches.count == 1 { return (prefixMatches[0], nil) }
+        if prefixMatches.count > 1 {
+            let titles = prefixMatches.compactMap { axCopyString($0, kAXTitleAttribute as String) }.joined(separator: ", ")
+            return (nil, "ambiguous segment '\(segment)' — multiple prefix matches: [\(titles)]")
+        }
+        return (nil, nil)
+    }
+
+    var current = bar as! AXUIElement
+    var kids = unwrapAXMenu(childrenOf(current))
+    for (idx, segment) in args.enumerated() {
+        if kids.isEmpty {
+            emitError("menu_walk_failed", "no children at depth \(idx)")
+        }
+        let pick = pickChild(kids, segment: segment)
+        if let err = pick.err {
+            emitError("ambiguous_menu_segment", err)
+        }
+        guard let next = pick.match else {
             emitError("menu_segment_not_found", "no menu item matching '\(segment)' at depth \(idx)")
         }
         if idx == args.count - 1 {
@@ -1309,16 +1401,13 @@ func cmdMenuCommand(_ args: [String]) -> Never {
             ])
             exit(0)
         }
-        // Non-leaf menu items need to be opened first via AXPress so
-        // their children appear in the AX tree.
-        let openStatus = AXUIElementPerformAction(next, kAXPressAction as CFString)
-        if openStatus != .success {
-            // Some apps expose AXShowMenu instead — try that.
-            let alt = AXUIElementPerformAction(next, "AXShowMenu" as CFString)
-            if alt != .success {
-                emitError("menu_open_failed", "ax_status=\(openStatus.rawValue) for '\(segment)'")
-            }
+        // Non-leaf: open it, poll briefly for children, then descend
+        // through any AXMenu intermediate.
+        if !openMenuNode(next) {
+            emitError("menu_open_failed", "could not open '\(segment)' (AXShowMenu and AXPress both failed)")
         }
+        let opened = childrenAfterOpen(next)
+        kids = unwrapAXMenu(opened)
         current = next
     }
     emitInternalError("menu-command: unreachable")
