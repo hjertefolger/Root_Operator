@@ -322,20 +322,26 @@ test('formatEventLine renders ts/event/app/role/value compactly', () => {
     assert.match(out, /value="Hello world"/);
 });
 
-test('halo show is invoked when read returns a frame', async () => {
-    const haloCalls = [];
-    const halo = { show: (frame) => haloCalls.push(frame), hide: () => {} };
-    const handler = init({
-        screen: fakeScreen(),
-        appPath: '/nope',
-        resourcesPath: '/nope',
-        getAgentAvatar: () => null,
-        getAgentHalo: () => halo,
-        logDebug: () => {},
-    });
-    // Helper is missing, so the handler returns an error result for
-    // read tools. The halo path requires a real frame from the helper —
-    // this test just confirms the wire-up: helper-missing → no halo.
-    await handler.handle({ tool: 'agent_read_at_cursor', args: {} });
-    assert.equal(haloCalls.length, 0);
+test('maybeTravelToFrame moves avatar to frame center', () => {
+    const calls = [];
+    const avatar = { moveTo: (x, y) => calls.push({ x, y }) };
+    __test.maybeTravelToFrame(avatar, { frame: { x: 100, y: 200, w: 60, h: 24 } });
+    assert.deepEqual(calls, [{ x: 130, y: 212 }]);
+});
+
+test('maybeTravelToFrame is a no-op without an avatar or frame', () => {
+    const calls = [];
+    const avatar = { moveTo: (x, y) => calls.push({ x, y }) };
+    __test.maybeTravelToFrame(null, { frame: { x: 100, y: 200, w: 60, h: 24 } });
+    __test.maybeTravelToFrame(avatar, null);
+    __test.maybeTravelToFrame(avatar, {}); // no frame
+    __test.maybeTravelToFrame(avatar, { frame: { x: NaN, y: 1, w: 1, h: 1 } });
+    assert.equal(calls.length, 0);
+});
+
+test('maybeTravelToFrame swallows avatar.moveTo errors (best-effort)', () => {
+    const avatar = { moveTo: () => { throw new Error('boom'); } };
+    // Must not throw — purely decorative.
+    __test.maybeTravelToFrame(avatar, { frame: { x: 1, y: 1, w: 1, h: 1 } });
+    assert.ok(true);
 });

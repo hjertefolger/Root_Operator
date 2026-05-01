@@ -279,6 +279,23 @@ function formatEvents(events) {
     return events.map(formatEventLine).join('\n');
 }
 
+// Travel the agent body to the frame center of an AX result so every
+// action is visibly grounded — the user sees the dot land where the
+// agent just acted (read, find, press, write). Pairs with maybeHalo
+// at the call site: halo flashes around the element, dot dwells
+// beside it. No-op when avatar is missing or the frame is degenerate.
+// Pure module-level function so tests can call it directly.
+function maybeTravelToFrame(avatar, result) {
+    if (!avatar || typeof avatar.moveTo !== 'function') return;
+    if (!result || !result.frame) return;
+    const f = result.frame;
+    if (!Number.isFinite(f.x) || !Number.isFinite(f.y)
+        || !Number.isFinite(f.w) || !Number.isFinite(f.h)) return;
+    const cx = f.x + f.w / 2;
+    const cy = f.y + f.h / 2;
+    try { avatar.moveTo(cx, cy); } catch (_) { /* best-effort */ }
+}
+
 function init(deps) {
     if (!deps || !deps.getAgentAvatar || !deps.screen) {
         throw new Error('agent-actions.init requires getAgentAvatar, screen');
@@ -303,6 +320,13 @@ function init(deps) {
                 h: result.frame.h,
             });
         } catch (_) { /* swallow halo errors — purely decorative */ }
+    }
+
+    // Halo + travel together — every successful AX action where we have
+    // a frame should make the dot legible at the action site.
+    function showActionAt(avatar, result) {
+        maybeHalo(result);
+        maybeTravelToFrame(avatar, result);
     }
 
     async function handle(req) {
@@ -366,13 +390,13 @@ function init(deps) {
                 case 'agent_read_at_cursor': {
                     const cursor = deps.screen.getCursorScreenPoint();
                     const r = await runHelper(deps, ['read-at', String(cursor.x), String(cursor.y)]);
-                    if (!r.error || r.error === 'no_text') maybeHalo(r);
+                    if (!r.error || r.error === 'no_text') showActionAt(avatar, r);
                     return { result: formatRead(r), isError: !!r.error && r.error !== 'no_text' };
                 }
 
                 case 'agent_read_focused': {
                     const r = await runHelper(deps, ['read-focused']);
-                    if (!r.error || r.error === 'no_text') maybeHalo(r);
+                    if (!r.error || r.error === 'no_text') showActionAt(avatar, r);
                     return { result: formatRead(r), isError: !!r.error && r.error !== 'no_text' };
                 }
 
@@ -408,7 +432,7 @@ function init(deps) {
                         ? ['write-at', String(cursor.x), String(cursor.y), '--replace-all', text]
                         : ['write-at', String(cursor.x), String(cursor.y), text];
                     const r = await runHelper(deps, helperArgs);
-                    if (r.ok) maybeHalo(r);
+                    if (r.ok) showActionAt(avatar, r);
                     return { result: formatWrite(r), isError: !r.ok };
                 }
 
@@ -433,7 +457,7 @@ function init(deps) {
                     helperArgs.push(...disambig.args);
                     helperArgs.push(label);
                     const r = await runHelper(deps, helperArgs);
-                    if (r.found) maybeHalo(r);
+                    if (r.found) showActionAt(avatar, r);
                     return { result: formatFind(r), isError: !!r.error };
                 }
 
@@ -479,7 +503,7 @@ function init(deps) {
                     helperArgs.push(...disambig.args);
                     helperArgs.push(label);
                     const r = await runHelper(deps, helperArgs);
-                    if (r.ok) maybeHalo(r);
+                    if (r.ok) showActionAt(avatar, r);
                     return { result: formatPress(r), isError: !r.ok };
                 }
 
@@ -508,5 +532,6 @@ module.exports = {
         formatEvents,
         runHelper,
         buildDisambiguationArgs,
+        maybeTravelToFrame,
     },
 };
