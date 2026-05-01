@@ -1,0 +1,35 @@
+{
+  "avatar": {
+    "travelMinMs": 620,
+    "travelMaxMs": 1100,
+    "travelDistanceSlopeMsPerPx": 0.34,
+    "travelBaseMs": 520,
+    "settleMs": 150,
+    "overshootPx": 1.7,
+    "driftRadiusPx": 9,
+    "driftPeriodMs": 5400,
+    "driftSecondaryPeriodMs": 7600,
+    "driftVerticalScale": 0.72,
+    "microTourMinDelayMs": 8000,
+    "microTourMaxDelayMs": 15000,
+    "microTourMinDurationMs": 1200,
+    "microTourMaxDurationMs": 2000,
+    "microTourMinRadiusPx": 20,
+    "microTourMaxRadiusPx": 40
+  },
+  "halo": {
+    "padPx": 18,
+    "actionAutoHideMs": 1700,
+    "focusAutoHideMs": 0,
+    "fadeInMs": 250,
+    "fadeOutMs": 400,
+    "borderScanDurationMs": 3600,
+    "borderOpacityMin": 0.15,
+    "borderOpacityMax": 0.34,
+    "waveSpotCount": 42,
+    "waveMinDurationMs": 1500,
+    "waveMaxDurationMs": 3000,
+    "waveMaxOpacity": 0.18,
+    "accent": "#4B6BFF"
+  }
+}

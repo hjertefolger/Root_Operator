@@ -16,15 +16,17 @@
  * the renderer fades opacity. Sizing only changes between shows.
  */
 const path = require('path');
+const presenceMotionConfig = require('../shared/presence-motion-config.json');
 
 // Padding around the element frame, in pixels. Halo sits this far
 // outside every edge.
-const PAD = 14;
+const HALO_CONFIG = presenceMotionConfig.halo || {};
+const PAD = HALO_CONFIG.padPx || 18;
 
 // Auto-hide after this much time. Long enough to read; short enough
 // that a stalled agent doesn't leave a lingering ring. Renderer fade-out
 // duration is added on top inside the React component.
-const AUTO_HIDE_MS = 1400;
+const AUTO_HIDE_MS = HALO_CONFIG.actionAutoHideMs || 1700;
 
 function init(deps) {
     if (!deps || !deps.BrowserWindow || !deps.app || !deps.loadRendererWindow) {
@@ -110,7 +112,7 @@ function init(deps) {
         return w;
     }
 
-    function show(frame) {
+    function show(frame, options = {}) {
         if (!frame
             || !Number.isFinite(frame.x)
             || !Number.isFinite(frame.y)
@@ -128,7 +130,14 @@ function init(deps) {
 
         try {
             w.setBounds({ x, y, width, height });
-            const payload = { width, height };
+            const payload = {
+                width,
+                height,
+                mode: options.mode || 'action',
+                sustain: options.sustain === true,
+                seed: Math.floor(Date.now() % 2147483647),
+                accent: HALO_CONFIG.accent,
+            };
             if (rendererReady) {
                 try {
                     w.webContents.send('AGENT_HALO_SHOW', payload);
@@ -144,11 +153,16 @@ function init(deps) {
         }
 
         clearAutoHide();
-        autoHideTimer = setTimeout(() => {
-            autoHideTimer = null;
-            hide();
-        }, AUTO_HIDE_MS);
-        if (typeof autoHideTimer.unref === 'function') autoHideTimer.unref();
+        const autoHideMs = options.sustain === true
+            ? (HALO_CONFIG.focusAutoHideMs || 0)
+            : (Number.isFinite(options.autoHideMs) ? options.autoHideMs : AUTO_HIDE_MS);
+        if (autoHideMs > 0) {
+            autoHideTimer = setTimeout(() => {
+                autoHideTimer = null;
+                hide();
+            }, autoHideMs);
+            if (typeof autoHideTimer.unref === 'function') autoHideTimer.unref();
+        }
     }
 
     function hide() {

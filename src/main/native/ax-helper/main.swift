@@ -274,10 +274,14 @@ func currentExecutableURL() -> URL {
     return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(raw)
 }
 
-func freshFocusedSnapshot(timeoutMs: Int = 900) -> [String: Any]? {
+func freshFocusedSnapshot(timeoutMs: Int = 900, pid: pid_t? = nil) -> [String: Any]? {
     let process = Process()
     process.executableURL = currentExecutableURL()
-    process.arguments = ["focused-snapshot"]
+    if let pid = pid {
+        process.arguments = ["focused-snapshot", "--pid", String(Int(pid))]
+    } else {
+        process.arguments = ["focused-snapshot"]
+    }
     let stdout = Pipe()
     let stderr = Pipe()
     process.standardOutput = stdout
@@ -690,12 +694,30 @@ func cmdReadFocused() -> Never {
     emitReadResult(element)
 }
 
-func cmdFocusedSnapshot() -> Never {
+func cmdFocusedSnapshot(_ args: [String] = []) -> Never {
     guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    if args.count >= 2, args[0] == "--pid", let rawPid = Int32(args[1]) {
+        let appElem = AXUIElementCreateApplication(rawPid)
+        if let element = axCopyElement(appElem, kAXFocusedUIElementAttribute as String) {
+            var payload = snapshotPayload(element)
+            payload["source"] = "app_focused_ui_element"
+            emit(payload)
+            exit(0)
+        }
+        if let window = axCopyElement(appElem, kAXFocusedWindowAttribute as String),
+           let element = axCopyElement(window, kAXFocusedUIElementAttribute as String) {
+            var payload = snapshotPayload(element)
+            payload["source"] = "window_focused_ui_element"
+            emit(payload)
+            exit(0)
+        }
+    }
     guard let element = resolveFocusedElement() else {
         emitError("no_focused_element")
     }
-    emit(snapshotPayload(element))
+    var payload = snapshotPayload(element)
+    payload["source"] = "system_focused_ui_element"
+    emit(payload)
     exit(0)
 }
 
@@ -1683,11 +1705,12 @@ func waitForFocusToStick(target element: AXUIElement, timeoutMs: Int = 1200) -> 
     let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
     var lastFocused: AXUIElement? = nil
     var lastSnapshot: [String: Any]? = nil
+    let targetPid = pidOf(element)
     repeat {
         if let focused = resolveFocusedElement() {
             lastFocused = focused
             if focusMatches(target: element, focused: focused) {
-                if let snapshot = freshFocusedSnapshot() {
+                if let snapshot = freshFocusedSnapshot(pid: targetPid) {
                     lastSnapshot = snapshot
                     if snapshotMatchesTargetOrDescendant(snapshot, target: element) {
                         return FocusVerification(matched: true, focused: focused, snapshot: snapshot)
@@ -1698,7 +1721,7 @@ func waitForFocusToStick(target element: AXUIElement, timeoutMs: Int = 1200) -> 
         Thread.sleep(forTimeInterval: 0.035)
     } while Date() < deadline
     if lastSnapshot == nil {
-        lastSnapshot = freshFocusedSnapshot()
+        lastSnapshot = freshFocusedSnapshot(pid: targetPid)
     }
     return FocusVerification(matched: false, focused: lastFocused, snapshot: lastSnapshot)
 }
@@ -1719,6 +1742,25 @@ func tryTextFocusPressFallback(_ element: AXUIElement, tx: inout FocusTransactio
     tx.statuses["target_press"] = Int(pressStatus.rawValue)
     Thread.sleep(forTimeInterval: 0.08)
     return pressStatus == .success
+}
+
+func tryTextFocusHIDFallback(_ element: AXUIElement, tx: inout FocusTransaction) -> [String: Any]? {
+    let role = roleString(element)
+    guard FOCUS_PRESS_FALLBACK_ROLES.contains(role),
+          let point = centerPointOf(element) else {
+        return nil
+    }
+    // Cursor-invariant HID bootstrap, used only after AX focus setters and
+    // AXPress fail fresh verification. The click path restores and verifies
+    // the hardware cursor before this focus action can continue.
+    var click = hidClickPayload(point: point, button: "left", count: 1)
+    tx.statuses["target_hid_click"] = click["error"] == nil ? 0 : -1
+    click["target_role"] = role
+    if let frame = frameOf(element) {
+        click["target_frame"] = frame
+    }
+    Thread.sleep(forTimeInterval: 0.08)
+    return click
 }
 
 func focusElementPayload(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> [String: Any] {
@@ -1753,6 +1795,24 @@ func focusElementPayload(_ element: AXUIElement, window knownWindow: AXUIElement
                 kCFBooleanTrue
             )
             tx.statuses["target_focused_after_press"] = Int(status.rawValue)
+            if status == .success {
+                verified = waitForFocusToStick(target: element)
+            }
+        }
+        if !verified.matched, let hidFallback = tryTextFocusHIDFallback(element, tx: &tx) {
+            if hidFallback["error"] != nil {
+                var failed = hidFallback
+                failed["focus_context"] = "hid_focus_fallback"
+                failed["focus_statuses"] = statusPayload(tx.statuses)
+                addFocusTransactionDetails(&failed, tx)
+                return failed
+            }
+            status = AXUIElementSetAttributeValue(
+                element,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+            tx.statuses["target_focused_after_hid"] = Int(status.rawValue)
             if status == .success {
                 verified = waitForFocusToStick(target: element)
             }
@@ -1847,21 +1907,28 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
 func cmdFocusElement(_ args: [String]) -> Never {
     guard AXIsProcessTrusted() else { emitError("not_trusted") }
     let parsed = parseElementArgs(args, cmd: "focus-element")
-    guard let window = resolveFocusedWindow() else {
+    var roots: [AXUIElement] = []
+    appendUniqueElement(resolveFocusedWindow(), to: &roots)
+    for root in appRootCandidates(identifier: nil) {
+        appendUniqueElement(root.element, to: &roots)
+    }
+    guard !roots.isEmpty else {
         emitError("no_window")
     }
     let visited = NodeCounter()
     var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
-    collectElementCandidates(
-        in: window,
-        role: parsed.role,
-        label: parsed.label,
-        depth: 0,
-        visited: visited,
-        skipRoles: parsed.skipRoles,
-        preferRoles: parsed.preferRoles,
-        out: &matches
-    )
+    for root in roots {
+        collectElementCandidates(
+            in: root,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: parsed.skipRoles,
+            preferRoles: parsed.preferRoles,
+            out: &matches
+        )
+    }
     guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
         emit([
             "error": "not_found",
@@ -1870,7 +1937,7 @@ func cmdFocusElement(_ args: [String]) -> Never {
         ])
         exit(0)
     }
-    focusElement(pick.elem, window: window)
+    focusElement(pick.elem, window: resolveContainingWindow(pick.elem))
 }
 
 func cmdFocusAt(_ args: [String]) -> Never {
@@ -2326,18 +2393,60 @@ func cursorRestorePayload(before: CGPoint?, tolerance: Double = 1.0) -> [String:
     guard let before = before else {
         return ["cursor_restored": false, "cursor_error": "cursor_unavailable"]
     }
+    let started = Date()
+    // The macOS event stream can report the click location for a short
+    // moment after restore is posted. Save/restore follows the mcp-server
+    // state contract (MIT) but adds a bounded settle-poll before declaring
+    // cursor invariance.
     CGWarpMouseCursorPosition(before)
     CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-    Thread.sleep(forTimeInterval: 0.01)
-    let after = currentCursorLocation() ?? before
-    let dx = Double(after.x - before.x)
-    let dy = Double(after.y - before.y)
-    let distance = (dx * dx + dy * dy).squareRoot()
+    var last = currentCursorLocation() ?? before
+    var best = last
+    var bestDistance = Double.greatestFiniteMagnitude
+    var stableHits = 0
+    var attempts = 0
+    for attempt in 1...36 {
+        attempts = attempt
+        Thread.sleep(forTimeInterval: 0.008)
+        let after = currentCursorLocation() ?? last
+        let dx = Double(after.x - before.x)
+        let dy = Double(after.y - before.y)
+        let distance = (dx * dx + dy * dy).squareRoot()
+        if distance < bestDistance {
+            bestDistance = distance
+            best = after
+        }
+        let sx = Double(after.x - last.x)
+        let sy = Double(after.y - last.y)
+        let stableDelta = (sx * sx + sy * sy).squareRoot()
+        if distance <= tolerance && stableDelta <= 0.25 {
+            stableHits += 1
+            if stableHits >= 2 {
+                let elapsed = Date().timeIntervalSince(started) * 1000.0
+                return [
+                    "cursor_before": pointPayload(before),
+                    "cursor_after": pointPayload(after),
+                    "cursor_delta": distance,
+                    "cursor_restored": true,
+                    "cursor_restore_attempts": attempts,
+                    "cursor_restore_settle_ms": elapsed,
+                ]
+            }
+        } else if distance <= tolerance {
+            stableHits = 1
+        } else {
+            stableHits = 0
+        }
+        last = after
+    }
+    let elapsed = Date().timeIntervalSince(started) * 1000.0
     return [
         "cursor_before": pointPayload(before),
-        "cursor_after": pointPayload(after),
-        "cursor_delta": distance,
-        "cursor_restored": distance <= tolerance,
+        "cursor_after": pointPayload(best),
+        "cursor_delta": bestDistance,
+        "cursor_restored": bestDistance <= tolerance,
+        "cursor_restore_attempts": attempts,
+        "cursor_restore_settle_ms": elapsed,
     ]
 }
 
@@ -3224,34 +3333,122 @@ func applicationElement(bundleID: String) -> (app: NSRunningApplication, element
     return (app, AXUIElementCreateApplication(app.processIdentifier))
 }
 
+func stepAppIdentifier(_ step: [String: Any]) -> String? {
+    return stringValue(step["bundle_id"])
+        ?? stringValue(step["bundle"])
+        ?? stringValue(step["app"])
+        ?? stringValue(step["application"])
+}
+
+func bundleIDForAppIdentifier(_ identifier: String?) -> String? {
+    guard let raw = identifier?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return nil
+    }
+    if raw.contains(".") {
+        return raw
+    }
+    if let running = NSWorkspace.shared.runningApplications.first(where: {
+        !$0.isTerminated
+            && (($0.localizedName ?? "").caseInsensitiveCompare(raw) == .orderedSame
+                || ($0.bundleIdentifier ?? "").caseInsensitiveCompare(raw) == .orderedSame)
+    }) {
+        return running.bundleIdentifier
+    }
+    let candidates = [
+        "/Applications/\(raw).app",
+        "/System/Applications/\(raw).app",
+        "/System/Applications/Utilities/\(raw).app",
+    ]
+    for path in candidates {
+        let url = URL(fileURLWithPath: path)
+        if let appURL = NSWorkspace.shared.urlForApplication(toOpen: url),
+           let bundle = Bundle(url: appURL),
+           let bundleID = bundle.bundleIdentifier {
+            return bundleID
+        }
+    }
+    return nil
+}
+
+func runningApplication(identifier: String?) -> NSRunningApplication? {
+    guard let raw = identifier?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return nil
+    }
+    if let bundleID = bundleIDForAppIdentifier(raw),
+       let app = runningApplication(bundleID: bundleID) {
+        return app
+    }
+    return NSWorkspace.shared.runningApplications.first {
+        !$0.isTerminated
+            && (($0.localizedName ?? "").caseInsensitiveCompare(raw) == .orderedSame
+                || ($0.bundleIdentifier ?? "").caseInsensitiveCompare(raw) == .orderedSame)
+    }
+}
+
+func applicationElement(identifier: String?) -> (app: NSRunningApplication, element: AXUIElement)? {
+    guard let app = runningApplication(identifier: identifier) else { return nil }
+    return (app, AXUIElementCreateApplication(app.processIdentifier))
+}
+
+func appWindows(_ appElem: AXUIElement) -> [AXUIElement] {
+    var roots: [AXUIElement] = []
+    appendUniqueElement(axCopyElement(appElem, kAXFocusedWindowAttribute as String), to: &roots)
+    appendUniqueElement(axCopyElement(appElem, kAXMainWindowAttribute as String), to: &roots)
+    for window in axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String).array {
+        appendUniqueElement(window, to: &roots)
+    }
+    return roots
+}
+
+func appRootCandidates(identifier: String?) -> [(element: AXUIElement, origin: String)] {
+    var roots: [(element: AXUIElement, origin: String)] = []
+    func append(_ element: AXUIElement?, _ origin: String) {
+        guard let element = element else { return }
+        if roots.contains(where: { elementIdentityMatches($0.element, element) }) { return }
+        roots.append((element, origin))
+    }
+
+    let pair: (app: NSRunningApplication, element: AXUIElement)?
+    if let identifier = identifier {
+        pair = applicationElement(identifier: identifier)
+    } else if let active = resolveActiveAppElement(),
+              let front = NSWorkspace.shared.frontmostApplication {
+        pair = (front, active.element)
+    } else {
+        pair = nil
+    }
+    guard let found = pair else { return roots }
+    let appElem = found.element
+    append(axCopyElement(appElem, kAXFocusedWindowAttribute as String), "focused_window")
+    append(axCopyElement(appElem, kAXMainWindowAttribute as String), "main_window")
+    for window in axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String).array {
+        append(window, "window")
+    }
+    append(appElem, "app")
+    return roots
+}
+
 func resolveWindowForApp(bundleID: String?) -> AXUIElement? {
     let appElem: AXUIElement
     if let bundleID = bundleID {
-        guard let pair = applicationElement(bundleID: bundleID) else { return nil }
+        guard let pair = applicationElement(identifier: bundleID) else { return nil }
         appElem = pair.element
     } else {
         guard let (_, elem) = resolveActiveAppElement() else { return nil }
         appElem = elem
     }
 
-    if let focused = axCopyElement(appElem, kAXFocusedWindowAttribute as String) {
-        return focused
-    }
-    if let main = axCopyElement(appElem, kAXMainWindowAttribute as String) {
-        return main
-    }
-    let windows = axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String).array
-    return windows.first
+    return appWindows(appElem).first
 }
 
 func waitForAppWindow(bundleID: String, timeoutMs: Int) -> [String: Any] {
     let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
     repeat {
-        if let pair = applicationElement(bundleID: bundleID),
+        if let pair = applicationElement(identifier: bundleID),
            let window = resolveWindowForApp(bundleID: bundleID) {
             var result: [String: Any] = [
                 "ok": true,
-                "bundle_id": bundleID,
+                "bundle_id": pair.app.bundleIdentifier ?? bundleID,
                 "pid": Int(pair.app.processIdentifier),
                 "app": pair.app.localizedName ?? "",
                 "window": windowDiagnosticsPayload(window),
@@ -3267,32 +3464,73 @@ func waitForAppWindow(bundleID: String, timeoutMs: Int) -> [String: Any] {
     ]
 }
 
+func activateAndRaiseApp(_ app: NSRunningApplication, timeoutMs: Int) -> [String: Any] {
+    var out: [String: Any] = [:]
+    let activated: Bool
+    if #available(macOS 14.0, *) {
+        activated = app.activate(options: [.activateAllWindows])
+    } else {
+        activated = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+    }
+    out["app_activated"] = activated
+
+    let appElem = AXUIElementCreateApplication(app.processIdentifier)
+    let frontmostStatus = AXUIElementSetAttributeValue(
+        appElem,
+        kAXFrontmostAttribute as CFString,
+        kCFBooleanTrue
+    )
+    out["app_frontmost_status"] = Int(frontmostStatus.rawValue)
+    out["frontmost_settled"] = waitForFrontmost(pid: app.processIdentifier, timeoutMs: timeoutMs)
+
+    if let window = appWindows(appElem).first {
+        let mainBeforeStatus = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let focusedWindowStatus = AXUIElementSetAttributeValue(
+            appElem,
+            kAXFocusedWindowAttribute as CFString,
+            window
+        )
+        let raiseStatus = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        let mainStatus = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let focusedStatus = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        out["window_main_before_raise_status"] = Int(mainBeforeStatus.rawValue)
+        out["app_focused_window_status"] = Int(focusedWindowStatus.rawValue)
+        out["window_raise_status"] = Int(raiseStatus.rawValue)
+        out["window_main_status"] = Int(mainStatus.rawValue)
+        out["window_focused_status"] = Int(focusedStatus.rawValue)
+        out["raised_window"] = windowDiagnosticsPayload(window)
+        if let frame = frameOf(window) { out["frame"] = frame }
+    }
+
+    Thread.sleep(forTimeInterval: 0.08)
+    return out
+}
+
 func launchAppPayload(bundleID: String, activate: Bool, timeoutMs: Int) -> [String: Any] {
-    if let app = runningApplication(bundleID: bundleID) {
-        if activate {
-            if #available(macOS 14.0, *) {
-                _ = app.activate(options: [.activateAllWindows])
-            } else {
-                _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-            }
-            _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: timeoutMs)
-        }
-        return [
+    let resolvedBundleID = bundleIDForAppIdentifier(bundleID) ?? bundleID
+    if let app = runningApplication(identifier: resolvedBundleID) {
+        var result: [String: Any] = [
             "ok": true,
-            "bundle_id": bundleID,
+            "bundle_id": app.bundleIdentifier ?? resolvedBundleID,
             "pid": Int(app.processIdentifier),
             "app": app.localizedName ?? "",
             "already_running": true,
         ]
+        if activate {
+            for (k, v) in activateAndRaiseApp(app, timeoutMs: timeoutMs) {
+                result[k] = v
+            }
+        }
+        return result
     }
 
-    guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil else {
-        return ["error": "app_not_found", "detail": "No application for bundle id \(bundleID)"]
+    guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: resolvedBundleID) != nil else {
+        return ["error": "app_not_found", "detail": "No application for \(bundleID)"]
     }
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    process.arguments = activate ? ["-b", bundleID] : ["-g", "-b", bundleID]
+    process.arguments = activate ? ["-b", resolvedBundleID] : ["-g", "-b", resolvedBundleID]
     let stderr = Pipe()
     process.standardError = stderr
     do {
@@ -3310,7 +3548,7 @@ func launchAppPayload(bundleID: String, activate: Bool, timeoutMs: Int) -> [Stri
     let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
     var launched: NSRunningApplication?
     repeat {
-        if let app = runningApplication(bundleID: bundleID) {
+        if let app = runningApplication(identifier: resolvedBundleID) {
             launched = app
             break
         }
@@ -3318,18 +3556,21 @@ func launchAppPayload(bundleID: String, activate: Bool, timeoutMs: Int) -> [Stri
     } while Date() < deadline
 
     guard let app = launched else {
-        return ["error": "launch_timeout", "detail": "Opening \(bundleID) exceeded \(timeoutMs)ms"]
+        return ["error": "launch_timeout", "detail": "Opening \(resolvedBundleID) exceeded \(timeoutMs)ms"]
     }
-    if activate {
-        _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: timeoutMs)
-    }
-    return [
+    var result: [String: Any] = [
         "ok": true,
-        "bundle_id": bundleID,
+        "bundle_id": app.bundleIdentifier ?? resolvedBundleID,
         "pid": Int(app.processIdentifier),
         "app": app.localizedName ?? "",
         "already_running": false,
     ]
+    if activate {
+        for (k, v) in activateAndRaiseApp(app, timeoutMs: timeoutMs) {
+            result[k] = v
+        }
+    }
+    return result
 }
 
 func stepElementArgs(_ step: [String: Any]) -> ElementArgs {
@@ -3348,9 +3589,32 @@ func stepElementArgs(_ step: [String: Any]) -> ElementArgs {
     )
 }
 
+func resolveSearchDiagnostics(step: [String: Any], context: ChainContext) -> (searched: Int, matchCount: Int) {
+    let parsed = stepElementArgs(step)
+    let roots = chainRootElements(step: step, context: context)
+    if stepPoint(step) != nil {
+        return (roots.count, 0)
+    }
+    let visited = NodeCounter()
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    for root in roots {
+        collectElementCandidates(
+            in: root,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: parsed.skipRoles,
+            preferRoles: parsed.preferRoles,
+            out: &matches
+        )
+    }
+    return (visited.count, matches.count)
+}
+
 func resolveElementPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
-    guard let name = stringValue(step["as"]), !name.isEmpty else {
-        return ["error": "bad_step", "detail": "resolve requires non-empty 'as'"]
+    guard let name = stringValue(step["as"]) ?? stringValue(step["var"]), !name.isEmpty else {
+        return ["error": "bad_step", "detail": "resolve requires non-empty 'as' or 'var'"]
     }
     guard let resolved = resolveElementFromStep(step: step, context: context) else {
         if boolValue(step["optional"], default: false) {
@@ -3363,10 +3627,11 @@ func resolveElementPayload(step: [String: Any], context: ChainContext) -> [Strin
                 "optional": true,
             ]
         }
+        let diag = resolveSearchDiagnostics(step: step, context: context)
         return [
             "error": "not_found",
-            "searched": 0,
-            "match_count": 0,
+            "searched": diag.searched,
+            "match_count": diag.matchCount,
         ]
     }
     context.targets[name] = resolved.element
@@ -3417,14 +3682,12 @@ func chainRootElements(step: [String: Any], context: ChainContext) -> [AXUIEleme
     }
 
     let scope = (stringValue(step["scope"]) ?? "window").lowercased()
-    let bundleID = stringValue(step["bundle_id"])
+    let appIdentifier = stepAppIdentifier(step)
 
     switch scope {
     case "app", "application":
-        if let bundleID = bundleID {
-            appendUniqueElement(applicationElement(bundleID: bundleID)?.element, to: &roots)
-        } else if let (_, elem) = resolveActiveAppElement() {
-            appendUniqueElement(elem, to: &roots)
+        for root in appRootCandidates(identifier: appIdentifier) {
+            appendUniqueElement(root.element, to: &roots)
         }
     case "focused", "focus":
         appendUniqueElement(resolveFocusedElement(), to: &roots)
@@ -3441,10 +3704,8 @@ func chainRootElements(step: [String: Any], context: ChainContext) -> [AXUIEleme
                 appendUniqueElement(appElem, to: &roots)
             }
         }
-        if let bundleID = bundleID {
-            appendUniqueElement(applicationElement(bundleID: bundleID)?.element, to: &roots)
-        } else if let (_, elem) = resolveActiveAppElement() {
-            appendUniqueElement(elem, to: &roots)
+        for root in appRootCandidates(identifier: appIdentifier) {
+            appendUniqueElement(root.element, to: &roots)
         }
         appendUniqueElement(system, to: &roots)
     case "target":
@@ -3454,7 +3715,10 @@ func chainRootElements(step: [String: Any], context: ChainContext) -> [AXUIEleme
     case "window", "focused_window", "frontmost_window":
         fallthrough
     default:
-        appendUniqueElement(resolveWindowForApp(bundleID: bundleID), to: &roots)
+        appendUniqueElement(resolveWindowForApp(bundleID: appIdentifier), to: &roots)
+        for root in appRootCandidates(identifier: appIdentifier) {
+            appendUniqueElement(root.element, to: &roots)
+        }
     }
 
     return roots
@@ -3520,8 +3784,8 @@ func resolveElementFromStep(
                 return (found, 1, 1, 0)
             }
         }
-        if let bundleID = stringValue(step["bundle_id"]),
-           let pair = applicationElement(bundleID: bundleID) {
+        if let appIdentifier = stepAppIdentifier(step),
+           let pair = applicationElement(identifier: appIdentifier) {
             var hit: AXUIElement?
             let status = AXUIElementCopyElementAtPosition(pair.element, Float(point.x), Float(point.y), &hit)
             if status == .success, let hit = hit {
@@ -3637,7 +3901,7 @@ func pressNamedPayload(step: [String: Any]) -> [String: Any] {
     guard let label = stringValue(step["label"]), !label.isEmpty else {
         return ["error": "bad_step", "detail": "press_named requires label"]
     }
-    let bundleID = stringValue(step["bundle_id"])
+    let appIdentifier = stepAppIdentifier(step)
     let role = normalizedRole(stringValue(step["role"]))
     let nearX = doubleValue(step["near_x"])
     let nearY = doubleValue(step["near_y"])
@@ -3646,14 +3910,18 @@ func pressNamedPayload(step: [String: Any]) -> [String: Any] {
 
     var lastFailure: [String: Any] = ["error": "press_failed", "detail": "not attempted"]
     for attempt in 0..<16 {
-        guard let window = resolveWindowForApp(bundleID: bundleID) else {
-            lastFailure = ["error": "no_window", "detail": bundleID ?? "frontmost app"]
+        let roots = appRootCandidates(identifier: appIdentifier)
+            .map { $0.element }
+        guard !roots.isEmpty else {
+            lastFailure = ["error": "no_window", "detail": appIdentifier ?? "frontmost app"]
             Thread.sleep(forTimeInterval: 0.25)
             continue
         }
         let visited = NodeCounter()
         var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
-        collectMatches(in: window, role: role, label: label, depth: 0, visited: visited, out: &matches)
+        for root in roots {
+            collectMatches(in: root, role: role, label: label, depth: 0, visited: visited, out: &matches)
+        }
         guard let pick = resolveMatch(matches: matches, near: near, index: index) else {
             lastFailure = [
                 "error": "not_found",
@@ -3710,12 +3978,24 @@ func setValuePayload(element: AXUIElement, text: String) -> [String: Any] {
     if status != .success {
         return ["error": "value_write_failed", "role": role, "detail": "ax_status=\(status.rawValue)"]
     }
-    Thread.sleep(forTimeInterval: 0.05)
+    let verified = waitForAXAttributeValue(element, kAXValueAttribute as String, expected: text)
+    if !verified.matched {
+        var failed: [String: Any] = [
+            "error": "value_verify_failed",
+            "role": role,
+            "expected": text,
+            "actual": verified.actual,
+            "detail": "AXValue did not match after AXUIElementSetAttributeValue succeeded",
+        ]
+        if let frame = frameOf(element) { failed["frame"] = frame }
+        return failed
+    }
     var result: [String: Any] = [
         "ok": true,
         "action": "set_value",
         "role": role,
         "length": (text as NSString).length,
+        "verified": true,
     ]
     if let frame = frameOf(element) { result["frame"] = frame }
     return result
@@ -3811,7 +4091,7 @@ func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activa
 
     let app: NSRunningApplication
     if let bundleID = bundleID {
-        guard let found = runningApplication(bundleID: bundleID) else {
+        guard let found = runningApplication(identifier: bundleID) else {
             return ["error": "app_not_running", "detail": bundleID]
         }
         app = found
@@ -4012,6 +4292,66 @@ func cfValueForAX(_ value: Any?) -> CFTypeRef? {
     return nil
 }
 
+func serializableAXValue(_ value: CFTypeRef?) -> Any {
+    guard let value = value else { return NSNull() }
+    let typeID = CFGetTypeID(value)
+    if typeID == CFStringGetTypeID(), let s = value as? String { return s }
+    if typeID == CFBooleanGetTypeID() { return CFBooleanGetValue((value as! CFBoolean)) }
+    if let n = value as? NSNumber { return n }
+    if typeID == AXUIElementGetTypeID() { return ["role": roleString(value as! AXUIElement)] }
+    return String(describing: value)
+}
+
+func axAttributeMatchesExpected(_ actual: CFTypeRef?, expected: Any?) -> Bool {
+    guard let actual = actual else { return expected == nil || expected is NSNull }
+    if let expected = expected as? String {
+        if CFGetTypeID(actual) == CFStringGetTypeID(), let s = actual as? String {
+            return s == expected
+        }
+        return String(describing: actual) == expected
+    }
+    if let expected = expected as? Bool {
+        if CFGetTypeID(actual) == CFBooleanGetTypeID() {
+            return CFBooleanGetValue((actual as! CFBoolean)) == expected
+        }
+        if let n = actual as? NSNumber {
+            return n.boolValue == expected
+        }
+        return false
+    }
+    if let expected = expected as? NSNumber,
+       let actualNumber = actual as? NSNumber {
+        return actualNumber == expected
+    }
+    if let expected = expected as? Int,
+       let actualNumber = actual as? NSNumber {
+        return actualNumber.intValue == expected
+    }
+    if let expected = expected as? Double,
+       let actualNumber = actual as? NSNumber {
+        return abs(actualNumber.doubleValue - expected) <= 0.0001
+    }
+    return false
+}
+
+func waitForAXAttributeValue(
+    _ element: AXUIElement,
+    _ attribute: String,
+    expected: Any?,
+    timeoutMs: Int = 700
+) -> (matched: Bool, actual: Any) {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    var last: CFTypeRef? = nil
+    repeat {
+        last = axCopyAttribute(element, attribute)
+        if axAttributeMatchesExpected(last, expected: expected) {
+            return (true, serializableAXValue(last))
+        }
+        Thread.sleep(forTimeInterval: 0.035)
+    } while Date() < deadline
+    return (false, serializableAXValue(last))
+}
+
 func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [String: Any] {
     let targetName = stringValue(step["target"]) ?? "target"
     guard let target = targetElement(step, context: context) else {
@@ -4047,13 +4387,33 @@ func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [
         if let frame = frameOf(attrTarget) { result["frame"] = frame }
         return result
     }
-    Thread.sleep(forTimeInterval: 0.05)
+    var verified = false
+    if attribute != kAXSelectedTextAttribute as String {
+        let verification = waitForAXAttributeValue(attrTarget, attribute, expected: rawValue)
+        if !verification.matched {
+            var result: [String: Any] = [
+                "error": "set_attribute_verify_failed",
+                "target": target.name,
+                "attribute": attribute,
+                "role": roleString(attrTarget),
+                "expected": rawValue as Any,
+                "actual": verification.actual,
+                "detail": "\(attribute) did not match after AXUIElementSetAttributeValue succeeded",
+            ]
+            if let frame = frameOf(attrTarget) { result["frame"] = frame }
+            return result
+        }
+        verified = true
+    } else {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
     var result = elementPayload(attrTarget)
     result.merge([
         "ok": true,
         "action": "set_attribute",
         "target": target.name,
         "attribute": attribute,
+        "verified": verified,
     ]) { _, new in new }
     return result
 }
@@ -4113,8 +4473,8 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
 
     switch op {
     case "launch_app", "launch":
-        guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
-            return ["error": "bad_step", "detail": "launch_app requires bundle_id"]
+        guard let bundleID = stepAppIdentifier(step), !bundleID.isEmpty else {
+            return ["error": "bad_step", "detail": "launch_app requires bundle_id, bundle, or app"]
         }
         return launchAppPayload(
             bundleID: bundleID,
@@ -4123,8 +4483,8 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
         )
 
     case "wait_for_app_window", "wait_window":
-        guard let bundleID = stringValue(step["bundle_id"]), !bundleID.isEmpty else {
-            return ["error": "bad_step", "detail": "wait_for_app_window requires bundle_id"]
+        guard let bundleID = stepAppIdentifier(step), !bundleID.isEmpty else {
+            return ["error": "bad_step", "detail": "wait_for_app_window requires bundle_id, bundle, or app"]
         }
         return waitForAppWindow(bundleID: bundleID, timeoutMs: intValue(step["timeout_ms"]) ?? 8000)
 
@@ -4248,7 +4608,7 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
         let path = stringArrayValue(step["path"])
         return performMenuCommandPayload(
             path,
-            bundleID: stringValue(step["bundle_id"]),
+            bundleID: stepAppIdentifier(step),
             activate: boolValue(step["activate"], default: true)
         )
 
@@ -4369,7 +4729,7 @@ switch cmd {
 case "check":             cmdCheck()
 case "read-at":           cmdReadAt(rest)
 case "read-focused":      cmdReadFocused()
-case "focused-snapshot":  cmdFocusedSnapshot()
+case "focused-snapshot":  cmdFocusedSnapshot(rest)
 case "diagnostics":       cmdDiagnostics()
 case "write-at":          cmdWriteAt(rest)
 case "write-focused":     cmdWriteFocused(rest)

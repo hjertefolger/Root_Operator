@@ -23,6 +23,16 @@ function fakeAvatar() {
     };
 }
 
+function fakeHalo() {
+    const calls = { show: [] };
+    return {
+        instance: {
+            show: (frame, options) => { calls.show.push({ frame, options }); },
+        },
+        calls,
+    };
+}
+
 function fakeScreen(cursor = { x: 500, y: 400 }) {
     return { getCursorScreenPoint: () => ({ ...cursor }) };
 }
@@ -33,7 +43,9 @@ function makeDeps(avatar, opts = {}) {
         appPath: opts.appPath || '/nonexistent/app',
         helperPath: Object.prototype.hasOwnProperty.call(opts, 'helperPath') ? opts.helperPath : null,
         getAgentAvatar: () => avatar,
+        getAgentHalo: opts.halo ? () => opts.halo : undefined,
         releaseKeyboardFocus: opts.releaseKeyboardFocus,
+        setTimeout: opts.setTimeout,
         logDebug: () => {},
     };
 }
@@ -296,7 +308,7 @@ if (argv[0] === 'focused-snapshot') {
     assert.deepEqual(calls[0], [
         'focus-element', '--role', 'AXTextArea', '--prefer-role', 'AXTextArea', '--near', '900,300',
     ]);
-    assert.deepEqual(calls[1], ['focused-snapshot']);
+    assert.deepEqual(calls[1], ['focused-snapshot', '--pid', '123']);
     assert.deepEqual(releaseCalls, ['agent_focus_element']);
     assert.equal(avatar.calls.moveTo.length, 1);
     assert.equal(avatar.calls.moveTo[0].x, 100 + 300 + __test.FRAME_LANDING_OFFSET_PX);
@@ -593,6 +605,48 @@ console.log(JSON.stringify({
     const payload = JSON.parse(argv[1]);
     assert.equal(payload.steps[0].scope, 'system');
     assert.equal(payload.steps[1].action, 'AXPress');
+});
+
+test('agent_act triggers visual feedback for every successful framed bridge step', async () => {
+    const helperPath = makeFakeHelper(`
+const steps = [
+  { ok: true, index: 0, op: 'perform_action', action: 'perform_action', frame: { x: 10, y: 10, w: 20, h: 20 } },
+  { ok: true, index: 1, op: 'set_attribute', action: 'set_attribute', frame: { x: 40, y: 10, w: 20, h: 20 } },
+  { ok: true, index: 2, op: 'hid', action: 'hid_click', frame: { x: 70, y: 10, w: 12, h: 12 } },
+  { ok: true, index: 3, op: 'set_attribute', action: 'set_attribute', frame: { x: 100, y: 10, w: 20, h: 20 } },
+  { ok: true, index: 4, op: 'perform_action', action: 'perform_action', frame: { x: 130, y: 10, w: 20, h: 20 } }
+];
+console.log(JSON.stringify({ ok: true, cursor_unchanged: true, cursor_delta: 0, steps }));
+`);
+    const avatar = fakeAvatar();
+    const halo = fakeHalo();
+    const scheduledDelays = [];
+    const handler = init(makeDeps(avatar.instance, {
+        helperPath,
+        halo: halo.instance,
+        setTimeout: (fn, delay) => {
+            scheduledDelays.push(delay);
+            fn();
+            return { unref: () => {} };
+        },
+    }));
+    const r = await handler.handle({
+        tool: 'agent_act',
+        args: {
+            force: true,
+            steps: [
+                { op: 'perform_action', target: 'a', action: 'AXPress' },
+                { op: 'set_attribute', target: 'a', attribute: 'AXValue', value: 'one' },
+                { op: 'hid', kind: 'click', x: 1, y: 1 },
+                { op: 'set_attribute', target: 'a', attribute: 'AXValue', value: 'two' },
+                { op: 'perform_action', target: 'a', action: 'AXPress' },
+            ],
+        },
+    });
+    assert.equal(r.isError, false);
+    assert.equal(avatar.calls.moveTo.length, 5);
+    assert.equal(halo.calls.show.length, 5);
+    assert.deepEqual(scheduledDelays, [620, 1240, 1860, 2480]);
 });
 
 test('agent_act validates step array before spawning helper', async () => {

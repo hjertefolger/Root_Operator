@@ -428,7 +428,10 @@ async function verifyFocusAfterReturn(deps, result) {
             focus_statuses: result.focus_statuses,
         });
     }
-    const snapshot = await runHelper(deps, ['focused-snapshot']);
+    const snapshotArgs = Number.isFinite(Number(result.pid))
+        ? ['focused-snapshot', '--pid', String(Number(result.pid))]
+        : ['focused-snapshot'];
+    const snapshot = await runHelper(deps, snapshotArgs);
     const expected = result.fresh_focused && !result.fresh_focused.error ? result.fresh_focused : result;
     if (!focusedSnapshotMatches(expected, snapshot)) {
         return withFocusDiagnostics(deps, formatFreshFocusFailure(result, snapshot));
@@ -620,6 +623,7 @@ function formatEvents(events) {
 // flush against a display edge; without it we just default to the
 // right edge.
 const FRAME_LANDING_OFFSET_PX = 12;
+const ACTION_FEEDBACK_STEP_MS = 620;
 
 function computeFrameLanding(frame, screen) {
     if (!frame || !Number.isFinite(frame.x) || !Number.isFinite(frame.y)
@@ -724,7 +728,15 @@ function init(deps) {
     // Pulse the halo around the AX element identified by the helper's
     // structured frame, if the halo overlay is wired and the frame is
     // valid. Best-effort — never throw, never block the action result.
-    function maybeHalo(result) {
+    function haloOptionsForResult(result) {
+        const action = String((result && (result.action || result.op)) || '').toLowerCase();
+        if (action === 'focus' || action === 'read' || action === 'inspect') {
+            return { mode: action || 'focus', sustain: action === 'focus' };
+        }
+        return { mode: action || 'action' };
+    }
+
+    function maybeHalo(result, options = {}) {
         if (!result || !result.frame) return;
         if (typeof deps.getAgentHalo !== 'function') return;
         const halo = deps.getAgentHalo();
@@ -735,15 +747,40 @@ function init(deps) {
                 y: result.frame.y,
                 w: result.frame.w,
                 h: result.frame.h,
-            });
+            }, { ...haloOptionsForResult(result), ...options });
         } catch (_) { /* swallow halo errors — purely decorative */ }
     }
 
     // Halo + travel together — every successful AX action where we have
     // a frame should make the dot legible at the action site.
-    function showActionAt(avatar, result) {
-        maybeHalo(result);
+    function showActionAt(avatar, result, options = {}) {
+        maybeHalo(result, options);
         maybeTravelToFrame(avatar, result, deps.screen);
+    }
+
+    function successfulFramedSteps(result) {
+        if (!result || !Array.isArray(result.steps)) return [];
+        return result.steps.filter((step) => {
+            if (!step || !step.frame || step.skipped) return false;
+            if (step.error) return false;
+            if (step.ok === false) return false;
+            return step.ok === true || step.found === true || step.action || step.op;
+        });
+    }
+
+    function scheduleActionSignals(avatar, result) {
+        const steps = successfulFramedSteps(result);
+        if (steps.length === 0) return false;
+        steps.forEach((step, index) => {
+            if (index === 0) {
+                showActionAt(avatar, step);
+                return;
+            }
+            const schedule = typeof deps.setTimeout === 'function' ? deps.setTimeout : setTimeout;
+            const timer = schedule(() => showActionAt(avatar, step), index * ACTION_FEEDBACK_STEP_MS);
+            if (typeof timer.unref === 'function') timer.unref();
+        });
+        return true;
     }
 
     async function withDrivingAvatar(avatar, fn) {
@@ -996,10 +1033,7 @@ function init(deps) {
                     const r = await runHelper(deps, ['run-chain', json]);
                     if (r.ok) {
                         bumpSelfActionAt();
-                        const lastWithFrame = Array.isArray(r.steps)
-                            ? [...r.steps].reverse().find((step) => step && step.frame)
-                            : null;
-                        if (lastWithFrame) showActionAt(avatar, lastWithFrame);
+                        scheduleActionSignals(avatar, r);
                     }
                     return { result: formatRunChain(r), isError: !r.ok };
                 }
@@ -1030,10 +1064,7 @@ function init(deps) {
                     const r = await runHelper(deps, ['act', json]);
                     if (r.ok) {
                         bumpSelfActionAt();
-                        const lastWithFrame = Array.isArray(r.steps)
-                            ? [...r.steps].reverse().find((step) => step && step.frame)
-                            : null;
-                        if (lastWithFrame) showActionAt(avatar, lastWithFrame);
+                        scheduleActionSignals(avatar, r);
                     }
                     return { result: formatRunChain(r).replace(/^Run chain/, 'Generic action'), isError: !r.ok };
                 }

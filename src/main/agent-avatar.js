@@ -23,6 +23,7 @@
  * Mission Control.
  */
 const path = require('path');
+const presenceMotionConfig = require('../shared/presence-motion-config.json');
 
 // Window is bigger than the dot it contains — extra padding so the
 // active-state dot + glow ring + halo arc fit without clipping.
@@ -40,8 +41,9 @@ const APP_HIDE_RESTORE_DELAYS_MS = [0, 50, 150, 350];
 const TICK_HZ = 60;
 const TICK_INTERVAL_MS = Math.round(1000 / TICK_HZ);
 
-// Travel duration. 800ms with cubic-out reads as walking-over rather
-// than teleporting. Tunable via deps.travelDurationMs for tests.
+// Test/default travel duration. Runtime travel is distance-scaled from
+// the shared presence config; deps.travelDurationMs fixes the duration
+// for deterministic tests.
 const DEFAULT_TRAVEL_DURATION_MS = 800;
 
 // Default offset from a cursor target — used both as the ambient
@@ -62,6 +64,23 @@ const AMBIENT_SPRING_K = 0.18;
 // becoming distracting.
 const BREATH_PERIOD_MS = 2400;
 const BREATH_AMPLITUDE_PX = 1.5;
+const AVATAR_MOTION = presenceMotionConfig.avatar || {};
+const TRAVEL_MIN_MS = AVATAR_MOTION.travelMinMs || 620;
+const TRAVEL_MAX_MS = AVATAR_MOTION.travelMaxMs || 1100;
+const TRAVEL_BASE_MS = AVATAR_MOTION.travelBaseMs || 520;
+const TRAVEL_DISTANCE_SLOPE_MS_PER_PX = AVATAR_MOTION.travelDistanceSlopeMsPerPx || 0.34;
+const TRAVEL_SETTLE_MS = AVATAR_MOTION.settleMs || 150;
+const TRAVEL_OVERSHOOT_PX = AVATAR_MOTION.overshootPx || 1.7;
+const ACTIVE_DRIFT_RADIUS_PX = AVATAR_MOTION.driftRadiusPx || 9;
+const ACTIVE_DRIFT_PERIOD_MS = AVATAR_MOTION.driftPeriodMs || 5400;
+const ACTIVE_DRIFT_SECONDARY_PERIOD_MS = AVATAR_MOTION.driftSecondaryPeriodMs || 7600;
+const ACTIVE_DRIFT_VERTICAL_SCALE = AVATAR_MOTION.driftVerticalScale || 0.72;
+const MICRO_TOUR_MIN_DELAY_MS = AVATAR_MOTION.microTourMinDelayMs || 8000;
+const MICRO_TOUR_MAX_DELAY_MS = AVATAR_MOTION.microTourMaxDelayMs || 15000;
+const MICRO_TOUR_MIN_DURATION_MS = AVATAR_MOTION.microTourMinDurationMs || 1200;
+const MICRO_TOUR_MAX_DURATION_MS = AVATAR_MOTION.microTourMaxDurationMs || 2000;
+const MICRO_TOUR_MIN_RADIUS_PX = AVATAR_MOTION.microTourMinRadiusPx || 20;
+const MICRO_TOUR_MAX_RADIUS_PX = AVATAR_MOTION.microTourMaxRadiusPx || 40;
 
 // Curved-path control-point parameters. Travel uses a cubic Bezier
 // instead of a straight line: P0 = from, P3 = to, P1 sits ahead of
@@ -88,6 +107,34 @@ const STATE = Object.freeze({
 
 function easeOutCubic(t) {
     return 1 - Math.pow(1 - t, 3);
+}
+
+function clamp01(t) {
+    return Math.max(0, Math.min(1, t));
+}
+
+function easeInOutSine(t) {
+    return -(Math.cos(Math.PI * t) - 1) / 2;
+}
+
+function clampMs(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function seededRandomFactory(seed) {
+    let state = (Number.isFinite(seed) ? seed : Date.now()) >>> 0;
+    if (state === 0) state = 0x9e3779b9;
+    return function seededRandom() {
+        state += 0x6D2B79F5;
+        let t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
 }
 
 // Compute the four control points of the travel Bezier. Pure function
@@ -156,13 +203,17 @@ function init(deps) {
         ? deps.clock
         : { now: () => Date.now() };
 
-    const travelDurationMs = Number.isFinite(deps.travelDurationMs)
+    const fixedTravelDurationMs = Number.isFinite(deps.travelDurationMs)
         ? deps.travelDurationMs
-        : DEFAULT_TRAVEL_DURATION_MS;
+        : null;
 
     const springK = Number.isFinite(deps.ambientSpringK)
         ? deps.ambientSpringK
         : AMBIENT_SPRING_K;
+    const random = seededRandomFactory(Number.isFinite(deps.motionSeed) ? deps.motionSeed : undefined);
+    const driftPhaseX = random() * Math.PI * 2;
+    const driftPhaseY = random() * Math.PI * 2;
+    const driftPhaseSecondary = random() * Math.PI * 2;
 
     let win = null;
     let displayHandlers = null;
@@ -172,7 +223,9 @@ function init(deps) {
     let state = STATE.AMBIENT;
     let stateBeforeDriving = STATE.AMBIENT;
     let position = { x: 0, y: 0 };
-    let travel = null; // { from, to, startedAt, settleState }
+    let travel = null; // { from, to, startedAt, durationMs, settleMs, controls, settleFrom, settleState }
+    let microTour = null;
+    let nextMicroTourAt = null;
     let tickTimer = null;
     let lastBroadcastState = null;
     const tickT0 = clock.now();
@@ -248,6 +301,105 @@ function init(deps) {
         return clampToDisplay(cursor.x + ox, cursor.y + oy);
     }
 
+    function resolveTravelDuration(from, to) {
+        if (Number.isFinite(fixedTravelDurationMs)) {
+            return Math.max(1, fixedTravelDurationMs);
+        }
+        const dist = Math.hypot(to.x - from.x, to.y - from.y);
+        return clampMs(
+            TRAVEL_BASE_MS + dist * TRAVEL_DISTANCE_SLOPE_MS_PER_PX,
+            TRAVEL_MIN_MS,
+            TRAVEL_MAX_MS,
+        );
+    }
+
+    function computeOvershootPoint(from, to) {
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const dist = Math.hypot(dx, dy);
+        if (!Number.isFinite(dist) || dist < 1) return { x: to.x, y: to.y };
+        const overshoot = Math.min(TRAVEL_OVERSHOOT_PX, dist * 0.12);
+        return {
+            x: to.x + (dx / dist) * overshoot,
+            y: to.y + (dy / dist) * overshoot,
+        };
+    }
+
+    function randomBetween(min, max) {
+        return min + (max - min) * random();
+    }
+
+    function scheduleNextMicroTour(now) {
+        nextMicroTourAt = now + randomBetween(MICRO_TOUR_MIN_DELAY_MS, MICRO_TOUR_MAX_DELAY_MS);
+    }
+
+    function startMicroTour(now) {
+        microTour = {
+            startedAt: now,
+            durationMs: randomBetween(MICRO_TOUR_MIN_DURATION_MS, MICRO_TOUR_MAX_DURATION_MS),
+            radius: randomBetween(MICRO_TOUR_MIN_RADIUS_PX, MICRO_TOUR_MAX_RADIUS_PX),
+            phase: random() * Math.PI * 2,
+            direction: random() < 0.5 ? -1 : 1,
+        };
+        nextMicroTourAt = null;
+    }
+
+    function activeVisualOffset(now) {
+        if (!Number.isFinite(now)) return { x: 0, y: 0 };
+        if (nextMicroTourAt === null && microTour === null) {
+            scheduleNextMicroTour(now);
+        }
+        if (!microTour && nextMicroTourAt !== null && now >= nextMicroTourAt) {
+            startMicroTour(now);
+        }
+
+        const t = now - tickT0;
+        const driftA = (t / ACTIVE_DRIFT_PERIOD_MS) * Math.PI * 2;
+        const driftB = (t / ACTIVE_DRIFT_SECONDARY_PERIOD_MS) * Math.PI * 2;
+        const drift = {
+            x: Math.sin(driftA + driftPhaseX) * ACTIVE_DRIFT_RADIUS_PX
+                + Math.sin(driftB + driftPhaseSecondary) * ACTIVE_DRIFT_RADIUS_PX * 0.35,
+            y: (Math.cos(driftA * 0.92 + driftPhaseY) * ACTIVE_DRIFT_RADIUS_PX
+                + Math.sin(driftB * 1.08 + driftPhaseSecondary) * ACTIVE_DRIFT_RADIUS_PX * 0.28)
+                * ACTIVE_DRIFT_VERTICAL_SCALE,
+        };
+
+        if (!microTour) return drift;
+        const elapsed = now - microTour.startedAt;
+        const rawProgress = clamp01(elapsed / microTour.durationMs);
+        if (rawProgress >= 1) {
+            microTour = null;
+            scheduleNextMicroTour(now);
+            return drift;
+        }
+        const envelope = Math.sin(Math.PI * rawProgress);
+        const lap = rawProgress * Math.PI * 2 * microTour.direction + microTour.phase;
+        return {
+            x: drift.x + Math.cos(lap) * microTour.radius * envelope,
+            y: drift.y + Math.sin(lap) * microTour.radius * envelope,
+        };
+    }
+
+    function activeVisualPosition(now) {
+        const offset = activeVisualOffset(now);
+        return clampToDisplay(position.x + offset.x, position.y + offset.y);
+    }
+
+    function sampleTravelPositionAt(now) {
+        if (!travel) return { x: position.x, y: position.y };
+        const elapsed = now - travel.startedAt;
+        const approachMs = Math.max(1, travel.durationMs - travel.settleMs);
+        if (elapsed <= approachMs) {
+            const eased = easeOutCubic(clamp01(elapsed / approachMs));
+            return bezierAt(travel.controls, eased);
+        }
+        const settleProgress = easeInOutSine(clamp01((elapsed - approachMs) / Math.max(1, travel.settleMs)));
+        return {
+            x: lerp(travel.settleFrom.x, travel.to.x, settleProgress),
+            y: lerp(travel.settleFrom.y, travel.to.y, settleProgress),
+        };
+    }
+
     function broadcastState() {
         if (!isUsable(win)) return;
         if (state === lastBroadcastState) return;
@@ -310,9 +462,8 @@ function init(deps) {
                 return;
             }
             const elapsed = now - travel.startedAt;
-            const progress = Math.min(1, elapsed / travelDurationMs);
-            const eased = easeOutCubic(progress);
-            const pt = bezierAt(travel.controls, eased);
+            const progress = Math.min(1, elapsed / travel.durationMs);
+            const pt = sampleTravelPositionAt(now);
             position.x = pt.x;
             position.y = pt.y;
 
@@ -320,6 +471,8 @@ function init(deps) {
                 const settleState = travel.settleState;
                 travel = null;
                 state = settleState;
+                microTour = null;
+                nextMicroTourAt = null;
                 broadcastState();
                 if (state === STATE.AMBIENT) {
                     // Tick stays running — ambient needs the loop to
@@ -333,8 +486,9 @@ function init(deps) {
 
         if (state === STATE.ACTIVE) {
             const phase = ((now - tickT0) / BREATH_PERIOD_MS) * 2 * Math.PI;
-            const renderY = position.y + Math.sin(phase) * BREATH_AMPLITUDE_PX;
-            applyBoundsCentered(position.x, renderY);
+            const hover = Math.sin(phase) * BREATH_AMPLITUDE_PX;
+            const render = activeVisualPosition(now);
+            applyBoundsCentered(render.x, render.y + hover);
         }
 
         if (state === STATE.DRIVING) {
@@ -351,12 +505,15 @@ function init(deps) {
     // the dot ACTUALLY is, not from the last persisted base position.
     function sampleCurrentPosition() {
         if (state === STATE.TRAVELING && travel) {
-            const elapsed = clock.now() - travel.startedAt;
-            const progress = Math.min(1, elapsed / travelDurationMs);
-            const eased = easeOutCubic(progress);
-            const pt = bezierAt(travel.controls, eased);
+            const pt = sampleTravelPositionAt(clock.now());
             position.x = pt.x;
             position.y = pt.y;
+        } else if (state === STATE.ACTIVE) {
+            const pt = activeVisualPosition(clock.now());
+            position.x = pt.x;
+            position.y = pt.y;
+            microTour = null;
+            nextMicroTourAt = null;
         }
     }
 
@@ -378,13 +535,21 @@ function init(deps) {
         }
         const from = { x: position.x, y: position.y };
         const to = { x: target.x, y: target.y };
+        const durationMs = resolveTravelDuration(from, to);
+        const settleMs = Math.min(TRAVEL_SETTLE_MS, Math.max(0, durationMs * 0.25));
+        const settleFrom = computeOvershootPoint(from, to);
         travel = {
             from,
             to,
             controls: computeBezierControls(from, to),
             startedAt: clock.now(),
+            durationMs,
+            settleMs,
+            settleFrom,
             settleState,
         };
+        microTour = null;
+        nextMicroTourAt = null;
         state = STATE.TRAVELING;
         broadcastState();
         startTick();
@@ -648,6 +813,13 @@ module.exports = {
         AMBIENT_SPRING_K,
         BREATH_PERIOD_MS,
         BREATH_AMPLITUDE_PX,
+        TRAVEL_MIN_MS,
+        TRAVEL_MAX_MS,
+        TRAVEL_SETTLE_MS,
+        TRAVEL_OVERSHOOT_PX,
+        ACTIVE_DRIFT_RADIUS_PX,
+        MICRO_TOUR_MIN_DELAY_MS,
+        MICRO_TOUR_MAX_DELAY_MS,
         DETACH_KICK_FRACTION,
         DETACH_KICK_MAX_PX,
         ARC_PERPENDICULAR_FRACTION,
