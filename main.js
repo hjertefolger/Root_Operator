@@ -522,6 +522,29 @@ const agentActions = initAgentActions({
         }
         return false;
     },
+    prepareForExternalFocus: (reason) => {
+        let released = false;
+        for (const w of BrowserWindow.getAllWindows()) {
+            if (!w || w.isDestroyed()) continue;
+            try {
+                if (typeof w.isFocused === 'function' && !w.isFocused()) continue;
+            } catch (_) {
+                // Fall through to a best-effort blur.
+            }
+            try {
+                if (typeof w.blur === 'function') {
+                    w.blur();
+                    released = true;
+                }
+            } catch (_) {
+                // Best-effort host focus release.
+            }
+        }
+        if (released) {
+            logDebug(`[AGENT] released focused Root Operator window before ${reason}`);
+        }
+        return released;
+    },
     logDebug,
 });
 

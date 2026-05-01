@@ -323,6 +323,55 @@ console.log(JSON.stringify({
     assert.equal(avatar.calls.moveTo.length, 0);
 });
 
+test('agent_focus_element augments non-sticky focus with diagnostics', async () => {
+    const argvPath = path.join(os.tmpdir(), `focus-diag-argv-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv) + '\\n');
+if (argv[0] === 'diagnostics') {
+  console.log(JSON.stringify({
+    frontmost_application: { name: 'Notes', pid: 42, bundle_id: 'com.apple.Notes' },
+    system_focused_application: {
+      name: 'Notes',
+      pid: 42,
+      bundle_id: 'com.apple.Notes',
+      focused_window: { role: 'AXWindow', title: 'Work', frame: { x: 10, y: 20, w: 800, h: 600 }, is_key: false, is_main: true },
+      focused_ui_element: { role: 'AXWindow', pid: 42, frame: { x: 10, y: 20, w: 800, h: 600 } }
+    },
+    system_focused_ui_element: { role: 'AXWindow', pid: 42, frame: { x: 10, y: 20, w: 800, h: 600 } },
+    root_operator_focused_windows: [
+      { app: 'Root_Operator', bundle_id: 'com.hjertefolger.rootoperator', role: 'AXWindow', title: 'Cursor Presence', is_key: true, is_main: false }
+    ],
+    running_applications: [
+      { name: 'Notes', pid: 42, windows: [{ role: 'AXWindow', title: 'Work', is_key: false, is_main: true }] }
+    ]
+  }));
+} else {
+  console.log(JSON.stringify({
+    error: 'focus_not_sticky',
+    role: 'AXTextArea',
+    pid: 42,
+    detail: 'AXFocused setter succeeded, but system AXFocusedUIElement did not match the target within the settle window.',
+    frame: { x: 100, y: 200, w: 300, h: 80 }
+  }));
+}
+`);
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_focus_element',
+        args: { role: 'AXTextArea' },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /Focus diagnostics:/);
+    assert.match(r.result, /system_focused_app=Notes pid=42 com\.apple\.Notes/);
+    assert.match(r.result, /root_operator_focused_windows=AXWindow "Cursor Presence"/);
+    const calls = fs.readFileSync(argvPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual(calls[0], ['focus-element', '--role', 'AXTextArea']);
+    assert.deepEqual(calls[1], ['diagnostics']);
+});
+
 test('agent_focus_element rejects ok result when fresh post-return focus is empty', async () => {
     const helperPath = makeFakeHelper(`
 const argv = process.argv.slice(2);

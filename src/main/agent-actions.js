@@ -409,21 +409,27 @@ function formatFreshFocusFailure(result, snapshot) {
     };
 }
 
+async function withFocusDiagnostics(deps, result) {
+    if (!result || result.error !== 'focus_not_sticky' || result.diagnostics) return result;
+    const diagnostics = await runHelper(deps, ['diagnostics']);
+    return { ...result, diagnostics };
+}
+
 async function verifyFocusAfterReturn(deps, result) {
-    if (!result || !result.ok) return result;
+    if (!result || !result.ok) return withFocusDiagnostics(deps, result);
     if (result.fresh_verified !== true) {
-        return {
+        return withFocusDiagnostics(deps, {
             error: 'focus_not_sticky',
             role: result.role,
             detail: 'native helper returned focus success without fresh process verification',
             frame: result.frame,
             focus_statuses: result.focus_statuses,
-        };
+        });
     }
     const snapshot = await runHelper(deps, ['focused-snapshot']);
     const expected = result.fresh_focused && !result.fresh_focused.error ? result.fresh_focused : result;
     if (!focusedSnapshotMatches(expected, snapshot)) {
-        return formatFreshFocusFailure(result, snapshot);
+        return withFocusDiagnostics(deps, formatFreshFocusFailure(result, snapshot));
     }
     return {
         ...result,
@@ -432,9 +438,86 @@ async function verifyFocusAfterReturn(deps, result) {
     };
 }
 
+function formatFrameShort(frame) {
+    if (!frame) return '';
+    const x = numberish(frame.x);
+    const y = numberish(frame.y);
+    const w = numberish(frame.w);
+    const h = numberish(frame.h);
+    if (x === null || y === null || w === null || h === null) return '';
+    return `[${Math.round(x)},${Math.round(y)} ${Math.round(w)}x${Math.round(h)}]`;
+}
+
+function formatAppShort(app) {
+    if (!app || typeof app !== 'object') return 'none';
+    const name = app.name || app.app || 'unknown';
+    const pid = app.pid !== undefined ? ` pid=${app.pid}` : '';
+    const bundle = app.bundle_id ? ` ${app.bundle_id}` : '';
+    return `${name}${pid}${bundle}`;
+}
+
+function formatWindowShort(window) {
+    if (!window || typeof window !== 'object') return 'none';
+    const name = window.title || window.label;
+    const title = name ? ` "${name}"` : '';
+    const key = window.is_key !== undefined ? ` key=${window.is_key}` : '';
+    const main = window.is_main !== undefined ? ` main=${window.is_main}` : '';
+    const frame = formatFrameShort(window.frame);
+    return `${window.role || 'AXWindow'}${title}${frame ? ` ${frame}` : ''}${key}${main}`;
+}
+
+function formatElementShort(element) {
+    if (!element || typeof element !== 'object') return 'none';
+    const label = element.label ? ` "${String(element.label).slice(0, 80)}"` : '';
+    const frame = formatFrameShort(element.frame);
+    const pid = element.pid !== undefined ? ` pid=${element.pid}` : '';
+    return `${element.role || 'AXUnknown'}${label}${frame ? ` ${frame}` : ''}${pid}`;
+}
+
+function formatFocusDiagnostics(result) {
+    const diag = result && result.diagnostics;
+    if (!diag) return '';
+    if (diag.error) {
+        return `\nFocus diagnostics: ${diag.error}${diag.detail ? ` (${diag.detail})` : ''}`;
+    }
+
+    const lines = ['Focus diagnostics:'];
+    if (diag.frontmost_application) {
+        lines.push(`frontmost=${formatAppShort(diag.frontmost_application)}`);
+    }
+    if (diag.system_focused_application) {
+        lines.push(`system_focused_app=${formatAppShort(diag.system_focused_application)}`);
+        if (diag.system_focused_application.focused_window) {
+            lines.push(`system_focused_window=${formatWindowShort(diag.system_focused_application.focused_window)}`);
+        }
+        const focusedInApp = diag.system_focused_application.focused_ui_element
+            || diag.system_focused_application.window_focused_ui_element;
+        if (focusedInApp) {
+            lines.push(`app_focused_element=${formatElementShort(focusedInApp)}`);
+        }
+    }
+    if (diag.system_focused_ui_element) {
+        lines.push(`system_focused_element=${formatElementShort(diag.system_focused_ui_element)}`);
+    }
+    if (Array.isArray(diag.root_operator_focused_windows)) {
+        const ro = diag.root_operator_focused_windows.slice(0, 3).map(formatWindowShort);
+        lines.push(`root_operator_focused_windows=${ro.length ? ro.join(' | ') : 'none'}`);
+    }
+    const targetPid = result && result.pid !== undefined ? Number(result.pid) : null;
+    if (targetPid !== null && Array.isArray(diag.running_applications)) {
+        const app = diag.running_applications.find((entry) => Number(entry.pid) === targetPid);
+        if (app && Array.isArray(app.windows) && app.windows.length > 0) {
+            const windows = app.windows.slice(0, 4).map(formatWindowShort).join(' | ');
+            const more = app.windows.length > 4 ? ` | +${app.windows.length - 4} more` : '';
+            lines.push(`target_app_windows=${windows}${more}`);
+        }
+    }
+    return `\n${lines.join('\n')}`;
+}
+
 function formatFocus(result) {
     if (result.error) {
-        return `Focus failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}${formatMatchSuffix(result)}`;
+        return `Focus failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}${formatMatchSuffix(result)}${formatFocusDiagnostics(result)}`;
     }
     if (result.ok) {
         const label = result.label ? ` "${result.label}"` : '';
@@ -1328,6 +1411,7 @@ module.exports = {
         formatFind,
         formatPress,
         formatFocus,
+        formatFocusDiagnostics,
         formatEventLine,
         formatEvents,
         runHelper,

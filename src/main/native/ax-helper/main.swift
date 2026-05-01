@@ -47,6 +47,12 @@ func axCopyAttribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
     return status == .success ? value : nil
 }
 
+func axCopyAttributeWithStatus(_ element: AXUIElement, _ key: String) -> (status: AXError, value: CFTypeRef?) {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+    return (status, status == .success ? value : nil)
+}
+
 func axCopyString(_ element: AXUIElement, _ key: String) -> String? {
     guard let raw = axCopyAttribute(element, key) else { return nil }
     if CFGetTypeID(raw) == CFStringGetTypeID() {
@@ -122,6 +128,40 @@ func axCopyElement(_ element: AXUIElement, _ key: String) -> AXUIElement? {
     guard let raw = axCopyAttribute(element, key) else { return nil }
     if CFGetTypeID(raw) == AXUIElementGetTypeID() {
         return (raw as! AXUIElement)
+    }
+    return nil
+}
+
+func axCopyElementWithStatus(_ element: AXUIElement, _ key: String) -> (status: AXError, element: AXUIElement?) {
+    let copied = axCopyAttributeWithStatus(element, key)
+    guard copied.status == .success,
+          let raw = copied.value,
+          CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+        return (copied.status, nil)
+    }
+    return (copied.status, (raw as! AXUIElement))
+}
+
+func axCopyArrayWithStatus(_ element: AXUIElement, _ key: String) -> (status: AXError, array: [AXUIElement]) {
+    let copied = axCopyAttributeWithStatus(element, key)
+    guard copied.status == .success,
+          let raw = copied.value,
+          CFGetTypeID(raw) == CFArrayGetTypeID() else {
+        return (copied.status, [])
+    }
+    return (copied.status, raw as! [AXUIElement])
+}
+
+func axCopyBool(_ element: AXUIElement, _ key: String) -> Bool? {
+    guard let raw = axCopyAttribute(element, key) else { return nil }
+    if CFGetTypeID(raw) == CFBooleanGetTypeID() {
+        return CFBooleanGetValue((raw as! CFBoolean))
+    }
+    if let n = raw as? NSNumber {
+        return n.boolValue
+    }
+    if let b = raw as? Bool {
+        return b
     }
     return nil
 }
@@ -268,6 +308,248 @@ func freshFocusedSnapshot(timeoutMs: Int = 900) -> [String: Any]? {
     } catch {
         return ["error": "fresh_parse_failed", "detail": error.localizedDescription]
     }
+}
+
+func freshFocusDiagnostics(timeoutMs: Int = 3500) -> [String: Any]? {
+    let process = Process()
+    process.executableURL = currentExecutableURL()
+    process.arguments = ["diagnostics"]
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+
+    do {
+        try process.run()
+    } catch {
+        return ["error": "diagnostics_spawn_failed", "detail": error.localizedDescription]
+    }
+
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    while process.isRunning && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    if process.isRunning {
+        process.terminate()
+        return ["error": "diagnostics_timeout"]
+    }
+
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    guard !data.isEmpty else {
+        return ["error": "diagnostics_empty"]
+    }
+    do {
+        let raw = try JSONSerialization.jsonObject(with: data, options: [])
+        return raw as? [String: Any]
+    } catch {
+        return ["error": "diagnostics_parse_failed", "detail": error.localizedDescription]
+    }
+}
+
+func runningAppMeta(pid: pid_t) -> [String: Any] {
+    var out: [String: Any] = ["pid": Int(pid)]
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        out["name"] = app.localizedName ?? ""
+        out["bundle_id"] = app.bundleIdentifier ?? ""
+        out["activation_policy"] = Int(app.activationPolicy.rawValue)
+        if let path = app.executableURL?.path {
+            out["executable"] = path
+        }
+    }
+    return out
+}
+
+func appMeta(_ app: NSRunningApplication) -> [String: Any] {
+    var out: [String: Any] = [
+        "pid": Int(app.processIdentifier),
+        "name": app.localizedName ?? "",
+        "bundle_id": app.bundleIdentifier ?? "",
+        "activation_policy": Int(app.activationPolicy.rawValue),
+        "is_active": app.isActive,
+        "is_hidden": app.isHidden,
+        "is_finished_launching": app.isFinishedLaunching,
+    ]
+    if let path = app.executableURL?.path {
+        out["executable"] = path
+    }
+    return out
+}
+
+func windowDiagnosticsPayload(_ window: AXUIElement) -> [String: Any] {
+    _ = AXUIElementSetMessagingTimeout(window, 0.08)
+    var out: [String: Any] = ["role": roleString(window)]
+    if let pid = pidOf(window) { out["pid"] = Int(pid) }
+    if let subrole = axCopyString(window, kAXSubroleAttribute as String), !subrole.isEmpty {
+        out["subrole"] = subrole
+    }
+    if let title = axCopyString(window, kAXTitleAttribute as String), !title.isEmpty {
+        out["title"] = truncate(title, TREE_VALUE_TRUNC)
+    } else if let label = displayLabel(window) {
+        out["title"] = truncate(label, TREE_VALUE_TRUNC)
+    }
+    if let frame = frameOf(window) {
+        out["frame"] = frame
+    }
+    if let isMain = axCopyBool(window, kAXMainAttribute as String) {
+        out["is_main"] = isMain
+    }
+    if let isKey = axCopyBool(window, kAXFocusedAttribute as String) {
+        out["is_key"] = isKey
+    }
+    return out
+}
+
+func focusedElementDiagnosticsPayload(_ element: AXUIElement) -> [String: Any] {
+    _ = AXUIElementSetMessagingTimeout(element, 0.08)
+    var out = snapshotPayload(element)
+    if let subrole = axCopyString(element, kAXSubroleAttribute as String), !subrole.isEmpty {
+        out["subrole"] = subrole
+    }
+    if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
+        out["value"] = truncate(value, TREE_VALUE_TRUNC)
+    }
+    return out
+}
+
+func windowish(_ element: AXUIElement) -> Bool {
+    let role = roleString(element)
+    return role == "AXWindow" || role == "AXSheet" || role == "AXDialog"
+}
+
+func isRootOperatorApp(_ app: NSRunningApplication) -> Bool {
+    let fields = [
+        app.localizedName ?? "",
+        app.bundleIdentifier ?? "",
+        app.executableURL?.path ?? "",
+        app.bundleURL?.path ?? "",
+    ].joined(separator: " ").lowercased()
+    return fields.contains("root_operator")
+        || fields.contains("root operator")
+        || fields.contains("rootoperator")
+        || fields.contains("hjertefolger.rootoperator")
+}
+
+func appWindowsDiagnostics(_ appElem: AXUIElement) -> (childrenStatus: AXError, windowsStatus: AXError, windows: [[String: Any]]) {
+    let childResult = axCopyArrayWithStatus(appElem, kAXChildrenAttribute as String)
+    let axWindowsResult = axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String)
+    var out: [[String: Any]] = []
+    for child in childResult.array where windowish(child) {
+        var payload = windowDiagnosticsPayload(child)
+        payload["source"] = "AXChildren"
+        out.append(payload)
+    }
+    for window in axWindowsResult.array where windowish(window) {
+        var payload = windowDiagnosticsPayload(window)
+        payload["source"] = "AXWindows"
+        out.append(payload)
+    }
+    return (childResult.status, axWindowsResult.status, out)
+}
+
+func focusDiagnosticsPayload() -> [String: Any] {
+    let system = AXUIElementCreateSystemWide()
+    var result: [String: Any] = [
+        "trusted": AXIsProcessTrusted(),
+        "ts": Date().timeIntervalSince1970,
+    ]
+
+    if let front = NSWorkspace.shared.frontmostApplication {
+        result["frontmost_application"] = appMeta(front)
+    }
+
+    let focusedAppResult = axCopyElementWithStatus(system, kAXFocusedApplicationAttribute as String)
+    result["system_focused_application_status"] = Int(focusedAppResult.status.rawValue)
+    if let focusedApp = focusedAppResult.element {
+        var appPayload: [String: Any] = [:]
+        if let pid = pidOf(focusedApp) {
+            appPayload = runningAppMeta(pid: pid)
+            let appElem = AXUIElementCreateApplication(pid)
+            _ = AXUIElementSetMessagingTimeout(appElem, 0.2)
+            let focusedWindowResult = axCopyElementWithStatus(appElem, kAXFocusedWindowAttribute as String)
+            appPayload["focused_window_status"] = Int(focusedWindowResult.status.rawValue)
+            if let focusedWindow = focusedWindowResult.element {
+                appPayload["focused_window"] = windowDiagnosticsPayload(focusedWindow)
+                let windowFocusedResult = axCopyElementWithStatus(focusedWindow, kAXFocusedUIElementAttribute as String)
+                appPayload["window_focused_ui_element_status"] = Int(windowFocusedResult.status.rawValue)
+                if let windowFocused = windowFocusedResult.element {
+                    appPayload["window_focused_ui_element"] = focusedElementDiagnosticsPayload(windowFocused)
+                }
+            }
+            let appFocusedElementResult = axCopyElementWithStatus(appElem, kAXFocusedUIElementAttribute as String)
+            appPayload["focused_ui_element_status"] = Int(appFocusedElementResult.status.rawValue)
+            if let focusedElement = appFocusedElementResult.element {
+                appPayload["focused_ui_element"] = focusedElementDiagnosticsPayload(focusedElement)
+            }
+        }
+        result["system_focused_application"] = appPayload
+    }
+
+    let systemFocusedElementResult = axCopyElementWithStatus(system, kAXFocusedUIElementAttribute as String)
+    result["system_focused_ui_element_status"] = Int(systemFocusedElementResult.status.rawValue)
+    if let focusedElement = systemFocusedElementResult.element {
+        result["system_focused_ui_element"] = focusedElementDiagnosticsPayload(focusedElement)
+    }
+
+    var appPayloads: [[String: Any]] = []
+    var roFocusedWindows: [[String: Any]] = []
+    let apps = NSWorkspace.shared.runningApplications.sorted {
+        let left = ($0.localizedName ?? "").lowercased()
+        let right = ($1.localizedName ?? "").lowercased()
+        if left != right { return left < right }
+        return $0.processIdentifier < $1.processIdentifier
+    }
+    for app in apps {
+        let pid = app.processIdentifier
+        let appElem = AXUIElementCreateApplication(pid)
+        _ = AXUIElementSetMessagingTimeout(appElem, 0.06)
+        var payload = appMeta(app)
+
+        let mainWindowResult = axCopyElementWithStatus(appElem, kAXMainWindowAttribute as String)
+        payload["ax_main_window_status"] = Int(mainWindowResult.status.rawValue)
+        if let mainWindow = mainWindowResult.element {
+            payload["ax_main_window"] = windowDiagnosticsPayload(mainWindow)
+        }
+
+        let focusedWindowResult = axCopyElementWithStatus(appElem, kAXFocusedWindowAttribute as String)
+        payload["ax_focused_window_status"] = Int(focusedWindowResult.status.rawValue)
+        if let focusedWindow = focusedWindowResult.element {
+            let focusedPayload = windowDiagnosticsPayload(focusedWindow)
+            payload["ax_focused_window"] = focusedPayload
+            if isRootOperatorApp(app) {
+                var roPayload = focusedPayload
+                roPayload["app"] = app.localizedName ?? ""
+                roPayload["bundle_id"] = app.bundleIdentifier ?? ""
+                roFocusedWindows.append(roPayload)
+            }
+        }
+
+        let windowsResult = appWindowsDiagnostics(appElem)
+        payload["ax_children_status"] = Int(windowsResult.childrenStatus.rawValue)
+        payload["ax_windows_status"] = Int(windowsResult.windowsStatus.rawValue)
+        if !windowsResult.windows.isEmpty {
+            payload["windows"] = windowsResult.windows
+        }
+        if isRootOperatorApp(app) {
+            for window in windowsResult.windows {
+                if (window["is_key"] as? Bool) == true {
+                    var roPayload = window
+                    roPayload["app"] = app.localizedName ?? ""
+                    roPayload["bundle_id"] = app.bundleIdentifier ?? ""
+                    roFocusedWindows.append(roPayload)
+                }
+            }
+        }
+        appPayloads.append(payload)
+    }
+    result["running_applications"] = appPayloads
+    result["root_operator_focused_windows"] = roFocusedWindows
+    return result
+}
+
+func cmdDiagnostics() -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    emit(focusDiagnosticsPayload())
+    exit(0)
 }
 
 func resolveContainingWindow(_ element: AXUIElement) -> AXUIElement? {
@@ -1244,8 +1526,11 @@ func addFocusTransactionDetails(_ result: inout [String: Any], _ tx: FocusTransa
 func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AXUIElement?) -> FocusTransaction {
     var tx = FocusTransaction(pid: pidOf(element), window: knownWindow)
     captureFrontmost(prefix: "before", into: &tx)
-    if tx.window == nil {
-        tx.window = resolveContainingWindow(element)
+    if let owningWindow = resolveContainingWindow(element) {
+        tx.window = owningWindow
+        tx.statuses["target_window_resolved"] = 0
+    } else if tx.window != nil {
+        tx.statuses["target_window_resolved"] = -1
     }
 
     guard let pid = tx.pid else {
@@ -1269,8 +1554,12 @@ func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AX
     tx.statuses["app_frontmost"] = Int(frontmostStatus.rawValue)
 
     if let window = tx.window {
-        let raiseStatus = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        tx.statuses["window_raise"] = Int(raiseStatus.rawValue)
+        let mainBeforeRaiseStatus = AXUIElementSetAttributeValue(
+            window,
+            kAXMainAttribute as CFString,
+            kCFBooleanTrue
+        )
+        tx.statuses["window_main_before_raise"] = Int(mainBeforeRaiseStatus.rawValue)
 
         let focusedWindowStatus = AXUIElementSetAttributeValue(
             appElem,
@@ -1278,6 +1567,9 @@ func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AX
             window
         )
         tx.statuses["app_focused_window"] = Int(focusedWindowStatus.rawValue)
+
+        let raiseStatus = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        tx.statuses["window_raise"] = Int(raiseStatus.rawValue)
 
         let mainStatus = AXUIElementSetAttributeValue(
             window,
@@ -1436,6 +1728,12 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
             }
         }
         if let frame = frameOf(element) { result["frame"] = frame }
+        if let window = tx.window {
+            result["target_window"] = windowDiagnosticsPayload(window)
+        }
+        if let diagnostics = freshFocusDiagnostics() {
+            result["diagnostics"] = diagnostics
+        }
         emit(result)
         exit(0)
     }
@@ -2690,7 +2988,7 @@ func cmdMenuCommand(_ args: [String]) -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -2701,6 +2999,7 @@ case "check":             cmdCheck()
 case "read-at":           cmdReadAt(rest)
 case "read-focused":      cmdReadFocused()
 case "focused-snapshot":  cmdFocusedSnapshot()
+case "diagnostics":       cmdDiagnostics()
 case "write-at":          cmdWriteAt(rest)
 case "write-focused":     cmdWriteFocused(rest)
 case "read-window":       cmdReadWindow()
