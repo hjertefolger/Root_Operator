@@ -207,6 +207,53 @@ test('formatPress handles success and failure', () => {
     assert.match(fail, /Press failed: press_failed/);
 });
 
+test('agent_recent_events returns formatted lines from getAgentEvents', async () => {
+    const ts = 1717800000;
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        getAgentEvents: () => ({
+            getEvents: () => [
+                { event: 'app_activated', ts, app: 'Notes' },
+                { event: 'AXSelectedTextChanged', ts: ts + 1, app: 'Notes', role: 'AXTextArea', selected_text: 'hello' },
+            ],
+        }),
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_recent_events', args: {} });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /app_activated/);
+    assert.match(r.result, /AXSelectedTextChanged/);
+    assert.match(r.result, /selected="hello"/);
+});
+
+test('agent_recent_events surfaces when events not wired', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_recent_events', args: {} });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /not wired/);
+});
+
+test('formatEventLine renders ts/event/app/role/value compactly', () => {
+    const out = __test.formatEventLine({
+        event: 'AXValueChanged',
+        ts: 1717800000,
+        app: 'Notes',
+        role: 'AXTextArea',
+        value: 'Hello world',
+    });
+    assert.match(out, /AXValueChanged/);
+    assert.match(out, /app=Notes/);
+    assert.match(out, /role=AXTextArea/);
+    assert.match(out, /value="Hello world"/);
+});
+
 test('halo show is invoked when read returns a frame', async () => {
     const haloCalls = [];
     const halo = { show: (frame) => haloCalls.push(frame), hide: () => {} };

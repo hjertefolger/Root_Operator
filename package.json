@@ -28,7 +28,7 @@
     "postinstall": "electron-rebuild -f -w node-pty keytar better-sqlite3",
     "_note:rebuild": "onnxruntime-node intentionally NOT in rebuild list — ships prebuilt N-API v3 binaries for darwin/arm64 (the only arch we publish), no source build needed.",
     "_note:arch": "Apple Silicon only as of v2.4.4. Drop reasoning: Apple stopped selling Intel Macs in mid-2023; macOS 26 (Tahoe) drops Intel later in 2026; native deps (onnxruntime, cloudflared, etc.) increasingly ship arm64-first prebuilds. Maintaining the x64 lane was a permanent multi-arch packaging tax for one known Intel user. To re-enable: add 'x64' back to the arch arrays AND fix the multi-arch packaging path for native binaries (cloudflared install, onnxruntime-node x64 prebuild).",
-    "test": "node --test src/orphan-kill.test.js src/scheduler.test.js src/channel-mode.test.js src/claude-lifecycle.test.js src/tray.test.js src/tunnel.test.js src/websocket-bridge.test.js src/crypto-pairing.test.js src/cursor-companion.test.js src/cursor-companion-controller.test.js src/agent-avatar.test.js src/agent-actions.test.js",
+    "test": "node --test src/orphan-kill.test.js src/scheduler.test.js src/channel-mode.test.js src/claude-lifecycle.test.js src/tray.test.js src/tunnel.test.js src/websocket-bridge.test.js src/crypto-pairing.test.js src/cursor-companion.test.js src/cursor-companion-controller.test.js src/agent-avatar.test.js src/agent-actions.test.js src/agent-events.test.js",
     "security:audit": "npm audit --audit-level=critical",
     "security:audit:fix": "npm audit fix",
     "security:check": "npm audit && echo '✅ No known vulnerabilities'"

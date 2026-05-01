@@ -612,11 +612,195 @@ func cmdCheck() -> Never {
     exit(0)
 }
 
+// MARK: — Subscribe / passive awareness (Layer 3)
+//
+// Long-running mode. Attaches an AXObserver to the frontmost app and
+// re-attaches when the frontmost app changes. Each AX notification
+// emits a JSON line on stdout that the Electron host reads with a
+// JSONL parser. Exits on SIGINT / SIGTERM.
+
+// Notifications subscribed per app. Curated to the events that move
+// what's "happening on screen" forward — not every AXValueChanged
+// from every text field while typing (that would flood the channel
+// with tokens for almost no signal). The selected-text and value
+// changes ARE valuable but rate-limited at consumer side.
+let SUBSCRIBE_NOTIFICATIONS: [String] = [
+    kAXFocusedWindowChangedNotification as String,
+    kAXFocusedUIElementChangedNotification as String,
+    kAXSelectedTextChangedNotification as String,
+    kAXValueChangedNotification as String,
+    kAXWindowCreatedNotification as String,
+    kAXMainWindowChangedNotification as String,
+]
+
+// Boxed mutable state passed through the Unmanaged refcon channel
+// so the C-style AXObserver callback can reach back into Swift state.
+final class SubscribeState {
+    var observer: AXObserver?
+    var attachedPid: pid_t = 0
+    var attachedAppName: String = ""
+    var attachedBundleId: String = ""
+}
+
+func emitEvent(_ kind: String, _ details: [String: Any]) {
+    var obj: [String: Any] = ["event": kind]
+    obj["ts"] = Date().timeIntervalSince1970
+    for (k, v) in details {
+        obj[k] = v
+    }
+    emit(obj)
+    // Force flush so the consumer sees the line immediately. stdout
+    // is line-buffered when attached to a tty but block-buffered when
+    // piped to a parent process.
+    fflush(stdout)
+}
+
+let axObserverCallback: AXObserverCallback = { (observer, element, notification, refcon) in
+    guard let refcon = refcon else { return }
+    let state = Unmanaged<SubscribeState>.fromOpaque(refcon).takeUnretainedValue()
+    let notifName = notification as String
+    var details: [String: Any] = [
+        "app": state.attachedAppName,
+        "bundle_id": state.attachedBundleId,
+        "role": roleString(element),
+    ]
+    if let title = axCopyString(element, kAXTitleAttribute as String), !title.isEmpty {
+        details["label"] = truncate(title, TREE_VALUE_TRUNC)
+    }
+    if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
+        details["value"] = truncate(value, TREE_VALUE_TRUNC)
+    }
+    if let selected = axCopyString(element, kAXSelectedTextAttribute as String), !selected.isEmpty {
+        details["selected_text"] = truncate(selected, TREE_VALUE_TRUNC)
+    }
+    if let frame = frameOf(element) {
+        details["frame"] = frame
+    }
+    emitEvent(notifName, details)
+}
+
+func detachObserver(_ state: SubscribeState) {
+    guard let observer = state.observer else { return }
+    let runLoop = CFRunLoopGetCurrent()
+    CFRunLoopRemoveSource(runLoop, AXObserverGetRunLoopSource(observer), .defaultMode)
+    state.observer = nil
+}
+
+func attachObserver(to app: NSRunningApplication, state: SubscribeState) {
+    detachObserver(state)
+    let pid = app.processIdentifier
+    state.attachedPid = pid
+    state.attachedAppName = app.localizedName ?? ""
+    state.attachedBundleId = app.bundleIdentifier ?? ""
+
+    var observer: AXObserver?
+    let createStatus = AXObserverCreate(pid, axObserverCallback, &observer)
+    guard createStatus == .success, let obs = observer else {
+        emitEvent("subscribe_attach_failed", [
+            "app": state.attachedAppName,
+            "bundle_id": state.attachedBundleId,
+            "ax_status": Int(createStatus.rawValue),
+        ])
+        return
+    }
+    state.observer = obs
+    let appElem = AXUIElementCreateApplication(pid)
+    let refcon = Unmanaged.passUnretained(state).toOpaque()
+    var subscribed: [String] = []
+    var failed: [String: Int] = [:]
+    for n in SUBSCRIBE_NOTIFICATIONS {
+        let status = AXObserverAddNotification(obs, appElem, n as CFString, refcon)
+        if status == .success {
+            subscribed.append(n)
+        } else {
+            failed[n] = Int(status.rawValue)
+        }
+    }
+    let runLoop = CFRunLoopGetCurrent()
+    CFRunLoopAddSource(runLoop, AXObserverGetRunLoopSource(obs), .defaultMode)
+
+    var details: [String: Any] = [
+        "app": state.attachedAppName,
+        "bundle_id": state.attachedBundleId,
+        "subscribed": subscribed,
+    ]
+    if !failed.isEmpty {
+        details["failed"] = failed
+    }
+    emitEvent("subscribe_attached", details)
+}
+
+func cmdSubscribe() -> Never {
+    guard AXIsProcessTrusted() else {
+        emit(["error": "not_trusted"])
+        exit(0)
+    }
+    let state = SubscribeState()
+
+    // Initial attach to the current frontmost app.
+    if let front = NSWorkspace.shared.frontmostApplication {
+        emitEvent("app_activated", [
+            "app": front.localizedName ?? "",
+            "bundle_id": front.bundleIdentifier ?? "",
+            "pid": Int(front.processIdentifier),
+        ])
+        attachObserver(to: front, state: state)
+    } else {
+        emitEvent("subscribe_started", ["app": ""])
+    }
+
+    // Watch for app changes — re-attach the AXObserver when the user
+    // switches apps. NSWorkspace posts didActivateApplicationNotification
+    // on the workspace notification center.
+    let center = NSWorkspace.shared.notificationCenter
+    center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        emitEvent("app_activated", [
+            "app": app.localizedName ?? "",
+            "bundle_id": app.bundleIdentifier ?? "",
+            "pid": Int(app.processIdentifier),
+        ])
+        attachObserver(to: app, state: state)
+    }
+    // Detach when the active app terminates so we don't leak observer
+    // run-loop sources for dead pids.
+    center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        if app.processIdentifier == state.attachedPid {
+            detachObserver(state)
+            emitEvent("subscribe_detached", [
+                "app": app.localizedName ?? "",
+                "reason": "app_terminated",
+            ])
+        }
+    }
+
+    // Clean exit on SIGINT / SIGTERM so the parent's spawn().kill() is
+    // graceful. Signals fire on the run loop's main thread via dispatch.
+    let sigintSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    let sigtermSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    let exitHandler: @Sendable () -> Void = {
+        emitEvent("subscribe_stopped", [:])
+        exit(0)
+    }
+    sigintSrc.setEventHandler(handler: exitHandler)
+    sigtermSrc.setEventHandler(handler: exitHandler)
+    signal(SIGINT, SIG_IGN)
+    signal(SIGTERM, SIG_IGN)
+    sigintSrc.resume()
+    sigtermSrc.resume()
+
+    // Block forever on the run loop. The AXObserver and NSWorkspace
+    // callbacks both fire here.
+    CFRunLoopRun()
+    exit(0)
+}
+
 // MARK: — Entry point
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -631,5 +815,6 @@ case "write-focused":   cmdWriteFocused(rest)
 case "read-window":     cmdReadWindow()
 case "find-element":    cmdFindElement(rest)
 case "press-named":     cmdPressNamed(rest)
+case "subscribe":       cmdSubscribe()
 default:                emitInternalError("unknown command: \(cmd)")
 }

@@ -200,6 +200,30 @@ function formatPress(result) {
     return `Press returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
+function formatEventLine(evt) {
+    if (!evt || typeof evt !== 'object') return '';
+    const tsIso = Number.isFinite(evt.ts)
+        ? new Date(evt.ts * 1000).toISOString().slice(11, 19)
+        : '--:--:--';
+    const parts = [tsIso, evt.event || 'unknown'];
+    if (evt.app) parts.push(`app=${evt.app}`);
+    if (evt.role) parts.push(`role=${evt.role}`);
+    if (evt.label) parts.push(`label="${evt.label}"`);
+    if (evt.selected_text) {
+        parts.push(`selected=${JSON.stringify(evt.selected_text).slice(0, 80)}`);
+    } else if (evt.value) {
+        parts.push(`value=${JSON.stringify(evt.value).slice(0, 80)}`);
+    }
+    return parts.join(' · ');
+}
+
+function formatEvents(events) {
+    if (!Array.isArray(events) || events.length === 0) {
+        return 'No recent events.';
+    }
+    return events.map(formatEventLine).join('\n');
+}
+
 function init(deps) {
     if (!deps || !deps.getAgentAvatar || !deps.screen) {
         throw new Error('agent-actions.init requires getAgentAvatar, screen');
@@ -353,6 +377,23 @@ function init(deps) {
                     return { result: formatFind(r), isError: !!r.error };
                 }
 
+                case 'agent_recent_events': {
+                    if (typeof deps.getAgentEvents !== 'function') {
+                        return { result: 'Agent events not wired.', isError: true };
+                    }
+                    const events = deps.getAgentEvents();
+                    if (!events || typeof events.getEvents !== 'function') {
+                        return { result: 'Agent events not running.', isError: true };
+                    }
+                    const count = Number(args.count);
+                    const sinceMs = Number(args.since_ms);
+                    const list = events.getEvents({
+                        count: Number.isFinite(count) ? count : undefined,
+                        since_ms: Number.isFinite(sinceMs) ? sinceMs : undefined,
+                    });
+                    return { result: formatEvents(list), isError: false };
+                }
+
                 case 'agent_press_named': {
                     const label = String(args.label || '').trim();
                     if (!label) {
@@ -398,6 +439,8 @@ module.exports = {
         formatReadWindow,
         formatFind,
         formatPress,
+        formatEventLine,
+        formatEvents,
         runHelper,
     },
 };

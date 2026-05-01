@@ -250,6 +250,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_recent_events',
+      description: 'Read the most recent passive-awareness events from the macOS Accessibility observer — focused window changes, focused element changes, selected-text changes, value changes, app activations. Use this to know what just happened on screen before you act ("the user just selected text in Mail"). Returns one event per line, ordered oldest → newest within the buffer (last 50 events). Optional filters: count (cap), since_ms (only events newer than now-since_ms).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          count: { type: 'number', description: 'Maximum number of events to return (returns the most recent).' },
+          since_ms: { type: 'number', description: 'Only return events newer than this many milliseconds ago.' },
+        },
+      },
+    },
+    {
       name: 'agent_press_named',
       description: 'Find a UI element by label substring (and optional role) in the active app\'s focused window and perform an AX press action on it (clicks the button, activates the link, etc.). Goes through the macOS accessibility channel — does NOT move the user\'s cursor or synthesize a click event. Use this for buttons, links, menu items the user named ("press the Send button"). Like agent_write_selection, prefer to confirm with the user first for any destructive action.',
       inputSchema: {
@@ -338,6 +349,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_read_window',
     'agent_find_element',
     'agent_press_named',
+    'agent_recent_events',
   ];
   if (agentTools.includes(toolName)) {
     return handleAgentTool(toolName, request.params.arguments || {});
