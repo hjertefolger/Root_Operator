@@ -34,6 +34,8 @@ const PRESS_INTERVAL_MIN_MS = 750;
 // a single helper call so it gets the same window as a write.
 const KEYSTROKE_INTERVAL_MIN_MS = 200;
 const TYPE_TEXT_INTERVAL_MIN_MS = 750;
+const HID_INTERVAL_MIN_MS = 250;
+const FOCUS_INTERVAL_MIN_MS = 250;
 // Keyboard-synthesis path is more conservative than AX value-write
 // because a single CGEvent unicode string types into focus, exercises
 // app key handlers, and behaves less like natural typing for long
@@ -54,6 +56,10 @@ const USER_ACTIVITY_WINDOW_MS = 1200;
 const SELF_ACTION_WINDOW_MS = 800;
 
 function resolveHelperPath(deps) {
+    if (deps && Object.prototype.hasOwnProperty.call(deps, 'helperPath')) {
+        if (!deps.helperPath) return null;
+        return fs.existsSync(deps.helperPath) ? deps.helperPath : null;
+    }
     const candidates = [];
     // Packaged build (electron-builder copies the binary into Resources/
     // via the extraResources entry).
@@ -200,6 +206,13 @@ function formatReadWindow(result) {
     return header + lines.join('\n');
 }
 
+function formatReadSubtree(result) {
+    if (result.error) {
+        return `Read subtree failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    return formatReadWindow(result);
+}
+
 // Validate the optional disambiguation args (`index`, `near_x`, `near_y`)
 // shared by agent_find_element and agent_press_named, and turn them
 // into the corresponding ax-helper argv tail. Codex flagged the silent
@@ -244,6 +257,83 @@ function buildDisambiguationArgs(args, toolName) {
     return { args: out };
 }
 
+function normalizeRole(role) {
+    const s = String(role || '').trim();
+    return s ? s : '';
+}
+
+function appendRoleList(out, flag, value) {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const role = normalizeRole(item);
+            if (role) out.push(flag, role);
+        }
+    } else {
+        const role = normalizeRole(value);
+        if (role) out.push(flag, role);
+    }
+}
+
+function buildElementTargetArgs(args, toolName, { requireLabel = false, requireTarget = true } = {}) {
+    const out = [];
+    const label = String(args.label || '').trim();
+    const role = normalizeRole(args.role);
+    if (requireLabel && !label) {
+        return { error: `${toolName} requires a non-empty label.` };
+    }
+    if (requireTarget && !label && !role) {
+        return { error: `${toolName} requires either label or role.` };
+    }
+    if (role) out.push('--role', role);
+    appendRoleList(out, '--skip-role', args.skip_role || args.skip_roles);
+    appendRoleList(out, '--prefer-role', args.prefer_role || args.prefer_roles);
+
+    const disambig = buildDisambiguationArgs(args, toolName);
+    if (disambig.error) return disambig;
+    out.push(...disambig.args);
+    if (label) out.push(label);
+    return { args: out };
+}
+
+function finiteNumber(value) {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+function requireFiniteArg(args, key, toolName) {
+    const n = finiteNumber(args[key]);
+    if (n === null) {
+        return { error: `${toolName} requires numeric ${key}.` };
+    }
+    return { value: n };
+}
+
+function optionalDurationMs(value, fallback, min, max, toolName) {
+    if (value === undefined || value === null) return { value: fallback };
+    const n = finiteNumber(value);
+    if (n === null || !Number.isInteger(n) || n < min || n > max) {
+        return { error: `${toolName} duration_ms must be an integer from ${min} to ${max}.` };
+    }
+    return { value: n };
+}
+
+function optionalClickCount(value) {
+    if (value === undefined || value === null) return { value: 1 };
+    const n = finiteNumber(value);
+    if (n === null || !Number.isInteger(n) || n < 1 || n > 3) {
+        return { error: 'agent_click_at count must be 1, 2, or 3.' };
+    }
+    return { value: n };
+}
+
+function normalizeButton(value, fallback = 'left') {
+    const button = String(value || fallback).trim().toLowerCase();
+    if (!['left', 'right', 'middle', 'center'].includes(button)) {
+        return { error: 'button must be left, right, or middle.' };
+    }
+    return { value: button === 'center' ? 'middle' : button };
+}
+
 function formatMatchSuffix(result) {
     const total = Number(result.match_count);
     if (!Number.isFinite(total) || total <= 1) return '';
@@ -278,6 +368,52 @@ function formatPress(result) {
         return `Pressed ${result.role}${label}.${formatMatchSuffix(result)}`;
     }
     return `Press returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
+function formatFocus(result) {
+    if (result.error) {
+        return `Focus failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}${formatMatchSuffix(result)}`;
+    }
+    if (result.ok) {
+        const label = result.label ? ` "${result.label}"` : '';
+        return `Focused ${result.role || 'element'}${label}.`;
+    }
+    return `Focus returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
+function formatPointAction(result, verb) {
+    if (result.error) {
+        return `${verb} failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    if (result.ok) {
+        const x = Number.isFinite(Number(result.x)) ? Math.round(Number(result.x)) : null;
+        const y = Number.isFinite(Number(result.y)) ? Math.round(Number(result.y)) : null;
+        const where = x !== null && y !== null ? ` at (${x}, ${y})` : '';
+        return `${verb} succeeded${where}.`;
+    }
+    return `${verb} returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
+function formatDrag(result) {
+    if (result.error) {
+        return `Drag failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    if (result.ok) {
+        const from = result.from || {};
+        const to = result.to || {};
+        return `Drag succeeded from (${Math.round(from.x || 0)}, ${Math.round(from.y || 0)}) to (${Math.round(to.x || 0)}, ${Math.round(to.y || 0)}).`;
+    }
+    return `Drag returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
+}
+
+function formatKeyboardAction(result, verb) {
+    if (result.error) {
+        return `${verb} failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    if (result.ok) {
+        return `${verb} succeeded.`;
+    }
+    return `${verb} returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
 function formatEventLine(evt) {
@@ -361,6 +497,8 @@ function init(deps) {
     let lastPressAt = 0;
     let lastKeystrokeAt = 0;
     let lastTypeTextAt = 0;
+    let lastHidAt = 0;
+    let lastFocusAt = 0;
     // Timestamp of the most recent AX-mutating action we performed
     // (write, press, keystroke, type-text, select-*). Subsequent
     // user-activity checks ignore events older than this — those are
@@ -387,6 +525,10 @@ function init(deps) {
             'AXValueChanged',
             'AXFocusedUIElementChanged',
             'AXSelectedTextChanged',
+            'AXFocusedWindowChanged',
+            'AXMainWindowChanged',
+            'AXMenuOpened',
+            'app_activated',
         ]);
         for (const e of list) {
             if (!e || !triggers.has(e.event)) continue;
@@ -425,6 +567,29 @@ function init(deps) {
     function showActionAt(avatar, result) {
         maybeHalo(result);
         maybeTravelToFrame(avatar, result, deps.screen);
+    }
+
+    async function withDrivingAvatar(avatar, fn) {
+        if (avatar && typeof avatar.beginDriving === 'function') {
+            try { avatar.beginDriving(); } catch (_) { /* best-effort */ }
+        }
+        try {
+            return await fn();
+        } finally {
+            if (avatar && typeof avatar.endDriving === 'function') {
+                try { avatar.endDriving(); } catch (_) { /* best-effort */ }
+            }
+        }
+    }
+
+    function refuseIfUserActive(force, prefix) {
+        if (force) return null;
+        const offending = detectUserActivity();
+        if (!offending) return null;
+        return {
+            result: `${prefix}: user activity detected (${offending.event}${offending.app ? ' in ' + offending.app : ''}). Pass force=true to override.`,
+            isError: true,
+        };
     }
 
     async function handle(req) {
@@ -518,6 +683,9 @@ function init(deps) {
                             isError: true,
                         };
                     }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused write');
+                    if (refused) return refused;
                     lastWriteAt = now;
                     // Resolve the target via the user's cursor position
                     // rather than system focus. The Presence bubble owns
@@ -539,6 +707,14 @@ function init(deps) {
                     return { result: formatReadWindow(r), isError: !!r.error };
                 }
 
+                case 'agent_read_subtree': {
+                    const target = buildElementTargetArgs(args, 'agent_read_subtree', { requireTarget: true });
+                    if (target.error) return { result: target.error, isError: true };
+                    const r = await runHelper(deps, ['read-subtree', ...target.args]);
+                    if (r.tree && r.tree.frame) showActionAt(avatar, r.tree);
+                    return { result: formatReadSubtree(r), isError: !!r.error };
+                }
+
                 case 'agent_find_element': {
                     const label = String(args.label || '').trim();
                     if (!label) {
@@ -557,6 +733,42 @@ function init(deps) {
                     const r = await runHelper(deps, helperArgs);
                     if (r.found) showActionAt(avatar, r);
                     return { result: formatFind(r), isError: !!r.error };
+                }
+
+                case 'agent_focus_element': {
+                    const target = buildElementTargetArgs(args, 'agent_focus_element', { requireTarget: true });
+                    if (target.error) return { result: target.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastFocusAt < FOCUS_INTERVAL_MIN_MS) {
+                        const wait = FOCUS_INTERVAL_MIN_MS - (now - lastFocusAt);
+                        return { result: `Rate limited: focus allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused focus');
+                    if (refused) return refused;
+                    lastFocusAt = now;
+                    const r = await runHelper(deps, ['focus-element', ...target.args]);
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatFocus(r), isError: !r.ok };
+                }
+
+                case 'agent_focus_at': {
+                    const x = requireFiniteArg(args, 'x', 'agent_focus_at');
+                    const y = requireFiniteArg(args, 'y', 'agent_focus_at');
+                    if (x.error) return { result: x.error, isError: true };
+                    if (y.error) return { result: y.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastFocusAt < FOCUS_INTERVAL_MIN_MS) {
+                        const wait = FOCUS_INTERVAL_MIN_MS - (now - lastFocusAt);
+                        return { result: `Rate limited: focus allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused focus');
+                    if (refused) return refused;
+                    lastFocusAt = now;
+                    const r = await runHelper(deps, ['focus-at', String(x.value), String(y.value)]);
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatFocus(r), isError: !r.ok };
                 }
 
                 case 'agent_recent_events': {
@@ -593,6 +805,9 @@ function init(deps) {
                     if (disambig.error) {
                         return { result: disambig.error, isError: true };
                     }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused press');
+                    if (refused) return refused;
                     lastPressAt = now;
                     const helperArgs = ['press-named'];
                     if (args.role) {
@@ -603,6 +818,131 @@ function init(deps) {
                     const r = await runHelper(deps, helperArgs);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     return { result: formatPress(r), isError: !r.ok };
+                }
+
+                case 'agent_press_at': {
+                    const x = requireFiniteArg(args, 'x', 'agent_press_at');
+                    const y = requireFiniteArg(args, 'y', 'agent_press_at');
+                    if (x.error) return { result: x.error, isError: true };
+                    if (y.error) return { result: y.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastPressAt < PRESS_INTERVAL_MIN_MS) {
+                        const wait = PRESS_INTERVAL_MIN_MS - (now - lastPressAt);
+                        return { result: `Rate limited: another press is allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused press');
+                    if (refused) return refused;
+                    lastPressAt = now;
+                    const r = await runHelper(deps, ['press-at', String(x.value), String(y.value)]);
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatPress(r), isError: !r.ok };
+                }
+
+                case 'agent_click_at': {
+                    const x = requireFiniteArg(args, 'x', 'agent_click_at');
+                    const y = requireFiniteArg(args, 'y', 'agent_click_at');
+                    if (x.error) return { result: x.error, isError: true };
+                    if (y.error) return { result: y.error, isError: true };
+                    const button = normalizeButton(args.button);
+                    if (button.error) return { result: button.error, isError: true };
+                    const count = optionalClickCount(args.count);
+                    if (count.error) return { result: count.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastHidAt < HID_INTERVAL_MIN_MS) {
+                        const wait = HID_INTERVAL_MIN_MS - (now - lastHidAt);
+                        return { result: `Rate limited: HID action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused click');
+                    if (refused) return refused;
+                    lastHidAt = now;
+                    const r = await withDrivingAvatar(avatar, () => runHelper(deps, [
+                        'click-at', String(x.value), String(y.value),
+                        '--button', button.value,
+                        '--count', String(count.value),
+                    ]));
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatPointAction(r, 'Click'), isError: !r.ok };
+                }
+
+                case 'agent_hover_at': {
+                    const x = requireFiniteArg(args, 'x', 'agent_hover_at');
+                    const y = requireFiniteArg(args, 'y', 'agent_hover_at');
+                    if (x.error) return { result: x.error, isError: true };
+                    if (y.error) return { result: y.error, isError: true };
+                    const duration = optionalDurationMs(args.duration_ms, 0, 0, 5000, 'agent_hover_at');
+                    if (duration.error) return { result: duration.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastHidAt < HID_INTERVAL_MIN_MS) {
+                        const wait = HID_INTERVAL_MIN_MS - (now - lastHidAt);
+                        return { result: `Rate limited: HID action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused hover');
+                    if (refused) return refused;
+                    lastHidAt = now;
+                    const helperArgs = ['hover-at', String(x.value), String(y.value)];
+                    if (duration.value > 0) helperArgs.push('--duration-ms', String(duration.value));
+                    const r = await withDrivingAvatar(avatar, () => runHelper(deps, helperArgs));
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatPointAction(r, 'Hover'), isError: !r.ok };
+                }
+
+                case 'agent_drag': {
+                    const fx = requireFiniteArg(args, 'from_x', 'agent_drag');
+                    const fy = requireFiniteArg(args, 'from_y', 'agent_drag');
+                    const tx = requireFiniteArg(args, 'to_x', 'agent_drag');
+                    const ty = requireFiniteArg(args, 'to_y', 'agent_drag');
+                    for (const checked of [fx, fy, tx, ty]) {
+                        if (checked.error) return { result: checked.error, isError: true };
+                    }
+                    const duration = optionalDurationMs(args.duration_ms, 450, 50, 5000, 'agent_drag');
+                    if (duration.error) return { result: duration.error, isError: true };
+                    const button = normalizeButton(args.button);
+                    if (button.error) return { result: button.error, isError: true };
+                    const now = Date.now();
+                    if (now - lastHidAt < HID_INTERVAL_MIN_MS) {
+                        const wait = HID_INTERVAL_MIN_MS - (now - lastHidAt);
+                        return { result: `Rate limited: HID action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused drag');
+                    if (refused) return refused;
+                    lastHidAt = now;
+                    const r = await withDrivingAvatar(avatar, () => runHelper(deps, [
+                        'drag',
+                        String(fx.value), String(fy.value),
+                        String(tx.value), String(ty.value),
+                        '--duration-ms', String(duration.value),
+                        '--button', button.value,
+                    ]));
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatDrag(r), isError: !r.ok };
+                }
+
+                case 'agent_scroll_at': {
+                    const x = requireFiniteArg(args, 'x', 'agent_scroll_at');
+                    const y = requireFiniteArg(args, 'y', 'agent_scroll_at');
+                    const dx = requireFiniteArg(args, 'dx', 'agent_scroll_at');
+                    const dy = requireFiniteArg(args, 'dy', 'agent_scroll_at');
+                    for (const checked of [x, y, dx, dy]) {
+                        if (checked.error) return { result: checked.error, isError: true };
+                    }
+                    const now = Date.now();
+                    if (now - lastHidAt < HID_INTERVAL_MIN_MS) {
+                        const wait = HID_INTERVAL_MIN_MS - (now - lastHidAt);
+                        return { result: `Rate limited: HID action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused scroll');
+                    if (refused) return refused;
+                    lastHidAt = now;
+                    const r = await withDrivingAvatar(avatar, () => runHelper(deps, [
+                        'scroll-at', String(x.value), String(y.value), String(dx.value), String(dy.value),
+                    ]));
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatPointAction(r, 'Scroll'), isError: !r.ok };
                 }
 
                 case 'agent_keystroke': {
@@ -636,7 +976,7 @@ function init(deps) {
                     if (mods) helperArgs.push('--mods', mods);
                     helperArgs.push(key);
                     const r = await runHelper(deps, helperArgs);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Keystroke failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -647,6 +987,81 @@ function init(deps) {
                         result: `Sent ${mods ? mods + '+' : ''}${key}.`,
                         isError: false,
                     };
+                }
+
+                case 'agent_keystroke_global': {
+                    const key = String(args.key || '').trim();
+                    if (!key) {
+                        return { result: 'agent_keystroke_global requires a non-empty key.', isError: true };
+                    }
+                    const mods = args.mods ? String(args.mods).trim() : '';
+                    const force = args.force === true;
+                    const now = Date.now();
+                    if (now - lastKeystrokeAt < KEYSTROKE_INTERVAL_MIN_MS) {
+                        const wait = KEYSTROKE_INTERVAL_MIN_MS - (now - lastKeystrokeAt);
+                        return { result: `Rate limited: another keystroke allowed in ${wait}ms.`, isError: true };
+                    }
+                    const refused = refuseIfUserActive(force, 'Refused global keystroke');
+                    if (refused) return refused;
+                    lastKeystrokeAt = now;
+                    const helperArgs = ['keystroke', '--no-focus-check'];
+                    if (mods) helperArgs.push('--mods', mods);
+                    helperArgs.push(key);
+                    const r = await runHelper(deps, helperArgs);
+                    if (r.ok) bumpSelfActionAt();
+                    if (r.error) {
+                        return { result: `Global keystroke failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`, isError: true };
+                    }
+                    return { result: `Sent global ${mods ? mods + '+' : ''}${key}.`, isError: false };
+                }
+
+                case 'agent_key_hold': {
+                    const key = String(args.key || '').trim();
+                    if (!key) {
+                        return { result: 'agent_key_hold requires a non-empty key.', isError: true };
+                    }
+                    const mods = args.mods ? String(args.mods).trim() : '';
+                    const duration = optionalDurationMs(args.duration_ms, 250, 10, 5000, 'agent_key_hold');
+                    if (duration.error) return { result: duration.error, isError: true };
+                    const force = args.force === true;
+                    const now = Date.now();
+                    if (now - lastKeystrokeAt < KEYSTROKE_INTERVAL_MIN_MS) {
+                        const wait = KEYSTROKE_INTERVAL_MIN_MS - (now - lastKeystrokeAt);
+                        return { result: `Rate limited: another key action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const refused = refuseIfUserActive(force, 'Refused key hold');
+                    if (refused) return refused;
+                    lastKeystrokeAt = now;
+                    const helperArgs = ['key-hold'];
+                    if (args.global === true) helperArgs.push('--no-focus-check');
+                    if (mods) helperArgs.push('--mods', mods);
+                    helperArgs.push('--duration-ms', String(duration.value), key);
+                    const r = await runHelper(deps, helperArgs);
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    return { result: formatKeyboardAction(r, 'Key hold'), isError: !r.ok };
+                }
+
+                case 'agent_modifier_latch': {
+                    const mods = String(args.mods || '').trim();
+                    if (!mods) {
+                        return { result: 'agent_modifier_latch requires mods (e.g. "cmd,shift").', isError: true };
+                    }
+                    const duration = optionalDurationMs(args.duration_ms, 250, 10, 5000, 'agent_modifier_latch');
+                    if (duration.error) return { result: duration.error, isError: true };
+                    const force = args.force === true;
+                    const now = Date.now();
+                    if (now - lastKeystrokeAt < KEYSTROKE_INTERVAL_MIN_MS) {
+                        const wait = KEYSTROKE_INTERVAL_MIN_MS - (now - lastKeystrokeAt);
+                        return { result: `Rate limited: another key action allowed in ${wait}ms.`, isError: true };
+                    }
+                    const refused = refuseIfUserActive(force, 'Refused modifier latch');
+                    if (refused) return refused;
+                    lastKeystrokeAt = now;
+                    const r = await runHelper(deps, [
+                        'modifier-latch', '--mods', mods, '--duration-ms', String(duration.value),
+                    ]);
+                    if (r.ok) bumpSelfActionAt();
+                    return { result: formatKeyboardAction(r, 'Modifier latch'), isError: !r.ok };
                 }
 
                 case 'agent_type_text': {
@@ -680,7 +1095,7 @@ function init(deps) {
                     }
                     lastTypeTextAt = now;
                     const r = await runHelper(deps, ['type-text', text]);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Type-text failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -702,10 +1117,13 @@ function init(deps) {
                     if (!Number.isInteger(length) || length < 0) {
                         return { result: 'agent_select_range requires a non-negative integer length.', isError: true };
                     }
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused select range');
+                    if (refused) return refused;
                     const r = await runHelper(deps, [
                         'select-range', '--location', String(location), '--length', String(length),
                     ]);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Select range failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -719,8 +1137,11 @@ function init(deps) {
                 }
 
                 case 'agent_select_all': {
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused select all');
+                    if (refused) return refused;
                     const r = await runHelper(deps, ['select-all']);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Select all failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -741,9 +1162,12 @@ function init(deps) {
                     const occurrence = Number.isInteger(Number(args.occurrence)) && Number(args.occurrence) >= 0
                         ? Number(args.occurrence)
                         : 0;
+                    const force = args.force === true;
+                    const refused = refuseIfUserActive(force, 'Refused select substring');
+                    if (refused) return refused;
                     const helperArgs = ['select-substring', '--occurrence', String(occurrence), needle];
                     const r = await runHelper(deps, helperArgs);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Select substring failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -788,7 +1212,7 @@ function init(deps) {
                     }
                     lastPressAt = now;
                     const r = await runHelper(deps, ['menu-command', ...path]);
-                    if (r.ok) bumpSelfActionAt();
+                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
                         return {
                             result: `Menu command failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`,
@@ -820,12 +1244,18 @@ module.exports = {
         formatRead,
         formatWrite,
         formatReadWindow,
+        formatReadSubtree,
         formatFind,
         formatPress,
+        formatFocus,
         formatEventLine,
         formatEvents,
         runHelper,
         buildDisambiguationArgs,
+        buildElementTargetArgs,
+        requireFiniteArg,
+        optionalDurationMs,
+        normalizeButton,
         maybeTravelToFrame,
         computeFrameLanding,
         FRAME_LANDING_OFFSET_PX,

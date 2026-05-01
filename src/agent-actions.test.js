@@ -1,10 +1,13 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { init, __test } = require('./main/agent-actions');
 
 function fakeAvatar() {
-    const calls = { moveTo: [], moveToCursor: [], park: 0 };
+    const calls = { moveTo: [], moveToCursor: [], park: 0, beginDriving: 0, endDriving: 0 };
     return {
         instance: {
             moveTo: (x, y) => { calls.moveTo.push({ x, y }); return { to: { x, y } }; },
@@ -13,6 +16,8 @@ function fakeAvatar() {
                 return { to: { x: 500 + (ox || 30), y: 400 + (oy || 0) } };
             },
             park: () => { calls.park += 1; return { to: { x: 16, y: 800 } }; },
+            beginDriving: () => { calls.beginDriving += 1; },
+            endDriving: () => { calls.endDriving += 1; },
         },
         calls,
     };
@@ -26,9 +31,18 @@ function makeDeps(avatar, opts = {}) {
     return {
         screen: fakeScreen(opts.cursor),
         appPath: opts.appPath || '/nonexistent/app',
+        helperPath: Object.prototype.hasOwnProperty.call(opts, 'helperPath') ? opts.helperPath : null,
         getAgentAvatar: () => avatar,
         logDebug: () => {},
     };
+}
+
+function makeFakeHelper(handlerSource) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-actions-helper-'));
+    const helperPath = path.join(dir, 'helper.js');
+    fs.writeFileSync(helperPath, `#!/usr/bin/env node\n${handlerSource}\n`, 'utf8');
+    fs.chmodSync(helperPath, 0o755);
+    return helperPath;
 }
 
 test('agent_move_to_cursor calls avatar.moveToCursor and returns target', async () => {
@@ -74,7 +88,7 @@ test('agent_park calls avatar.park', async () => {
 test('motion calls without an avatar return a soft error', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -83,30 +97,22 @@ test('motion calls without an avatar return a soft error', async () => {
     assert.match(r.result, /Agent avatar not available/);
 });
 
-test('agent_check_ax returns either trusted state or helper-missing', async () => {
-    // The handler's helper resolver looks in resourcesPath, appPath/build/native,
-    // and finally the source tree. In CI we may or may not have a built binary,
-    // so we accept either outcome here — what matters is that the response is
-    // structured (no thrown errors) and reports a reasonable shape.
+test('agent_check_ax returns helper-missing when helperPath override is null', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/definitely-not-here',
+        helperPath: null,
         resourcesPath: '/also-not-here',
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
     const r = await handler.handle({ tool: 'agent_check_ax', args: {} });
-    assert.match(
-        r.result,
-        /helper_missing|AX permission (?:granted|NOT granted)/,
-        `unexpected result: ${r.result}`,
-    );
+    assert.match(r.result, /helper_missing/);
 });
 
 test('agent_write_selection rejects empty text', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -118,7 +124,7 @@ test('agent_write_selection rejects empty text', async () => {
 test('unknown agent tool returns a structured error', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -130,7 +136,7 @@ test('unknown agent tool returns a structured error', async () => {
 test('agent_find_element rejects empty label', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -142,7 +148,7 @@ test('agent_find_element rejects empty label', async () => {
 test('agent_press_named rejects empty label', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -241,7 +247,7 @@ test('buildDisambiguationArgs returns empty argv when no disambiguation provided
 test('agent_find_element returns structured error on malformed index', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -251,6 +257,72 @@ test('agent_find_element returns structured error on malformed index', async () 
     });
     assert.equal(r.isError, true);
     assert.match(r.result, /agent_find_element: index/);
+});
+
+test('agent_focus_element sends target args and travels to focused frame', async () => {
+    const argvPath = path.join(os.tmpdir(), `focus-argv-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+console.log(JSON.stringify({ ok: true, action: 'focus', role: 'AXTextArea', frame: { x: 100, y: 200, w: 300, h: 80 } }));
+`);
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_focus_element',
+        args: { role: 'AXTextArea', near_x: 900, near_y: 300, prefer_roles: ['AXTextArea'] },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Focused AXTextArea/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argvPath, 'utf8')), [
+        'focus-element', '--role', 'AXTextArea', '--prefer-role', 'AXTextArea', '--near', '900,300',
+    ]);
+    assert.equal(avatar.calls.moveTo.length, 1);
+    assert.equal(avatar.calls.moveTo[0].x, 100 + 300 + __test.FRAME_LANDING_OFFSET_PX);
+});
+
+test('agent_click_at borrows driving state and passes HID args to helper', async () => {
+    const argvPath = path.join(os.tmpdir(), `click-argv-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+console.log(JSON.stringify({ ok: true, action: 'click', x: 10, y: 20, frame: { x: 4, y: 14, w: 12, h: 12 } }));
+`);
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_click_at',
+        args: { x: 10, y: 20, button: 'right', count: 2 },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Click succeeded/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argvPath, 'utf8')), [
+        'click-at', '10', '20', '--button', 'right', '--count', '2',
+    ]);
+    assert.equal(avatar.calls.beginDriving, 1);
+    assert.equal(avatar.calls.endDriving, 1);
+    assert.equal(avatar.calls.moveTo.length, 1);
+});
+
+test('agent_click_at refuses recent user activity before driving', async () => {
+    const avatar = fakeAvatar();
+    const handler = init({
+        screen: fakeScreen(),
+        helperPath: null,
+        getAgentAvatar: () => avatar.instance,
+        getAgentEvents: () => ({
+            getEvents: () => [
+                { event: 'app_activated', ts: Date.now() / 1000 - 0.1, app: 'Notes' },
+            ],
+        }),
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_click_at', args: { x: 10, y: 20 } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /Refused click/);
+    assert.equal(avatar.calls.beginDriving, 0);
 });
 
 test('formatFind / formatPress include disambiguation hint when match_count > 1', () => {
@@ -279,7 +351,7 @@ test('agent_recent_events returns formatted lines from getAgentEvents', async ()
     const ts = 1717800000;
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         getAgentEvents: () => ({
             getEvents: () => [
@@ -299,7 +371,7 @@ test('agent_recent_events returns formatted lines from getAgentEvents', async ()
 test('agent_recent_events surfaces when events not wired', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -380,7 +452,7 @@ test('maybeTravelToFrame swallows avatar.moveTo errors (best-effort)', () => {
 test('agent_keystroke rejects empty key', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -392,7 +464,7 @@ test('agent_keystroke rejects empty key', async () => {
 test('agent_type_text rejects empty text and over-cap text', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -409,7 +481,7 @@ test('agent_menu_command refuses on user activity (no force)', async () => {
     const recentTs = Date.now() / 1000 - 0.2;
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         getAgentEvents: () => ({
             getEvents: () => [
@@ -429,7 +501,7 @@ test('agent_menu_command refuses on user activity (no force)', async () => {
 test('agent_select_range rejects non-integer or negative bounds', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -451,7 +523,7 @@ test('agent_select_range rejects non-integer or negative bounds', async () => {
 test('agent_select_substring rejects empty needle', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -463,7 +535,7 @@ test('agent_select_substring rejects empty needle', async () => {
 test('agent_menu_command rejects empty or non-string path', async () => {
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         logDebug: () => {},
     });
@@ -485,7 +557,7 @@ test('agent_keystroke refuses while user activity is detected (no force)', async
     const recentTs = Date.now() / 1000 - 0.2; // 200ms ago
     const handler = init({
         screen: fakeScreen(),
-        appPath: '/nope',
+        helperPath: null,
         getAgentAvatar: () => null,
         getAgentEvents: () => ({
             getEvents: () => [

@@ -118,6 +118,37 @@ func resolveFocusedElement() -> AXUIElement? {
     return nil
 }
 
+func actionNames(_ element: AXUIElement) -> Set<String> {
+    var raw: CFArray?
+    guard AXUIElementCopyActionNames(element, &raw) == .success,
+          let names = raw as? [String] else { return [] }
+    return Set(names)
+}
+
+func emitElementActionResult(
+    ok: Bool,
+    action: String,
+    element: AXUIElement,
+    extras: [String: Any] = [:]
+) -> Never {
+    var result: [String: Any] = [
+        "ok": ok,
+        "action": action,
+        "role": roleString(element),
+    ]
+    if let label = displayLabel(element) {
+        result["label"] = label
+    }
+    if let frame = frameOf(element) {
+        result["frame"] = frame
+    }
+    for (k, v) in extras {
+        result[k] = v
+    }
+    emit(result)
+    exit(0)
+}
+
 // MARK: — Read commands
 
 func emitReadResult(_ element: AXUIElement) -> Never {
@@ -362,25 +393,82 @@ func axCopyChildren(_ element: AXUIElement) -> [AXUIElement] {
     return []
 }
 
+let TREE_DEFAULT_PREFERRED_ROLES: Set<String> = [
+    "AXTextArea",
+    "AXTextField",
+    "AXSearchField",
+    "AXComboBox",
+    "AXWebArea",
+    "AXButton",
+    "AXLink",
+    "AXMenuButton",
+    "AXPopUpButton",
+    "AXToolbar",
+]
+
+func frameArea(_ element: AXUIElement) -> Double {
+    guard let f = frameOf(element),
+          let w = f["w"] as? Double,
+          let h = f["h"] as? Double else { return 0 }
+    return max(0, w) * max(0, h)
+}
+
+func frameMinX(_ element: AXUIElement) -> Double {
+    guard let f = frameOf(element), let x = f["x"] as? Double else { return 0 }
+    return x
+}
+
+func walkPriority(_ element: AXUIElement, preferRoles: Set<String>) -> Int {
+    let role = roleString(element)
+    if preferRoles.contains(role) { return 1200 }
+    if TREE_DEFAULT_PREFERRED_ROLES.contains(role) { return 1000 }
+    switch role {
+    case "AXToolbar", "AXMenuBar", "AXMenuBarItem":
+        return 950
+    case "AXWindow", "AXSheet", "AXPopover":
+        return 850
+    case "AXSplitGroup", "AXGroup", "AXScrollArea", "AXTabGroup":
+        return 650
+    case "AXTable", "AXOutline", "AXBrowser":
+        return 150
+    case "AXRow", "AXCell", "AXStaticText":
+        return 80
+    default:
+        return 300
+    }
+}
+
+func sortChildrenForWalk(_ children: [AXUIElement], preferRoles: Set<String>) -> [AXUIElement] {
+    return children.enumerated().sorted { a, b in
+        let ap = walkPriority(a.element, preferRoles: preferRoles)
+        let bp = walkPriority(b.element, preferRoles: preferRoles)
+        if ap != bp { return ap > bp }
+        let aa = frameArea(a.element)
+        let ba = frameArea(b.element)
+        if aa != ba { return aa > ba }
+        let ax = frameMinX(a.element)
+        let bx = frameMinX(b.element)
+        if ax != bx { return ax > bx }
+        return a.offset < b.offset
+    }.map { $0.element }
+}
+
 // On a window, the toolbar typically lives as a direct AXChildren entry
 // AND/OR is exposed via the kAXToolbarAttribute (rare on modern Cocoa).
-// In Notes the AXToolbar appears at AXChildren[1] AFTER a giant
-// AXSplitGroup that contains the entire sidebar — depth-first walk
-// hits the 500-node cap inside the split group long before the toolbar,
-// so toolbar buttons (e.g. "New Note") are unreachable.
-//
-// Fix: when assembling children for the walk, hoist any AXToolbar(s) and
-// kAXToolbarAttribute to the FRONT of the list so they're visited first.
-// Costs ~one extra attribute-fetch per node but makes the toolbar room
-// visible regardless of where Cocoa decided to attach it.
-func axCopyChildrenForWalk(_ element: AXUIElement) -> [AXUIElement] {
+// In Notes the AXToolbar appears after a giant split group that contains
+// the sidebar, so pure depth-first traversal can burn the node cap before
+// reaching high-value controls. Child ordering is priority-aware:
+// text/action-bearing roles first, large/right-hand containers before
+// narrow sidebars, table/row content last.
+func axCopyChildrenForWalk(_ element: AXUIElement, preferRoles: Set<String> = []) -> [AXUIElement] {
     let children = axCopyChildren(element)
     let role = roleString(element)
-    guard role == "AXWindow" else { return children }
+    let sortedChildren = sortChildrenForWalk(children, preferRoles: preferRoles)
+    guard role == "AXWindow" else { return sortedChildren }
 
     var toolbars: [AXUIElement] = []
     var rest: [AXUIElement] = []
-    for child in children {
+    for child in sortedChildren {
         if roleString(child) == "AXToolbar" {
             toolbars.append(child)
         } else {
@@ -451,6 +539,42 @@ func walkTree(_ element: AXUIElement, depth: Int, counter: NodeCounter) -> [Stri
                 break
             }
             kids.append(walkTree(child, depth: depth + 1, counter: counter))
+        }
+        if !kids.isEmpty {
+            node["children"] = kids
+        }
+    }
+    return node
+}
+
+func walkTreeScoped(
+    _ element: AXUIElement,
+    depth: Int,
+    counter: NodeCounter,
+    skipRoles: Set<String>,
+    preferRoles: Set<String>
+) -> [String: Any] {
+    var node = nodeSummary(element)
+    counter.count += 1
+    if depth >= TREE_MAX_DEPTH || counter.count >= TREE_MAX_NODES {
+        return node
+    }
+    let children = axCopyChildrenForWalk(element, preferRoles: preferRoles)
+        .filter { !skipRoles.contains(roleString($0)) }
+    if !children.isEmpty {
+        var kids: [[String: Any]] = []
+        for child in children {
+            if counter.count >= TREE_MAX_NODES {
+                node["truncated"] = true
+                break
+            }
+            kids.append(walkTreeScoped(
+                child,
+                depth: depth + 1,
+                counter: counter,
+                skipRoles: skipRoles,
+                preferRoles: preferRoles
+            ))
         }
         if !kids.isEmpty {
             node["children"] = kids
@@ -669,6 +793,106 @@ func parseFindArgs(_ args: [String], cmd: String) -> FindArgs {
     return FindArgs(label: label, role: role, index: index, near: near)
 }
 
+struct ElementArgs {
+    var label: String?
+    var role: String?
+    var index: Int
+    var near: CGPoint?
+    var skipRoles: Set<String>
+    var preferRoles: Set<String>
+}
+
+func parseElementArgs(_ args: [String], cmd: String, requireTarget: Bool = true) -> ElementArgs {
+    var label = ""
+    var role: String? = nil
+    var index: Int = 0
+    var near: CGPoint? = nil
+    var skipRoles = Set<String>()
+    var preferRoles = Set<String>()
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--role", i + 1 < args.count {
+            let rawRole = args[i + 1]
+            role = rawRole.lowercased().hasPrefix("ax") ? rawRole : "AX" + rawRole
+            i += 2
+        } else if a == "--index", i + 1 < args.count {
+            guard let n = Int(args[i + 1]) else {
+                emitInternalError("\(cmd): --index requires an integer")
+            }
+            index = n
+            i += 2
+        } else if a == "--near", i + 1 < args.count {
+            let parts = args[i + 1].split(separator: ",")
+            guard parts.count == 2,
+                  let x = Double(parts[0]),
+                  let y = Double(parts[1]) else {
+                emitInternalError("\(cmd): --near requires <x,y>")
+            }
+            near = CGPoint(x: x, y: y)
+            i += 2
+        } else if a == "--skip-role", i + 1 < args.count {
+            let rawRole = args[i + 1]
+            let r = rawRole.lowercased().hasPrefix("ax") ? rawRole : "AX" + rawRole
+            skipRoles.insert(r)
+            i += 2
+        } else if a == "--prefer-role", i + 1 < args.count {
+            let rawRole = args[i + 1]
+            let r = rawRole.lowercased().hasPrefix("ax") ? rawRole : "AX" + rawRole
+            preferRoles.insert(r)
+            i += 2
+        } else {
+            label = label.isEmpty ? a : label + " " + a
+            i += 1
+        }
+    }
+    if requireTarget && label.isEmpty && (role == nil || role!.isEmpty) {
+        emitInternalError("\(cmd) requires a label substring or --role")
+    }
+    return ElementArgs(
+        label: label.isEmpty ? nil : label,
+        role: role,
+        index: index,
+        near: near,
+        skipRoles: skipRoles,
+        preferRoles: preferRoles
+    )
+}
+
+func collectElementCandidates(
+    in element: AXUIElement,
+    role: String?,
+    label: String?,
+    depth: Int,
+    visited: NodeCounter,
+    preferRoles: Set<String>,
+    out: inout [(elem: AXUIElement, score: Int, ordinal: Int)]
+) {
+    visited.count += 1
+    if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return }
+    let roleOk = role == nil || role!.isEmpty || roleMatches(element, role!)
+    var score: Int? = nil
+    if let label = label, !label.isEmpty {
+        score = labelScore(element, label)
+    } else if roleOk {
+        score = walkPriority(element, preferRoles: preferRoles)
+    }
+    if roleOk, let s = score {
+        out.append((element, s, out.count))
+    }
+    for child in axCopyChildrenForWalk(element, preferRoles: preferRoles) {
+        collectElementCandidates(
+            in: child,
+            role: role,
+            label: label,
+            depth: depth + 1,
+            visited: visited,
+            preferRoles: preferRoles,
+            out: &out
+        )
+    }
+}
+
 // Pick a "label" for response payloads using the same priority used by
 // labelScore: title > description > help. Returns nil if every field
 // is empty.
@@ -778,6 +1002,160 @@ func cmdPressNamed(_ args: [String]) -> Never {
     exit(0)
 }
 
+func focusElement(_ element: AXUIElement) -> Never {
+    let status = AXUIElementSetAttributeValue(
+        element,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    )
+    if status == .success {
+        emitElementActionResult(ok: true, action: "focus", element: element)
+    }
+    if status == .attributeUnsupported || status == .notImplemented {
+        var result: [String: Any] = [
+            "error": "not_focusable",
+            "role": roleString(element),
+            "detail": "target does not accept kAXFocusedAttribute",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        emit(result)
+        exit(0)
+    }
+    var result: [String: Any] = [
+        "error": "focus_failed",
+        "role": roleString(element),
+        "detail": "ax_status=\(status.rawValue)",
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    emit(result)
+    exit(0)
+}
+
+func cmdFocusElement(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let parsed = parseElementArgs(args, cmd: "focus-element")
+    guard let window = resolveFocusedWindow() else {
+        emitError("no_window")
+    }
+    let visited = NodeCounter()
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    collectElementCandidates(
+        in: window,
+        role: parsed.role,
+        label: parsed.label,
+        depth: 0,
+        visited: visited,
+        preferRoles: parsed.preferRoles,
+        out: &matches
+    )
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        emit([
+            "error": "not_found",
+            "searched": visited.count,
+            "match_count": matches.count,
+        ])
+        exit(0)
+    }
+    focusElement(pick.elem)
+}
+
+func cmdFocusAt(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    guard args.count >= 2,
+          let x = Float(args[0]),
+          let y = Float(args[1]) else {
+        emitInternalError("focus-at requires <x> <y>")
+    }
+    guard let element = resolveElementAtPoint(x, y) else {
+        emitError("no_element")
+    }
+    focusElement(element)
+}
+
+func cmdPressAt(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    guard args.count >= 2,
+          let x = Float(args[0]),
+          let y = Float(args[1]) else {
+        emitInternalError("press-at requires <x> <y>")
+    }
+    guard let element = resolveElementAtPoint(x, y) else {
+        emitError("no_element")
+    }
+    if !actionNames(element).contains(kAXPressAction as String) {
+        var result: [String: Any] = [
+            "error": "unsupported_action",
+            "role": roleString(element),
+            "detail": "target does not expose AXPress",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        emit(result)
+        exit(0)
+    }
+    let status = AXUIElementPerformAction(element, kAXPressAction as CFString)
+    if status == .success {
+        emitElementActionResult(ok: true, action: "press", element: element)
+    }
+    var result: [String: Any] = [
+        "error": "press_failed",
+        "role": roleString(element),
+        "detail": "ax_status=\(status.rawValue)",
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    emit(result)
+    exit(0)
+}
+
+func cmdReadSubtree(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let parsed = parseElementArgs(args, cmd: "read-subtree")
+    guard let window = resolveFocusedWindow() else {
+        emitError("no_window")
+    }
+    let visited = NodeCounter()
+    var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    collectElementCandidates(
+        in: window,
+        role: parsed.role,
+        label: parsed.label,
+        depth: 0,
+        visited: visited,
+        preferRoles: parsed.preferRoles,
+        out: &matches
+    )
+    guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
+        emit([
+            "error": "not_found",
+            "searched": visited.count,
+            "match_count": matches.count,
+        ])
+        exit(0)
+    }
+    let counter = NodeCounter()
+    let tree = walkTreeScoped(
+        pick.elem,
+        depth: 0,
+        counter: counter,
+        skipRoles: parsed.skipRoles,
+        preferRoles: parsed.preferRoles
+    )
+    var result: [String: Any] = [
+        "tree": tree,
+        "node_count": counter.count,
+        "searched": visited.count,
+        "match_count": pick.total,
+        "match_index": pick.rank,
+        "max_depth": TREE_MAX_DEPTH,
+        "max_nodes": TREE_MAX_NODES,
+    ]
+    if let frontApp = NSWorkspace.shared.frontmostApplication {
+        result["app"] = frontApp.localizedName ?? ""
+        result["bundle_id"] = frontApp.bundleIdentifier ?? ""
+    }
+    emit(result)
+    exit(0)
+}
+
 // MARK: — Permission check
 
 func cmdCheck() -> Never {
@@ -805,6 +1183,10 @@ let SUBSCRIBE_NOTIFICATIONS: [String] = [
     kAXValueChangedNotification as String,
     kAXWindowCreatedNotification as String,
     kAXMainWindowChangedNotification as String,
+    "AXMoved",
+    "AXResized",
+    "AXMenuOpened",
+    "AXMenuClosed",
 ]
 
 // Boxed mutable state passed through the Unmanaged refcon channel
@@ -1057,6 +1439,299 @@ func makeEventSource() -> CGEventSource? {
     return CGEventSource(stateID: .privateState)
 }
 
+func activeDisplayRects() -> [CGRect] {
+    let maxDisplays: UInt32 = 32
+    var displays = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
+    var count: UInt32 = 0
+    let err = displays.withUnsafeMutableBufferPointer { buf in
+        CGGetActiveDisplayList(maxDisplays, buf.baseAddress, &count)
+    }
+    if err == .success && count > 0 {
+        return displays.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+    return NSScreen.screens.map { $0.frame }
+}
+
+func distanceToRect(_ p: CGPoint, _ r: CGRect) -> CGFloat {
+    let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+    let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+    return (dx * dx + dy * dy).squareRoot()
+}
+
+func clampPointToDisplay(_ p: CGPoint) -> (point: CGPoint, display: CGRect)? {
+    let rects = activeDisplayRects().filter { $0.width > 1 && $0.height > 1 }
+    guard !rects.isEmpty else { return nil }
+    let rect = rects.first(where: { $0.contains(p) })
+        ?? rects.min(by: { distanceToRect(p, $0) < distanceToRect(p, $1) })!
+    let x = min(max(p.x, rect.minX), rect.maxX - 1)
+    let y = min(max(p.y, rect.minY), rect.maxY - 1)
+    return (CGPoint(x: x, y: y), rect)
+}
+
+func parseFiniteDouble(_ raw: String, _ name: String) -> Double {
+    guard let v = Double(raw), v.isFinite else {
+        emitError("bad_coordinate", "\(name) must be finite")
+    }
+    return v
+}
+
+func displayFramePayload(_ rect: CGRect) -> [String: Any] {
+    return [
+        "x": Double(rect.origin.x),
+        "y": Double(rect.origin.y),
+        "w": Double(rect.width),
+        "h": Double(rect.height),
+    ]
+}
+
+func pointFramePayload(_ p: CGPoint, size: Double = 12) -> [String: Any] {
+    return [
+        "x": Double(p.x) - size / 2,
+        "y": Double(p.y) - size / 2,
+        "w": size,
+        "h": size,
+    ]
+}
+
+struct MouseButtonSpec {
+    let name: String
+    let button: CGMouseButton
+    let down: CGEventType
+    let up: CGEventType
+    let drag: CGEventType
+}
+
+func parseMouseButton(_ raw: String) -> MouseButtonSpec {
+    switch raw.lowercased() {
+    case "left":
+        return MouseButtonSpec(name: "left", button: .left, down: .leftMouseDown, up: .leftMouseUp, drag: .leftMouseDragged)
+    case "right":
+        return MouseButtonSpec(name: "right", button: .right, down: .rightMouseDown, up: .rightMouseUp, drag: .rightMouseDragged)
+    case "middle", "center":
+        return MouseButtonSpec(name: "middle", button: .center, down: .otherMouseDown, up: .otherMouseUp, drag: .otherMouseDragged)
+    default:
+        emitError("bad_button", "expected left, right, or middle")
+    }
+}
+
+func postMouseMove(_ src: CGEventSource, _ p: CGPoint) {
+    guard let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left) else {
+        emitError("hid_event_create_failed", "mouse move")
+    }
+    move.post(tap: .cghidEventTap)
+}
+
+func postMouse(_ src: CGEventSource, _ type: CGEventType, _ p: CGPoint, _ button: CGMouseButton, clickState: Int64 = 1) {
+    guard let event = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: p, mouseButton: button) else {
+        emitError("hid_event_create_failed", "mouse event")
+    }
+    event.setIntegerValueField(.mouseEventClickState, value: clickState)
+    if button == .center {
+        event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+    }
+    event.post(tap: .cghidEventTap)
+}
+
+func parsePointFromArgs(_ args: [String], cmd: String) -> CGPoint {
+    guard args.count >= 2 else {
+        emitInternalError("\(cmd) requires <x> <y>")
+    }
+    let x = parseFiniteDouble(args[0], "x")
+    let y = parseFiniteDouble(args[1], "y")
+    return CGPoint(x: x, y: y)
+}
+
+func clampRequired(_ p: CGPoint) -> (point: CGPoint, display: CGRect) {
+    guard let clamped = clampPointToDisplay(p) else {
+        emitError("display_unavailable", "no active display geometry")
+    }
+    return clamped
+}
+
+func cmdClickAt(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let rawPoint = parsePointFromArgs(args, cmd: "click-at")
+    var button = parseMouseButton("left")
+    var count = 1
+    var i = 2
+    while i < args.count {
+        let a = args[i]
+        if a == "--button", i + 1 < args.count {
+            button = parseMouseButton(args[i + 1])
+            i += 2
+        } else if a == "--count", i + 1 < args.count {
+            guard let c = Int(args[i + 1]), c >= 1, c <= 3 else {
+                emitError("bad_count", "click count must be 1, 2, or 3")
+            }
+            count = c
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    let clamped = clampRequired(rawPoint)
+    postMouseMove(src, clamped.point)
+    Thread.sleep(forTimeInterval: 0.025)
+    for click in 1...count {
+        postMouse(src, button.down, clamped.point, button.button, clickState: Int64(click))
+        Thread.sleep(forTimeInterval: 0.025)
+        postMouse(src, button.up, clamped.point, button.button, clickState: Int64(click))
+        if click < count { Thread.sleep(forTimeInterval: 0.08) }
+    }
+    emit([
+        "ok": true,
+        "action": "click",
+        "button": button.name,
+        "count": count,
+        "x": Double(clamped.point.x),
+        "y": Double(clamped.point.y),
+        "frame": pointFramePayload(clamped.point),
+        "display": displayFramePayload(clamped.display),
+    ])
+    exit(0)
+}
+
+func cmdHoverAt(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let rawPoint = parsePointFromArgs(args, cmd: "hover-at")
+    var durationMs = 0
+    var i = 2
+    while i < args.count {
+        if args[i] == "--duration-ms", i + 1 < args.count {
+            guard let d = Int(args[i + 1]), d >= 0, d <= 5000 else {
+                emitError("bad_duration", "hover duration must be 0..5000ms")
+            }
+            durationMs = d
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    let clamped = clampRequired(rawPoint)
+    postMouseMove(src, clamped.point)
+    if durationMs > 0 {
+        Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+    }
+    emit([
+        "ok": true,
+        "action": "hover",
+        "x": Double(clamped.point.x),
+        "y": Double(clamped.point.y),
+        "frame": pointFramePayload(clamped.point),
+        "display": displayFramePayload(clamped.display),
+    ])
+    exit(0)
+}
+
+func cmdDrag(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    guard args.count >= 4 else {
+        emitInternalError("drag requires <from_x> <from_y> <to_x> <to_y>")
+    }
+    let fromRaw = CGPoint(x: parseFiniteDouble(args[0], "from_x"), y: parseFiniteDouble(args[1], "from_y"))
+    let toRaw = CGPoint(x: parseFiniteDouble(args[2], "to_x"), y: parseFiniteDouble(args[3], "to_y"))
+    var durationMs = 450
+    var button = parseMouseButton("left")
+    var i = 4
+    while i < args.count {
+        let a = args[i]
+        if a == "--duration-ms", i + 1 < args.count {
+            guard let d = Int(args[i + 1]), d >= 50, d <= 5000 else {
+                emitError("bad_duration", "drag duration must be 50..5000ms")
+            }
+            durationMs = d
+            i += 2
+        } else if a == "--button", i + 1 < args.count {
+            button = parseMouseButton(args[i + 1])
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    let from = clampRequired(fromRaw)
+    let to = clampRequired(toRaw)
+    postMouseMove(src, from.point)
+    Thread.sleep(forTimeInterval: 0.04)
+    postMouse(src, button.down, from.point, button.button)
+    let steps = max(4, min(80, durationMs / 16))
+    for step in 1...steps {
+        let t = Double(step) / Double(steps)
+        let eased = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
+        let x = from.point.x + (to.point.x - from.point.x) * CGFloat(eased)
+        let y = from.point.y + (to.point.y - from.point.y) * CGFloat(eased)
+        postMouse(src, button.drag, CGPoint(x: x, y: y), button.button)
+        Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0 / Double(steps))
+    }
+    postMouse(src, button.up, to.point, button.button)
+    emit([
+        "ok": true,
+        "action": "drag",
+        "button": button.name,
+        "duration_ms": durationMs,
+        "from": ["x": Double(from.point.x), "y": Double(from.point.y)],
+        "to": ["x": Double(to.point.x), "y": Double(to.point.y)],
+        "frame": pointFramePayload(to.point),
+        "display": displayFramePayload(to.display),
+    ])
+    exit(0)
+}
+
+func clampToInt32(_ v: Double) -> Int32 {
+    if v > Double(Int32.max) { return Int32.max }
+    if v < Double(Int32.min) { return Int32.min }
+    return Int32(v.rounded())
+}
+
+func cmdScrollAt(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    guard args.count >= 4 else {
+        emitInternalError("scroll-at requires <x> <y> <dx> <dy>")
+    }
+    let rawPoint = CGPoint(x: parseFiniteDouble(args[0], "x"), y: parseFiniteDouble(args[1], "y"))
+    let dx = parseFiniteDouble(args[2], "dx")
+    let dy = parseFiniteDouble(args[3], "dy")
+    guard dx.isFinite && dy.isFinite else {
+        emitError("bad_coordinate", "scroll deltas must be finite")
+    }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    let clamped = clampRequired(rawPoint)
+    postMouseMove(src, clamped.point)
+    guard let event = CGEvent(
+        scrollWheelEvent2Source: src,
+        units: .pixel,
+        wheelCount: 2,
+        wheel1: clampToInt32(dy),
+        wheel2: clampToInt32(dx),
+        wheel3: 0
+    ) else {
+        emitError("hid_event_create_failed", "scroll event")
+    }
+    event.location = clamped.point
+    event.post(tap: .cghidEventTap)
+    emit([
+        "ok": true,
+        "action": "scroll",
+        "dx": dx,
+        "dy": dy,
+        "x": Double(clamped.point.x),
+        "y": Double(clamped.point.y),
+        "frame": pointFramePayload(clamped.point),
+        "display": displayFramePayload(clamped.display),
+    ])
+    exit(0)
+}
+
 func cmdKeystroke(_ args: [String]) -> Never {
     guard AXIsProcessTrusted() else { emitError("not_trusted") }
 
@@ -1072,7 +1747,7 @@ func cmdKeystroke(_ args: [String]) -> Never {
     }
     guard let k = keyArg else { emitInternalError("keystroke: missing key arg") }
 
-    if requireFocus { _ = ensureFocusedElement() }
+    let focusedElement: AXUIElement? = requireFocus ? ensureFocusedElement() : nil
 
     let key = parseKey(k)
     let flags = parseModifierFlags(modCsv)
@@ -1093,12 +1768,17 @@ func cmdKeystroke(_ args: [String]) -> Never {
     Thread.sleep(forTimeInterval: 0.012)
     up.post(tap: .cghidEventTap)
 
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "key": k,
         "key_code": Int(key),
         "mods": modCsv,
-    ])
+    ]
+    if let elem = focusedElement {
+        result["role"] = roleString(elem)
+        if let frame = frameOf(elem) { result["frame"] = frame }
+    }
+    emit(result)
     exit(0)
 }
 
@@ -1125,7 +1805,7 @@ func cmdTypeText(_ args: [String]) -> Never {
         emitError("text_too_long", "max 2000 UTF-16 code units; got \(utf16.count)")
     }
 
-    if requireFocus { _ = ensureFocusedElement() }
+    let focusedElement: AXUIElement? = requireFocus ? ensureFocusedElement() : nil
     guard let src = makeEventSource() else {
         emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
     }
@@ -1147,9 +1827,154 @@ func cmdTypeText(_ args: [String]) -> Never {
         }
         up.post(tap: .cghidEventTap)
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "length": utf16.count,
+    ]
+    if let elem = focusedElement {
+        result["role"] = roleString(elem)
+        if let frame = frameOf(elem) { result["frame"] = frame }
+    }
+    emit(result)
+    exit(0)
+}
+
+let MODIFIER_KEY_SPECS: [String: (code: CGKeyCode, flag: CGEventFlags)] = [
+    "cmd": (0x37, .maskCommand),
+    "command": (0x37, .maskCommand),
+    "shift": (0x38, .maskShift),
+    "opt": (0x3A, .maskAlternate),
+    "option": (0x3A, .maskAlternate),
+    "alt": (0x3A, .maskAlternate),
+    "ctrl": (0x3B, .maskControl),
+    "control": (0x3B, .maskControl),
+    "fn": (0x3F, .maskSecondaryFn),
+]
+
+func parseModifierSpecs(_ csv: String) -> [(name: String, code: CGKeyCode, flag: CGEventFlags)] {
+    let tokens = csv.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    var out: [(name: String, code: CGKeyCode, flag: CGEventFlags)] = []
+    var seen = Set<String>()
+    for tok in tokens where !tok.isEmpty {
+        guard let spec = MODIFIER_KEY_SPECS[tok] else {
+            emitError("bad_modifier", "unknown modifier '\(tok)'")
+        }
+        let canonical: String
+        switch tok {
+        case "command": canonical = "cmd"
+        case "option", "alt": canonical = "opt"
+        case "control": canonical = "ctrl"
+        default: canonical = tok
+        }
+        if seen.contains(canonical) { continue }
+        seen.insert(canonical)
+        out.append((canonical, spec.code, spec.flag))
+    }
+    return out
+}
+
+func postKey(_ src: CGEventSource, key: CGKeyCode, down: Bool, flags: CGEventFlags) {
+    guard let event = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else {
+        emitError("event_create_failed")
+    }
+    if !flags.isEmpty {
+        event.flags = flags
+    }
+    event.post(tap: .cghidEventTap)
+}
+
+func cmdKeyHold(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    var keyArg: String?
+    var modCsv = ""
+    var requireFocus = true
+    var durationMs = 250
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--mods" && i + 1 < args.count { modCsv = args[i + 1]; i += 2; continue }
+        if a == "--duration-ms" && i + 1 < args.count {
+            guard let d = Int(args[i + 1]), d >= 10, d <= 5000 else {
+                emitError("bad_duration", "key hold duration must be 10..5000ms")
+            }
+            durationMs = d
+            i += 2
+            continue
+        }
+        if a == "--no-focus-check" { requireFocus = false; i += 1; continue }
+        keyArg = a; i += 1
+    }
+    guard let k = keyArg else { emitInternalError("key-hold: missing key arg") }
+    let focusedElement: AXUIElement? = requireFocus ? ensureFocusedElement() : nil
+    let key = parseKey(k)
+    let flags = parseModifierFlags(modCsv)
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    postKey(src, key: key, down: true, flags: flags)
+    Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+    postKey(src, key: key, down: false, flags: flags)
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "key_hold",
+        "key": k,
+        "key_code": Int(key),
+        "mods": modCsv,
+        "duration_ms": durationMs,
+    ]
+    if let elem = focusedElement {
+        result["role"] = roleString(elem)
+        if let frame = frameOf(elem) { result["frame"] = frame }
+    }
+    emit(result)
+    exit(0)
+}
+
+func cmdModifierLatch(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    var modCsv = ""
+    var durationMs = 250
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--mods" && i + 1 < args.count { modCsv = args[i + 1]; i += 2; continue }
+        if a == "--duration-ms" && i + 1 < args.count {
+            guard let d = Int(args[i + 1]), d >= 10, d <= 5000 else {
+                emitError("bad_duration", "modifier latch duration must be 10..5000ms")
+            }
+            durationMs = d
+            i += 2
+            continue
+        }
+        if modCsv.isEmpty {
+            modCsv = a
+        }
+        i += 1
+    }
+    let specs = parseModifierSpecs(modCsv)
+    if specs.isEmpty {
+        emitError("bad_modifier", "at least one modifier is required")
+    }
+    guard let src = makeEventSource() else {
+        emitError("event_source_private_failed", "CGEventSource(.privateState) returned nil")
+    }
+    var flags: CGEventFlags = []
+    for spec in specs {
+        flags.insert(spec.flag)
+        postKey(src, key: spec.code, down: true, flags: flags)
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+    for spec in specs.reversed() {
+        postKey(src, key: spec.code, down: false, flags: flags)
+        flags.remove(spec.flag)
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    emit([
+        "ok": true,
+        "action": "modifier_latch",
+        "mods": specs.map { $0.name }.joined(separator: ","),
+        "duration_ms": durationMs,
     ])
     exit(0)
 }
@@ -1199,12 +2024,15 @@ func cmdSelectRange(_ args: [String]) -> Never {
     if status != .success {
         emitError("set_failed", "ax_status=\(status.rawValue)")
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "location": loc,
         "length": cappedLen,
         "total_chars": total,
-    ])
+        "role": roleString(elem),
+    ]
+    if let frame = frameOf(elem) { result["frame"] = frame }
+    emit(result)
     exit(0)
 }
 
@@ -1213,19 +2041,30 @@ func cmdSelectAll() -> Never {
     let elem = ensureFocusedElement()
     let total = axNumberOfCharacters(elem) ?? 0
     if total <= 0 {
-        emit(["ok": true, "location": 0, "length": 0, "total_chars": 0])
+        var empty: [String: Any] = [
+            "ok": true,
+            "location": 0,
+            "length": 0,
+            "total_chars": 0,
+            "role": roleString(elem),
+        ]
+        if let frame = frameOf(elem) { empty["frame"] = frame }
+        emit(empty)
         exit(0)
     }
     let status = setSelectedRange(elem, location: 0, length: total)
     if status != .success {
         emitError("set_failed", "ax_status=\(status.rawValue)")
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "location": 0,
         "length": total,
         "total_chars": total,
-    ])
+        "role": roleString(elem),
+    ]
+    if let frame = frameOf(elem) { result["frame"] = frame }
+    emit(result)
     exit(0)
 }
 
@@ -1268,12 +2107,15 @@ func cmdSelectSubstring(_ args: [String]) -> Never {
     if status != .success {
         emitError("set_failed", "ax_status=\(status.rawValue)")
     }
-    emit([
+    var result: [String: Any] = [
         "ok": true,
         "location": foundLoc,
         "length": len,
         "total_chars": v.length,
-    ])
+        "role": roleString(elem),
+    ]
+    if let frame = frameOf(elem) { result["frame"] = frame }
+    emit(result)
     exit(0)
 }
 
@@ -1394,11 +2236,14 @@ func cmdMenuCommand(_ args: [String]) -> Never {
             if status != .success {
                 emitError("press_failed", "ax_status=\(status.rawValue)")
             }
-            emit([
+            var result: [String: Any] = [
                 "ok": true,
                 "path": args,
                 "leaf": axCopyString(next, kAXTitleAttribute as String) ?? segment,
-            ])
+                "role": roleString(next),
+            ]
+            if let frame = frameOf(next) { result["frame"] = frame }
+            emit(result)
             exit(0)
         }
         // Non-leaf: open it, poll briefly for children, then descend
@@ -1417,7 +2262,7 @@ func cmdMenuCommand(_ args: [String]) -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|keystroke|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -1430,9 +2275,19 @@ case "read-focused":      cmdReadFocused()
 case "write-at":          cmdWriteAt(rest)
 case "write-focused":     cmdWriteFocused(rest)
 case "read-window":       cmdReadWindow()
+case "read-subtree":      cmdReadSubtree(rest)
 case "find-element":      cmdFindElement(rest)
+case "focus-element":     cmdFocusElement(rest)
+case "focus-at":          cmdFocusAt(rest)
 case "press-named":       cmdPressNamed(rest)
+case "press-at":          cmdPressAt(rest)
+case "click-at":          cmdClickAt(rest)
+case "drag":              cmdDrag(rest)
+case "scroll-at":         cmdScrollAt(rest)
+case "hover-at":          cmdHoverAt(rest)
 case "keystroke":         cmdKeystroke(rest)
+case "key-hold":          cmdKeyHold(rest)
+case "modifier-latch":    cmdModifierLatch(rest)
 case "type-text":         cmdTypeText(rest)
 case "select-range":      cmdSelectRange(rest)
 case "select-all":        cmdSelectAll()

@@ -223,6 +223,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           text: { type: 'string', description: 'The text to write. Must be non-empty.' },
           replace_all: { type: 'boolean', description: 'If true, replace the entire focused field even with no selection. Default false. Use only when the user has explicitly asked to replace the whole field.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['text'],
       },
@@ -238,6 +239,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: 'object', properties: {} },
     },
     {
+      name: 'agent_read_subtree',
+      description: 'Read a scoped AX subtree by resolving a label/role target first, then walking only that subtree. Use this when read_window is too broad or sidebar/table content hides the target. Supports role, label, index, near_x/near_y, skip_role(s), and prefer_role(s). Pure AX read; does not move the cursor.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Optional label/value substring to resolve the subtree root.' },
+          role: { type: 'string', description: 'Optional AX role for the subtree root, e.g. AXTextArea or AXScrollArea.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y for proximity disambiguation.' },
+          skip_roles: { type: 'array', items: { type: 'string' }, description: 'Optional AX roles to omit while walking the subtree.' },
+          prefer_roles: { type: 'array', items: { type: 'string' }, description: 'Optional AX roles to prioritize before lower-value branches.' },
+        },
+      },
+    },
+    {
       name: 'agent_find_element',
       description: 'Find a UI element in the active app\'s focused window by label substring (case-insensitive) and optionally by role. Returns the element\'s role, label, screen-space frame, total match count and selected match index. By default returns the best lexical match (title > description > help > value). When labels collide ("More" matching multiple toolbar items), use `index` to pick the Nth-best match (0-based) or `near` to bias toward proximity to a screen point.',
       inputSchema: {
@@ -250,6 +267,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
         },
         required: ['label'],
+      },
+    },
+    {
+      name: 'agent_focus_element',
+      description: 'Resolve an AX element by label and/or role, then set kAXFocusedAttribute=true without moving the hardware cursor. Use this to enter a cold app window before read_focused, select_*, type_text, or menu formatting. Same disambiguation as agent_find_element; pass force=true only after explicit consent if recent user activity is detected.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Optional label/value substring. Required unless role is specific enough.' },
+          role: { type: 'string', description: 'Optional AX role, e.g. AXTextArea.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
+          prefer_roles: { type: 'array', items: { type: 'string' }, description: 'Optional roles to prioritize while resolving.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+      },
+    },
+    {
+      name: 'agent_focus_at',
+      description: 'AX hit-test a screen coordinate and focus that element without sending a mouse event. Use this when you know the target coordinate and want a clean AX focus handoff instead of HID click.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Screen x coordinate.' },
+          y: { type: 'number', description: 'Screen y coordinate.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['x', 'y'],
       },
     },
     {
@@ -279,6 +325,80 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_press_at',
+      description: 'AX hit-test a screen coordinate and perform AXPress on the element at that point if it exposes the press action. Does not move the hardware cursor. Use this before HID click when AX can press the target cleanly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Screen x coordinate.' },
+          y: { type: 'number', description: 'Screen y coordinate.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['x', 'y'],
+      },
+    },
+    {
+      name: 'agent_click_at',
+      description: 'Borrow the HID cursor lane and post a real mouse move + click at screen coordinates. Supports left/right/middle and single/double/triple clicks. The avatar enters DRIVING state while the cursor is borrowed. Refuses on recent user activity unless force=true after explicit consent.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Screen x coordinate.' },
+          y: { type: 'number', description: 'Screen y coordinate.' },
+          button: { type: 'string', description: 'left, right, or middle. Default left.' },
+          count: { type: 'number', description: '1, 2, or 3 clicks. Default 1.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['x', 'y'],
+      },
+    },
+    {
+      name: 'agent_drag',
+      description: 'Borrow the HID cursor lane and perform a real mouse drag from one screen coordinate to another with eased intermediate moves. Required for Finder drag/drop, sliders, canvas tools, and partial-AX apps. Avatar follows the cursor while dragging.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          from_x: { type: 'number', description: 'Source screen x coordinate.' },
+          from_y: { type: 'number', description: 'Source screen y coordinate.' },
+          to_x: { type: 'number', description: 'Destination screen x coordinate.' },
+          to_y: { type: 'number', description: 'Destination screen y coordinate.' },
+          duration_ms: { type: 'number', description: 'Drag duration, 50..5000ms. Default 450.' },
+          button: { type: 'string', description: 'left, right, or middle. Default left.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['from_x', 'from_y', 'to_x', 'to_y'],
+      },
+    },
+    {
+      name: 'agent_scroll_at',
+      description: 'Borrow the HID cursor lane, move to a screen coordinate, and post a pixel scroll wheel event. Use when AX scrolling is unavailable or the target is a canvas/web surface.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Screen x coordinate.' },
+          y: { type: 'number', description: 'Screen y coordinate.' },
+          dx: { type: 'number', description: 'Horizontal scroll delta in pixels.' },
+          dy: { type: 'number', description: 'Vertical scroll delta in pixels.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['x', 'y', 'dx', 'dy'],
+      },
+    },
+    {
+      name: 'agent_hover_at',
+      description: 'Borrow the HID cursor lane and move the cursor to a screen coordinate without clicking. Useful for hover menus and tooltips. The avatar enters DRIVING state while the cursor is borrowed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'Screen x coordinate.' },
+          y: { type: 'number', description: 'Screen y coordinate.' },
+          duration_ms: { type: 'number', description: 'Optional hover dwell, 0..5000ms.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['x', 'y'],
+      },
+    },
+    {
       name: 'agent_keystroke',
       description: 'Post a single keyboard event (down + up) via macOS CGEvent — does NOT move the user\'s hardware cursor. Routes the keystroke to whatever element currently has system focus, so this requires a focused element (refuses with no_focus otherwise). Use named keys ("return", "esc", "tab", "up", "down", "left", "right", "j", "f5") or numeric virtual codes ("0x26"). Combine with `mods` (CSV: cmd, shift, opt, ctrl, fn) for chord shortcuts (Cmd+Shift+J, Cmd+S). Refuses by default if user activity is detected in the last ~1.2s — pass force=true to override after explicit user consent. Rate-limited to one keystroke per 200ms. Prefer agent_menu_command for menu invocations and agent_select_* for text selection — keystrokes are the right tool for app-specific shortcuts and key-driven navigation.',
       inputSchema: {
@@ -289,6 +409,47 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           force: { type: 'boolean', description: 'Override the user-activity guard. Use only after explicit user consent (e.g. user said "go ahead even if I just typed").' },
         },
         required: ['key'],
+      },
+    },
+    {
+      name: 'agent_keystroke_global',
+      description: 'Post a single keyboard event without requiring a focused AX element. Use for apps/windows where only the app has focus or AX focus is unavailable. Same key/mod syntax, user-activity guard, and rate limit as agent_keystroke.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Named key or numeric virtual key code.' },
+          mods: { type: 'string', description: 'Optional comma-separated modifiers: cmd,shift,opt,ctrl,fn.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['key'],
+      },
+    },
+    {
+      name: 'agent_key_hold',
+      description: 'Post key-down, hold for duration_ms, then key-up. Use for app shortcuts, games, sliders, or controls that distinguish held keys. Requires focused AX element unless global=true. Same user-activity guard and rate limit as keystroke.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Named key or numeric virtual key code.' },
+          mods: { type: 'string', description: 'Optional comma-separated modifiers.' },
+          duration_ms: { type: 'number', description: 'Hold duration, 10..5000ms. Default 250.' },
+          global: { type: 'boolean', description: 'If true, skip the focused-element requirement.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['key'],
+      },
+    },
+    {
+      name: 'agent_modifier_latch',
+      description: 'Press one or more modifiers down, hold for duration_ms, then release. Useful for apps that react to a held modifier without a character key. Same user-activity guard and rate limit as keystroke.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          mods: { type: 'string', description: 'Comma-separated modifiers: cmd,shift,opt,ctrl,fn.' },
+          duration_ms: { type: 'number', description: 'Latch duration, 10..5000ms. Default 250.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+        required: ['mods'],
       },
     },
     {
@@ -311,6 +472,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           location: { type: 'number', description: '0-based character offset where the selection starts.' },
           length: { type: 'number', description: 'Number of characters to select. Capped at remaining text.' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['location', 'length'],
       },
@@ -318,7 +480,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'agent_select_all',
       description: 'Select every character in the currently focused text element via AX (not Cmd+A). Cursor and keyboard are untouched. Returns the total character count for downstream sizing decisions.',
-      inputSchema: { type: 'object', properties: {} },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
+        },
+      },
     },
     {
       name: 'agent_select_substring',
@@ -328,6 +495,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           needle: { type: 'string', description: 'Text to find within the focused element.' },
           occurrence: { type: 'number', description: '0-based occurrence index (default 0 = first match).' },
+          force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['needle'],
       },
@@ -423,10 +591,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_write_selection',
     'agent_check_ax',
     'agent_read_window',
+    'agent_read_subtree',
     'agent_find_element',
+    'agent_focus_element',
+    'agent_focus_at',
     'agent_press_named',
+    'agent_press_at',
+    'agent_click_at',
+    'agent_drag',
+    'agent_scroll_at',
+    'agent_hover_at',
     'agent_recent_events',
     'agent_keystroke',
+    'agent_keystroke_global',
+    'agent_key_hold',
+    'agent_modifier_latch',
     'agent_type_text',
     'agent_select_range',
     'agent_select_all',

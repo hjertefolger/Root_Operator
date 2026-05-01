@@ -1,21 +1,26 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const outDir = path.join(root, 'build', 'native');
+const moduleCacheDir = process.env.CLANG_MODULE_CACHE_PATH
+    || path.join(os.tmpdir(), 'root-operator-clang-module-cache');
 
 if (process.platform !== 'darwin') {
     process.exit(0);
 }
 
 fs.mkdirSync(outDir, { recursive: true });
+fs.mkdirSync(moduleCacheDir, { recursive: true });
 
 function runCompiler(label, compiler, args, fallbackArgs) {
-    let result = spawnSync('xcrun', [compiler, ...args], { stdio: 'inherit' });
+    const env = { ...process.env, CLANG_MODULE_CACHE_PATH: moduleCacheDir };
+    let result = spawnSync('xcrun', [compiler, ...args], { stdio: 'inherit', env });
     if (result.error && result.error.code === 'ENOENT') {
-        result = spawnSync(compiler, fallbackArgs || args, { stdio: 'inherit' });
+        result = spawnSync(compiler, fallbackArgs || args, { stdio: 'inherit', env });
     }
     if (result.error) {
         console.error(`[build:native] ${label}: failed to spawn ${compiler}: ${result.error.message}`);

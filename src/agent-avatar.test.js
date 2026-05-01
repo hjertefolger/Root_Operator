@@ -410,6 +410,31 @@ test('AGENT_AVATAR_STATE is broadcast on transitions', () => {
     assert.ok(states.includes('active'));
 });
 
+test('beginDriving locks avatar to live cursor and broadcasts driving state', () => {
+    const { deps, fake, setCursor, advanceClock } = createDeps({ cursor: { x: 500, y: 400 } });
+    const avatar = init(deps);
+    avatar.start();
+    fake.emit('ready-to-show');
+
+    avatar.beginDriving();
+    assert.equal(avatar.getStateForTest(), __test.STATE.DRIVING);
+
+    setCursor(700, 550);
+    advanceClock(20);
+    avatar.tickForTest();
+    const pos = avatar.getPositionForTest();
+    assert.equal(Math.round(pos.x), 700);
+    assert.equal(Math.round(pos.y), 550);
+
+    avatar.endDriving();
+    assert.equal(avatar.getStateForTest(), __test.STATE.AMBIENT);
+    const states = fake.sentMessages
+        .filter((m) => m.channel === 'AGENT_AVATAR_STATE')
+        .map((m) => m.payload.state);
+    assert.ok(states.includes('driving'));
+    assert.ok(states.includes('ambient'));
+});
+
 test('stop closes the window', () => {
     const { deps, fake } = createDeps();
     const avatar = init(deps);

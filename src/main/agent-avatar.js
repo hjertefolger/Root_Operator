@@ -14,6 +14,8 @@
  *   ambient        — spring-follow the user's cursor (small dot)
  *   traveling      — eased interpolation from current to target
  *   active         — at target, breath only, no follow (bigger dot)
+ *   driving        — agent is borrowing the HID cursor lane; dot locks
+ *                   to the live cursor and renderer shifts color/scale
  *
  * Implementation pattern follows `cursor-companion.js`: a transparent
  * NSPanel `BrowserWindow` with always-on-top floating level, visible
@@ -81,6 +83,7 @@ const STATE = Object.freeze({
     AMBIENT: 'ambient',
     TRAVELING: 'traveling',
     ACTIVE: 'active',
+    DRIVING: 'driving',
 });
 
 function easeOutCubic(t) {
@@ -167,6 +170,7 @@ function init(deps) {
     let restoreTimers = [];
 
     let state = STATE.AMBIENT;
+    let stateBeforeDriving = STATE.AMBIENT;
     let position = { x: 0, y: 0 };
     let travel = null; // { from, to, startedAt, settleState }
     let tickTimer = null;
@@ -332,6 +336,14 @@ function init(deps) {
             const renderY = position.y + Math.sin(phase) * BREATH_AMPLITUDE_PX;
             applyBoundsCentered(position.x, renderY);
         }
+
+        if (state === STATE.DRIVING) {
+            const cursor = deps.screen.getCursorScreenPoint();
+            const target = clampToDisplay(cursor.x, cursor.y);
+            position.x = target.x;
+            position.y = target.y;
+            applyBoundsCentered(position.x, position.y);
+        }
     }
 
     // If we're mid-travel when a new motion is requested, sample the
@@ -409,6 +421,32 @@ function init(deps) {
         startTravelTo(target, STATE.AMBIENT);
         logDebug('[AGENT-AVATAR] park (return to cursor)');
         return { to: target };
+    }
+
+    function beginDriving() {
+        if (state === STATE.DRIVING) return { state };
+        sampleCurrentPosition();
+        stateBeforeDriving = state === STATE.TRAVELING ? STATE.ACTIVE : state;
+        hiddenForLoader = false;
+        if (isUsable(win) && typeof win.showInactive === 'function') {
+            try { win.showInactive(); } catch (_) { /* best-effort */ }
+        }
+        state = STATE.DRIVING;
+        broadcastState();
+        startTick();
+        tick();
+        logDebug('[AGENT-AVATAR] beginDriving');
+        return { state };
+    }
+
+    function endDriving() {
+        if (state !== STATE.DRIVING) return { state };
+        state = stateBeforeDriving || STATE.AMBIENT;
+        stateBeforeDriving = STATE.AMBIENT;
+        broadcastState();
+        startTick();
+        logDebug('[AGENT-AVATAR] endDriving');
+        return { state };
     }
 
     // Tests / reset utilities.
@@ -586,6 +624,8 @@ function init(deps) {
         moveTo,
         moveToCursor,
         park,
+        beginDriving,
+        endDriving,
         getWindow: () => (isUsable(win) ? win : null),
         // Test seams.
         triggerAppHideForTest: () => {
