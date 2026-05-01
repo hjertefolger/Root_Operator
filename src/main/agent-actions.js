@@ -23,6 +23,11 @@ const MAX_WRITE_TEXT_LENGTH = 8000; // characters
 // a write/observe cycle) from rapid-firing edits into the user's app.
 const WRITE_INTERVAL_MIN_MS = 750;
 
+// Same idea for AX presses. A button-press loop has the same blast
+// radius as a write loop — could click "Delete" repeatedly on a list,
+// drain a queue, send messages. Keep button presses paced.
+const PRESS_INTERVAL_MIN_MS = 750;
+
 function resolveHelperPath(deps) {
     const candidates = [];
     // Packaged build (electron-builder copies the binary into Resources/
@@ -201,6 +206,7 @@ function init(deps) {
     }
 
     let lastWriteAt = 0;
+    let lastPressAt = 0;
 
     // Pulse the halo around the AX element identified by the helper's
     // structured frame, if the halo overlay is wired and the frame is
@@ -352,6 +358,15 @@ function init(deps) {
                     if (!label) {
                         return { result: 'agent_press_named requires a non-empty label.', isError: true };
                     }
+                    const now = Date.now();
+                    if (now - lastPressAt < PRESS_INTERVAL_MIN_MS) {
+                        const wait = PRESS_INTERVAL_MIN_MS - (now - lastPressAt);
+                        return {
+                            result: `Rate limited: another press is allowed in ${wait}ms.`,
+                            isError: true,
+                        };
+                    }
+                    lastPressAt = now;
                     const helperArgs = ['press-named'];
                     if (args.role) {
                         helperArgs.push('--role', String(args.role));

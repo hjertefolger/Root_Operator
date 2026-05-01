@@ -437,6 +437,25 @@ func cmdReadWindow() -> Never {
 
 // MARK: — Find / press by role + label (Layer 2)
 
+// Roles AXPress is allowed to act on. Excludes text fields, areas,
+// images, rows, and other non-pressable surfaces — pressing those is
+// usually wrong and never what the user means by "press the X
+// button." Keeping this tight is the difference between an agent
+// that can act and an agent that can flail.
+let PRESS_ALLOWED_ROLES: Set<String> = [
+    "AXButton",
+    "AXLink",
+    "AXMenuItem",
+    "AXMenuButton",
+    "AXMenuBarItem",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXDisclosureTriangle",
+    "AXSwitch",
+    "AXToolbarButton",
+]
+
 func roleMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
     let role = roleString(element)
     if role.caseInsensitiveCompare(wanted) == .orderedSame { return true }
@@ -550,6 +569,15 @@ func cmdPressNamed(_ args: [String]) -> Never {
     let visited = NodeCounter()
     guard let elem = findElement(in: window, role: role, label: label, depth: 0, visited: visited) else {
         emit(["error": "not_found", "searched": visited.count])
+        exit(0)
+    }
+    let elemRole = roleString(elem)
+    if !PRESS_ALLOWED_ROLES.contains(elemRole) {
+        emit([
+            "error": "unsupported_role",
+            "role": elemRole,
+            "detail": "AX press is restricted to button-like roles. Found a non-pressable role; refuse.",
+        ])
         exit(0)
     }
     let status = AXUIElementPerformAction(elem, kAXPressAction as CFString)
