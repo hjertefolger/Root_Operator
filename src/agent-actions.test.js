@@ -322,11 +322,43 @@ test('formatEventLine renders ts/event/app/role/value compactly', () => {
     assert.match(out, /value="Hello world"/);
 });
 
-test('maybeTravelToFrame moves avatar to frame center', () => {
+test('computeFrameLanding lands at right edge + offset, vertically centered', () => {
+    // No screen helper → defaults to right side.
+    const landing = __test.computeFrameLanding({ x: 100, y: 200, w: 60, h: 24 });
+    assert.deepEqual(landing, { x: 100 + 60 + __test.FRAME_LANDING_OFFSET_PX, y: 212 });
+});
+
+test('computeFrameLanding falls back to left edge when right would overflow display', () => {
+    // Frame near the right edge of a 1440-wide display; right landing
+    // would push past 1440. Should fall back to left side.
+    const screen = {
+        getDisplayNearestPoint: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }),
+    };
+    const landing = __test.computeFrameLanding({ x: 1400, y: 200, w: 30, h: 24 }, screen);
+    assert.equal(landing.x, 1400 - __test.FRAME_LANDING_OFFSET_PX); // left edge
+    assert.equal(landing.y, 212);
+});
+
+test('computeFrameLanding stays on right when display has room', () => {
+    const screen = {
+        getDisplayNearestPoint: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }),
+    };
+    const landing = __test.computeFrameLanding({ x: 100, y: 200, w: 60, h: 24 }, screen);
+    assert.equal(landing.x, 100 + 60 + __test.FRAME_LANDING_OFFSET_PX);
+});
+
+test('computeFrameLanding returns null on bad input', () => {
+    assert.equal(__test.computeFrameLanding(null), null);
+    assert.equal(__test.computeFrameLanding({ x: NaN, y: 1, w: 1, h: 1 }), null);
+});
+
+test('maybeTravelToFrame calls avatar.moveTo with edge landing', () => {
     const calls = [];
     const avatar = { moveTo: (x, y) => calls.push({ x, y }) };
     __test.maybeTravelToFrame(avatar, { frame: { x: 100, y: 200, w: 60, h: 24 } });
-    assert.deepEqual(calls, [{ x: 130, y: 212 }]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].x, 100 + 60 + __test.FRAME_LANDING_OFFSET_PX);
+    assert.equal(calls[0].y, 212);
 });
 
 test('maybeTravelToFrame is a no-op without an avatar or frame', () => {
@@ -341,7 +373,6 @@ test('maybeTravelToFrame is a no-op without an avatar or frame', () => {
 
 test('maybeTravelToFrame swallows avatar.moveTo errors (best-effort)', () => {
     const avatar = { moveTo: () => { throw new Error('boom'); } };
-    // Must not throw — purely decorative.
     __test.maybeTravelToFrame(avatar, { frame: { x: 1, y: 1, w: 1, h: 1 } });
     assert.ok(true);
 });

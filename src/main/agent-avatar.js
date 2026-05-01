@@ -61,6 +61,22 @@ const AMBIENT_SPRING_K = 0.18;
 const BREATH_PERIOD_MS = 2400;
 const BREATH_AMPLITUDE_PX = 1.5;
 
+// Curved-path control-point parameters. Travel uses a cubic Bezier
+// instead of a straight line: P0 = from, P3 = to, P1 sits ahead of
+// from in the travel direction (detach kick — first impression that
+// the agent leaves where it was), P2 sits past the midpoint with a
+// perpendicular offset (arc — reads as a natural human-like curve
+// rather than a straight rail). Magnitudes are fractions of the
+// from→to distance with hard caps to prevent extreme curves on long
+// cross-screen travels.
+const DETACH_KICK_FRACTION = 0.18;     // P1 = from + dir × dist × 0.18
+const DETACH_KICK_MAX_PX = 36;
+const ARC_PERPENDICULAR_FRACTION = 0.12; // P2 = mid + perp × dist × 0.12
+const ARC_PERPENDICULAR_MAX_PX = 90;
+// Avoid degenerate curves on tiny travels (< MIN_CURVE_DIST_PX): fall
+// back to a linear interpolation. Below this, arcs look jittery.
+const MIN_CURVE_DIST_PX = 20;
+
 const STATE = Object.freeze({
     AMBIENT: 'ambient',
     TRAVELING: 'traveling',
@@ -69,6 +85,63 @@ const STATE = Object.freeze({
 
 function easeOutCubic(t) {
     return 1 - Math.pow(1 - t, 3);
+}
+
+// Compute the four control points of the travel Bezier. Pure function
+// so tests can assert curve geometry independently. Returns
+// { P0, P1, P2, P3, linear } where `linear: true` means the travel is
+// short enough (< MIN_CURVE_DIST_PX) that we should fall back to a
+// straight interpolation between P0 and P3 to avoid wobble.
+function computeBezierControls(from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dist = Math.hypot(dx, dy);
+    if (!Number.isFinite(dist) || dist < MIN_CURVE_DIST_PX) {
+        return {
+            P0: { x: from.x, y: from.y },
+            P1: { x: from.x, y: from.y },
+            P2: { x: to.x, y: to.y },
+            P3: { x: to.x, y: to.y },
+            linear: true,
+        };
+    }
+    const dirX = dx / dist;
+    const dirY = dy / dist;
+    // Perpendicular vector (90° counterclockwise of travel dir).
+    // Always picks the same handedness — gives consistent curve shape
+    // rather than randomized direction-flicker.
+    const perpX = -dirY;
+    const perpY = dirX;
+    const kick = Math.min(DETACH_KICK_MAX_PX, dist * DETACH_KICK_FRACTION);
+    const arc = Math.min(ARC_PERPENDICULAR_MAX_PX, dist * ARC_PERPENDICULAR_FRACTION);
+    const midX = (from.x + to.x) / 2;
+    const midY = (from.y + to.y) / 2;
+    return {
+        P0: { x: from.x, y: from.y },
+        P1: { x: from.x + dirX * kick, y: from.y + dirY * kick },
+        P2: { x: midX + perpX * arc, y: midY + perpY * arc },
+        P3: { x: to.x, y: to.y },
+        linear: false,
+    };
+}
+
+// Cubic Bezier B(t) = (1-t)³P0 + 3(1-t)²t P1 + 3(1-t)t² P2 + t³ P3
+function bezierAt(controls, t) {
+    if (controls.linear) {
+        return {
+            x: controls.P0.x + (controls.P3.x - controls.P0.x) * t,
+            y: controls.P0.y + (controls.P3.y - controls.P0.y) * t,
+        };
+    }
+    const u = 1 - t;
+    const u2 = u * u;
+    const u3 = u2 * u;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return {
+        x: u3 * controls.P0.x + 3 * u2 * t * controls.P1.x + 3 * u * t2 * controls.P2.x + t3 * controls.P3.x,
+        y: u3 * controls.P0.y + 3 * u2 * t * controls.P1.y + 3 * u * t2 * controls.P2.y + t3 * controls.P3.y,
+    };
 }
 
 function init(deps) {
@@ -235,8 +308,9 @@ function init(deps) {
             const elapsed = now - travel.startedAt;
             const progress = Math.min(1, elapsed / travelDurationMs);
             const eased = easeOutCubic(progress);
-            position.x = travel.from.x + (travel.to.x - travel.from.x) * eased;
-            position.y = travel.from.y + (travel.to.y - travel.from.y) * eased;
+            const pt = bezierAt(travel.controls, eased);
+            position.x = pt.x;
+            position.y = pt.y;
 
             if (progress >= 1) {
                 const settleState = travel.settleState;
@@ -268,8 +342,9 @@ function init(deps) {
             const elapsed = clock.now() - travel.startedAt;
             const progress = Math.min(1, elapsed / travelDurationMs);
             const eased = easeOutCubic(progress);
-            position.x = travel.from.x + (travel.to.x - travel.from.x) * eased;
-            position.y = travel.from.y + (travel.to.y - travel.from.y) * eased;
+            const pt = bezierAt(travel.controls, eased);
+            position.x = pt.x;
+            position.y = pt.y;
         }
     }
 
@@ -289,9 +364,12 @@ function init(deps) {
                 try { win.showInactive(); } catch (_) { /* best-effort */ }
             }
         }
+        const from = { x: position.x, y: position.y };
+        const to = { x: target.x, y: target.y };
         travel = {
-            from: { x: position.x, y: position.y },
-            to: { x: target.x, y: target.y },
+            from,
+            to,
+            controls: computeBezierControls(from, to),
             startedAt: clock.now(),
             settleState,
         };
@@ -530,6 +608,13 @@ module.exports = {
         AMBIENT_SPRING_K,
         BREATH_PERIOD_MS,
         BREATH_AMPLITUDE_PX,
+        DETACH_KICK_FRACTION,
+        DETACH_KICK_MAX_PX,
+        ARC_PERPENDICULAR_FRACTION,
+        ARC_PERPENDICULAR_MAX_PX,
+        MIN_CURVE_DIST_PX,
         STATE,
+        computeBezierControls,
+        bezierAt,
     },
 };

@@ -310,7 +310,7 @@ test('park() while AMBIENT refreshes position but stays AMBIENT', () => {
     assert.equal(r.to.x, 500 + __test.DEFAULT_CURSOR_OFFSET_X);
 });
 
-test('travel midway is between from and to (eased)', () => {
+test('travel midway is between from and to (eased + bezier)', () => {
     const { deps, advanceClock } = createDeps({ cursor: { x: 500, y: 400 } });
     const avatar = init(deps);
     avatar.start();
@@ -321,10 +321,56 @@ test('travel midway is between from and to (eased)', () => {
     avatar.tickForTest();
 
     const pos = avatar.getPositionForTest();
-    // Eased cubic-out: at t=0.5 progress is roughly 0.875.
+    // Cubic-out time mapping pushes t to ~0.875 at real-time midway,
+    // so the bezier sample is well past the linear midpoint in the
+    // direction of the target, but not yet at the target.
     assert.ok(pos.x > startPos.x + (1200 - startPos.x) * 0.5, `x past 50%: ${pos.x}`);
     assert.ok(pos.x < 1200, `x < target: ${pos.x}`);
     assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING);
+});
+
+test('computeBezierControls produces a curved path on long travels', () => {
+    const ctrl = __test.computeBezierControls({ x: 100, y: 100 }, { x: 900, y: 100 });
+    assert.equal(ctrl.linear, false);
+    // P1 should sit ahead of P0 in the travel direction (detach kick).
+    assert.ok(ctrl.P1.x > 100, `P1.x > P0.x: ${ctrl.P1.x}`);
+    assert.ok(ctrl.P1.x < 200, `P1 within kick magnitude: ${ctrl.P1.x}`);
+    // P2 should sit off the straight midpoint (perpendicular arc).
+    assert.equal(Math.round(ctrl.P2.x), 500); // near midpoint x
+    assert.notEqual(ctrl.P2.y, 100); // perpendicular offset moves y off the line
+    // P3 = to, exactly.
+    assert.deepEqual(ctrl.P3, { x: 900, y: 100 });
+});
+
+test('computeBezierControls falls back to linear on tiny travels', () => {
+    const ctrl = __test.computeBezierControls({ x: 100, y: 100 }, { x: 110, y: 105 });
+    assert.equal(ctrl.linear, true);
+    // Linear: P0 = P1 = from, P2 = P3 = to. bezierAt with linear flag
+    // returns straight interpolation.
+    const mid = __test.bezierAt(ctrl, 0.5);
+    assert.equal(mid.x, 105);
+    assert.equal(mid.y, 102.5);
+});
+
+test('bezierAt(0) = P0 and bezierAt(1) = P3 for both modes', () => {
+    const curved = __test.computeBezierControls({ x: 0, y: 0 }, { x: 600, y: 400 });
+    const start = __test.bezierAt(curved, 0);
+    const end = __test.bezierAt(curved, 1);
+    assert.deepEqual(start, { x: 0, y: 0 });
+    assert.deepEqual(end, { x: 600, y: 400 });
+
+    const linear = __test.computeBezierControls({ x: 0, y: 0 }, { x: 5, y: 5 });
+    assert.deepEqual(__test.bezierAt(linear, 0), { x: 0, y: 0 });
+    assert.deepEqual(__test.bezierAt(linear, 1), { x: 5, y: 5 });
+});
+
+test('Bezier kick + perpendicular respect their hard caps on long travels', () => {
+    // 5000px travel — fraction-based kick would be 900px without the cap.
+    const ctrl = __test.computeBezierControls({ x: 0, y: 0 }, { x: 5000, y: 0 });
+    const kickMag = Math.hypot(ctrl.P1.x - 0, ctrl.P1.y - 0);
+    const arcMag = Math.hypot(ctrl.P2.x - 2500, ctrl.P2.y - 0);
+    assert.ok(kickMag <= __test.DETACH_KICK_MAX_PX + 0.001, `kick capped: ${kickMag}`);
+    assert.ok(arcMag <= __test.ARC_PERPENDICULAR_MAX_PX + 0.001, `arc capped: ${arcMag}`);
 });
 
 test('travelDurationMs override is honored', () => {

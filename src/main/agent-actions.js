@@ -279,21 +279,52 @@ function formatEvents(events) {
     return events.map(formatEventLine).join('\n');
 }
 
-// Travel the agent body to the frame center of an AX result so every
-// action is visibly grounded — the user sees the dot land where the
-// agent just acted (read, find, press, write). Pairs with maybeHalo
-// at the call site: halo flashes around the element, dot dwells
-// beside it. No-op when avatar is missing or the frame is degenerate.
-// Pure module-level function so tests can call it directly.
-function maybeTravelToFrame(avatar, result) {
+// Travel the agent body to land BESIDE an AX result frame so every
+// action is visibly grounded without the dot covering the content
+// it's reading or writing. Default landing point: right edge of the
+// frame, vertically centered, with a small outward offset. If the
+// frame's right side would push the dot off the cursor's display,
+// fall back to landing at the left edge. Pairs with maybeHalo at the
+// call site: halo around the element, dot beside it.
+//
+// Pure module-level function so tests can call it directly. Optional
+// `screen` dep used to keep the dot on-screen when an element sits
+// flush against a display edge; without it we just default to the
+// right edge.
+const FRAME_LANDING_OFFSET_PX = 12;
+
+function computeFrameLanding(frame, screen) {
+    if (!frame || !Number.isFinite(frame.x) || !Number.isFinite(frame.y)
+        || !Number.isFinite(frame.w) || !Number.isFinite(frame.h)) return null;
+    const cy = frame.y + frame.h / 2;
+    const right = frame.x + frame.w + FRAME_LANDING_OFFSET_PX;
+    const left = frame.x - FRAME_LANDING_OFFSET_PX;
+
+    // No screen helper → default to right.
+    if (!screen || typeof screen.getDisplayNearestPoint !== 'function') {
+        return { x: right, y: cy };
+    }
+    try {
+        const display = screen.getDisplayNearestPoint({
+            x: Math.round(frame.x + frame.w / 2),
+            y: Math.round(cy),
+        });
+        const wa = display && display.workArea;
+        if (!wa) return { x: right, y: cy };
+        const fitsRight = right <= wa.x + wa.width;
+        if (fitsRight) return { x: right, y: cy };
+        // Right edge would push past display — fall back to left.
+        return { x: left, y: cy };
+    } catch (_) {
+        return { x: right, y: cy };
+    }
+}
+
+function maybeTravelToFrame(avatar, result, screen) {
     if (!avatar || typeof avatar.moveTo !== 'function') return;
-    if (!result || !result.frame) return;
-    const f = result.frame;
-    if (!Number.isFinite(f.x) || !Number.isFinite(f.y)
-        || !Number.isFinite(f.w) || !Number.isFinite(f.h)) return;
-    const cx = f.x + f.w / 2;
-    const cy = f.y + f.h / 2;
-    try { avatar.moveTo(cx, cy); } catch (_) { /* best-effort */ }
+    const landing = computeFrameLanding(result && result.frame, screen);
+    if (!landing) return;
+    try { avatar.moveTo(landing.x, landing.y); } catch (_) { /* best-effort */ }
 }
 
 function init(deps) {
@@ -326,7 +357,7 @@ function init(deps) {
     // a frame should make the dot legible at the action site.
     function showActionAt(avatar, result) {
         maybeHalo(result);
-        maybeTravelToFrame(avatar, result);
+        maybeTravelToFrame(avatar, result, deps.screen);
     }
 
     async function handle(req) {
@@ -533,5 +564,7 @@ module.exports = {
         runHelper,
         buildDisambiguationArgs,
         maybeTravelToFrame,
+        computeFrameLanding,
+        FRAME_LANDING_OFFSET_PX,
     },
 };
