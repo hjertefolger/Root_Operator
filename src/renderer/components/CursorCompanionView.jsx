@@ -529,29 +529,10 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* Dot layer */}
-      <LayerWrapper visible={showDot} duration={220}>
-        {(state) => (
-          <div
-            style={{
-              position: 'absolute',
-              left: STACK_LEFT,
-              top: STACK_TOP,
-              width: DOT_SIZE,
-              height: DOT_SIZE,
-              borderRadius: '50%',
-              backgroundColor: ACCENT,
-              opacity: state === 'visible' ? 1 : 0,
-              transform: state === 'visible' ? 'scale(1)' : 'scale(0.65)',
-              transition: 'opacity 200ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1)',
-              transformOrigin: 'top left',
-              animation: presenceAnim === 'enter' ? 'cursor-presence-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both'
-                : presenceAnim === 'exit' ? 'cursor-presence-exit 200ms ease both' : undefined,
-              pointerEvents: 'none',
-            }}
-          />
-        )}
-      </LayerWrapper>
+      {/* Legacy ambient dot — superseded by the agent-avatar overlay,
+          which now provides the cursor-anchored body in its AMBIENT mode.
+          Kept here as a no-op layer so showDot still drives layout and
+          the error-pill-at-stack-origin fallback below.  */}
 
       {/* Loader layer */}
       <LayerWrapper visible={loading} duration={220}>
