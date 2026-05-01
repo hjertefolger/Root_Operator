@@ -47,10 +47,16 @@ function init(deps) {
     }
 
     const bufferSize = Number.isFinite(deps.bufferSize) ? deps.bufferSize : RING_BUFFER_DEFAULT;
+    // Only treat the helper as "healthy" after this many ms of uptime
+    // before resetting the restart backoff. Without this, a helper that
+    // crashes within a millisecond would reset the backoff to 500ms and
+    // storm the parent log.
+    const HEALTHY_UPTIME_MS = 5000;
     const ring = []; // newest events appended at the end
     let child = null;
     let stopped = false;
     let restartTimer = null;
+    let healthyTimer = null;
     let restartDelayMs = RESTART_INITIAL_DELAY_MS;
     let stdoutBuf = '';
 
@@ -94,6 +100,13 @@ function init(deps) {
         }
     }
 
+    function clearHealthyTimer() {
+        if (healthyTimer) {
+            clearTimeout(healthyTimer);
+            healthyTimer = null;
+        }
+    }
+
     function spawnHelper() {
         if (stopped) return;
         const helperPath = resolveHelperPath(deps);
@@ -109,6 +122,8 @@ function init(deps) {
             return;
         }
         stdoutBuf = '';
+        // Force utf8 decoding so Node handles multi-byte boundaries.
+        child.stdout.setEncoding('utf8');
         child.stdout.on('data', onStdoutChunk);
         child.stderr.on('data', (chunk) => {
             logDebug(`[AGENT-EVENTS] stderr: ${chunk.toString().slice(0, 200)}`);
@@ -117,20 +132,24 @@ function init(deps) {
             logDebug(`[AGENT-EVENTS] child error: ${err && err.message}`);
         });
         child.on('close', (code, signal) => {
+            clearHealthyTimer();
             child = null;
-            // Drain any remaining buffered line.
             if (stdoutBuf.length > 0) {
                 consumeLine(stdoutBuf);
                 stdoutBuf = '';
             }
             if (stopped) return;
-            // Reset backoff if the helper survived for a while; otherwise
-            // grow it.
             scheduleRestart();
         });
-        // Successful spawn — reset the backoff so a clean run benefits
-        // from a fast retry next time something goes wrong.
-        restartDelayMs = RESTART_INITIAL_DELAY_MS;
+        // Only reset backoff after the helper has stayed alive long
+        // enough to count as a stable run. Crash-loop scenarios will
+        // grow backoff up to RESTART_MAX_DELAY_MS.
+        clearHealthyTimer();
+        healthyTimer = setTimeout(() => {
+            healthyTimer = null;
+            restartDelayMs = RESTART_INITIAL_DELAY_MS;
+        }, HEALTHY_UPTIME_MS);
+        if (typeof healthyTimer.unref === 'function') healthyTimer.unref();
     }
 
     function scheduleRestart() {
@@ -156,6 +175,7 @@ function init(deps) {
     function stop() {
         stopped = true;
         clearRestartTimer();
+        clearHealthyTimer();
         if (child) {
             try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
             child = null;
