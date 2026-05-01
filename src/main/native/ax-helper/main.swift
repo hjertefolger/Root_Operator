@@ -362,6 +362,48 @@ func axCopyChildren(_ element: AXUIElement) -> [AXUIElement] {
     return []
 }
 
+// On a window, the toolbar typically lives as a direct AXChildren entry
+// AND/OR is exposed via the kAXToolbarAttribute (rare on modern Cocoa).
+// In Notes the AXToolbar appears at AXChildren[1] AFTER a giant
+// AXSplitGroup that contains the entire sidebar — depth-first walk
+// hits the 500-node cap inside the split group long before the toolbar,
+// so toolbar buttons (e.g. "New Note") are unreachable.
+//
+// Fix: when assembling children for the walk, hoist any AXToolbar(s) and
+// kAXToolbarAttribute to the FRONT of the list so they're visited first.
+// Costs ~one extra attribute-fetch per node but makes the toolbar room
+// visible regardless of where Cocoa decided to attach it.
+func axCopyChildrenForWalk(_ element: AXUIElement) -> [AXUIElement] {
+    let children = axCopyChildren(element)
+    let role = roleString(element)
+    guard role == "AXWindow" else { return children }
+
+    var toolbars: [AXUIElement] = []
+    var rest: [AXUIElement] = []
+    for child in children {
+        if roleString(child) == "AXToolbar" {
+            toolbars.append(child)
+        } else {
+            rest.append(child)
+        }
+    }
+
+    // kAXToolbarAttribute isn't bridged into Swift's AX constants (only
+    // AppKit's NSAccessibilityToolbarAttribute exposes it). The AX-level
+    // attribute string is the well-known "AXToolbar". Some apps expose
+    // their toolbar this way instead of as a child — capture it too.
+    if let raw = axCopyAttribute(element, "AXToolbar") {
+        let typeId = CFGetTypeID(raw)
+        if typeId == AXUIElementGetTypeID() {
+            toolbars.append(raw as! AXUIElement)
+        } else if typeId == CFArrayGetTypeID() {
+            toolbars.append(contentsOf: raw as! [AXUIElement])
+        }
+    }
+
+    return toolbars + rest
+}
+
 func truncate(_ s: String, _ n: Int) -> String {
     if s.count <= n { return s }
     let end = s.index(s.startIndex, offsetBy: n)
@@ -377,6 +419,8 @@ func nodeSummary(_ element: AXUIElement) -> [String: Any] {
         node["label"] = truncate(title, TREE_VALUE_TRUNC)
     } else if let desc = axCopyString(element, kAXDescriptionAttribute as String), !desc.isEmpty {
         node["label"] = truncate(desc, TREE_VALUE_TRUNC)
+    } else if let help = axCopyString(element, kAXHelpAttribute as String), !help.isEmpty {
+        node["label"] = truncate(help, TREE_VALUE_TRUNC)
     }
     if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
         node["value"] = truncate(value, TREE_VALUE_TRUNC)
@@ -398,7 +442,7 @@ func walkTree(_ element: AXUIElement, depth: Int, counter: NodeCounter) -> [Stri
     if depth >= TREE_MAX_DEPTH || counter.count >= TREE_MAX_NODES {
         return node
     }
-    let children = axCopyChildren(element)
+    let children = axCopyChildrenForWalk(element)
     if !children.isEmpty {
         var kids: [[String: Any]] = []
         for child in children {
@@ -472,6 +516,9 @@ func labelMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
     if let desc = axCopyString(element, kAXDescriptionAttribute as String) {
         if desc.lowercased().contains(needle) { return true }
     }
+    if let help = axCopyString(element, kAXHelpAttribute as String) {
+        if help.lowercased().contains(needle) { return true }
+    }
     if let value = axCopyString(element, kAXValueAttribute as String) {
         if value.lowercased().contains(needle) { return true }
     }
@@ -493,7 +540,7 @@ func findElement(
     if roleOk && labelMatches(element, label) {
         return element
     }
-    for child in axCopyChildren(element) {
+    for child in axCopyChildrenForWalk(element) {
         if let m = findElement(in: child, role: role, label: label, depth: depth + 1, visited: visited) {
             return m
         }
@@ -533,8 +580,15 @@ func cmdFindElement(_ args: [String]) -> Never {
         "found": true,
         "role": roleString(elem),
     ]
-    if let title = axCopyString(elem, kAXTitleAttribute as String) {
+    // Toolbar buttons usually have an empty title and carry their human
+    // label on AXDescription (or AXHelp for tooltip). Prefer title when
+    // present, fall back so the user sees what we matched.
+    if let title = axCopyString(elem, kAXTitleAttribute as String), !title.isEmpty {
         result["label"] = title
+    } else if let desc = axCopyString(elem, kAXDescriptionAttribute as String), !desc.isEmpty {
+        result["label"] = desc
+    } else if let help = axCopyString(elem, kAXHelpAttribute as String), !help.isEmpty {
+        result["label"] = help
     }
     if let frame = frameOf(elem) {
         result["frame"] = frame
@@ -587,8 +641,12 @@ func cmdPressNamed(_ args: [String]) -> Never {
             "action": "press",
             "role": roleString(elem),
         ]
-        if let title = axCopyString(elem, kAXTitleAttribute as String) {
+        if let title = axCopyString(elem, kAXTitleAttribute as String), !title.isEmpty {
             ok["label"] = title
+        } else if let desc = axCopyString(elem, kAXDescriptionAttribute as String), !desc.isEmpty {
+            ok["label"] = desc
+        } else if let help = axCopyString(elem, kAXHelpAttribute as String), !help.isEmpty {
+            ok["label"] = help
         }
         if let frame = frameOf(elem) {
             ok["frame"] = frame
