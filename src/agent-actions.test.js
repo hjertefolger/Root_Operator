@@ -376,3 +376,108 @@ test('maybeTravelToFrame swallows avatar.moveTo errors (best-effort)', () => {
     __test.maybeTravelToFrame(avatar, { frame: { x: 1, y: 1, w: 1, h: 1 } });
     assert.ok(true);
 });
+
+test('agent_keystroke rejects empty key', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_keystroke', args: { key: '' } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty key/);
+});
+
+test('agent_type_text rejects empty text and over-cap text', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const empty = await handler.handle({ tool: 'agent_type_text', args: { text: '' } });
+    assert.equal(empty.isError, true);
+    assert.match(empty.result, /non-empty/);
+
+    const tooLong = await handler.handle({ tool: 'agent_type_text', args: { text: 'a'.repeat(9000) } });
+    assert.equal(tooLong.isError, true);
+    assert.match(tooLong.result, /exceeds limit/);
+});
+
+test('agent_select_range rejects non-integer or negative bounds', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const fractional = await handler.handle({
+        tool: 'agent_select_range',
+        args: { location: 1.5, length: 10 },
+    });
+    assert.equal(fractional.isError, true);
+    assert.match(fractional.result, /non-negative integer location/);
+
+    const negative = await handler.handle({
+        tool: 'agent_select_range',
+        args: { location: 0, length: -3 },
+    });
+    assert.equal(negative.isError, true);
+    assert.match(negative.result, /non-negative integer length/);
+});
+
+test('agent_select_substring rejects empty needle', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_select_substring', args: { needle: '' } });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /non-empty needle/);
+});
+
+test('agent_menu_command rejects empty or non-string path', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const empty = await handler.handle({ tool: 'agent_menu_command', args: {} });
+    assert.equal(empty.isError, true);
+    assert.match(empty.result, /non-empty path array/);
+
+    const bad = await handler.handle({
+        tool: 'agent_menu_command',
+        args: { path: ['Format', '', 'Body'] },
+    });
+    assert.equal(bad.isError, true);
+    assert.match(bad.result, /must be non-empty strings/);
+});
+
+test('agent_keystroke refuses while user activity is detected (no force)', async () => {
+    // getAgentEvents returns an event that should look like user activity:
+    // recent (within window) and outside our self-action window.
+    const recentTs = Date.now() / 1000 - 0.2; // 200ms ago
+    const handler = init({
+        screen: fakeScreen(),
+        appPath: '/nope',
+        getAgentAvatar: () => null,
+        getAgentEvents: () => ({
+            getEvents: () => [
+                { event: 'AXValueChanged', ts: recentTs, app: 'Notes' },
+            ],
+        }),
+        logDebug: () => {},
+    });
+    const r = await handler.handle({
+        tool: 'agent_keystroke',
+        args: { key: 'j', mods: 'cmd,shift' },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /user activity detected/);
+    assert.match(r.result, /AXValueChanged/);
+});

@@ -279,6 +279,75 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'agent_keystroke',
+      description: 'Post a single keyboard event (down + up) via macOS CGEvent — does NOT move the user\'s hardware cursor. Routes the keystroke to whatever element currently has system focus, so this requires a focused element (refuses with no_focus otherwise). Use named keys ("return", "esc", "tab", "up", "down", "left", "right", "j", "f5") or numeric virtual codes ("0x26"). Combine with `mods` (CSV: cmd, shift, opt, ctrl, fn) for chord shortcuts (Cmd+Shift+J, Cmd+S). Refuses by default if user activity is detected in the last ~1.2s — pass force=true to override after explicit user consent. Rate-limited to one keystroke per 200ms. Prefer agent_menu_command for menu invocations and agent_select_* for text selection — keystrokes are the right tool for app-specific shortcuts and key-driven navigation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Named key or numeric virtual key code. Examples: "return", "esc", "tab", "left", "right", "j", "f5", "0x26".' },
+          mods: { type: 'string', description: 'Optional comma-separated modifier keys: cmd,shift,opt,ctrl,fn.' },
+          force: { type: 'boolean', description: 'Override the user-activity guard. Use only after explicit user consent (e.g. user said "go ahead even if I just typed").' },
+        },
+        required: ['key'],
+      },
+    },
+    {
+      name: 'agent_type_text',
+      description: 'Type Unicode text via macOS CGEvent into the focused element — exercises real key handling (paragraph styling, autocomplete, IME, app key handlers) unlike AX value-write. Use this for natural-typing flows where character-by-character behavior matters; use agent_write_selection when you want a clean AX replacement that bypasses key handlers. Requires focused element. Same user-activity guard and rate limit as keystroke (one per 750ms). Hard-capped at 8000 characters.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Text to type. Must be non-empty, max 8000 chars.' },
+          force: { type: 'boolean', description: 'Override the user-activity guard.' },
+        },
+        required: ['text'],
+      },
+    },
+    {
+      name: 'agent_select_range',
+      description: 'Select a specific character range in the currently focused text element via the AX kAXSelectedTextRangeAttribute — does NOT move the cursor or send keystrokes. Useful for selecting a known offset+length without resorting to Cmd+A or arrow-key navigation. Length is automatically capped at the remaining text (so selecting more than exists never overruns).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          location: { type: 'number', description: '0-based character offset where the selection starts.' },
+          length: { type: 'number', description: 'Number of characters to select. Capped at remaining text.' },
+        },
+        required: ['location', 'length'],
+      },
+    },
+    {
+      name: 'agent_select_all',
+      description: 'Select every character in the currently focused text element via AX (not Cmd+A). Cursor and keyboard are untouched. Returns the total character count for downstream sizing decisions.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_select_substring',
+      description: 'Find a substring in the currently focused text element and select it via AX (kAXSelectedTextRangeAttribute). UTF-16 code-unit accurate so it works correctly with native text apps (Notes, Mail, TextEdit). Pick a specific occurrence with `occurrence` (0-based, default 0 = first match).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          needle: { type: 'string', description: 'Text to find within the focused element.' },
+          occurrence: { type: 'number', description: '0-based occurrence index (default 0 = first match).' },
+        },
+        required: ['needle'],
+      },
+    },
+    {
+      name: 'agent_menu_command',
+      description: 'Invoke a menu item in the frontmost app by walking the AXMenuBar with a path of titles (e.g. ["Format","Body"], ["Edit","Find","Find…"]). Pure AX — no keystrokes, no menu visually flashing open. Path segments match by case-insensitive prefix to tolerate "..." suffixes and ellipses. Prefer this over keystroke-based shortcuts whenever the menu path is known: it\'s decoupled from focus, doesn\'t race with the user\'s typing, and is reflectable through agent_read_window.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'array',
+            description: 'Menu path as an array of titles, top-level first. E.g. ["Format","Body"].',
+            items: { type: 'string' },
+          },
+        },
+        required: ['path'],
+      },
+    },
+    {
       name: '_ping',
       description: 'Internal health check. Call this when asked to verify spawn.',
       inputSchema: { type: 'object', properties: {} },
@@ -356,6 +425,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_find_element',
     'agent_press_named',
     'agent_recent_events',
+    'agent_keystroke',
+    'agent_type_text',
+    'agent_select_range',
+    'agent_select_all',
+    'agent_select_substring',
+    'agent_menu_command',
   ];
   if (agentTools.includes(toolName)) {
     return handleAgentTool(toolName, request.params.arguments || {});

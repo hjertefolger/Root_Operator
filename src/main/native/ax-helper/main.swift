@@ -970,25 +970,385 @@ func cmdSubscribe() -> Never {
     exit(0)
 }
 
+// MARK: — Keyboard / selection / menu commands (v1.6 + v1.7)
+
+// Map of named keys to HID virtual key codes. Apple's HIToolbox header
+// "Events.h" defines kVK_* constants but they are not vended in Swift.
+// These are stable since macOS 10.5.
+let NAMED_KEYS: [String: CGKeyCode] = [
+    "return": 0x24, "enter": 0x24,
+    "tab": 0x30,
+    "space": 0x31,
+    "delete": 0x33, "backspace": 0x33,
+    "escape": 0x35, "esc": 0x35,
+    "up": 0x7E, "down": 0x7D, "left": 0x7B, "right": 0x7C,
+    "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
+    "forwarddelete": 0x75, "fwddelete": 0x75,
+    "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76,
+    "f5": 0x60, "f6": 0x61, "f7": 0x62, "f8": 0x64,
+    "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+    // Letters A..Z. The values here are standard ANSI keycodes;
+    // they will type the corresponding character in the user's
+    // current keyboard layout regardless of layout, since modifier
+    // combos (Cmd+Shift+J etc.) bypass the typed character mapping
+    // and target the physical key.
+    "a": 0x00, "b": 0x0B, "c": 0x08, "d": 0x02, "e": 0x0E, "f": 0x03,
+    "g": 0x05, "h": 0x04, "i": 0x22, "j": 0x26, "k": 0x28, "l": 0x25,
+    "m": 0x2E, "n": 0x2D, "o": 0x1F, "p": 0x23, "q": 0x0C, "r": 0x0F,
+    "s": 0x01, "t": 0x11, "u": 0x20, "v": 0x09, "w": 0x0D, "x": 0x07,
+    "y": 0x10, "z": 0x06,
+    "0": 0x1D, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15,
+    "5": 0x17, "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19,
+    "-": 0x1B, "=": 0x18, "[": 0x21, "]": 0x1E, "\\": 0x2A,
+    ";": 0x29, "'": 0x27, ",": 0x2B, ".": 0x2F, "/": 0x2C, "`": 0x32,
+]
+
+func parseModifierFlags(_ csv: String) -> CGEventFlags {
+    var flags: CGEventFlags = []
+    let tokens = csv.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    for tok in tokens where !tok.isEmpty {
+        switch tok {
+        case "cmd", "command":   flags.insert(.maskCommand)
+        case "shift":            flags.insert(.maskShift)
+        case "opt", "option", "alt": flags.insert(.maskAlternate)
+        case "ctrl", "control":  flags.insert(.maskControl)
+        case "fn":               flags.insert(.maskSecondaryFn)
+        default:                 emitError("bad_modifier", "unknown modifier '\(tok)'")
+        }
+    }
+    return flags
+}
+
+func parseKey(_ raw: String) -> CGKeyCode {
+    // Numeric form: "38" or "0x26"
+    if let hex = raw.lowercased().hasPrefix("0x") ? UInt16(raw.dropFirst(2), radix: 16) : nil {
+        return CGKeyCode(hex)
+    }
+    if let dec = UInt16(raw) {
+        return CGKeyCode(dec)
+    }
+    if let mapped = NAMED_KEYS[raw.lowercased()] {
+        return mapped
+    }
+    emitError("bad_key", "unknown key name '\(raw)' — use a named key or numeric virtual code")
+}
+
+// Refuse to post keys when nothing is focused. The keystroke would
+// otherwise dispatch to whatever element happens to gain focus next,
+// disrupting the user. Caller (JS) is also expected to verify focus
+// matches a captured lease before invoking us.
+func ensureFocusedElement() -> AXUIElement {
+    let systemWide = AXUIElementCreateSystemWide()
+    var focused: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused)
+    guard status == .success, let raw = focused else {
+        emitError("no_focus", "no focused UI element; keystroke would have no target")
+    }
+    return raw as! AXUIElement
+}
+
+// Build a CGEventSource. Apple recommends `.privateState` for posted
+// events that should not merge with stale modifier state from the
+// hardware keyboard (e.g. user holds Shift while we post Cmd+J).
+func makeEventSource() -> CGEventSource? {
+    return CGEventSource(stateID: .privateState)
+        ?? CGEventSource(stateID: .hidSystemState)
+}
+
+func cmdKeystroke(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+
+    var keyArg: String?
+    var modCsv = ""
+    var requireFocus = true
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--mods" && i + 1 < args.count { modCsv = args[i + 1]; i += 2; continue }
+        if a == "--no-focus-check" { requireFocus = false; i += 1; continue }
+        keyArg = a; i += 1
+    }
+    guard let k = keyArg else { emitInternalError("keystroke: missing key arg") }
+
+    if requireFocus { _ = ensureFocusedElement() }
+
+    let key = parseKey(k)
+    let flags = parseModifierFlags(modCsv)
+    guard let src = makeEventSource() else { emitError("event_source_failed") }
+
+    guard
+        let down = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true),
+        let up = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: false)
+    else { emitError("event_create_failed") }
+    if !flags.isEmpty {
+        down.flags = flags
+        up.flags = flags
+    }
+    down.post(tap: .cghidEventTap)
+    // Tiny delay so apps that latch on key-down register before the up.
+    Thread.sleep(forTimeInterval: 0.012)
+    up.post(tap: .cghidEventTap)
+
+    emit([
+        "ok": true,
+        "key": k,
+        "key_code": Int(key),
+        "mods": modCsv,
+    ])
+    exit(0)
+}
+
+func cmdTypeText(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    var requireFocus = true
+    var text: String?
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--no-focus-check" { requireFocus = false; i += 1; continue }
+        text = a; i += 1
+    }
+    guard let t = text, !t.isEmpty else { emitInternalError("type-text: missing text arg") }
+    if t.count > 8000 { emitError("text_too_long", "max 8000 chars; got \(t.count)") }
+
+    if requireFocus { _ = ensureFocusedElement() }
+    guard let src = makeEventSource() else { emitError("event_source_failed") }
+
+    // Use CGEvent.keyboardSetUnicodeString — types each Unicode scalar
+    // through a single keyDown event, no per-key dispatch. Cheaper and
+    // more reliable for plain text than per-character keystroke loops.
+    let utf16 = Array(t.utf16)
+    guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else {
+        emitError("event_create_failed")
+    }
+    utf16.withUnsafeBufferPointer { buf in
+        down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+    }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.012)
+    if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+        utf16.withUnsafeBufferPointer { buf in
+            up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+        }
+        up.post(tap: .cghidEventTap)
+    }
+    emit([
+        "ok": true,
+        "length": t.count,
+    ])
+    exit(0)
+}
+
+// Set kAXSelectedTextRangeAttribute on the focused element to a CFRange.
+// Pure AX, no keystrokes. Ranges are character offsets, not byte offsets.
+func setSelectedRange(_ element: AXUIElement, location: Int, length: Int) -> AXError {
+    var range = CFRange(location: location, length: length)
+    let axValue = AXValueCreate(.cfRange, &range)!
+    return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axValue)
+}
+
+func axNumberOfCharacters(_ element: AXUIElement) -> Int? {
+    var raw: CFTypeRef?
+    let s = AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &raw)
+    if s == .success, let n = raw as? NSNumber {
+        return n.intValue
+    }
+    // Fallback: count from the value string.
+    if let v = axCopyString(element, kAXValueAttribute as String) {
+        return v.utf16.count
+    }
+    return nil
+}
+
+func cmdSelectRange(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    var location: Int?
+    var length: Int?
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--location" && i + 1 < args.count { location = Int(args[i + 1]); i += 2; continue }
+        if a == "--length" && i + 1 < args.count { length = Int(args[i + 1]); i += 2; continue }
+        i += 1
+    }
+    guard let loc = location, let len = length else {
+        emitInternalError("select-range: requires --location and --length")
+    }
+    if loc < 0 || len < 0 { emitError("bad_range", "negative values not allowed") }
+
+    let elem = ensureFocusedElement()
+    let total = axNumberOfCharacters(elem) ?? 0
+    if loc > total { emitError("out_of_range", "location \(loc) > length \(total)") }
+    let cappedLen = min(len, total - loc)
+    let status = setSelectedRange(elem, location: loc, length: cappedLen)
+    if status != .success {
+        emitError("set_failed", "ax_status=\(status.rawValue)")
+    }
+    emit([
+        "ok": true,
+        "location": loc,
+        "length": cappedLen,
+        "total_chars": total,
+    ])
+    exit(0)
+}
+
+func cmdSelectAll() -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    let elem = ensureFocusedElement()
+    let total = axNumberOfCharacters(elem) ?? 0
+    if total <= 0 {
+        emit(["ok": true, "location": 0, "length": 0, "total_chars": 0])
+        exit(0)
+    }
+    let status = setSelectedRange(elem, location: 0, length: total)
+    if status != .success {
+        emitError("set_failed", "ax_status=\(status.rawValue)")
+    }
+    emit([
+        "ok": true,
+        "location": 0,
+        "length": total,
+        "total_chars": total,
+    ])
+    exit(0)
+}
+
+func cmdSelectSubstring(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    var occurrence = 0  // 0 = first
+    var needle: String?
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--occurrence" && i + 1 < args.count {
+            occurrence = Int(args[i + 1]) ?? 0; i += 2; continue
+        }
+        needle = a; i += 1
+    }
+    guard let n = needle, !n.isEmpty else { emitInternalError("select-substring: missing needle") }
+    let elem = ensureFocusedElement()
+    guard let value = axCopyString(elem, kAXValueAttribute as String) else {
+        emitError("no_value", "focused element has no AXValue text")
+    }
+    // Locate the Nth occurrence (0-based) of needle in the UTF-16 value.
+    // AX selection ranges are UTF-16 code-unit offsets, matching what
+    // Notes/TextEdit/Mail expect.
+    let v = value as NSString
+    var searchStart = 0
+    var foundLoc = NSNotFound
+    var hits = 0
+    while searchStart < v.length {
+        let r = v.range(of: n, options: [], range: NSRange(location: searchStart, length: v.length - searchStart))
+        if r.location == NSNotFound { break }
+        if hits == occurrence { foundLoc = r.location; break }
+        hits += 1
+        searchStart = r.location + max(1, r.length)
+    }
+    if foundLoc == NSNotFound {
+        emitError("not_found", "needle not found at occurrence \(occurrence)")
+    }
+    let len = (n as NSString).length
+    let status = setSelectedRange(elem, location: foundLoc, length: len)
+    if status != .success {
+        emitError("set_failed", "ax_status=\(status.rawValue)")
+    }
+    emit([
+        "ok": true,
+        "location": foundLoc,
+        "length": len,
+        "total_chars": v.length,
+    ])
+    exit(0)
+}
+
+// AX-only menu navigation: walk the frontmost app's menu bar by path
+// (e.g. ["Format", "Body"] or ["Edit", "Find", "Find…"]) and AXPress
+// the leaf. No keystrokes; menus open and close through the AX
+// channel only.
+func cmdMenuCommand(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    if args.isEmpty { emitInternalError("menu-command: requires at least one path segment") }
+
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        emitError("no_app", "no frontmost application")
+    }
+    let appElem = AXUIElementCreateApplication(app.processIdentifier)
+    var menuBar: CFTypeRef?
+    let s = AXUIElementCopyAttributeValue(appElem, kAXMenuBarAttribute as CFString, &menuBar)
+    guard s == .success, let bar = menuBar else {
+        emitError("no_menu_bar", "frontmost app exposes no AXMenuBar")
+    }
+    var current = bar as! AXUIElement
+    for (idx, segment) in args.enumerated() {
+        var children: CFTypeRef?
+        AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &children)
+        guard let kids = children as? [AXUIElement], !kids.isEmpty else {
+            emitError("menu_walk_failed", "no children at depth \(idx)")
+        }
+        var match: AXUIElement?
+        for k in kids {
+            let title = axCopyString(k, kAXTitleAttribute as String) ?? ""
+            if title.lowercased() == segment.lowercased()
+                || title.lowercased().hasPrefix(segment.lowercased()) {
+                match = k; break
+            }
+        }
+        guard let next = match else {
+            emitError("menu_segment_not_found", "no menu item matching '\(segment)' at depth \(idx)")
+        }
+        if idx == args.count - 1 {
+            let status = AXUIElementPerformAction(next, kAXPressAction as CFString)
+            if status != .success {
+                emitError("press_failed", "ax_status=\(status.rawValue)")
+            }
+            emit([
+                "ok": true,
+                "path": args,
+                "leaf": axCopyString(next, kAXTitleAttribute as String) ?? segment,
+            ])
+            exit(0)
+        }
+        // Non-leaf menu items need to be opened first via AXPress so
+        // their children appear in the AX tree.
+        let openStatus = AXUIElementPerformAction(next, kAXPressAction as CFString)
+        if openStatus != .success {
+            // Some apps expose AXShowMenu instead — try that.
+            let alt = AXUIElementPerformAction(next, "AXShowMenu" as CFString)
+            if alt != .success {
+                emitError("menu_open_failed", "ax_status=\(openStatus.rawValue) for '\(segment)'")
+            }
+        }
+        current = next
+    }
+    emitInternalError("menu-command: unreachable")
+}
+
 // MARK: — Entry point
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|find-element|press-named|keystroke|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
 let rest = Array(argv.dropFirst(2))
 
 switch cmd {
-case "check":           cmdCheck()
-case "read-at":         cmdReadAt(rest)
-case "read-focused":    cmdReadFocused()
-case "write-at":        cmdWriteAt(rest)
-case "write-focused":   cmdWriteFocused(rest)
-case "read-window":     cmdReadWindow()
-case "find-element":    cmdFindElement(rest)
-case "press-named":     cmdPressNamed(rest)
-case "subscribe":       cmdSubscribe()
-default:                emitInternalError("unknown command: \(cmd)")
+case "check":             cmdCheck()
+case "read-at":           cmdReadAt(rest)
+case "read-focused":      cmdReadFocused()
+case "write-at":          cmdWriteAt(rest)
+case "write-focused":     cmdWriteFocused(rest)
+case "read-window":       cmdReadWindow()
+case "find-element":      cmdFindElement(rest)
+case "press-named":       cmdPressNamed(rest)
+case "keystroke":         cmdKeystroke(rest)
+case "type-text":         cmdTypeText(rest)
+case "select-range":      cmdSelectRange(rest)
+case "select-all":        cmdSelectAll()
+case "select-substring":  cmdSelectSubstring(rest)
+case "menu-command":      cmdMenuCommand(rest)
+case "subscribe":         cmdSubscribe()
+default:                  emitInternalError("unknown command: \(cmd)")
 }
