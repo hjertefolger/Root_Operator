@@ -271,7 +271,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_focus_element',
-      description: 'Resolve an AX element by label and/or role, then set kAXFocusedAttribute=true without moving the hardware cursor. Use this to enter a cold app window before read_focused, select_*, type_text, or menu formatting. Same disambiguation as agent_find_element; pass force=true only after explicit consent if recent user activity is detected.',
+      description: 'Resolve an AX element by label and/or role, then perform a verified AX focus transaction without moving the hardware cursor. The native helper activates/raises the target app/window, focuses the element, and refuses success unless a fresh helper process can read the same focused target. Use this to enter a cold app window before read_focused, select_*, type_text, or menu formatting. Same disambiguation as agent_find_element; pass force=true only after explicit consent if recent user activity is detected.',
       inputSchema: {
         type: 'object',
         properties: {

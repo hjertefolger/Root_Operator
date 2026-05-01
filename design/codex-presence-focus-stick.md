@@ -49,3 +49,21 @@ If step 2 fails with `focus_not_sticky`, the helper is no longer lying about foc
 - `npm test` passes 144/144.
 - `build/native/ax-helper check` returns `{"trusted":false}` in this shell, so the live Notes acceptance must be run from the trusted Root Operator app context.
 - `build/native/ax-helper read-focused` returns `{"error":"no_focused_element"}` in this shell, matching the untrusted/no-live-focus state and not exercising the Notes path.
+
+## Round 2: false-success verifier
+
+The round-1 verifier checked a useful but insufficient condition: after setting `AXFocused=true`, the same helper process polled `AXUIElementCreateSystemWide()` for `kAXFocusedUIElementAttribute` and accepted a match when the returned element was the requested target or either side was an ancestor of the other.
+
+The real cold-start run showed why that still lied:
+
+- The verifier could accept an ancestor such as the focused window/container. A focused window is necessary context, but it is not proof that the `AXTextArea` owns keyboard focus.
+- The check was same-process only. The next MCP call starts a fresh helper process; that fresh process immediately saw `no_focused_element`, while the focus observer saw no `AXFocusedUIElementChanged` notification. The postcondition was therefore checking a transient/client-local reading, not the durable system state that later tools depend on.
+- Activation diagnostics were too thin. The helper did not report the frontmost app before/after the transaction, so it could not distinguish “Notes is frontmost and still no text focus” from “Root Operator or another process stayed frontmost.”
+
+Round 2 changes the contract:
+
+1. Focus matching is directional. Exact target matches and focused descendants of the target are allowed; focused ancestors are not.
+2. `focus-element` now requires fresh-process verification. The helper spawns the same `ax-helper focused-snapshot` command and only returns `ok` when that separate process sees the same target/descendant by pid, role, and frame.
+3. The MCP wrapper performs one more immediate `focused-snapshot` after the native command returns. This mirrors the user's next `agent_read_focused` call and prevents stale native success from crossing the MCP boundary.
+4. The transaction uses stronger activation (`activateIgnoringOtherApps` + all windows), attempts the app-level `AXFocusedUIElement` setter, records frontmost app before/after, and uses an AXPress fallback only for text roles that expose it.
+5. `scripts/test-presence-coldstart.sh` exercises the real helper sequence against frontmost Notes and fails on `not_trusted`, `focus_not_sticky`, `no_focused_element`, or `no_focus` before running the Body/Title formatting commands.

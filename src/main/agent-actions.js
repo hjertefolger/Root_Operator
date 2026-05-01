@@ -370,6 +370,68 @@ function formatPress(result) {
     return `Press returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
+function numberish(value) {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+function framesApproximatelyEqual(a, b) {
+    if (!a || !b) return false;
+    for (const key of ['x', 'y', 'w', 'h']) {
+        const av = numberish(a[key]);
+        const bv = numberish(b[key]);
+        if (av === null || bv === null || Math.abs(av - bv) > 1) return false;
+    }
+    return true;
+}
+
+function focusedSnapshotMatches(expected, snapshot) {
+    if (!expected || !snapshot || snapshot.error) return false;
+    if (expected.role && snapshot.role && expected.role !== snapshot.role) return false;
+    if (expected.pid !== undefined && snapshot.pid !== undefined && Number(expected.pid) !== Number(snapshot.pid)) {
+        return false;
+    }
+    return framesApproximatelyEqual(expected.frame, snapshot.frame);
+}
+
+function formatFreshFocusFailure(result, snapshot) {
+    const fresh = snapshot && snapshot.error
+        ? `${snapshot.error}${snapshot.detail ? ` (${snapshot.detail})` : ''}`
+        : JSON.stringify(snapshot || null).slice(0, 160);
+    return {
+        error: 'focus_not_sticky',
+        role: result.role,
+        detail: `fresh post-focus snapshot did not match the verified target; focused=${fresh}`,
+        frame: result.frame,
+        focused_role: snapshot && snapshot.role ? snapshot.role : null,
+        focused_frame: snapshot && snapshot.frame ? snapshot.frame : undefined,
+        focus_statuses: result.focus_statuses,
+    };
+}
+
+async function verifyFocusAfterReturn(deps, result) {
+    if (!result || !result.ok) return result;
+    if (result.fresh_verified !== true) {
+        return {
+            error: 'focus_not_sticky',
+            role: result.role,
+            detail: 'native helper returned focus success without fresh process verification',
+            frame: result.frame,
+            focus_statuses: result.focus_statuses,
+        };
+    }
+    const snapshot = await runHelper(deps, ['focused-snapshot']);
+    const expected = result.fresh_focused && !result.fresh_focused.error ? result.fresh_focused : result;
+    if (!focusedSnapshotMatches(expected, snapshot)) {
+        return formatFreshFocusFailure(result, snapshot);
+    }
+    return {
+        ...result,
+        post_return_verified: true,
+        post_return_focused: snapshot,
+    };
+}
+
 function formatFocus(result) {
     if (result.error) {
         return `Focus failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}${formatMatchSuffix(result)}`;
@@ -758,7 +820,10 @@ function init(deps) {
                     if (refused) return refused;
                     lastFocusAt = now;
                     releaseHostKeyboardFocus('agent_focus_element');
-                    const r = await runHelper(deps, ['focus-element', ...target.args]);
+                    const r = await verifyFocusAfterReturn(
+                        deps,
+                        await runHelper(deps, ['focus-element', ...target.args]),
+                    );
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     return { result: formatFocus(r), isError: !r.ok };
                 }
@@ -778,7 +843,10 @@ function init(deps) {
                     if (refused) return refused;
                     lastFocusAt = now;
                     releaseHostKeyboardFocus('agent_focus_at');
-                    const r = await runHelper(deps, ['focus-at', String(x.value), String(y.value)]);
+                    const r = await verifyFocusAfterReturn(
+                        deps,
+                        await runHelper(deps, ['focus-at', String(x.value), String(y.value)]),
+                    );
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     return { result: formatFocus(r), isError: !r.ok };
                 }

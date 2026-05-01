@@ -165,11 +165,109 @@ func elementHasAncestor(_ ancestor: AXUIElement, child: AXUIElement) -> Bool {
 func focusMatches(target: AXUIElement, focused: AXUIElement) -> Bool {
     if elementIdentityMatches(target, focused) { return true }
     // Some apps report the focused leaf inside the requested container, or
-    // the requested control while AX returns a child text node. Treat either
-    // direct ancestry relation as a successful focus transaction.
+    // the requested control while AX returns a child text node. Accept
+    // target -> focused ancestry only. A focused ancestor such as AXWindow
+    // does not mean the requested text control owns keyboard focus.
     if elementHasAncestor(target, child: focused) { return true }
-    if elementHasAncestor(focused, child: target) { return true }
     return false
+}
+
+func numericValue(_ value: Any?) -> Double? {
+    if let d = value as? Double { return d }
+    if let n = value as? NSNumber { return n.doubleValue }
+    if let i = value as? Int { return Double(i) }
+    return nil
+}
+
+func framePayloadMatches(_ payload: Any?, _ frame: [String: Any]?) -> Bool {
+    guard let p = payload as? [String: Any], let f = frame else { return false }
+    for key in ["x", "y", "w", "h"] {
+        guard let pv = numericValue(p[key]), let fv = numericValue(f[key]) else {
+            return false
+        }
+        if abs(pv - fv) > 1.0 { return false }
+    }
+    return true
+}
+
+func snapshotPayload(_ element: AXUIElement) -> [String: Any] {
+    var result: [String: Any] = ["role": roleString(element)]
+    if let pid = pidOf(element) { result["pid"] = Int(pid) }
+    if let label = displayLabel(element) { result["label"] = label }
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
+func snapshotMatchesElement(_ snapshot: [String: Any], _ element: AXUIElement) -> Bool {
+    guard let snapshotRole = snapshot["role"] as? String,
+          snapshotRole == roleString(element) else { return false }
+    if let snapshotPid = numericValue(snapshot["pid"]),
+       let elementPid = pidOf(element),
+       Int(snapshotPid) != Int(elementPid) {
+        return false
+    }
+    return framePayloadMatches(snapshot["frame"], frameOf(element))
+}
+
+func snapshotMatchesTargetOrDescendant(
+    _ snapshot: [String: Any],
+    target: AXUIElement,
+    depth: Int = 0,
+    visited: NodeCounter = NodeCounter()
+) -> Bool {
+    visited.count += 1
+    if snapshotMatchesElement(snapshot, target) { return true }
+    if depth >= TREE_MAX_DEPTH || visited.count >= TREE_MAX_NODES { return false }
+    for child in axCopyChildren(target) {
+        if snapshotMatchesTargetOrDescendant(snapshot, target: child, depth: depth + 1, visited: visited) {
+            return true
+        }
+    }
+    return false
+}
+
+func currentExecutableURL() -> URL {
+    let raw = CommandLine.arguments[0]
+    if raw.hasPrefix("/") {
+        return URL(fileURLWithPath: raw)
+    }
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(raw)
+}
+
+func freshFocusedSnapshot(timeoutMs: Int = 900) -> [String: Any]? {
+    let process = Process()
+    process.executableURL = currentExecutableURL()
+    process.arguments = ["focused-snapshot"]
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+
+    do {
+        try process.run()
+    } catch {
+        return ["error": "fresh_spawn_failed", "detail": error.localizedDescription]
+    }
+
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    while process.isRunning && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    if process.isRunning {
+        process.terminate()
+        return ["error": "fresh_timeout"]
+    }
+
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    guard !data.isEmpty else {
+        return ["error": "fresh_empty"]
+    }
+    do {
+        let raw = try JSONSerialization.jsonObject(with: data, options: [])
+        return raw as? [String: Any]
+    } catch {
+        return ["error": "fresh_parse_failed", "detail": error.localizedDescription]
+    }
 }
 
 func resolveContainingWindow(_ element: AXUIElement) -> AXUIElement? {
@@ -266,6 +364,15 @@ func cmdReadFocused() -> Never {
         emitError("no_focused_element")
     }
     emitReadResult(element)
+}
+
+func cmdFocusedSnapshot() -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+    guard let element = resolveFocusedElement() else {
+        emitError("no_focused_element")
+    }
+    emit(snapshotPayload(element))
+    exit(0)
 }
 
 // MARK: — Write commands
@@ -1083,6 +1190,13 @@ struct FocusTransaction {
     var window: AXUIElement?
     var statuses: [String: Int] = [:]
     var activated: Bool?
+    var frontmostBeforePid: pid_t?
+    var frontmostBeforeApp: String?
+    var frontmostBeforeBundleID: String?
+    var frontmostAfterPid: pid_t?
+    var frontmostAfterApp: String?
+    var frontmostAfterBundleID: String?
+    var frontmostSettled: Bool?
 }
 
 func statusPayload(_ statuses: [String: Int]) -> [String: Any] {
@@ -1091,8 +1205,45 @@ func statusPayload(_ statuses: [String: Int]) -> [String: Any] {
     return out
 }
 
+func captureFrontmost(prefix: String, into tx: inout FocusTransaction) {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return }
+    if prefix == "before" {
+        tx.frontmostBeforePid = app.processIdentifier
+        tx.frontmostBeforeApp = app.localizedName ?? ""
+        tx.frontmostBeforeBundleID = app.bundleIdentifier ?? ""
+    } else {
+        tx.frontmostAfterPid = app.processIdentifier
+        tx.frontmostAfterApp = app.localizedName ?? ""
+        tx.frontmostAfterBundleID = app.bundleIdentifier ?? ""
+    }
+}
+
+func waitForFrontmost(pid: pid_t, timeoutMs: Int = 650) -> Bool {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    repeat {
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.03)
+    } while Date() < deadline
+    return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+}
+
+func addFocusTransactionDetails(_ result: inout [String: Any], _ tx: FocusTransaction) {
+    if let pid = tx.pid { result["pid"] = Int(pid) }
+    if let activated = tx.activated { result["app_activated"] = activated }
+    if let settled = tx.frontmostSettled { result["frontmost_settled"] = settled }
+    if let pid = tx.frontmostBeforePid { result["frontmost_before_pid"] = Int(pid) }
+    if let app = tx.frontmostBeforeApp { result["frontmost_before_app"] = app }
+    if let bundle = tx.frontmostBeforeBundleID { result["frontmost_before_bundle_id"] = bundle }
+    if let pid = tx.frontmostAfterPid { result["frontmost_after_pid"] = Int(pid) }
+    if let app = tx.frontmostAfterApp { result["frontmost_after_app"] = app }
+    if let bundle = tx.frontmostAfterBundleID { result["frontmost_after_bundle_id"] = bundle }
+}
+
 func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AXUIElement?) -> FocusTransaction {
     var tx = FocusTransaction(pid: pidOf(element), window: knownWindow)
+    captureFrontmost(prefix: "before", into: &tx)
     if tx.window == nil {
         tx.window = resolveContainingWindow(element)
     }
@@ -1103,9 +1254,9 @@ func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AX
 
     if let running = NSRunningApplication(processIdentifier: pid) {
         if #available(macOS 14.0, *) {
-            tx.activated = running.activate()
+            tx.activated = running.activate(options: [.activateAllWindows])
         } else {
-            tx.activated = running.activate(options: [.activateIgnoringOtherApps])
+            tx.activated = running.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         }
     }
 
@@ -1143,26 +1294,69 @@ func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AX
         tx.statuses["window_focused"] = Int(focusedStatus.rawValue)
     }
 
+    let focusedElementStatus = AXUIElementSetAttributeValue(
+        appElem,
+        kAXFocusedUIElementAttribute as CFString,
+        element
+    )
+    tx.statuses["app_focused_ui_element"] = Int(focusedElementStatus.rawValue)
+
+    tx.frontmostSettled = waitForFrontmost(pid: pid)
+    captureFrontmost(prefix: "after", into: &tx)
+
     // App/window activation is asynchronous in several Cocoa apps. A short
     // settle makes the following AXFocused setter land after the key-window
     // transition instead of racing it.
-    Thread.sleep(forTimeInterval: 0.05)
+    Thread.sleep(forTimeInterval: 0.12)
     return tx
 }
 
-func waitForFocusToStick(target element: AXUIElement, timeoutMs: Int = 800) -> (matched: Bool, focused: AXUIElement?) {
+struct FocusVerification {
+    var matched: Bool
+    var focused: AXUIElement?
+    var snapshot: [String: Any]?
+}
+
+func waitForFocusToStick(target element: AXUIElement, timeoutMs: Int = 1200) -> FocusVerification {
     let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
     var lastFocused: AXUIElement? = nil
+    var lastSnapshot: [String: Any]? = nil
     repeat {
         if let focused = resolveFocusedElement() {
             lastFocused = focused
             if focusMatches(target: element, focused: focused) {
-                return (true, focused)
+                if let snapshot = freshFocusedSnapshot() {
+                    lastSnapshot = snapshot
+                    if snapshotMatchesTargetOrDescendant(snapshot, target: element) {
+                        return FocusVerification(matched: true, focused: focused, snapshot: snapshot)
+                    }
+                }
             }
         }
         Thread.sleep(forTimeInterval: 0.035)
     } while Date() < deadline
-    return (false, lastFocused)
+    if lastSnapshot == nil {
+        lastSnapshot = freshFocusedSnapshot()
+    }
+    return FocusVerification(matched: false, focused: lastFocused, snapshot: lastSnapshot)
+}
+
+let FOCUS_PRESS_FALLBACK_ROLES: Set<String> = [
+    "AXTextArea",
+    "AXTextField",
+    "AXSearchField",
+]
+
+func tryTextFocusPressFallback(_ element: AXUIElement, tx: inout FocusTransaction) -> Bool {
+    let role = roleString(element)
+    guard FOCUS_PRESS_FALLBACK_ROLES.contains(role),
+          actionNames(element).contains(kAXPressAction as String) else {
+        return false
+    }
+    let pressStatus = AXUIElementPerformAction(element, kAXPressAction as CFString)
+    tx.statuses["target_press"] = Int(pressStatus.rawValue)
+    Thread.sleep(forTimeInterval: 0.08)
+    return pressStatus == .success
 }
 
 func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> Never {
@@ -1172,6 +1366,7 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
         kAXFocusedAttribute as CFString,
         kCFBooleanTrue
     )
+    tx.statuses["target_focused"] = Int(status.rawValue)
     if status == .success {
         var verified = waitForFocusToStick(target: element)
         if !verified.matched {
@@ -1184,6 +1379,18 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
                 kAXFocusedAttribute as CFString,
                 kCFBooleanTrue
             )
+            tx.statuses["target_focused_retry"] = Int(status.rawValue)
+            if status == .success {
+                verified = waitForFocusToStick(target: element)
+            }
+        }
+        if !verified.matched, tryTextFocusPressFallback(element, tx: &tx) {
+            status = AXUIElementSetAttributeValue(
+                element,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+            tx.statuses["target_focused_after_press"] = Int(status.rawValue)
             if status == .success {
                 verified = waitForFocusToStick(target: element)
             }
@@ -1191,10 +1398,13 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
         if verified.matched {
             var extras: [String: Any] = [
                 "verified": true,
+                "fresh_verified": true,
                 "focus_statuses": statusPayload(tx.statuses),
             ]
-            if let pid = tx.pid { extras["pid"] = Int(pid) }
-            if let activated = tx.activated { extras["app_activated"] = activated }
+            addFocusTransactionDetails(&extras, tx)
+            if let snapshot = verified.snapshot {
+                extras["fresh_focused"] = snapshot
+            }
             emitElementActionResult(ok: true, action: "focus", element: element, extras: extras)
         }
         var result: [String: Any] = [
@@ -1203,8 +1413,7 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
             "detail": "AXFocused setter succeeded, but system AXFocusedUIElement did not match the target within the settle window.",
             "focus_statuses": statusPayload(tx.statuses),
         ]
-        if let pid = tx.pid { result["pid"] = Int(pid) }
-        if let activated = tx.activated { result["app_activated"] = activated }
+        addFocusTransactionDetails(&result, tx)
         if let focused = verified.focused {
             result["focused_role"] = roleString(focused)
             if let focusedPid = pidOf(focused) {
@@ -1219,6 +1428,12 @@ func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil
             }
         } else {
             result["focused_role"] = NSNull()
+        }
+        if let snapshot = verified.snapshot {
+            result["fresh_focused"] = snapshot
+            if let freshError = snapshot["error"] {
+                result["fresh_error"] = freshError
+            }
         }
         if let frame = frameOf(element) { result["frame"] = frame }
         emit(result)
@@ -2475,7 +2690,7 @@ func cmdMenuCommand(_ args: [String]) -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -2485,6 +2700,7 @@ switch cmd {
 case "check":             cmdCheck()
 case "read-at":           cmdReadAt(rest)
 case "read-focused":      cmdReadFocused()
+case "focused-snapshot":  cmdFocusedSnapshot()
 case "write-at":          cmdWriteAt(rest)
 case "write-focused":     cmdWriteFocused(rest)
 case "read-window":       cmdReadWindow()

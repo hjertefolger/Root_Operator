@@ -265,8 +265,20 @@ test('agent_focus_element sends target args and travels to focused frame', async
     const helperPath = makeFakeHelper(`
 const fs = require('fs');
 const argv = process.argv.slice(2);
-fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
-console.log(JSON.stringify({ ok: true, action: 'focus', role: 'AXTextArea', frame: { x: 100, y: 200, w: 300, h: 80 } }));
+fs.appendFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv) + '\\n');
+if (argv[0] === 'focused-snapshot') {
+  console.log(JSON.stringify({ role: 'AXTextArea', pid: 123, frame: { x: 100, y: 200, w: 300, h: 80 } }));
+} else {
+  console.log(JSON.stringify({
+    ok: true,
+    action: 'focus',
+    role: 'AXTextArea',
+    pid: 123,
+    frame: { x: 100, y: 200, w: 300, h: 80 },
+    fresh_verified: true,
+    fresh_focused: { role: 'AXTextArea', pid: 123, frame: { x: 100, y: 200, w: 300, h: 80 } }
+  }));
+}
 `);
     const avatar = fakeAvatar();
     const releaseCalls = [];
@@ -280,9 +292,11 @@ console.log(JSON.stringify({ ok: true, action: 'focus', role: 'AXTextArea', fram
     });
     assert.equal(r.isError, false);
     assert.match(r.result, /Focused AXTextArea/);
-    assert.deepEqual(JSON.parse(fs.readFileSync(argvPath, 'utf8')), [
+    const calls = fs.readFileSync(argvPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual(calls[0], [
         'focus-element', '--role', 'AXTextArea', '--prefer-role', 'AXTextArea', '--near', '900,300',
     ]);
+    assert.deepEqual(calls[1], ['focused-snapshot']);
     assert.deepEqual(releaseCalls, ['agent_focus_element']);
     assert.equal(avatar.calls.moveTo.length, 1);
     assert.equal(avatar.calls.moveTo[0].x, 100 + 300 + __test.FRAME_LANDING_OFFSET_PX);
@@ -306,6 +320,35 @@ console.log(JSON.stringify({
     });
     assert.equal(r.isError, true);
     assert.match(r.result, /focus_not_sticky/);
+    assert.equal(avatar.calls.moveTo.length, 0);
+});
+
+test('agent_focus_element rejects ok result when fresh post-return focus is empty', async () => {
+    const helperPath = makeFakeHelper(`
+const argv = process.argv.slice(2);
+if (argv[0] === 'focused-snapshot') {
+  console.log(JSON.stringify({ error: 'no_focused_element' }));
+} else {
+  console.log(JSON.stringify({
+    ok: true,
+    action: 'focus',
+    role: 'AXTextArea',
+    pid: 123,
+    frame: { x: 100, y: 200, w: 300, h: 80 },
+    fresh_verified: true,
+    fresh_focused: { role: 'AXTextArea', pid: 123, frame: { x: 100, y: 200, w: 300, h: 80 } }
+  }));
+}
+`);
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_focus_element',
+        args: { role: 'AXTextArea' },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /focus_not_sticky/);
+    assert.match(r.result, /no_focused_element/);
     assert.equal(avatar.calls.moveTo.length, 0);
 });
 
