@@ -509,6 +509,16 @@ function init(deps) {
         lastSelfActionAt = Date.now();
     }
 
+    function releaseHostKeyboardFocus(reason) {
+        const fns = [
+            deps.releaseKeyboardFocus,
+            deps.prepareForExternalFocus,
+        ].filter((fn) => typeof fn === 'function');
+        for (const fn of fns) {
+            try { fn(reason); } catch (_) { /* best-effort host focus release */ }
+        }
+    }
+
     // Inspect the AX subscribe ring buffer for evidence that the user
     // is actively typing or navigating in the time window leading up
     // to a planned keystroke. Returns the offending event line, or
@@ -747,6 +757,7 @@ function init(deps) {
                     const refused = refuseIfUserActive(force, 'Refused focus');
                     if (refused) return refused;
                     lastFocusAt = now;
+                    releaseHostKeyboardFocus('agent_focus_element');
                     const r = await runHelper(deps, ['focus-element', ...target.args]);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     return { result: formatFocus(r), isError: !r.ok };
@@ -766,6 +777,7 @@ function init(deps) {
                     const refused = refuseIfUserActive(force, 'Refused focus');
                     if (refused) return refused;
                     lastFocusAt = now;
+                    releaseHostKeyboardFocus('agent_focus_at');
                     const r = await runHelper(deps, ['focus-at', String(x.value), String(y.value)]);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     return { result: formatFocus(r), isError: !r.ok };

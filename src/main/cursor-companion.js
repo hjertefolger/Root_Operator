@@ -120,6 +120,7 @@ let pointerGestureCapture = { right: false, wheel: false };
 let lastRightDismissAt = 0;
 let lastRightDismissSource = null;
 let inputRefocusTimer = null;
+let nativeWindowFocusable = null;
 
 // Hit-regions are still accepted from the renderer for compatibility,
 // but cursor-anchored replies are not hit-tested by pointer position:
@@ -248,6 +249,7 @@ function getApi() {
         notifyEnabledChanged,
         adoptAnnotation,
         getWindow: () => (isUsable(win) ? win : null),
+        releaseKeyboardFocus,
         isPending: () => pending !== null,
         // Whether the two-dot loader layer is currently visible. The
         // agent-avatar reads this so the ambient dot can yield the slot
@@ -446,12 +448,49 @@ function clearInputRefocusTimer() {
     inputRefocusTimer = null;
 }
 
+function setNativeWindowFocusable(next) {
+    if (!isUsable(win) || typeof win.setFocusable !== 'function') return;
+    const value = Boolean(next);
+    if (nativeWindowFocusable === value) return;
+    try {
+        win.setFocusable(value);
+        nativeWindowFocusable = value;
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] setFocusable failed: ${err.message}`);
+    }
+}
+
+function blurNativeWindowIfFocused() {
+    if (!isUsable(win)) return;
+    try {
+        if (typeof win.isFocused === 'function' && !win.isFocused()) return;
+    } catch (_) { /* fall through to best-effort blur */ }
+    try {
+        if (typeof win.blur === 'function') win.blur();
+    } catch (err) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] blur failed: ${err.message}`);
+    }
+}
+
+function releaseKeyboardFocus(reason = 'external-focus') {
+    if (!isUsable(win)) return false;
+    if (inputOpen) {
+        depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] focus release skipped while input is open (${reason})`);
+        return false;
+    }
+    clearInputRefocusTimer();
+    blurNativeWindowIfFocused();
+    setNativeWindowFocusable(false);
+    return true;
+}
+
 function scheduleInputRefocusAfterPassthroughClick() {
     if (!inputOpen || !isUsable(win)) return;
     clearInputRefocusTimer();
     inputRefocusTimer = setTimeout(() => {
         inputRefocusTimer = null;
         if (!inputOpen || !isUsable(win)) return;
+        setNativeWindowFocusable(true);
         try { win.focus(); } catch (_) {}
         try {
             win.webContents.send('CURSOR_FOCUS_INPUT', { reason: 'left-click-passthrough' });
@@ -683,6 +722,7 @@ function stop() {
     rendererReplyDismissBlockedUntil = 0;
     isShiftHeld = false;
     activeAppProbe = null;
+    nativeWindowFocusable = null;
     if (pendingAttachment) {
         try { fs.unlinkSync(pendingAttachment.path); } catch (_) {}
     }
@@ -709,10 +749,10 @@ function createWindow() {
         maximizable: false,
         fullscreenable: false,
         skipTaskbar: true,
-        // NSPanel on macOS — can become key window without activating
-        // our entire app or stealing dock focus.
+        // NSPanel on macOS. It is only focusable while the input is open;
+        // passive dot/reply/loader layers must not keep the key window.
         type: process.platform === 'darwin' ? 'panel' : undefined,
-        focusable: true,
+        focusable: false,
         hasShadow: false,
         webPreferences: {
             nodeIntegration: false,
@@ -722,6 +762,7 @@ function createWindow() {
             backgroundThrottling: false,
         },
     });
+    nativeWindowFocusable = false;
 
     w.setAlwaysOnTop(true, 'floating');
     w.setVisibleOnAllWorkspaces(true, {
@@ -870,6 +911,11 @@ function setMousePassthrough(passThrough) {
 
 function applyInteractivity() {
     if (!isUsable(win)) return;
+    if (inputOpen) {
+        setNativeWindowFocusable(true);
+    } else {
+        releaseKeyboardFocus('passive-layer');
+    }
     // Keep the native overlay left-click-through even while replies are
     // anchored beside the cursor. Wheel/right-click ownership is handled
     // by the narrow pointer tap, not by making the whole window clickable.
@@ -971,6 +1017,7 @@ function openInput() {
     // double-tapped Shift, not whatever happens to be frontmost at submit.
     activeAppProbe = getActiveApp().catch(() => null);
     inputOpen = true;
+    setNativeWindowFocusable(true);
     try { win.focus(); } catch (_) {}
     applyInteractivity();
     broadcastState({ event: 'input_opened', draftPrompt: getFreshDraft() });
@@ -1608,6 +1655,8 @@ module.exports = {
         setHitRegionsForTest: (next) => { hitRegions = Array.isArray(next) ? next.slice() : []; },
         getMousePassthroughForTest: () => mousePassthrough,
         setMousePassthroughForTest: (next) => { mousePassthrough = Boolean(next); },
+        setNativeWindowFocusableForTest: (next) => { nativeWindowFocusable = next; },
+        releaseKeyboardFocusForTest: releaseKeyboardFocus,
         setPointerGestureTapForTest: (tap) => { pointerGestureTap = tap || null; },
         getPointerGestureCaptureForTest: () => ({ ...pointerGestureCapture }),
         syncPointerGestureCaptureForTest: syncPointerGestureCapture,

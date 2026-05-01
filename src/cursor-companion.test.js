@@ -12,6 +12,8 @@ function createFakeWindow({ visible = true, focused = false, minimized = false }
     const ignoreCalls = [];
     const positions = [];
     const focusCalls = [];
+    const blurCalls = [];
+    const focusableCalls = [];
     return {
         visible,
         focused,
@@ -22,6 +24,8 @@ function createFakeWindow({ visible = true, focused = false, minimized = false }
         ignoreCalls,
         positions,
         focusCalls,
+        blurCalls,
+        focusableCalls,
         isDestroyed() { return this.destroyed; },
         isFocused() { return this.focused; },
         isVisible() { return this.visible; },
@@ -34,6 +38,13 @@ function createFakeWindow({ visible = true, focused = false, minimized = false }
         focus() {
             this.focused = true;
             focusCalls.push(Date.now());
+        },
+        blur() {
+            this.focused = false;
+            blurCalls.push(Date.now());
+        },
+        setFocusable(next) {
+            focusableCalls.push(Boolean(next));
         },
         setPosition(...args) { positions.push(args); },
         setIgnoreMouseEvents(...args) { ignoreCalls.push(args); },
@@ -85,6 +96,47 @@ test('mode reflects layer priority: input > response > loading > dot', () => {
     __test.setInputOpenForTest(false);
     __test.setRepliesForTest([]);
     __test.setPendingForTest(null);
+});
+
+test('passive cursor surface releases native keyboard focus', () => {
+    const fake = createFakeWindow({ focused: true });
+    __test.setWindowForTest(fake);
+    __test.setInputOpenForTest(false);
+    __test.setNativeWindowFocusableForTest(true);
+
+    const released = __test.releaseKeyboardFocusForTest('test');
+
+    assert.equal(released, true);
+    assert.equal(fake.focused, false);
+    assert.equal(fake.blurCalls.length, 1);
+    assert.deepEqual(fake.focusableCalls, [false]);
+});
+
+test('cursor surface does not release focus while input is open', () => {
+    const fake = createFakeWindow({ focused: true });
+    __test.setWindowForTest(fake);
+    __test.setInputOpenForTest(true);
+    __test.setNativeWindowFocusableForTest(true);
+
+    const released = __test.releaseKeyboardFocusForTest('test');
+
+    assert.equal(released, false);
+    assert.equal(fake.focused, true);
+    assert.equal(fake.blurCalls.length, 0);
+    assert.deepEqual(fake.focusableCalls, []);
+    __test.setInputOpenForTest(false);
+});
+
+test('input interactivity makes cursor surface focusable again', () => {
+    const fake = createFakeWindow({ focused: false });
+    __test.setWindowForTest(fake);
+    __test.setInputOpenForTest(true);
+    __test.setNativeWindowFocusableForTest(false);
+
+    __test.applyInteractivityForTest();
+
+    assert.deepEqual(fake.focusableCalls, [true]);
+    __test.setInputOpenForTest(false);
 });
 
 test('shift held state can be toggled and read', () => {

@@ -118,6 +118,82 @@ func resolveFocusedElement() -> AXUIElement? {
     return nil
 }
 
+func axCopyElement(_ element: AXUIElement, _ key: String) -> AXUIElement? {
+    guard let raw = axCopyAttribute(element, key) else { return nil }
+    if CFGetTypeID(raw) == AXUIElementGetTypeID() {
+        return (raw as! AXUIElement)
+    }
+    return nil
+}
+
+func pidOf(_ element: AXUIElement) -> pid_t? {
+    var pid: pid_t = 0
+    let status = AXUIElementGetPid(element, &pid)
+    return status == .success ? pid : nil
+}
+
+func framesApproximatelyEqual(_ a: [String: Any]?, _ b: [String: Any]?) -> Bool {
+    guard let a = a, let b = b else { return false }
+    let keys = ["x", "y", "w", "h"]
+    for key in keys {
+        guard let av = a[key] as? Double, let bv = b[key] as? Double else {
+            return false
+        }
+        if abs(av - bv) > 1.0 { return false }
+    }
+    return true
+}
+
+func elementIdentityMatches(_ a: AXUIElement, _ b: AXUIElement) -> Bool {
+    if CFEqual(a, b) { return true }
+    guard let aPid = pidOf(a), let bPid = pidOf(b), aPid == bPid else { return false }
+    if roleString(a) != roleString(b) { return false }
+    return framesApproximatelyEqual(frameOf(a), frameOf(b))
+}
+
+func elementHasAncestor(_ ancestor: AXUIElement, child: AXUIElement) -> Bool {
+    var current: AXUIElement? = child
+    var depth = 0
+    while let elem = current, depth < 20 {
+        if elementIdentityMatches(ancestor, elem) { return true }
+        current = axCopyElement(elem, kAXParentAttribute as String)
+        depth += 1
+    }
+    return false
+}
+
+func focusMatches(target: AXUIElement, focused: AXUIElement) -> Bool {
+    if elementIdentityMatches(target, focused) { return true }
+    // Some apps report the focused leaf inside the requested container, or
+    // the requested control while AX returns a child text node. Treat either
+    // direct ancestry relation as a successful focus transaction.
+    if elementHasAncestor(target, child: focused) { return true }
+    if elementHasAncestor(focused, child: target) { return true }
+    return false
+}
+
+func resolveContainingWindow(_ element: AXUIElement) -> AXUIElement? {
+    if let window = axCopyElement(element, kAXWindowAttribute as String) {
+        return window
+    }
+    if let topLevel = axCopyElement(element, "AXTopLevelUIElement"),
+       roleString(topLevel) == "AXWindow" || roleString(topLevel) == "AXSheet" {
+        return topLevel
+    }
+
+    var current: AXUIElement? = element
+    var depth = 0
+    while let elem = current, depth < 20 {
+        let role = roleString(elem)
+        if role == "AXWindow" || role == "AXSheet" {
+            return elem
+        }
+        current = axCopyElement(elem, kAXParentAttribute as String)
+        depth += 1
+    }
+    return nil
+}
+
 func actionNames(_ element: AXUIElement) -> Set<String> {
     var raw: CFArray?
     guard AXUIElementCopyActionNames(element, &raw) == .success,
@@ -1002,14 +1078,151 @@ func cmdPressNamed(_ args: [String]) -> Never {
     exit(0)
 }
 
-func focusElement(_ element: AXUIElement) -> Never {
-    let status = AXUIElementSetAttributeValue(
+struct FocusTransaction {
+    var pid: pid_t?
+    var window: AXUIElement?
+    var statuses: [String: Int] = [:]
+    var activated: Bool?
+}
+
+func statusPayload(_ statuses: [String: Int]) -> [String: Any] {
+    var out: [String: Any] = [:]
+    for (k, v) in statuses { out[k] = v }
+    return out
+}
+
+func prepareFocusTransaction(target element: AXUIElement, window knownWindow: AXUIElement?) -> FocusTransaction {
+    var tx = FocusTransaction(pid: pidOf(element), window: knownWindow)
+    if tx.window == nil {
+        tx.window = resolveContainingWindow(element)
+    }
+
+    guard let pid = tx.pid else {
+        return tx
+    }
+
+    if let running = NSRunningApplication(processIdentifier: pid) {
+        if #available(macOS 14.0, *) {
+            tx.activated = running.activate()
+        } else {
+            tx.activated = running.activate(options: [.activateIgnoringOtherApps])
+        }
+    }
+
+    let appElem = AXUIElementCreateApplication(pid)
+    let frontmostStatus = AXUIElementSetAttributeValue(
+        appElem,
+        kAXFrontmostAttribute as CFString,
+        kCFBooleanTrue
+    )
+    tx.statuses["app_frontmost"] = Int(frontmostStatus.rawValue)
+
+    if let window = tx.window {
+        let raiseStatus = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        tx.statuses["window_raise"] = Int(raiseStatus.rawValue)
+
+        let focusedWindowStatus = AXUIElementSetAttributeValue(
+            appElem,
+            kAXFocusedWindowAttribute as CFString,
+            window
+        )
+        tx.statuses["app_focused_window"] = Int(focusedWindowStatus.rawValue)
+
+        let mainStatus = AXUIElementSetAttributeValue(
+            window,
+            kAXMainAttribute as CFString,
+            kCFBooleanTrue
+        )
+        tx.statuses["window_main"] = Int(mainStatus.rawValue)
+
+        let focusedStatus = AXUIElementSetAttributeValue(
+            window,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
+        tx.statuses["window_focused"] = Int(focusedStatus.rawValue)
+    }
+
+    // App/window activation is asynchronous in several Cocoa apps. A short
+    // settle makes the following AXFocused setter land after the key-window
+    // transition instead of racing it.
+    Thread.sleep(forTimeInterval: 0.05)
+    return tx
+}
+
+func waitForFocusToStick(target element: AXUIElement, timeoutMs: Int = 800) -> (matched: Bool, focused: AXUIElement?) {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    var lastFocused: AXUIElement? = nil
+    repeat {
+        if let focused = resolveFocusedElement() {
+            lastFocused = focused
+            if focusMatches(target: element, focused: focused) {
+                return (true, focused)
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.035)
+    } while Date() < deadline
+    return (false, lastFocused)
+}
+
+func focusElement(_ element: AXUIElement, window knownWindow: AXUIElement? = nil) -> Never {
+    var tx = prepareFocusTransaction(target: element, window: knownWindow)
+    var status = AXUIElementSetAttributeValue(
         element,
         kAXFocusedAttribute as CFString,
         kCFBooleanTrue
     )
     if status == .success {
-        emitElementActionResult(ok: true, action: "focus", element: element)
+        var verified = waitForFocusToStick(target: element)
+        if !verified.matched {
+            // One retry after reasserting app/window key state covers apps
+            // that accepted the first setter before their focused window
+            // transition finished.
+            tx = prepareFocusTransaction(target: element, window: tx.window)
+            status = AXUIElementSetAttributeValue(
+                element,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+            if status == .success {
+                verified = waitForFocusToStick(target: element)
+            }
+        }
+        if verified.matched {
+            var extras: [String: Any] = [
+                "verified": true,
+                "focus_statuses": statusPayload(tx.statuses),
+            ]
+            if let pid = tx.pid { extras["pid"] = Int(pid) }
+            if let activated = tx.activated { extras["app_activated"] = activated }
+            emitElementActionResult(ok: true, action: "focus", element: element, extras: extras)
+        }
+        var result: [String: Any] = [
+            "error": "focus_not_sticky",
+            "role": roleString(element),
+            "detail": "AXFocused setter succeeded, but system AXFocusedUIElement did not match the target within the settle window.",
+            "focus_statuses": statusPayload(tx.statuses),
+        ]
+        if let pid = tx.pid { result["pid"] = Int(pid) }
+        if let activated = tx.activated { result["app_activated"] = activated }
+        if let focused = verified.focused {
+            result["focused_role"] = roleString(focused)
+            if let focusedPid = pidOf(focused) {
+                result["focused_pid"] = Int(focusedPid)
+                if let focusedApp = NSRunningApplication(processIdentifier: focusedPid) {
+                    result["focused_app"] = focusedApp.localizedName ?? ""
+                    result["focused_bundle_id"] = focusedApp.bundleIdentifier ?? ""
+                }
+            }
+            if let frame = frameOf(focused) {
+                result["focused_frame"] = frame
+            }
+        } else {
+            result["focused_role"] = NSNull()
+        }
+        if let frame = frameOf(element) { result["frame"] = frame }
+        emit(result)
+        exit(0)
     }
     if status == .attributeUnsupported || status == .notImplemented {
         var result: [String: Any] = [
@@ -1056,7 +1269,7 @@ func cmdFocusElement(_ args: [String]) -> Never {
         ])
         exit(0)
     }
-    focusElement(pick.elem)
+    focusElement(pick.elem, window: window)
 }
 
 func cmdFocusAt(_ args: [String]) -> Never {
@@ -1069,7 +1282,7 @@ func cmdFocusAt(_ args: [String]) -> Never {
     guard let element = resolveElementAtPoint(x, y) else {
         emitError("no_element")
     }
-    focusElement(element)
+    focusElement(element, window: resolveContainingWindow(element))
 }
 
 func cmdPressAt(_ args: [String]) -> Never {

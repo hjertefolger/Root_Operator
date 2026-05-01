@@ -33,6 +33,7 @@ function makeDeps(avatar, opts = {}) {
         appPath: opts.appPath || '/nonexistent/app',
         helperPath: Object.prototype.hasOwnProperty.call(opts, 'helperPath') ? opts.helperPath : null,
         getAgentAvatar: () => avatar,
+        releaseKeyboardFocus: opts.releaseKeyboardFocus,
         logDebug: () => {},
     };
 }
@@ -268,7 +269,11 @@ fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
 console.log(JSON.stringify({ ok: true, action: 'focus', role: 'AXTextArea', frame: { x: 100, y: 200, w: 300, h: 80 } }));
 `);
     const avatar = fakeAvatar();
-    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const releaseCalls = [];
+    const handler = init(makeDeps(avatar.instance, {
+        helperPath,
+        releaseKeyboardFocus: (reason) => releaseCalls.push(reason),
+    }));
     const r = await handler.handle({
         tool: 'agent_focus_element',
         args: { role: 'AXTextArea', near_x: 900, near_y: 300, prefer_roles: ['AXTextArea'] },
@@ -278,8 +283,30 @@ console.log(JSON.stringify({ ok: true, action: 'focus', role: 'AXTextArea', fram
     assert.deepEqual(JSON.parse(fs.readFileSync(argvPath, 'utf8')), [
         'focus-element', '--role', 'AXTextArea', '--prefer-role', 'AXTextArea', '--near', '900,300',
     ]);
+    assert.deepEqual(releaseCalls, ['agent_focus_element']);
     assert.equal(avatar.calls.moveTo.length, 1);
     assert.equal(avatar.calls.moveTo[0].x, 100 + 300 + __test.FRAME_LANDING_OFFSET_PX);
+});
+
+test('agent_focus_element treats non-sticky native focus as failure', async () => {
+    const helperPath = makeFakeHelper(`
+console.log(JSON.stringify({
+  error: 'focus_not_sticky',
+  role: 'AXTextArea',
+  detail: 'AXFocused setter succeeded, but system AXFocusedUIElement did not match the target within the settle window.',
+  frame: { x: 100, y: 200, w: 300, h: 80 },
+  focused_role: null
+}));
+`);
+    const avatar = fakeAvatar();
+    const handler = init(makeDeps(avatar.instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_focus_element',
+        args: { role: 'AXTextArea' },
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.result, /focus_not_sticky/);
+    assert.equal(avatar.calls.moveTo.length, 0);
 });
 
 test('agent_click_at borrows driving state and passes HID args to helper', async () => {
