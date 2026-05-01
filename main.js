@@ -49,6 +49,7 @@ const { init: initWindowManager } = require('./src/main/window-manager');
 const { init: initCursorCompanion } = require('./src/main/cursor-companion');
 const { init: initCursorCompanionController } = require('./src/main/cursor-companion-controller');
 const { init: initAgentAvatar } = require('./src/main/agent-avatar');
+const { init: initAgentHalo } = require('./src/main/agent-halo');
 const { init: initAgentActions } = require('./src/main/agent-actions');
 const { init: initCursorAnnotation } = require('./src/main/cursor-annotation');
 const { init: initNotifications } = require('./src/main/notifications');
@@ -145,6 +146,7 @@ const setAppQuittingState = (value) => (isAppQuitting = Boolean(value));
 // the Cmd+Shift+L hotkey resolves the live toggle when fired.
 let cursorCompanionController = null;
 let agentAvatar = null;
+let agentHalo = null;
 function toggleCursorCompanionEnabledFromHotkey() {
     if (!cursorCompanionController) return;
     try {
@@ -510,6 +512,7 @@ const agentActions = initAgentActions({
     appPath: __dirname,
     resourcesPath: process.resourcesPath,
     getAgentAvatar: () => agentAvatar,
+    getAgentHalo: () => agentHalo,
     logDebug,
 });
 
@@ -855,6 +858,20 @@ app.whenReady().then(async () => {
         agentAvatar = null;
     }
 
+    try {
+        agentHalo = initAgentHalo({
+            BrowserWindow,
+            app,
+            loadRendererWindow,
+            logDebug,
+        });
+        // Halo window is lazy — created on first show() call. No
+        // explicit start/stop needed beyond construction.
+    } catch (err) {
+        logDebug(`[AGENT-HALO] init failed: ${err && err.message}`);
+        agentHalo = null;
+    }
+
     // powerMonitor lifecycle — the macOS CGEvent tap that uIOhook sits
     // on can be silently invalidated when the screen locks, the user
     // switches sessions, or the machine sleeps/resumes. We rebuild it on
@@ -1033,6 +1050,7 @@ app.on('will-quit', () => {
     } catch (_) { /* ignore */ }
     try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
     try { if (agentAvatar) agentAvatar.stop(); } catch (_) { /* ignore */ }
+    try { if (agentHalo) agentHalo.stop(); } catch (_) { /* ignore */ }
     clearPid();
     clearDesktopIdentityKeyPairCache();
     currentFingerprint = null;

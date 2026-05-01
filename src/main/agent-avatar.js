@@ -1,19 +1,19 @@
 /**
- * ROOT OPERATOR — AGENT AVATAR (v1.5)
+ * ROOT OPERATOR — AGENT AVATAR (v1.6 — cursor-as-home)
  *
- * The agent's body in the user's desktop. Lives parked near the Dock
- * (anchor side detected from the workArea / bounds delta). On an
- * intentional moveTo() the body travels to a target point and stays
- * there — no spring-follow, no auto-tracking. On park() it travels
- * back to the anchor.
+ * The agent's body in the user's desktop. Lives ATTACHED to the user's
+ * cursor (small dot, spring-follow with a soft lag) — the cursor is
+ * home, not the Dock. On an intentional moveTo() it detaches, travels,
+ * scales up, and dwells at the target. On park()/return() it travels
+ * back to the cursor and resumes the spring-follow ambient.
  *
  * Motion is INTENTIONAL: the LLM calls it via the agent_* MCP tools.
- * Nothing in this module is wired to cursor-companion turns anymore.
+ * Nothing in this module is wired to cursor-companion turns automatically.
  *
  * State machine:
- *   idle_parked          — at anchor, no motion, tick stopped
- *   traveling            — eased interpolation from current to target
- *   active               — at target, breath only, no follow
+ *   ambient        — spring-follow the user's cursor (small dot)
+ *   traveling      — eased interpolation from current to target
+ *   active         — at target, breath only, no follow (bigger dot)
  *
  * Implementation pattern follows `cursor-companion.js`: a transparent
  * NSPanel `BrowserWindow` with always-on-top floating level, visible
@@ -22,12 +22,10 @@
  */
 const path = require('path');
 
-const WIN_WIDTH = 32;
-const WIN_HEIGHT = 32;
-
-// Margin from the screen edge when parking. Keeps the dot off the
-// bezel without crowding the Dock corner.
-const ANCHOR_EDGE_MARGIN = 16;
+// Window is bigger than the dot it contains — extra padding so the
+// active-state dot + glow ring + halo arc fit without clipping.
+const WIN_WIDTH = 40;
+const WIN_HEIGHT = 40;
 
 // Cmd+H / app-hide restoration delays. macOS hides every window owned
 // by the process, including transparent NSPanels, when the user issues
@@ -44,12 +42,18 @@ const TICK_INTERVAL_MS = Math.round(1000 / TICK_HZ);
 // than teleporting. Tunable via deps.travelDurationMs for tests.
 const DEFAULT_TRAVEL_DURATION_MS = 800;
 
-// Default offset from a cursor target — used when the LLM asks
+// Default offset from a cursor target — used both as the ambient
+// resting offset (spring-follow target) and when the LLM asks
 // agent_move_to_cursor without explicit offsets. 30px right of the
 // cursor, vertically aligned. Close enough to read as "next to you,"
 // not so close it overlaps with cursor-companion's own dot.
 const DEFAULT_CURSOR_OFFSET_X = 30;
 const DEFAULT_CURSOR_OFFSET_Y = 0;
+
+// Spring constant for ambient cursor-follow. 0.18 gives a soft trailing
+// lag that reads as alive without feeling heavy. Higher = snappier,
+// lower = sleepier.
+const AMBIENT_SPRING_K = 0.18;
 
 // Breath oscillation while active. ±1.5px sinusoidal y-offset over a
 // 2.4s period gives a subtle hover that reads as alive without ever
@@ -58,7 +62,7 @@ const BREATH_PERIOD_MS = 2400;
 const BREATH_AMPLITUDE_PX = 1.5;
 
 const STATE = Object.freeze({
-    IDLE_PARKED: 'idle_parked',
+    AMBIENT: 'ambient',
     TRAVELING: 'traveling',
     ACTIVE: 'active',
 });
@@ -80,15 +84,20 @@ function init(deps) {
         ? deps.travelDurationMs
         : DEFAULT_TRAVEL_DURATION_MS;
 
+    const springK = Number.isFinite(deps.ambientSpringK)
+        ? deps.ambientSpringK
+        : AMBIENT_SPRING_K;
+
     let win = null;
     let displayHandlers = null;
     let appHideHandler = null;
     let restoreTimers = [];
 
-    let state = STATE.IDLE_PARKED;
+    let state = STATE.AMBIENT;
     let position = { x: 0, y: 0 };
     let travel = null; // { from, to, startedAt, settleState }
     let tickTimer = null;
+    let lastBroadcastState = null;
     const tickT0 = clock.now();
 
     function logDebug(message) {
@@ -101,54 +110,17 @@ function init(deps) {
         return w && !w.isDestroyed();
     }
 
-    // Detect which edge the Dock occupies. macOS exposes this via the
-    // delta between display.bounds (the full pixel area) and
-    // display.workArea (excludes menu bar + Dock). When the Dock is
-    // hidden or absent we fall back to bottom — the most common config.
-    function detectDockSide(display) {
-        const { bounds, workArea } = display;
-        if (workArea.x > bounds.x) return 'left';
-        if ((workArea.x + workArea.width) < (bounds.x + bounds.width)) return 'right';
-        if ((workArea.y + workArea.height) < (bounds.y + bounds.height)) return 'bottom';
-        return 'bottom';
-    }
-
-    // Compute the parked position. Sits just outside the Dock corner
-    // closest to the start of the icon strip, with a margin off the
-    // screen edge so the dot doesn't visually fuse into the Dock.
-    function computeParkedPosition() {
-        const display = deps.screen.getPrimaryDisplay();
-        const { workArea } = display;
-        const side = detectDockSide(display);
-
-        if (side === 'bottom') {
-            // Park at the workArea bottom-left, which sits just above
-            // the Dock corner where the first icon (Finder) begins.
-            return {
-                x: workArea.x + ANCHOR_EDGE_MARGIN,
-                y: workArea.y + workArea.height - WIN_HEIGHT - ANCHOR_EDGE_MARGIN,
-            };
-        }
-        if (side === 'left') {
-            // Dock on the left — park at the top-left of the workArea
-            // (above where the first Dock icon would sit).
-            return {
-                x: workArea.x + ANCHOR_EDGE_MARGIN,
-                y: workArea.y + ANCHOR_EDGE_MARGIN,
-            };
-        }
-        if (side === 'right') {
-            // Mirror of the left case.
-            return {
-                x: workArea.x + workArea.width - WIN_WIDTH - ANCHOR_EDGE_MARGIN,
-                y: workArea.y + ANCHOR_EDGE_MARGIN,
-            };
-        }
-        // Fallback: top-left of workArea.
-        return {
-            x: workArea.x + ANCHOR_EDGE_MARGIN,
-            y: workArea.y + ANCHOR_EDGE_MARGIN,
-        };
+    // The window holds a 40x40 transparent canvas with the dot drawn
+    // centered. To position the dot at logical (px, py) we set the
+    // window's top-left so that the center lands on (px, py).
+    function applyBoundsCentered(px, py) {
+        if (!isUsable(win)) return;
+        win.setBounds({
+            x: Math.round(px - WIN_WIDTH / 2),
+            y: Math.round(py - WIN_HEIGHT / 2),
+            width: WIN_WIDTH,
+            height: WIN_HEIGHT,
+        });
     }
 
     function computeCursorTarget(offsetX, offsetY) {
@@ -158,21 +130,13 @@ function init(deps) {
         return { x: cursor.x + ox, y: cursor.y + oy };
     }
 
-    function applyBoundsAt(x, y) {
+    function broadcastState() {
         if (!isUsable(win)) return;
-        win.setBounds({
-            x: Math.round(x),
-            y: Math.round(y),
-            width: WIN_WIDTH,
-            height: WIN_HEIGHT,
-        });
-    }
-
-    function applyParkedPosition() {
-        const { x, y } = computeParkedPosition();
-        position.x = x;
-        position.y = y;
-        applyBoundsAt(x, y);
+        if (state === lastBroadcastState) return;
+        try {
+            win.webContents.send('AGENT_AVATAR_STATE', { state });
+            lastBroadcastState = state;
+        } catch (_) { /* renderer not ready yet; will retry on next change */ }
     }
 
     function startTick() {
@@ -191,11 +155,18 @@ function init(deps) {
     function tick() {
         const now = clock.now();
 
+        if (state === STATE.AMBIENT) {
+            const target = computeCursorTarget();
+            position.x += (target.x - position.x) * springK;
+            position.y += (target.y - position.y) * springK;
+            applyBoundsCentered(position.x, position.y);
+            return;
+        }
+
         if (state === STATE.TRAVELING) {
             if (!travel) {
-                state = STATE.IDLE_PARKED;
-                stopTick();
-                applyParkedPosition();
+                state = STATE.AMBIENT;
+                broadcastState();
                 return;
             }
             const elapsed = now - travel.startedAt;
@@ -207,37 +178,28 @@ function init(deps) {
             if (progress >= 1) {
                 const settleState = travel.settleState;
                 travel = null;
-                if (settleState === STATE.IDLE_PARKED) {
-                    state = STATE.IDLE_PARKED;
-                    applyBoundsAt(position.x, position.y);
-                    stopTick();
+                state = settleState;
+                broadcastState();
+                if (state === STATE.AMBIENT) {
+                    // Tick stays running — ambient needs the loop to
+                    // spring-follow.
                     return;
                 }
-                state = STATE.ACTIVE;
             }
-        } else if (state === STATE.ACTIVE) {
-            // Stay put. Only breath modulates the rendered y. The base
-            // position never moves until another moveTo / park call.
-        } else {
-            // IDLE_PARKED — tick should not be running, but be defensive.
-            stopTick();
+            applyBoundsCentered(position.x, position.y);
             return;
         }
 
-        let renderY = position.y;
         if (state === STATE.ACTIVE) {
             const phase = ((now - tickT0) / BREATH_PERIOD_MS) * 2 * Math.PI;
-            renderY += Math.sin(phase) * BREATH_AMPLITUDE_PX;
+            const renderY = position.y + Math.sin(phase) * BREATH_AMPLITUDE_PX;
+            applyBoundsCentered(position.x, renderY);
         }
-
-        applyBoundsAt(position.x, renderY);
     }
 
     // If we're mid-travel when a new motion is requested, sample the
     // current eased position first so the new travel starts from where
     // the dot ACTUALLY is, not from the last persisted base position.
-    // Without this, a re-target before the next 60Hz tick would jump
-    // backward and re-traverse the missed delta.
     function sampleCurrentPosition() {
         if (state === STATE.TRAVELING && travel) {
             const elapsed = clock.now() - travel.startedAt;
@@ -257,6 +219,7 @@ function init(deps) {
             settleState,
         };
         state = STATE.TRAVELING;
+        broadcastState();
         startTick();
     }
 
@@ -278,19 +241,18 @@ function init(deps) {
         return { to: target };
     }
 
-    // Travel back to the parked anchor.
+    // Travel back to the user's cursor and resume ambient follow.
     function park() {
-        const target = computeParkedPosition();
-        if (state === STATE.IDLE_PARKED) {
-            // Already parked — snap to the current anchor in case the
-            // display geometry changed and refresh.
+        const target = computeCursorTarget();
+        if (state === STATE.AMBIENT) {
+            // Already following — refresh once for safety.
             position.x = target.x;
             position.y = target.y;
-            applyBoundsAt(target.x, target.y);
+            applyBoundsCentered(target.x, target.y);
             return { to: target };
         }
-        startTravelTo(target, STATE.IDLE_PARKED);
-        logDebug('[AGENT-AVATAR] park');
+        startTravelTo(target, STATE.AMBIENT);
+        logDebug('[AGENT-AVATAR] park (return to cursor)');
         return { to: target };
     }
 
@@ -301,16 +263,18 @@ function init(deps) {
 
     function createWindow() {
         const { BrowserWindow, app, loadRendererWindow } = deps;
-        const { x, y } = computeParkedPosition();
+        const cursor = deps.screen.getCursorScreenPoint();
+        const startX = cursor.x + DEFAULT_CURSOR_OFFSET_X;
+        const startY = cursor.y + DEFAULT_CURSOR_OFFSET_Y;
 
-        position.x = x;
-        position.y = y;
+        position.x = startX;
+        position.y = startY;
 
         const w = new BrowserWindow({
             width: WIN_WIDTH,
             height: WIN_HEIGHT,
-            x,
-            y,
+            x: Math.round(startX - WIN_WIDTH / 2),
+            y: Math.round(startY - WIN_HEIGHT / 2),
             show: false,
             frame: false,
             transparent: true,
@@ -348,6 +312,7 @@ function init(deps) {
         w.once('ready-to-show', () => {
             if (isUsable(w)) {
                 w.showInactive();
+                broadcastState();
             }
         });
 
@@ -402,11 +367,13 @@ function init(deps) {
         appHideHandler = null;
     }
 
+    // Display changes don't need any explicit handler in cursor-as-home
+    // mode: the spring-follow tick already re-targets to the live cursor
+    // every frame, so the dot tracks across resolution changes naturally.
     function attachDisplayListeners() {
         const handler = () => {
-            if (state === STATE.IDLE_PARKED) {
-                applyParkedPosition();
-            }
+            // No-op for ambient. For active/traveling we leave position
+            // intact — the cursor wasn't necessarily where we're acting.
         };
         deps.screen.on('display-metrics-changed', handler);
         deps.screen.on('display-added', handler);
@@ -430,7 +397,9 @@ function init(deps) {
         win = createWindow();
         attachDisplayListeners();
         attachAppHideHandler();
-        logDebug('[AGENT-AVATAR] started');
+        // Ambient needs the tick running to spring-follow the cursor.
+        startTick();
+        logDebug('[AGENT-AVATAR] started (ambient at cursor)');
     }
 
     function stop() {
@@ -438,7 +407,7 @@ function init(deps) {
         detachDisplayListeners();
         clearRestoreTimers();
         stopTick();
-        state = STATE.IDLE_PARKED;
+        state = STATE.AMBIENT;
         travel = null;
         if (isUsable(win)) {
             try {
@@ -446,7 +415,8 @@ function init(deps) {
             } catch (_) { /* ignore */ }
         }
         win = null;
-        logDebug('[AGENT-AVATAR] stopped');
+        lastBroadcastState = null;
+    logDebug('[AGENT-AVATAR] stopped');
     }
 
     return {
@@ -457,7 +427,6 @@ function init(deps) {
         park,
         getWindow: () => (isUsable(win) ? win : null),
         // Test seams.
-        repositionForTest: applyParkedPosition,
         triggerAppHideForTest: () => {
             if (typeof appHideHandler === 'function') appHideHandler();
         },
@@ -472,10 +441,10 @@ module.exports = {
     __test: {
         WIN_WIDTH,
         WIN_HEIGHT,
-        ANCHOR_EDGE_MARGIN,
         DEFAULT_TRAVEL_DURATION_MS,
         DEFAULT_CURSOR_OFFSET_X,
         DEFAULT_CURSOR_OFFSET_Y,
+        AMBIENT_SPRING_K,
         BREATH_PERIOD_MS,
         BREATH_AMPLITUDE_PX,
         STATE,

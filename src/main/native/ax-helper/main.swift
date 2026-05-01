@@ -234,7 +234,9 @@ func writeToElement(
             text as CFTypeRef
         )
         if status == .success {
-            emit(["ok": true, "mode": "selection", "role": role])
+            var ok: [String: Any] = ["ok": true, "mode": "selection", "role": role]
+            if let frame = frameOf(element) { ok["frame"] = frame }
+            emit(ok)
             exit(0)
         }
         // Hard refusal: do NOT silently fall back to whole-value replace.
@@ -263,7 +265,9 @@ func writeToElement(
         text as CFTypeRef
     )
     if status == .success {
-        emit(["ok": true, "mode": "value", "role": role])
+        var ok: [String: Any] = ["ok": true, "mode": "value", "role": role]
+        if let frame = frameOf(element) { ok["frame"] = frame }
+        emit(ok)
         exit(0)
     }
     emit([

@@ -75,7 +75,10 @@ const VALID_RECEIVE_CHANNELS = [
     'CURSOR_WHEEL',
     'CURSOR_ERROR',
     'CURSOR_ENABLED_CHANGED',
-    'CURSOR_COMPANION_ENABLED_CHANGED'
+    'CURSOR_COMPANION_ENABLED_CHANGED',
+    'AGENT_AVATAR_STATE',
+    'AGENT_HALO_SHOW',
+    'AGENT_HALO_HIDE'
 ];
 
 // Expose protected methods that only allow specific channels

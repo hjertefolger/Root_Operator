@@ -10,7 +10,7 @@
       // never paints opaque in these windows.
       (function () {
         var view = new URLSearchParams(location.search).get('view');
-        if (view === 'cursor-companion' || view === 'agent-avatar') {
+        if (view === 'cursor-companion' || view === 'agent-avatar' || view === 'agent-halo') {
           document.documentElement.classList.add('dark', 'transparent-overlay-view');
         }
       })();

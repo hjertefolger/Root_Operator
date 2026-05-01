@@ -142,6 +142,24 @@ function init(deps) {
 
     let lastWriteAt = 0;
 
+    // Pulse the halo around the AX element identified by the helper's
+    // structured frame, if the halo overlay is wired and the frame is
+    // valid. Best-effort — never throw, never block the action result.
+    function maybeHalo(result) {
+        if (!result || !result.frame) return;
+        if (typeof deps.getAgentHalo !== 'function') return;
+        const halo = deps.getAgentHalo();
+        if (!halo || typeof halo.show !== 'function') return;
+        try {
+            halo.show({
+                x: result.frame.x,
+                y: result.frame.y,
+                w: result.frame.w,
+                h: result.frame.h,
+            });
+        } catch (_) { /* swallow halo errors — purely decorative */ }
+    }
+
     async function handle(req) {
         const tool = req.tool;
         const args = req.args || {};
@@ -203,11 +221,13 @@ function init(deps) {
                 case 'agent_read_at_cursor': {
                     const cursor = deps.screen.getCursorScreenPoint();
                     const r = await runHelper(deps, ['read-at', String(cursor.x), String(cursor.y)]);
+                    if (!r.error || r.error === 'no_text') maybeHalo(r);
                     return { result: formatRead(r), isError: !!r.error && r.error !== 'no_text' };
                 }
 
                 case 'agent_read_focused': {
                     const r = await runHelper(deps, ['read-focused']);
+                    if (!r.error || r.error === 'no_text') maybeHalo(r);
                     return { result: formatRead(r), isError: !!r.error && r.error !== 'no_text' };
                 }
 
@@ -243,6 +263,7 @@ function init(deps) {
                         ? ['write-at', String(cursor.x), String(cursor.y), '--replace-all', text]
                         : ['write-at', String(cursor.x), String(cursor.y), text];
                     const r = await runHelper(deps, helperArgs);
+                    if (r.ok) maybeHalo(r);
                     return { result: formatWrite(r), isError: !r.ok };
                 }
 

@@ -7,6 +7,7 @@ import ViewerWindow from './components/ViewerWindow';
 import CursorCompanionView from './components/CursorCompanionView';
 import CursorAnnotationView from './components/CursorAnnotationView';
 import AgentAvatarView from './components/AgentAvatarView';
+import AgentHaloView from './components/AgentHaloView';
 
 const RENDERER_VIEW = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('view')
@@ -16,8 +17,9 @@ const IS_VIEWER_WINDOW = RENDERER_VIEW === 'viewer';
 const IS_CURSOR_COMPANION_VIEW = RENDERER_VIEW === 'cursor-companion';
 const IS_CURSOR_ANNOTATION_VIEW = RENDERER_VIEW === 'cursor-annotation';
 const IS_AGENT_AVATAR_VIEW = RENDERER_VIEW === 'agent-avatar';
+const IS_AGENT_HALO_VIEW = RENDERER_VIEW === 'agent-halo';
 const IS_AUXILIARY_VIEW =
-  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW;
+  IS_LOCAL_CHAT_VIEW || IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW || IS_AGENT_HALO_VIEW;
 
 function App() {
   const { invoke, on } = useElectron();
@@ -82,7 +84,7 @@ function App() {
 
   // Load initial settings and sync tunnel state
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW || IS_AGENT_HALO_VIEW) {
       return undefined;
     }
 
@@ -120,7 +122,7 @@ function App() {
 
   // Listen for tunnel events
   useEffect(() => {
-    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW) {
+    if (IS_VIEWER_WINDOW || IS_CURSOR_COMPANION_VIEW || IS_CURSOR_ANNOTATION_VIEW || IS_AGENT_AVATAR_VIEW || IS_AGENT_HALO_VIEW) {
       return undefined;
     }
 
@@ -211,6 +213,8 @@ function App() {
         <CursorAnnotationView />
       ) : IS_AGENT_AVATAR_VIEW ? (
         <AgentAvatarView />
+      ) : IS_AGENT_HALO_VIEW ? (
+        <AgentHaloView />
       ) : IS_VIEWER_WINDOW ? (
         <ViewerWindow />
       ) : IS_LOCAL_CHAT_VIEW ? (
