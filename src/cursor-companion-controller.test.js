@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 const { init } = require('./main/cursor-companion-controller');
 
-function createSubject({ initialStore = {}, exitMs = 0 } = {}) {
+function createSubject({ initialStore = {}, exitMs = 0, withAgentAvatar = false } = {}) {
     const store = {
         data: { ...initialStore },
         get(key, fallback) {
@@ -13,7 +13,7 @@ function createSubject({ initialStore = {}, exitMs = 0 } = {}) {
             this.data[key] = value;
         },
     };
-    const calls = { start: 0, stop: 0, notify: [] };
+    const calls = { start: 0, stop: 0, notify: [], avatarStart: 0, avatarStop: 0 };
     const broadcastCalls = [];
 
     const cursorCompanion = {
@@ -21,10 +21,23 @@ function createSubject({ initialStore = {}, exitMs = 0 } = {}) {
         stop: () => { calls.stop += 1; },
         notifyEnabledChanged: (enabled) => { calls.notify.push(enabled); },
     };
+    let avatarWindow = null;
+    const agentAvatar = withAgentAvatar ? {
+        start: () => {
+            calls.avatarStart += 1;
+            avatarWindow = {};
+        },
+        stop: () => {
+            calls.avatarStop += 1;
+            avatarWindow = null;
+        },
+        getWindow: () => avatarWindow,
+    } : null;
 
     const controller = init({
         getStore: () => store,
         cursorCompanion,
+        getAgentAvatar: () => agentAvatar,
         logDebug: () => {},
         broadcastEnabled: (enabled) => broadcastCalls.push(enabled),
     });
@@ -88,6 +101,20 @@ test('setEnabled(false) plays exit animation then stops the companion', async ()
     assert.equal(calls.stop, 1);
     assert.equal(store.get('cursorCompanionEnabled'), false);
     assert.deepEqual(broadcastCalls, [false]);
+});
+
+test('presence avatar follows the cursor companion enabled state', async () => {
+    const { controller, calls } = createSubject({ withAgentAvatar: true });
+    controller.bootstrap();
+
+    controller.setEnabled(true, 'test');
+    assert.equal(calls.avatarStart, 1);
+
+    controller.setEnabled(false, 'test');
+    assert.equal(calls.avatarStop, 1);
+
+    await flushTimers(controller.EXIT_ANIMATION_MS + 30);
+    assert.equal(calls.stop, 1);
 });
 
 test('toggle flips state and broadcasts', () => {

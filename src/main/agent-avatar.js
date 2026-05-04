@@ -230,12 +230,11 @@ function init(deps) {
     let lastBroadcastState = null;
     const tickT0 = clock.now();
 
-    // True while ambient is suppressed because cursor-companion is
-    // showing its loader. We hide the avatar window so the two-dot
-    // loader and the ambient dot don't visually compete in the same
-    // slot. On the next motion call (moveTo/moveToCursor) we treat
-    // this as "starting from the cursor anchor" so the dot reads as
-    // appearing-and-leaving rather than teleporting.
+    // True while ambient is suppressed because cursor-companion owns the
+    // cursor slot (its legacy dot or loader is visible). On the next
+    // motion call (moveTo/moveToCursor) we treat this as "starting from
+    // the cursor anchor" so the dot reads as appearing-and-leaving
+    // rather than teleporting.
     let hiddenForLoader = false;
 
     function isLoaderActive() {
@@ -245,6 +244,19 @@ function init(deps) {
         } catch (_) {
             return false;
         }
+    }
+
+    function isAmbientSuppressed() {
+        if (typeof deps.isAmbientSuppressed !== 'function') return false;
+        try {
+            return Boolean(deps.isAmbientSuppressed());
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function shouldHideAmbient() {
+        return state === STATE.AMBIENT && (isLoaderActive() || isAmbientSuppressed());
     }
 
     function logDebug(message) {
@@ -426,13 +438,11 @@ function init(deps) {
         const now = clock.now();
 
         if (state === STATE.AMBIENT) {
-            // While ambient and the loader is showing, hide the dot so
-            // it doesn't co-occupy the cursor slot with the two-dot
-            // loader. Snap position to the live cursor target so a
-            // following moveTo can travel from the natural anchor.
+            // While cursor-companion owns the cursor slot, hide this
+            // ambient avatar. Snap position to the live cursor target
+            // so a following moveTo can travel from the natural anchor.
             const target = computeCursorTarget();
-            const loader = isLoaderActive();
-            if (loader) {
+            if (shouldHideAmbient()) {
                 position.x = target.x;
                 position.y = target.y;
                 if (!hiddenForLoader) {
@@ -669,7 +679,9 @@ function init(deps) {
 
         w.once('ready-to-show', () => {
             if (isUsable(w)) {
-                w.showInactive();
+                if (!shouldHideAmbient()) {
+                    w.showInactive();
+                }
                 broadcastState();
             }
         });
@@ -686,12 +698,10 @@ function init(deps) {
 
     function restoreVisibility() {
         if (!isUsable(win)) return;
-        // Don't re-show while we're deliberately hidden behind the
-        // cursor-companion loader. App-hide → restore can otherwise
-        // race the loader-yield logic and bring the ambient dot back
-        // into the cursor slot mid-turn. The next ambient tick after
-        // the loader clears will showInactive() naturally.
-        if (hiddenForLoader || isLoaderActive()) return;
+        // Don't re-show while cursor-companion deliberately owns the
+        // cursor slot. App-hide → restore can otherwise race that
+        // suppression and bring the ambient avatar back mid-turn.
+        if (hiddenForLoader || shouldHideAmbient()) return;
         try {
             if (typeof win.isVisible === 'function' && win.isVisible()) return;
             win.showInactive();

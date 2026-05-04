@@ -28,6 +28,7 @@ function init(deps = {}) {
         // open annotation surface should also tear down so a stale
         // panel doesn't survive a master-toggle-off.
         cursorAnnotation = null,
+        getAgentAvatar = () => null,
         logDebug = () => {},
         broadcastEnabled = () => {},
     } = deps;
@@ -71,6 +72,12 @@ function init(deps = {}) {
         clearPendingExit();
         try {
             cursorCompanion.start();
+            try {
+                const agentAvatar = getAgentAvatar();
+                if (agentAvatar && typeof agentAvatar.start === 'function' && !agentAvatar.getWindow?.()) {
+                    agentAvatar.start();
+                }
+            } catch (_) { /* optional sibling */ }
             // Ask the renderer to play its entrance animation. The
             // renderer no-ops if the window isn't ready yet (the
             // companion handles its own ready-to-show flow).
@@ -90,6 +97,12 @@ function init(deps = {}) {
         if (cursorAnnotation && typeof cursorAnnotation.stop === 'function') {
             try { cursorAnnotation.stop(); } catch (_) { /* ignore */ }
         }
+        try {
+            const agentAvatar = getAgentAvatar();
+            if (agentAvatar && typeof agentAvatar.stop === 'function') {
+                agentAvatar.stop();
+            }
+        } catch (_) { /* optional sibling */ }
         // Tell the renderer to play its exit animation first, then close
         // the window after a delay long enough to cover that animation.
         try {

@@ -14,6 +14,7 @@ function createFakeWindow({ visible = true, focused = false, minimized = false }
     const focusCalls = [];
     const blurCalls = [];
     const focusableCalls = [];
+    let windowPosition = [0, 0];
     return {
         visible,
         focused,
@@ -46,7 +47,12 @@ function createFakeWindow({ visible = true, focused = false, minimized = false }
         setFocusable(next) {
             focusableCalls.push(Boolean(next));
         },
-        setPosition(...args) { positions.push(args); },
+        setPosition(...args) {
+            positions.push(args);
+            windowPosition = [args[0], args[1]];
+        },
+        getPosition() { return windowPosition.slice(); },
+        driftTo(x, y) { windowPosition = [x, y]; },
         setIgnoreMouseEvents(...args) { ignoreCalls.push(args); },
         webContents: {
             send(channel, payload) {
@@ -170,6 +176,18 @@ test('empty draft assignment clears state', () => {
     assert.equal(after.updatedAt, 0);
 });
 
+test('renderer draft updates are ignored after input has closed', () => {
+    __test.setInputOpenForTest(true);
+    __test.setDraftForTest('');
+    assert.equal(__test.setDraftPromptFromRendererForTest('half typed'), true);
+    assert.equal(__test.getDraftForTest().prompt, 'half typed');
+
+    __test.setInputOpenForTest(false);
+    __test.setDraftForTest('');
+    assert.equal(__test.setDraftPromptFromRendererForTest('already sent'), false);
+    assert.equal(__test.getDraftForTest().prompt, '');
+});
+
 test('lastReply persists with TTL', () => {
     __test.setLastReplyForTest('hello world', '2026-04-28T08:00:00Z');
     const reply = __test.getLastReplyForTest();
@@ -252,8 +270,18 @@ test('reply and attachment layers leave left-click passthrough while pointer tap
     assert.deepEqual(fakeWindow.ignoreCalls, []);
     assert.deepEqual(captureCalls.at(-1), { right: true, wheel: true });
 
-    fakeWindow.ignoreCalls.length = 0;
     __test.setRepliesForTest([]);
+    __test.setInputOpenForTest(true);
+    __test.setInputScrollableForTest(true);
+    __test.applyInteractivityForTest();
+    assert.deepEqual(captureCalls.at(-1), { right: false, wheel: true });
+
+    __test.setInputScrollableForTest(false);
+    __test.applyInteractivityForTest();
+    assert.deepEqual(captureCalls.at(-1), { right: false, wheel: false });
+
+    __test.setInputOpenForTest(false);
+    fakeWindow.ignoreCalls.length = 0;
     __test.setPendingAttachmentForTest({ name: 'pending.png', size: 1 });
     __test.applyInteractivityForTest();
     assert.equal(__test.getMousePassthroughForTest(), true, 'attachment also does not block left-click');
@@ -285,6 +313,31 @@ test('cursor poll keeps the window anchored to the cursor even with interactive 
 
     point = { x: 480, y: 540 };
     __test.updateWindowPositionForTest();
+    assert.deepEqual(fakeWindow.positions.at(-1), [
+        point.x - __test.ANCHOR_X,
+        point.y - __test.ANCHOR_Y,
+        false,
+    ]);
+
+    __test.runStopForTest();
+});
+
+test('cursor poll reanchors when the native panel drifts without cursor movement', () => {
+    const fakeWindow = createFakeWindow();
+    const point = { x: 240, y: 360 };
+    __test.setWindowForTest(fakeWindow);
+    __test.setScreenForTest({ getCursorScreenPoint: () => point });
+    __test.setInputOpenForTest(false);
+    __test.setRepliesForTest([]);
+    __test.setPendingAttachmentForTest(null);
+
+    __test.updateWindowPositionForTest();
+    assert.equal(fakeWindow.positions.length, 1);
+
+    fakeWindow.driftTo(900, 700);
+    __test.updateWindowPositionForTest();
+
+    assert.equal(fakeWindow.positions.length, 2);
     assert.deepEqual(fakeWindow.positions.at(-1), [
         point.x - __test.ANCHOR_X,
         point.y - __test.ANCHOR_Y,
@@ -333,13 +386,22 @@ test('pointer tap wheel routes only to the top reply scroller event', () => {
     __test.handlePointerTapWheelForTest({ deltaY: 48, deltaX: 0 });
     assert.deepEqual(fakeWindow.sent.at(-1), {
         channel: 'CURSOR_WHEEL',
-        payload: { deltaX: 0, deltaY: 48, source: 'pointer-tap' },
+        payload: { deltaX: 0, deltaY: 48, source: 'pointer-tap', target: 'reply' },
     });
 
     fakeWindow.sent.length = 0;
     __test.setRepliesForTest([]);
+    __test.setInputOpenForTest(true);
+    __test.setInputScrollableForTest(false);
     __test.handlePointerTapWheelForTest({ deltaY: 48, deltaX: 0 });
-    assert.equal(fakeWindow.sent.length, 0, 'wheel is ignored without replies');
+    assert.equal(fakeWindow.sent.length, 0, 'wheel is ignored when input does not overflow');
+
+    __test.setInputScrollableForTest(true);
+    __test.handlePointerTapWheelForTest({ deltaY: 48, deltaX: 0 });
+    assert.deepEqual(fakeWindow.sent.at(-1), {
+        channel: 'CURSOR_WHEEL',
+        payload: { deltaX: 0, deltaY: 48, source: 'pointer-tap', target: 'input' },
+    });
 
     __test.runStopForTest();
 });

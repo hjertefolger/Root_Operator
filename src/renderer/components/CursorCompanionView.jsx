@@ -161,6 +161,7 @@ function CursorCompanionView() {
   const [replySizes, setReplySizes] = useState({}); // { [id]: { width, height } }
   const replyScrollRefs = useRef({}); // { [id]: HTMLElement }
   const repliesRef = useRef([]);
+  const inputScrollableRef = useRef(false);
 
   useEffect(() => {
     repliesRef.current = replies;
@@ -174,6 +175,23 @@ function CursorCompanionView() {
     if (!node) return;
     node.scrollTop += deltaY;
   }, []);
+
+  const scrollPromptByDelta = useCallback((deltaY) => {
+    const node = textareaRef.current;
+    if (!node) return false;
+    const maxScroll = Math.max(0, node.scrollHeight - node.clientHeight);
+    if (maxScroll <= 1) return false;
+    const before = node.scrollTop;
+    node.scrollTop = Math.max(0, Math.min(maxScroll, before + deltaY));
+    return node.scrollTop !== before;
+  }, []);
+
+  const reportInputScrollable = useCallback((scrollable) => {
+    const next = Boolean(scrollable);
+    if (inputScrollableRef.current === next) return;
+    inputScrollableRef.current = next;
+    void invoke('CURSOR_REPORT_INPUT_SCROLLABLE', { scrollable: next }).catch(() => {});
+  }, [invoke]);
 
   // Presence for the whole companion (master toggle).
   const [presenceAnim, setPresenceAnim] = useState('enter');
@@ -280,9 +298,20 @@ function CursorCompanionView() {
       try {
         const end = live.value.length;
         live.setSelectionRange(end, end);
+        live.scrollTop = live.scrollHeight;
       } catch (_) {}
     });
   }, [inputOpen, textareaMounted]);
+
+  useLayoutEffect(() => {
+    if (!inputOpen || !textareaMounted) {
+      reportInputScrollable(false);
+      return;
+    }
+    const node = textareaRef.current;
+    const scrollable = Boolean(node && node.scrollHeight > node.clientHeight + 1);
+    reportInputScrollable(scrollable);
+  }, [inputOpen, textareaMounted, inputBox.height, inputBox.textHeight, prompt, reportInputScrollable]);
 
   // Debounced draft sync.
   useEffect(() => {
@@ -293,29 +322,41 @@ function CursorCompanionView() {
     return () => clearTimeout(t);
   }, [prompt, inputOpen, invoke]);
 
-  // Global wheel capture while replies are visible. The native window stays
-  // left-click-through; main routes only wheel deltas from the pointer tap.
+  // Global wheel capture. Main owns the native pointer tap while scrollable
+  // cursor layers are visible; replies take priority over the prompt.
   useEffect(() => {
     const offWheel = on('CURSOR_WHEEL', (payload) => {
       const deltaY = Number(payload?.deltaY || 0);
       if (!Number.isFinite(deltaY) || deltaY === 0) return;
-      scrollTopReplyByDelta(deltaY);
+      if (replies.length > 0 || payload?.target === 'reply') {
+        scrollTopReplyByDelta(deltaY);
+        return;
+      }
+      if (inputOpen) {
+        scrollPromptByDelta(deltaY);
+      }
     });
     return () => offWheel?.();
-  }, [on, scrollTopReplyByDelta]);
+  }, [on, replies.length, inputOpen, scrollTopReplyByDelta, scrollPromptByDelta]);
 
   // Fallback for any wheel event that does arrive inside the renderer, such
   // as dev builds before the native tap is ready.
   useEffect(() => {
-    if (replies.length === 0) return undefined;
+    if (replies.length === 0 && !inputOpen) return undefined;
     const handler = (e) => {
-      e.preventDefault();
       const delta = e.deltaMode === 1 ? e.deltaY * INPUT_LINE_HEIGHT : e.deltaY;
-      scrollTopReplyByDelta(delta);
+      if (replies.length > 0) {
+        e.preventDefault();
+        scrollTopReplyByDelta(delta);
+        return;
+      }
+      if (inputOpen && scrollPromptByDelta(delta)) {
+        e.preventDefault();
+      }
     };
     document.addEventListener('wheel', handler, { passive: false, capture: true });
     return () => document.removeEventListener('wheel', handler, { capture: true });
-  }, [replies, scrollTopReplyByDelta]);
+  }, [replies.length, inputOpen, scrollTopReplyByDelta, scrollPromptByDelta]);
 
   // Measure prompt for input pill width/height.
   useLayoutEffect(() => {
@@ -357,6 +398,8 @@ function CursorCompanionView() {
   const handleSubmit = useCallback(async (screenshot = 'none') => {
     const trimmed = prompt.trim();
     if (trimmed.length === 0) return;
+    setPrompt('');
+    setIsBlurred(false);
     try {
       const result = await invoke('CURSOR_SUBMIT', { prompt: trimmed, screenshot });
       if (!result?.success) {
@@ -529,10 +572,29 @@ function CursorCompanionView() {
       }}
       onKeyDown={handleKeyDown}
     >
-      {/* Legacy ambient dot — superseded by the agent-avatar overlay,
-          which now provides the cursor-anchored body in its AMBIENT mode.
-          Kept here as a no-op layer so showDot still drives layout and
-          the error-pill-at-stack-origin fallback below.  */}
+      {/* Dot layer */}
+      <LayerWrapper visible={showDot} duration={220}>
+        {(state) => (
+          <div
+            style={{
+              position: 'absolute',
+              left: STACK_LEFT,
+              top: STACK_TOP,
+              width: DOT_SIZE,
+              height: DOT_SIZE,
+              borderRadius: '50%',
+              backgroundColor: ACCENT,
+              opacity: state === 'visible' ? 1 : 0,
+              transform: state === 'visible' ? 'scale(1)' : 'scale(0.65)',
+              transition: 'opacity 200ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1)',
+              transformOrigin: 'top left',
+              animation: presenceAnim === 'enter' ? 'cursor-presence-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both'
+                : presenceAnim === 'exit' ? 'cursor-presence-exit 200ms ease both' : undefined,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+      </LayerWrapper>
 
       {/* Loader layer */}
       <LayerWrapper visible={loading} duration={220}>

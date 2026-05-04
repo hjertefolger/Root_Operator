@@ -856,6 +856,7 @@ app.whenReady().then(async () => {
         getStore: () => store,
         cursorCompanion,
         cursorAnnotation,
+        getAgentAvatar: () => agentAvatar,
         logDebug,
         broadcastEnabled: (enabled) => {
             // Notify all open renderer windows so the Settings UI can
@@ -901,8 +902,21 @@ app.whenReady().then(async () => {
                     return false;
                 }
             },
+            // Cursor-companion owns the steady cursor stack (dot, loader,
+            // input, attachments, replies). The action avatar stays
+            // hidden while ambient so the two systems don't fight over
+            // that anchor; explicit agent actions can still show it.
+            isAmbientSuppressed: () => {
+                try {
+                    return Boolean(cursorCompanionController && cursorCompanionController.isEnabled());
+                } catch (_) {
+                    return false;
+                }
+            },
         });
-        agentAvatar.start();
+        if (cursorCompanionController && cursorCompanionController.isEnabled()) {
+            agentAvatar.start();
+        }
     } catch (err) {
         logDebug(`[AGENT-AVATAR] init/start failed: ${err && err.message}`);
         agentAvatar = null;

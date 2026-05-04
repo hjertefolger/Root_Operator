@@ -121,6 +121,7 @@ let lastRightDismissAt = 0;
 let lastRightDismissSource = null;
 let inputRefocusTimer = null;
 let nativeWindowFocusable = null;
+let inputScrollable = false;
 
 // Hit-regions are still accepted from the renderer for compatibility,
 // but cursor-anchored replies are not hit-tested by pointer position:
@@ -404,7 +405,7 @@ function stopPointerGestureTap() {
 function wantedPointerGestureCapture() {
     return {
         right: replies.length > 0 || pendingAttachment !== null,
-        wheel: replies.length > 0,
+        wheel: replies.length > 0 || (inputOpen && inputScrollable),
     };
 }
 
@@ -548,7 +549,7 @@ function handleGlobalMouseDown(event) {
 
 function handlePointerTapWheel(payload = {}) {
     if (!isUsable(win)) return;
-    if (replies.length === 0) return;
+    if (replies.length === 0 && !(inputOpen && inputScrollable)) return;
     const deltaX = Number(payload.deltaX || 0);
     const deltaY = Number(payload.deltaY || 0);
     if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return;
@@ -558,6 +559,7 @@ function handlePointerTapWheel(payload = {}) {
             deltaX,
             deltaY,
             source: payload.source || 'pointer-tap',
+            target: replies.length > 0 ? 'reply' : 'input',
         });
     } catch (err) {
         depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] wheel dispatch failed: ${err.message}`);
@@ -686,6 +688,7 @@ function restoreCursorVisibility(reason) {
     try {
         if (isAppHidden() || !win.isVisible()) {
             win.showInactive();
+            updateWindowPosition({ force: true });
         }
     } catch (err) {
         depsRef && depsRef.logDebug && depsRef.logDebug(`[CURSOR] restore after ${reason || 'hide'} failed: ${err.message}`);
@@ -716,6 +719,7 @@ function stop() {
     pointerGestureCapture = { right: false, wheel: false };
     lastRightDismissAt = 0;
     lastRightDismissSource = null;
+    inputScrollable = false;
     inputOpen = false;
     replies = [];
     gestureLockUntil = 0;
@@ -780,6 +784,7 @@ function createWindow() {
     w.once('ready-to-show', () => {
         if (isUsable(w)) {
             w.showInactive();
+            updateWindowPosition({ force: true });
         }
     });
 
@@ -798,7 +803,7 @@ function createWindow() {
 
 function startCursorPoll() {
     if (cursorPollTimer) return;
-    updateWindowPosition();
+    updateWindowPosition({ force: true });
     cursorPollTimer = setInterval(updateWindowPosition, CURSOR_POLL_INTERVAL_MS);
 }
 
@@ -809,13 +814,24 @@ function stopCursorPoll() {
     }
 }
 
-function updateWindowPosition() {
+function isWindowAtPosition(targetX, targetY) {
+    if (!isUsable(win) || typeof win.getPosition !== 'function') return true;
+    try {
+        const pos = win.getPosition();
+        return Array.isArray(pos) && pos[0] === targetX && pos[1] === targetY;
+    } catch (_) {
+        return true;
+    }
+}
+
+function updateWindowPosition(options = {}) {
     if (!isUsable(win)) return;
 
+    const force = Boolean(options && options.force);
     const point = depsRef.screen.getCursorScreenPoint();
     const targetX = point.x - ANCHOR_X;
     const targetY = point.y - ANCHOR_Y;
-    if (targetX !== lastWinPos.x || targetY !== lastWinPos.y) {
+    if (force || targetX !== lastWinPos.x || targetY !== lastWinPos.y || !isWindowAtPosition(targetX, targetY)) {
         lastWinPos = { x: targetX, y: targetY };
         try {
             win.setPosition(targetX, targetY, false);
@@ -986,6 +1002,12 @@ function setDraftPrompt(next) {
     draftUpdatedAt = Date.now();
 }
 
+function setDraftPromptFromRenderer(next) {
+    if (!inputOpen) return false;
+    setDraftPrompt(next);
+    return true;
+}
+
 function clearDraftPrompt() {
     draftPrompt = '';
     draftUpdatedAt = 0;
@@ -1026,6 +1048,7 @@ function openInput() {
 function closeInput() {
     if (!inputOpen) return;
     inputOpen = false;
+    inputScrollable = false;
     clearInputRefocusTimer();
     activeAppProbe = null;
     applyInteractivity();
@@ -1183,7 +1206,10 @@ function hideOverlayForCapture() {
 
 function restoreOverlayAfterCapture() {
     return new Promise((resolve) => {
-        if (isUsable(win)) win.showInactive();
+        if (isUsable(win)) {
+            win.showInactive();
+            updateWindowPosition({ force: true });
+        }
         resolve();
     });
 }
@@ -1249,7 +1275,9 @@ async function submitFromBubble({ prompt, screenshot = 'none' }) {
     // Closing input is part of the submit gesture — replies smoothly
     // shift up into the freed slot in the renderer.
     inputOpen = false;
+    inputScrollable = false;
     applyInteractivity();
+    updateWindowPosition({ force: true });
     broadcastState({ event: 'turn_submitted', turnId });
 
     // Snapshot the queued annotation (if any). Captured at invocation
@@ -1552,8 +1580,8 @@ function registerIpcHandlers() {
         if (typeof payload.prompt !== 'string') {
             return { success: false, error: 'invalid' };
         }
-        setDraftPrompt(payload.prompt);
-        return { success: true };
+        const accepted = setDraftPromptFromRenderer(payload.prompt);
+        return { success: true, accepted };
     });
 
     ipcMain.handle('CURSOR_REPORT_HIT_REGIONS', (event, payload = {}) => {
@@ -1577,6 +1605,15 @@ function registerIpcHandlers() {
             evaluatePassthroughForCursor(point);
         } catch (_) {}
         return { success: true, count: cleaned.length };
+    });
+
+    ipcMain.handle('CURSOR_REPORT_INPUT_SCROLLABLE', (event, payload = {}) => {
+        if (!isFromCursorWindow(event)) {
+            return { success: false, error: 'unauthorized' };
+        }
+        inputScrollable = inputOpen && Boolean(payload && payload.scrollable);
+        syncPointerGestureCapture();
+        return { success: true, scrollable: inputScrollable };
     });
 
     ipcMain.handle('CURSOR_GET_STATE', (event) => {
@@ -1627,6 +1664,7 @@ module.exports = {
             draftPrompt = prompt || '';
             draftUpdatedAt = updatedAt || (prompt ? Date.now() : 0);
         },
+        setDraftPromptFromRendererForTest: setDraftPromptFromRenderer,
         getFreshDraftForTest: getFreshDraft,
         getLastReplyForTest: () => lastReply,
         setLastReplyForTest: (content, ts, updatedAt) => {
@@ -1655,6 +1693,7 @@ module.exports = {
         setHitRegionsForTest: (next) => { hitRegions = Array.isArray(next) ? next.slice() : []; },
         getMousePassthroughForTest: () => mousePassthrough,
         setMousePassthroughForTest: (next) => { mousePassthrough = Boolean(next); },
+        setInputScrollableForTest: (next) => { inputScrollable = Boolean(next); },
         setNativeWindowFocusableForTest: (next) => { nativeWindowFocusable = next; },
         releaseKeyboardFocusForTest: releaseKeyboardFocus,
         setPointerGestureTapForTest: (tap) => { pointerGestureTap = tap || null; },

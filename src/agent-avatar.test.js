@@ -63,6 +63,7 @@ function createDeps({
     travelDurationMs,
     ambientSpringK,
     loadingRef = null,
+    ambientSuppressedRef = null,
 } = {}) {
     const fake = createFakeBrowserWindow();
     const screenListeners = new Map();
@@ -117,6 +118,7 @@ function createDeps({
             ...(travelDurationMs ? { travelDurationMs } : {}),
             ...(ambientSpringK !== undefined ? { ambientSpringK } : {}),
             ...(loadingRef ? { isCursorCompanionLoading: () => loadingRef.value } : {}),
+            ...(ambientSuppressedRef ? { isAmbientSuppressed: () => ambientSuppressedRef.value } : {}),
         },
         fake, screen, app, calls, cursorRef, displayRef,
         advanceClock: (ms) => { clockRef.now += ms; },
@@ -514,6 +516,28 @@ test('ambient hides while cursor-companion loader is active', () => {
     advanceClock(20);
     avatar.tickForTest();
     assert.ok(fake.calls.showInactive > showsBefore, 'showInactive should be called once loader clears');
+});
+
+test('ambient stays hidden while cursor-companion owns the cursor stack', () => {
+    const ambientSuppressedRef = { value: true };
+    const { deps, fake, advanceClock } = createDeps({
+        cursor: { x: 500, y: 400 },
+        ambientSuppressedRef,
+    });
+    const avatar = init(deps);
+    avatar.start();
+    fake.emit('ready-to-show');
+    assert.equal(fake.calls.showInactive, 0, 'ready-to-show should not reveal suppressed ambient');
+
+    advanceClock(20);
+    avatar.tickForTest();
+    assert.equal(fake.calls.hide, 1);
+    assert.equal(avatar.getStateForTest(), __test.STATE.AMBIENT);
+
+    const showsBefore = fake.calls.showInactive;
+    avatar.moveTo(800, 600);
+    assert.equal(avatar.getStateForTest(), __test.STATE.TRAVELING);
+    assert.ok(fake.calls.showInactive > showsBefore, 'intentional motion reveals the action avatar');
 });
 
 test('moveTo while hiddenForLoader starts travel from cursor anchor (not stale position)', () => {
