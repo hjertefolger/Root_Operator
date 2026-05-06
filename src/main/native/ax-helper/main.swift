@@ -41,13 +41,21 @@ func emitInternalError(_ message: String) -> Never {
 
 // MARK: — AX helpers
 
+let AX_MESSAGE_TIMEOUT_SECONDS: Float = 0.25
+
+func prepareAXElement(_ element: AXUIElement) {
+    _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGE_TIMEOUT_SECONDS)
+}
+
 func axCopyAttribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+    prepareAXElement(element)
     var value: CFTypeRef?
     let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
     return status == .success ? value : nil
 }
 
 func axCopyAttributeWithStatus(_ element: AXUIElement, _ key: String) -> (status: AXError, value: CFTypeRef?) {
+    prepareAXElement(element)
     var value: CFTypeRef?
     let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
     return (status, status == .success ? value : nil)
@@ -108,6 +116,7 @@ func frameOf(_ element: AXUIElement) -> [String: Any]? {
 
 func resolveElementAtPoint(_ x: Float, _ y: Float) -> AXUIElement? {
     let system = AXUIElementCreateSystemWide()
+    prepareAXElement(system)
     var element: AXUIElement?
     let status = AXUIElementCopyElementAtPosition(system, x, y, &element)
     return status == .success ? element : nil
@@ -579,6 +588,7 @@ func resolveContainingWindow(_ element: AXUIElement) -> AXUIElement? {
 }
 
 func actionNames(_ element: AXUIElement) -> Set<String> {
+    prepareAXElement(element)
     var raw: CFArray?
     guard AXUIElementCopyActionNames(element, &raw) == .success,
           let names = raw as? [String] else { return [] }
@@ -586,6 +596,7 @@ func actionNames(_ element: AXUIElement) -> Set<String> {
 }
 
 func attributeNames(_ element: AXUIElement) -> [String] {
+    prepareAXElement(element)
     var raw: CFArray?
     guard AXUIElementCopyAttributeNames(element, &raw) == .success,
           let names = raw as? [String] else { return [] }
@@ -918,6 +929,7 @@ func resolveFocusedWindow() -> AXUIElement? {
 func axCopyChildren(_ element: AXUIElement) -> [AXUIElement] {
     // Inspired by mediar-ai/MacosUseSDK's bounded/ranged child retrieval
     // pattern (MIT). Full AXChildren reads can block on large containers.
+    prepareAXElement(element)
     var childCount: CFIndex = 0
     let countStatus = AXUIElementGetAttributeValueCount(
         element,
@@ -1156,6 +1168,285 @@ func cmdReadWindow() -> Never {
     exit(0)
 }
 
+// MARK: — App discovery
+
+let DISCOVER_MAX_NODES = 1400
+let DISCOVER_MAX_CONTROLS = 80
+let DISCOVER_MAX_TEXT_INPUTS = 40
+let DISCOVER_MAX_MENU_BUTTONS = 30
+let DISCOVER_MAX_MENUS = 12
+let DISCOVER_MAX_MENU_ITEMS = 40
+
+let DISCOVER_CONTROL_ROLES: Set<String> = [
+    "AXButton",
+    "AXLink",
+    "AXMenuButton",
+    "AXMenuItem",
+    "AXMenuBarItem",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXDisclosureTriangle",
+    "AXIncrementor",
+    "AXSlider",
+    "AXTabGroup",
+]
+
+let DISCOVER_TEXT_ROLES: Set<String> = [
+    "AXTextArea",
+    "AXTextField",
+    "AXSearchField",
+    "AXComboBox",
+]
+
+let DISCOVER_SKIP_DESCENDANTS_ROLES: Set<String> = [
+    // These containers can expose hundreds or thousands of user records.
+    // Discovery is an affordance map, not content scraping; capture the
+    // container role/count and skip its rows/cells.
+    "AXTable",
+    "AXOutline",
+    "AXBrowser",
+    "AXRow",
+    "AXCell",
+]
+
+func discoverElementPayload(_ element: AXUIElement, includeActions: Bool = true) -> [String: Any] {
+    var payload = nodeSummary(element)
+    if includeActions {
+        let actions = Array(actionNames(element)).sorted()
+        if !actions.isEmpty { payload["actions"] = actions }
+        let settable = settableAttributeNames(element)
+        if !settable.isEmpty { payload["settable_attributes"] = settable }
+    }
+    return payload
+}
+
+func appendDiscoveredElement(_ element: AXUIElement, to out: inout [[String: Any]], limit: Int) {
+    if out.count >= limit { return }
+    let role = roleString(element)
+    let label = displayLabel(element) ?? ""
+    let frame = frameOf(element)
+    let duplicate = out.contains { existing in
+        guard (existing["role"] as? String) == role else { return false }
+        if (existing["label"] as? String ?? "") != label { return false }
+        guard let a = existing["frame"] as? [String: Any], let b = frame else {
+            return frame == nil
+        }
+        return framesApproximatelyEqual(a, b)
+    }
+    if duplicate { return }
+    out.append(discoverElementPayload(element))
+}
+
+func discoverWindowAffordances(
+    in element: AXUIElement,
+    depth: Int,
+    counter: NodeCounter,
+    roleCounts: inout [String: Int],
+    controls: inout [[String: Any]],
+    textInputs: inout [[String: Any]],
+    menuButtons: inout [[String: Any]]
+) {
+    counter.count += 1
+    if depth > TREE_MAX_DEPTH || counter.count > DISCOVER_MAX_NODES { return }
+
+    let role = roleString(element)
+    roleCounts[role] = (roleCounts[role] ?? 0) + 1
+
+    if DISCOVER_TEXT_ROLES.contains(role) {
+        appendDiscoveredElement(element, to: &textInputs, limit: DISCOVER_MAX_TEXT_INPUTS)
+    }
+    if role == "AXMenuButton" || role == "AXPopUpButton" {
+        appendDiscoveredElement(element, to: &menuButtons, limit: DISCOVER_MAX_MENU_BUTTONS)
+    }
+    if DISCOVER_CONTROL_ROLES.contains(role) {
+        appendDiscoveredElement(element, to: &controls, limit: DISCOVER_MAX_CONTROLS)
+    }
+
+    if DISCOVER_SKIP_DESCENDANTS_ROLES.contains(role) {
+        return
+    }
+
+    for child in axCopyChildrenForWalk(element) {
+        if counter.count > DISCOVER_MAX_NODES { break }
+        discoverWindowAffordances(
+            in: child,
+            depth: depth + 1,
+            counter: counter,
+            roleCounts: &roleCounts,
+            controls: &controls,
+            textInputs: &textInputs,
+            menuButtons: &menuButtons
+        )
+    }
+}
+
+func discoverMenuInventory(appElem: AXUIElement) -> [[String: Any]] {
+    guard let menuBar = axCopyElement(appElem, kAXMenuBarAttribute as String) else { return [] }
+
+    func childrenOf(_ element: AXUIElement) -> [AXUIElement] {
+        var raw: CFTypeRef?
+        let s = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw)
+        if s != .success { return [] }
+        return (raw as? [AXUIElement]) ?? []
+    }
+
+    func childrenAfterOpen(_ element: AXUIElement) -> [AXUIElement] {
+        for delayMs in [0, 30, 70, 130] {
+            if delayMs > 0 { Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0) }
+            let kids = childrenOf(element)
+            if !kids.isEmpty { return kids }
+        }
+        return []
+    }
+
+    func unwrapAXMenu(_ kids: [AXUIElement]) -> [AXUIElement] {
+        if kids.count == 1, roleString(kids[0]) == "AXMenu" {
+            return childrenOf(kids[0])
+        }
+        return kids
+    }
+
+    func openMenuNode(_ element: AXUIElement) -> Bool {
+        let actions = actionNames(element)
+        if actions.contains(kAXShowMenuAction as String),
+           AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success {
+            return true
+        }
+        return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+    }
+
+    let topLevel = unwrapAXMenu(childrenOf(menuBar)).prefix(DISCOVER_MAX_MENUS)
+    var menus: [[String: Any]] = []
+    for menu in topLevel {
+        let title = axCopyString(menu, kAXTitleAttribute as String) ?? ""
+        if title.isEmpty { continue }
+        _ = openMenuNode(menu)
+        let children = unwrapAXMenu(childrenAfterOpen(menu))
+        let items: [[String: Any]] = children.prefix(DISCOVER_MAX_MENU_ITEMS).compactMap { child in
+            let childTitle = axCopyString(child, kAXTitleAttribute as String) ?? ""
+            if childTitle.isEmpty { return nil }
+            var payload: [String: Any] = [
+                "title": childTitle,
+                "role": roleString(child),
+            ]
+            let actions = Array(actionNames(child)).sorted()
+            if !actions.isEmpty { payload["actions"] = actions }
+            if let frame = frameOf(child) { payload["frame"] = frame }
+            let submenuChildren = unwrapAXMenu(childrenOf(child))
+            if !submenuChildren.isEmpty {
+                payload["has_submenu"] = true
+            }
+            return payload
+        }
+        menus.append([
+            "title": title,
+            "items": items,
+            "truncated": children.count > DISCOVER_MAX_MENU_ITEMS,
+        ])
+    }
+    return menus
+}
+
+func cmdDiscoverApp(_ args: [String]) -> Never {
+    guard AXIsProcessTrusted() else { emitError("not_trusted") }
+
+    var identifier: String? = nil
+    var includeMenus = true
+    var activate = true
+    var i = 0
+    while i < args.count {
+        if (args[i] == "--app" || args[i] == "--bundle" || args[i] == "--bundle-id"), i + 1 < args.count {
+            identifier = args[i + 1]
+            i += 2
+        } else if args[i] == "--no-menus" {
+            includeMenus = false
+            i += 1
+        } else if args[i] == "--no-activate" {
+            activate = false
+            i += 1
+        } else {
+            identifier = args[i]
+            i += 1
+        }
+    }
+
+    let pair: (app: NSRunningApplication, element: AXUIElement)?
+    if let identifier = identifier, !identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        pair = applicationElement(identifier: identifier)
+    } else if let front = NSWorkspace.shared.frontmostApplication {
+        pair = (front, AXUIElementCreateApplication(front.processIdentifier))
+    } else {
+        pair = nil
+    }
+
+    guard let found = pair else {
+        emitError("app_not_running", identifier ?? "frontmost")
+    }
+
+    let app = found.app
+    if identifier != nil && activate {
+        if #available(macOS 14.0, *) {
+            _ = app.activate(options: [.activateAllWindows])
+        } else {
+            _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        }
+        _ = waitForFrontmost(pid: app.processIdentifier, timeoutMs: 800)
+    }
+    let appElem = found.element
+    let windows = appWindows(appElem)
+    let window = windows.first
+
+    var result: [String: Any] = [
+        "app": app.localizedName ?? "",
+        "bundle_id": app.bundleIdentifier ?? "",
+        "pid": Int(app.processIdentifier),
+        "window_count": windows.count,
+        "include_menus": includeMenus,
+    ]
+
+    result["windows"] = windows.prefix(8).map { discoverElementPayload($0, includeActions: false) }
+    if let window = window {
+        result["focused_window"] = discoverElementPayload(window, includeActions: false)
+        let counter = NodeCounter()
+        var roleCounts: [String: Int] = [:]
+        var controls: [[String: Any]] = []
+        var textInputs: [[String: Any]] = []
+        var menuButtons: [[String: Any]] = []
+        discoverWindowAffordances(
+            in: window,
+            depth: 0,
+            counter: counter,
+            roleCounts: &roleCounts,
+            controls: &controls,
+            textInputs: &textInputs,
+            menuButtons: &menuButtons
+        )
+        result["node_count"] = counter.count
+        result["truncated"] = counter.count > DISCOVER_MAX_NODES
+        result["role_counts"] = roleCounts
+        result["controls"] = controls
+        result["text_inputs"] = textInputs
+        result["menu_buttons"] = menuButtons
+    } else {
+        result["node_count"] = 0
+        result["role_counts"] = [:]
+        result["controls"] = []
+        result["text_inputs"] = []
+        result["menu_buttons"] = []
+    }
+
+    if let focused = resolveFocusedElement() {
+        result["focused_element"] = discoverElementPayload(focused)
+    }
+    if includeMenus {
+        result["menus"] = discoverMenuInventory(appElem: appElem)
+    }
+
+    emit(result)
+    exit(0)
+}
+
 // MARK: — Find / press by role + label (Layer 2)
 
 // Roles AXPress is allowed to act on. Excludes text fields, areas,
@@ -1353,6 +1644,7 @@ struct ElementArgs {
     var near: CGPoint?
     var skipRoles: Set<String>
     var preferRoles: Set<String>
+    var exact: Bool
 }
 
 func parseElementArgs(_ args: [String], cmd: String, requireTarget: Bool = true) -> ElementArgs {
@@ -1362,6 +1654,7 @@ func parseElementArgs(_ args: [String], cmd: String, requireTarget: Bool = true)
     var near: CGPoint? = nil
     var skipRoles = Set<String>()
     var preferRoles = Set<String>()
+    var exact = false
     var i = 0
     while i < args.count {
         let a = args[i]
@@ -1394,6 +1687,9 @@ func parseElementArgs(_ args: [String], cmd: String, requireTarget: Bool = true)
             let r = rawRole.lowercased().hasPrefix("ax") ? rawRole : "AX" + rawRole
             preferRoles.insert(r)
             i += 2
+        } else if a == "--exact" {
+            exact = true
+            i += 1
         } else {
             label = label.isEmpty ? a : label + " " + a
             i += 1
@@ -1408,7 +1704,8 @@ func parseElementArgs(_ args: [String], cmd: String, requireTarget: Bool = true)
         index: index,
         near: near,
         skipRoles: skipRoles,
-        preferRoles: preferRoles
+        preferRoles: preferRoles,
+        exact: exact
     )
 }
 
@@ -1450,6 +1747,62 @@ func collectElementCandidates(
     }
 }
 
+func exactLabelMatches(_ element: AXUIElement, _ wanted: String) -> Bool {
+    let needle = wanted.lowercased()
+    if needle.isEmpty { return false }
+    let fields = [
+        axCopyString(element, kAXTitleAttribute as String),
+        axCopyString(element, kAXDescriptionAttribute as String),
+        axCopyString(element, kAXHelpAttribute as String),
+        axCopyString(element, kAXValueAttribute as String),
+    ]
+    return fields.contains { value in
+        guard let value = value, !value.isEmpty else { return false }
+        return value.lowercased() == needle
+    }
+}
+
+func firstElementCandidate(
+    in element: AXUIElement,
+    role: String?,
+    label: String?,
+    depth: Int,
+    visited: NodeCounter,
+    skipRoles: Set<String>,
+    preferRoles: Set<String>
+) -> AXUIElement? {
+    visited.count += 1
+    if depth > TREE_MAX_DEPTH || visited.count > TREE_MAX_NODES { return nil }
+
+    let currentRole = roleString(element)
+    let roleOk = !skipRoles.contains(currentRole)
+        && (role == nil || role!.isEmpty || roleMatches(element, role!))
+    if roleOk {
+        if let label = label, !label.isEmpty {
+            if exactLabelMatches(element, label) {
+                return element
+            }
+        } else {
+            return element
+        }
+    }
+
+    for child in axCopyChildrenForWalk(element, preferRoles: preferRoles) {
+        if let found = firstElementCandidate(
+            in: child,
+            role: role,
+            label: label,
+            depth: depth + 1,
+            visited: visited,
+            skipRoles: skipRoles,
+            preferRoles: preferRoles
+        ) {
+            return found
+        }
+    }
+    return nil
+}
+
 // Pick a "label" for response payloads using the same priority used by
 // labelScore: title > description > help. Returns nil if every field
 // is empty.
@@ -1476,6 +1829,35 @@ func cmdFindElement(_ args: [String]) -> Never {
     }
     let visited = NodeCounter()
     var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    if parsed.index == 0 && parsed.near == nil {
+        if let quick = firstElementCandidate(
+            in: window,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: [],
+            preferRoles: []
+        ) {
+            var result: [String: Any] = [
+                "found": true,
+                "role": roleString(quick),
+                "match_count": 1,
+                "match_index": 0,
+                "searched": visited.count,
+                "fast_match": true,
+            ]
+            if let label = displayLabel(quick) {
+                result["label"] = label
+            }
+            if let frame = frameOf(quick) {
+                result["frame"] = frame
+            }
+            emit(result)
+            exit(0)
+        }
+        visited.count = 0
+    }
     collectMatches(in: window, role: parsed.role, label: parsed.label, depth: 0, visited: visited, out: &matches)
     guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
         emit([
@@ -1511,6 +1893,62 @@ func cmdPressNamed(_ args: [String]) -> Never {
     }
     let visited = NodeCounter()
     var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    if parsed.index == 0 && parsed.near == nil {
+        if let quick = firstElementCandidate(
+            in: window,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: [],
+            preferRoles: []
+        ) {
+            let elemRole = roleString(quick)
+            if !PRESS_ALLOWED_ROLES.contains(elemRole) {
+                emit([
+                    "error": "unsupported_role",
+                    "role": elemRole,
+                    "match_count": 1,
+                    "match_index": 0,
+                    "searched": visited.count,
+                    "fast_match": true,
+                    "detail": "AX press is restricted to button-like roles. Found a non-pressable role; refuse.",
+                ])
+                exit(0)
+            }
+            let status = AXUIElementPerformAction(quick, kAXPressAction as CFString)
+            if status == .success {
+                var ok: [String: Any] = [
+                    "ok": true,
+                    "action": "press",
+                    "role": elemRole,
+                    "match_count": 1,
+                    "match_index": 0,
+                    "searched": visited.count,
+                    "fast_match": true,
+                ]
+                if let label = displayLabel(quick) {
+                    ok["label"] = label
+                }
+                if let frame = frameOf(quick) {
+                    ok["frame"] = frame
+                }
+                emit(ok)
+                exit(0)
+            }
+            emit([
+                "error": "press_failed",
+                "role": elemRole,
+                "match_count": 1,
+                "match_index": 0,
+                "searched": visited.count,
+                "fast_match": true,
+                "detail": "ax_status=\(status.rawValue)",
+            ])
+            exit(0)
+        }
+        visited.count = 0
+    }
     collectMatches(in: window, role: parsed.role, label: parsed.label, depth: 0, visited: visited, out: &matches)
     guard let pick = resolveMatch(matches: matches, near: parsed.near, index: parsed.index) else {
         emit([
@@ -1994,6 +2432,51 @@ func cmdReadSubtree(_ args: [String]) -> Never {
         emitError("no_window")
     }
     let visited = NodeCounter()
+    if parsed.index == 0 && parsed.near == nil {
+        if let pick = firstElementCandidate(
+            in: window,
+            role: parsed.role,
+            label: parsed.label,
+            depth: 0,
+            visited: visited,
+            skipRoles: parsed.skipRoles,
+            preferRoles: parsed.preferRoles
+        ) {
+            let counter = NodeCounter()
+            let tree = walkTreeScoped(
+                pick,
+                depth: 0,
+                counter: counter,
+                skipRoles: parsed.skipRoles,
+                preferRoles: parsed.preferRoles
+            )
+            var result: [String: Any] = [
+                "tree": tree,
+                "node_count": counter.count,
+                "searched": visited.count,
+                "match_count": 1,
+                "match_index": 0,
+                "max_depth": TREE_MAX_DEPTH,
+                "max_nodes": TREE_MAX_NODES,
+                "fast_match": true,
+            ]
+            if let frontApp = NSWorkspace.shared.frontmostApplication {
+                result["app"] = frontApp.localizedName ?? ""
+                result["bundle_id"] = frontApp.bundleIdentifier ?? ""
+            }
+            emit(result)
+            exit(0)
+        }
+        if parsed.exact {
+            emit([
+                "error": "not_found",
+                "searched": visited.count,
+                "match_count": 0,
+            ])
+            exit(0)
+        }
+        visited.count = 0
+    }
     var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
     collectElementCandidates(
         in: window,
@@ -3232,6 +3715,13 @@ func cmdMenuCommand(_ args: [String]) -> Never {
         return (nil, nil)
     }
 
+    func availableMenuTitles(_ kids: [AXUIElement]) -> String {
+        let titles = kids.compactMap { axCopyString($0, kAXTitleAttribute as String) }
+            .filter { !$0.isEmpty }
+            .prefix(20)
+        return titles.joined(separator: ", ")
+    }
+
     var current = bar as! AXUIElement
     var kids = unwrapAXMenu(childrenOf(current))
     for (idx, segment) in args.enumerated() {
@@ -3243,7 +3733,7 @@ func cmdMenuCommand(_ args: [String]) -> Never {
             emitError("ambiguous_menu_segment", err)
         }
         guard let next = pick.match else {
-            emitError("menu_segment_not_found", "no menu item matching '\(segment)' at depth \(idx)")
+            emitError("menu_segment_not_found", "no menu item matching '\(segment)' at depth \(idx); available: [\(availableMenuTitles(kids))]")
         }
         if idx == args.count - 1 {
             let status = AXUIElementPerformAction(next, kAXPressAction as CFString)
@@ -3585,7 +4075,8 @@ func stepElementArgs(_ step: [String: Any]) -> ElementArgs {
         index: intValue(step["index"]) ?? 0,
         near: near,
         skipRoles: skipRoles,
-        preferRoles: preferRoles
+        preferRoles: preferRoles,
+        exact: boolValue(step["exact"], default: false)
     )
 }
 
@@ -3803,6 +4294,25 @@ func resolveElementFromStep(
     let roots = chainRootElements(step: step, context: context)
     let visited = NodeCounter()
     var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+    if parsed.index == 0 && parsed.near == nil {
+        for root in roots {
+            if let found = firstElementCandidate(
+                in: root,
+                role: parsed.role,
+                label: parsed.label,
+                depth: 0,
+                visited: visited,
+                skipRoles: parsed.skipRoles,
+                preferRoles: parsed.preferRoles
+            ) {
+                return (found, visited.count, 1, 0)
+            }
+        }
+        if parsed.exact {
+            return nil
+        }
+        visited.count = 0
+    }
     for root in roots {
         collectElementCandidates(
             in: root,
@@ -3919,6 +4429,59 @@ func pressNamedPayload(step: [String: Any]) -> [String: Any] {
         }
         let visited = NodeCounter()
         var matches: [(elem: AXUIElement, score: Int, ordinal: Int)] = []
+        if index == 0 && near == nil {
+            for root in roots {
+                if let quick = firstElementCandidate(
+                    in: root,
+                    role: role,
+                    label: label,
+                    depth: 0,
+                    visited: visited,
+                    skipRoles: [],
+                    preferRoles: []
+                ) {
+                    let elemRole = roleString(quick)
+                    if !PRESS_ALLOWED_ROLES.contains(elemRole) {
+                        return [
+                            "error": "unsupported_role",
+                            "role": elemRole,
+                            "match_count": 1,
+                            "match_index": 0,
+                            "searched": visited.count,
+                            "fast_match": true,
+                            "detail": "AX press is restricted to button-like roles.",
+                        ]
+                    }
+                    let status = AXUIElementPerformAction(quick, kAXPressAction as CFString)
+                    if status == .success {
+                        var result: [String: Any] = [
+                            "ok": true,
+                            "action": "press",
+                            "role": elemRole,
+                            "match_count": 1,
+                            "match_index": 0,
+                            "searched": visited.count,
+                            "fast_match": true,
+                            "attempt": attempt + 1,
+                        ]
+                        if let foundLabel = displayLabel(quick) { result["label"] = foundLabel }
+                        if let frame = frameOf(quick) { result["frame"] = frame }
+                        return result
+                    }
+                    lastFailure = [
+                        "error": "press_failed",
+                        "role": elemRole,
+                        "detail": "ax_status=\(status.rawValue)",
+                        "searched": visited.count,
+                        "fast_match": true,
+                        "attempt": attempt + 1,
+                    ]
+                    Thread.sleep(forTimeInterval: 0.25)
+                    continue
+                }
+            }
+        }
+        visited.count = 0
         for root in roots {
             collectMatches(in: root, role: role, label: label, depth: 0, visited: visited, out: &matches)
         }
@@ -4173,6 +4736,13 @@ func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activa
         return (nil, nil)
     }
 
+    func availableMenuTitles(_ kids: [AXUIElement]) -> String {
+        let titles = kids.compactMap { axCopyString($0, kAXTitleAttribute as String) }
+            .filter { !$0.isEmpty }
+            .prefix(20)
+        return titles.joined(separator: ", ")
+    }
+
     var kids = unwrapAXMenu(childrenOf(bar as! AXUIElement))
     for (idx, segment) in args.enumerated() {
         if kids.isEmpty {
@@ -4183,7 +4753,10 @@ func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activa
             return ["error": "ambiguous_menu_segment", "detail": err]
         }
         guard let next = pick.match else {
-            return ["error": "menu_segment_not_found", "detail": "no menu item matching '\(segment)' at depth \(idx)"]
+            return [
+                "error": "menu_segment_not_found",
+                "detail": "no menu item matching '\(segment)' at depth \(idx); available: [\(availableMenuTitles(kids))]",
+            ]
         }
         if idx == args.count - 1 {
             let press = AXUIElementPerformAction(next, kAXPressAction as CFString)
@@ -4719,7 +5292,7 @@ func cmdRunChain(_ args: [String]) -> Never {
 
 let argv = CommandLine.arguments
 guard argv.count >= 2 else {
-    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|run-chain|act|cursor-position|subscribe|check> [args]")
+    emitInternalError("usage: ax-helper <read-at|read-focused|focused-snapshot|diagnostics|write-at|write-focused|read-window|discover-app|read-subtree|find-element|focus-element|focus-at|press-named|press-at|click-at|drag|scroll-at|hover-at|keystroke|key-hold|modifier-latch|type-text|select-range|select-all|select-substring|menu-command|run-chain|act|cursor-position|subscribe|check> [args]")
 }
 
 let cmd = argv[1]
@@ -4734,6 +5307,7 @@ case "diagnostics":       cmdDiagnostics()
 case "write-at":          cmdWriteAt(rest)
 case "write-focused":     cmdWriteFocused(rest)
 case "read-window":       cmdReadWindow()
+case "discover-app":      cmdDiscoverApp(rest)
 case "read-subtree":      cmdReadSubtree(rest)
 case "find-element":      cmdFindElement(rest)
 case "focus-element":     cmdFocusElement(rest)

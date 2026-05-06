@@ -801,6 +801,7 @@ function init(deps) {
         park,
         beginDriving,
         endDriving,
+        getState: () => state,
         getWindow: () => (isUsable(win) ? win : null),
         // Test seams.
         triggerAppHideForTest: () => {

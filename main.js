@@ -516,6 +516,7 @@ const agentActions = initAgentActions({
     getAgentAvatar: () => agentAvatar,
     getAgentHalo: () => agentHalo,
     getAgentEvents: () => agentEvents,
+    getStore: () => store,
     releaseKeyboardFocus: (reason) => {
         if (cursorCompanion && typeof cursorCompanion.releaseKeyboardFocus === 'function') {
             return cursorCompanion.releaseKeyboardFocus(reason);

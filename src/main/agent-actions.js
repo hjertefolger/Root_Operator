@@ -12,8 +12,9 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const presenceMotionConfig = require('../shared/presence-motion-config.json');
 
-const HELPER_TIMEOUT_MS = 8000; // generous for first AX call
+const HELPER_TIMEOUT_MS = 20000; // Notes and other rich apps need room for multi-step AX chains
 
 // Hard caps on AX write payloads. The AX channel can technically accept
 // long strings but the user-visible blast radius scales with size.
@@ -43,6 +44,160 @@ const FOCUS_INTERVAL_MIN_MS = 250;
 const MAX_TYPE_TEXT_LENGTH = 2000;
 const MAX_CHAIN_STEPS = 80;
 const MAX_CHAIN_JSON_LENGTH = 120000;
+const APP_PROFILE_STORE_KEY = 'agentAppProfiles';
+const MAX_APP_WORKFLOWS = 40;
+const MAX_WORKFLOW_JSON_LENGTH = 80000;
+
+const DEFAULT_APP_WORKFLOWS = {
+    'com.apple.Notes': [
+        {
+            id: 'notes-create-format-delete',
+            name: 'Create, format, and delete a note',
+            summary: 'Create a temporary note, write text into the editor, format one line via Format > Heading, then delete via the toolbar More menu.',
+            preconditions: [
+                'Notes is running and an editable notes folder is selected.',
+                'The task is explicitly allowed to create and delete a temporary note.',
+            ],
+            postconditions: [
+                'Verify the exact temporary title is absent while skipping AXMenu and AXMenuItem roles.',
+            ],
+            selectors: {
+                editor: { app: 'Notes', scope: 'app', role: 'AXTextArea' },
+                new_note: { app: 'Notes', label: 'New Note', role: 'AXButton' },
+                more: { app: 'Notes', label: 'More', role: 'AXMenuButton' },
+                delete_note: { app: 'Notes', label: 'Delete Note', role: 'AXMenuItem' },
+                format_heading_menu: ['Format', 'Heading'],
+            },
+            steps: [
+                { op: 'launch', app: 'Notes', activate: true, timeout_ms: 8000 },
+                { op: 'wait_window', app: 'Notes', timeout_ms: 8000 },
+                { op: 'press_named', app: 'Notes', label: 'New Note', role: 'AXButton' },
+                { op: 'resolve', app: 'Notes', scope: 'app', role: 'AXTextArea', as: 'editor' },
+                { op: 'set_value', target: 'editor', text: '<title>\\n<format line>\\n<body>' },
+                { op: 'select_substring', target: 'editor', needle: '<format line>' },
+                { op: 'menu', app: 'Notes', path: ['Format', 'Heading'] },
+                { op: 'select_range', target: 'editor', location: 0, length: 0 },
+                { op: 'press_named', app: 'Notes', label: 'More', role: 'AXMenuButton' },
+                { op: 'press_named', app: 'Notes', label: 'Delete Note', role: 'AXMenuItem' },
+                { op: 'verify_absent', app: 'Notes', scope: 'app', label: '<title>', exact: true, skip_roles: ['AXMenu', 'AXMenuItem'] },
+            ],
+            destructive: true,
+            source: 'preset',
+        },
+    ],
+    'com.apple.calculator': [
+        {
+            id: 'calculator-enter-digits-smoke',
+            name: 'Enter digits in Calculator',
+            summary: 'Launch Calculator, press numeric buttons, and verify the display with a read-window observation.',
+            preconditions: [
+                'Calculator is allowed to become frontmost.',
+            ],
+            postconditions: [
+                'Calculator display contains the entered digit sequence.',
+            ],
+            selectors: {
+                one: { label: '1', role: 'AXButton' },
+                two: { label: '2', role: 'AXButton' },
+                clear: { label: 'Clear', role: 'AXButton', optional: true },
+            },
+            steps: [
+                { op: 'launch', app: 'Calculator', activate: true, timeout_ms: 8000 },
+                { op: 'wait_window', app: 'Calculator', timeout_ms: 8000 },
+                { op: 'press_named', app: 'Calculator', label: '1', role: 'AXButton' },
+                { op: 'press_named', app: 'Calculator', label: '2', role: 'AXButton' },
+            ],
+            destructive: false,
+            source: 'preset',
+        },
+    ],
+    'com.apple.finder': [
+        {
+            id: 'finder-front-window-smoke',
+            name: 'Inspect Finder front window',
+            summary: 'Launch Finder and resolve common navigation affordances without creating, moving, or deleting files.',
+            preconditions: [
+                'Finder is allowed to become frontmost.',
+            ],
+            postconditions: [
+                'A Finder window or Finder app surface is present and discoverable.',
+            ],
+            selectors: {
+                toolbar: { app: 'Finder', scope: 'app', role: 'AXToolbar' },
+                search: { app: 'Finder', scope: 'app', role: 'AXSearchField', optional: true },
+            },
+            steps: [
+                { op: 'launch', app: 'Finder', activate: true, timeout_ms: 8000 },
+                { op: 'wait_window', app: 'Finder', timeout_ms: 8000 },
+                { op: 'resolve', app: 'Finder', scope: 'app', role: 'AXToolbar', as: 'toolbar', optional: true },
+                { op: 'resolve', app: 'Finder', scope: 'app', role: 'AXSearchField', as: 'search', optional: true },
+            ],
+            destructive: false,
+            source: 'preset',
+        },
+    ],
+    'com.apple.TextEdit': [
+        {
+            id: 'textedit-scratch-write-smoke',
+            name: 'Write scratch text in TextEdit',
+            summary: 'Open TextEdit, create or use an untitled document, write a short scratch string, and verify the editor value. Close manually or add a confirmed cleanup step when needed.',
+            preconditions: [
+                'TextEdit is allowed to become frontmost.',
+                'The user permits creating a temporary unsaved document.',
+            ],
+            postconditions: [
+                'The editor contains the scratch string.',
+            ],
+            selectors: {
+                editor: { app: 'TextEdit', scope: 'app', role: 'AXTextArea' },
+                new_menu: ['File', 'New'],
+            },
+            steps: [
+                { op: 'launch', app: 'TextEdit', activate: true, timeout_ms: 8000 },
+                { op: 'wait_window', app: 'TextEdit', timeout_ms: 8000 },
+                { op: 'menu', app: 'TextEdit', path: ['File', 'New'] },
+                { op: 'resolve', app: 'TextEdit', scope: 'app', role: 'AXTextArea', as: 'editor' },
+                { op: 'set_value', target: 'editor', text: '<scratch text>' },
+                { op: 'verify_value', target: 'editor', contains: '<scratch text>' },
+            ],
+            destructive: false,
+            source: 'preset',
+        },
+    ],
+    'com.apple.Dictionary': [
+        {
+            id: 'dictionary-lookup-smoke',
+            name: 'Look up a word in Dictionary',
+            summary: 'Launch Dictionary, focus the search field, enter a word, and verify the window updates without changing user files.',
+            preconditions: [
+                'Dictionary is allowed to become frontmost.',
+            ],
+            postconditions: [
+                'Dictionary search field contains the lookup term or results are visible.',
+            ],
+            selectors: {
+                search: { app: 'Dictionary', scope: 'app', role: 'AXSearchField' },
+            },
+            steps: [
+                { op: 'launch', app: 'Dictionary', activate: true, timeout_ms: 8000 },
+                { op: 'wait_window', app: 'Dictionary', timeout_ms: 8000 },
+                { op: 'resolve', app: 'Dictionary', scope: 'app', role: 'AXSearchField', as: 'search' },
+                { op: 'set_value', target: 'search', text: '<word>' },
+                { op: 'verify_value', target: 'search', contains: '<word>' },
+            ],
+            destructive: false,
+            source: 'preset',
+        },
+    ],
+};
+
+const DEFAULT_APP_BUNDLE_ALIASES = {
+    Notes: 'com.apple.Notes',
+    Calculator: 'com.apple.calculator',
+    Finder: 'com.apple.finder',
+    TextEdit: 'com.apple.TextEdit',
+    Dictionary: 'com.apple.Dictionary',
+};
 
 // User-activity guard window. Before posting a keystroke or typing
 // text we look at the AX subscribe ring buffer. If we see a recent
@@ -215,6 +370,190 @@ function formatReadSubtree(result) {
     return formatReadWindow(result);
 }
 
+function frameShort(frame) {
+    if (!frame) return '';
+    return ` [${Math.round(frame.x || 0)},${Math.round(frame.y || 0)} ${Math.round(frame.w || 0)}x${Math.round(frame.h || 0)}]`;
+}
+
+function elementLine(item) {
+    if (!item || typeof item !== 'object') return '';
+    const label = item.label ? ` "${String(item.label).slice(0, 80)}"` : '';
+    const value = item.value && item.value !== item.label ? ` = ${JSON.stringify(String(item.value).slice(0, 80))}` : '';
+    const actionNames = Array.isArray(item.actions)
+        ? item.actions
+            .map((action) => String(action || '').trim())
+            .filter((action) => action.startsWith('AX') && action.length <= 40)
+        : [];
+    const actions = actionNames.length
+        ? ` actions=${actionNames.slice(0, 4).join(',')}`
+        : '';
+    return `${item.role || 'AXUnknown'}${label}${value}${frameShort(item.frame)}${actions}`;
+}
+
+function formatElementList(title, items, limit = 12) {
+    if (!Array.isArray(items) || items.length === 0) return `${title}: none`;
+    const lines = [`${title}:`];
+    for (const item of items.slice(0, limit)) {
+        const line = elementLine(item);
+        if (line) lines.push(`- ${line}`);
+    }
+    if (items.length > limit) lines.push(`- +${items.length - limit} more`);
+    return lines.join('\n');
+}
+
+function formatMenus(menus, limit = 8) {
+    if (!Array.isArray(menus) || menus.length === 0) return 'Menus: none';
+    const lines = ['Menus:'];
+    for (const menu of menus.slice(0, limit)) {
+        const items = Array.isArray(menu.items)
+            ? menu.items.map((item) => item.title).filter(Boolean).slice(0, 12)
+            : [];
+        const suffix = menu.truncated ? ', ...' : '';
+        lines.push(`- ${menu.title}: ${items.join(', ')}${suffix}`);
+    }
+    if (menus.length > limit) lines.push(`- +${menus.length - limit} more menus`);
+    return lines.join('\n');
+}
+
+function normalizeWorkflowList(value) {
+    return Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
+}
+
+function defaultWorkflowsFor(bundleId, appName) {
+    const keys = [
+        profileKey(bundleId, appName),
+        profileKey('', appName),
+        profileKey(bundleId, ''),
+    ].filter(Boolean);
+    for (const key of keys) {
+        if (Array.isArray(DEFAULT_APP_WORKFLOWS[key])) {
+            return DEFAULT_APP_WORKFLOWS[key];
+        }
+    }
+    return [];
+}
+
+function mergePresetWorkflows(profile, bundleId, appName) {
+    const base = profile && typeof profile === 'object' ? profile : {};
+    const stored = normalizeWorkflowList(base.workflows);
+    const presets = defaultWorkflowsFor(bundleId || base.bundle_id, appName || base.app);
+    const storedIds = new Set(stored.map((workflow) => workflow.id).filter(Boolean));
+    return {
+        ...base,
+        app: base.app || appName || '',
+        bundle_id: base.bundle_id || bundleId || '',
+        workflows: [
+            ...stored,
+            ...presets.filter((workflow) => !storedIds.has(workflow.id)),
+        ],
+    };
+}
+
+function getProfileStore(deps) {
+    if (!deps || typeof deps.getStore !== 'function') return null;
+    try {
+        const store = deps.getStore();
+        return store && typeof store.get === 'function' && typeof store.set === 'function' ? store : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function readAppProfiles(deps) {
+    const store = getProfileStore(deps);
+    if (!store) return {};
+    const raw = store.get(APP_PROFILE_STORE_KEY, {});
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+function writeAppProfiles(deps, profiles) {
+    const store = getProfileStore(deps);
+    if (!store) return false;
+    store.set(APP_PROFILE_STORE_KEY, profiles && typeof profiles === 'object' ? profiles : {});
+    return true;
+}
+
+function profileKey(bundleId, appName) {
+    return String(bundleId || appName || '').trim();
+}
+
+function profileForDiscovery(deps, discovery) {
+    const key = profileKey(discovery && discovery.bundle_id, discovery && discovery.app);
+    const appKey = profileKey('', discovery && discovery.app);
+    if (!key && !appKey) return null;
+    const profiles = readAppProfiles(deps);
+    const profile = profiles[key] || profiles[appKey];
+    return mergePresetWorkflows(profile, discovery && discovery.bundle_id, discovery && discovery.app);
+}
+
+function formatRememberedWorkflows(profile, limit = 8) {
+    const workflows = normalizeWorkflowList(profile && profile.workflows);
+    if (workflows.length === 0) return 'Remembered workflows: none';
+    const lines = ['Remembered workflows:'];
+    for (const workflow of workflows.slice(0, limit)) {
+        const flags = workflow.destructive ? ' destructive' : '';
+        const verified = workflow.last_verified_at ? ` verified=${workflow.last_verified_at}` : '';
+        lines.push(`- ${workflow.name || workflow.id || 'unnamed'}:${flags}${verified} ${workflow.summary || ''}`.trim());
+    }
+    if (workflows.length > limit) lines.push(`- +${workflows.length - limit} more`);
+    return lines.join('\n');
+}
+
+function formatDiscoverApp(result, profile) {
+    if (result.error) {
+        return `Discover app failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`;
+    }
+    const lines = [];
+    lines.push(`App: ${result.app || 'unknown'}${result.bundle_id ? ` (${result.bundle_id})` : ''} pid=${result.pid || 'unknown'}`);
+    lines.push(`Windows: ${result.window_count || 0}; scanned nodes=${result.node_count || 0}${result.truncated ? ' (truncated)' : ''}`);
+    if (result.focused_window) {
+        lines.push(`Focused window: ${elementLine(result.focused_window)}`);
+    }
+    if (result.focused_element) {
+        lines.push(`Focused element: ${elementLine(result.focused_element)}`);
+    }
+    lines.push(formatRememberedWorkflows(profile));
+    lines.push(formatElementList('Text inputs', result.text_inputs, 10));
+    lines.push(formatElementList('Menu buttons/popups', result.menu_buttons, 10));
+    lines.push(formatElementList('Controls', result.controls, 16));
+    lines.push(formatMenus(result.menus, 8));
+    if (result.role_counts && typeof result.role_counts === 'object') {
+        const roles = Object.entries(result.role_counts)
+            .sort((a, b) => Number(b[1]) - Number(a[1]))
+            .slice(0, 12)
+            .map(([role, count]) => `${role}:${count}`)
+            .join(', ');
+        lines.push(`Top roles: ${roles || 'none'}`);
+    }
+    return lines.join('\n');
+}
+
+async function resolveAppIdentity(deps, args) {
+    const explicitBundle = String(args.bundle_id || args.bundle || '').trim();
+    const explicitApp = String(args.app || args.application || '').trim();
+    if (explicitBundle || explicitApp) {
+        const lookup = explicitBundle || explicitApp;
+        const discovery = await runHelper(deps, ['discover-app', '--app', lookup, '--no-menus']);
+        if (!discovery.error) {
+            return {
+                bundle_id: discovery.bundle_id || explicitBundle || lookup,
+                app: discovery.app || explicitApp || lookup,
+            };
+        }
+        const aliasedBundle = DEFAULT_APP_BUNDLE_ALIASES[explicitApp] || DEFAULT_APP_BUNDLE_ALIASES[explicitBundle];
+        return {
+            bundle_id: explicitBundle || aliasedBundle || explicitApp,
+            app: explicitApp || explicitBundle,
+        };
+    }
+    const discovery = await runHelper(deps, ['discover-app', '--no-menus']);
+    if (discovery.error) return { error: discovery.error, detail: discovery.detail };
+    return {
+        bundle_id: discovery.bundle_id || discovery.app || '',
+        app: discovery.app || discovery.bundle_id || '',
+    };
+}
+
 // Validate the optional disambiguation args (`index`, `near_x`, `near_y`)
 // shared by agent_find_element and agent_press_named, and turn them
 // into the corresponding ax-helper argv tail. Codex flagged the silent
@@ -289,6 +628,7 @@ function buildElementTargetArgs(args, toolName, { requireLabel = false, requireT
     if (role) out.push('--role', role);
     appendRoleList(out, '--skip-role', args.skip_role || args.skip_roles);
     appendRoleList(out, '--prefer-role', args.prefer_role || args.prefer_roles);
+    if (args.exact === true) out.push('--exact');
 
     const disambig = buildDisambiguationArgs(args, toolName);
     if (disambig.error) return disambig;
@@ -571,10 +911,16 @@ function formatRunChain(result) {
         const failed = result.failed_step !== undefined
             ? ` at step ${result.failed_step}${result.failed_op ? ` (${result.failed_op})` : ''}`
             : '';
+        const failedStep = Array.isArray(result.steps) && result.failed_step !== undefined
+            ? result.steps[Number(result.failed_step)]
+            : null;
+        const helperDetail = failedStep && failedStep.error
+            ? `; helper: ${failedStep.error}${failedStep.detail ? ` (${failedStep.detail})` : ''}`
+            : '';
         const cursor = result.cursor_unchanged === false
             ? ` Cursor moved by ${Math.round(Number(result.cursor_delta) || 0)} point(s).`
             : '';
-        return `Run chain failed${failed}: ${result.error}${result.detail ? ` (${result.detail})` : ''}.${cursor}`;
+        return `Run chain failed${failed}: ${result.error}${result.detail ? ` (${result.detail})` : ''}${helperDetail}.${cursor}`;
     }
     if (result.ok) {
         const count = Array.isArray(result.steps) ? result.steps.length : 0;
@@ -624,6 +970,10 @@ function formatEvents(events) {
 // right edge.
 const FRAME_LANDING_OFFSET_PX = 12;
 const ACTION_FEEDBACK_STEP_MS = 620;
+const HALO_CONFIG = presenceMotionConfig.halo || {};
+const ACTION_AVATAR_DISMISS_MS = Number.isFinite(HALO_CONFIG.avatarDismissMs)
+    ? HALO_CONFIG.avatarDismissMs
+    : ((HALO_CONFIG.actionAutoHideMs || 1700) + 550);
 
 function computeFrameLanding(frame, screen) {
     if (!frame || !Number.isFinite(frame.x) || !Number.isFinite(frame.y)
@@ -670,6 +1020,7 @@ function init(deps) {
     let lastTypeTextAt = 0;
     let lastHidAt = 0;
     let lastFocusAt = 0;
+    let avatarDismissTimer = null;
     // Timestamp of the most recent AX-mutating action we performed
     // (write, press, keystroke, type-text, select-*). Subsequent
     // user-activity checks ignore events older than this — those are
@@ -678,6 +1029,32 @@ function init(deps) {
 
     function bumpSelfActionAt() {
         lastSelfActionAt = Date.now();
+    }
+
+    function clearAvatarDismissTimer() {
+        if (avatarDismissTimer) {
+            clearTimeout(avatarDismissTimer);
+            avatarDismissTimer = null;
+        }
+    }
+
+    function scheduleAvatarDismiss(avatar, delayMs = ACTION_AVATAR_DISMISS_MS) {
+        if (!avatar || typeof avatar.park !== 'function') return;
+        clearAvatarDismissTimer();
+        const ms = Math.max(400, Math.round(Number.isFinite(delayMs) ? delayMs : ACTION_AVATAR_DISMISS_MS));
+        avatarDismissTimer = setTimeout(() => {
+            avatarDismissTimer = null;
+            try {
+                const state = typeof avatar.getState === 'function' ? avatar.getState() : null;
+                if (state === 'driving') {
+                    scheduleAvatarDismiss(avatar, 700);
+                    return;
+                }
+                if (state === 'ambient') return;
+                avatar.park();
+            } catch (_) { /* best-effort visual dismissal */ }
+        }, ms);
+        if (typeof avatarDismissTimer.unref === 'function') avatarDismissTimer.unref();
     }
 
     function releaseHostKeyboardFocus(reason) {
@@ -731,7 +1108,7 @@ function init(deps) {
     function haloOptionsForResult(result) {
         const action = String((result && (result.action || result.op)) || '').toLowerCase();
         if (action === 'focus' || action === 'read' || action === 'inspect') {
-            return { mode: action || 'focus', sustain: action === 'focus' };
+            return { mode: action || 'focus' };
         }
         return { mode: action || 'action' };
     }
@@ -754,8 +1131,10 @@ function init(deps) {
     // Halo + travel together — every successful AX action where we have
     // a frame should make the dot legible at the action site.
     function showActionAt(avatar, result, options = {}) {
-        maybeHalo(result, options);
+        const { dismiss = true, dismissMs, ...haloOptions } = options;
+        maybeHalo(result, haloOptions);
         maybeTravelToFrame(avatar, result, deps.screen);
+        if (dismiss) scheduleAvatarDismiss(avatar, dismissMs);
     }
 
     function successfulFramedSteps(result) {
@@ -785,6 +1164,7 @@ function init(deps) {
 
     async function withDrivingAvatar(avatar, fn) {
         if (avatar && typeof avatar.beginDriving === 'function') {
+            clearAvatarDismissTimer();
             try { avatar.beginDriving(); } catch (_) { /* best-effort */ }
         }
         try {
@@ -817,6 +1197,7 @@ function init(deps) {
                     if (!avatar) return { result: 'Agent avatar not available.', isError: true };
                     const ox = Number(args.offset_x);
                     const oy = Number(args.offset_y);
+                    clearAvatarDismissTimer();
                     const r = avatar.moveToCursor(
                         Number.isFinite(ox) ? ox : undefined,
                         Number.isFinite(oy) ? oy : undefined,
@@ -834,6 +1215,7 @@ function init(deps) {
                     if (!Number.isFinite(x) || !Number.isFinite(y)) {
                         return { result: 'agent_move_to requires numeric x and y.', isError: true };
                     }
+                    clearAvatarDismissTimer();
                     avatar.moveTo(x, y);
                     return {
                         result: `Moving to (${Math.round(x)}, ${Math.round(y)}).`,
@@ -843,6 +1225,7 @@ function init(deps) {
 
                 case 'agent_park': {
                     if (!avatar) return { result: 'Agent avatar not available.', isError: true };
+                    clearAvatarDismissTimer();
                     const r = avatar.park();
                     return {
                         result: `Parking at (${Math.round(r.to.x)}, ${Math.round(r.to.y)}).`,
@@ -919,6 +1302,98 @@ function init(deps) {
                 case 'agent_read_window': {
                     const r = await runHelper(deps, ['read-window']);
                     return { result: formatReadWindow(r), isError: !!r.error };
+                }
+
+                case 'agent_discover_app': {
+                    const helperArgs = ['discover-app'];
+                    const appName = String(args.app || args.application || args.bundle_id || args.bundle || '').trim();
+                    if (appName) helperArgs.push('--app', appName);
+                    if (args.include_menus === false) helperArgs.push('--no-menus');
+                    if (args.activate === false) helperArgs.push('--no-activate');
+                    const r = await runHelper(deps, helperArgs);
+                    const profile = r.error ? null : profileForDiscovery(deps, r);
+                    return { result: formatDiscoverApp(r, profile), isError: !!r.error };
+                }
+
+                case 'agent_list_app_workflows': {
+                    const identity = await resolveAppIdentity(deps, args);
+                    if (identity.error) {
+                        return {
+                            result: `Could not resolve app profile: ${identity.error}${identity.detail ? ` (${identity.detail})` : ''}`,
+                            isError: true,
+                        };
+                    }
+                    const key = profileKey(identity.bundle_id, identity.app);
+                    const profiles = readAppProfiles(deps);
+                    const storedProfile = profiles[key] || profiles[profileKey('', identity.app)] || {
+                        app: identity.app,
+                        bundle_id: identity.bundle_id,
+                        workflows: [],
+                    };
+                    const profile = mergePresetWorkflows(storedProfile, identity.bundle_id, identity.app);
+                    return {
+                        result: `App profile: ${profile.app || identity.app || key}${profile.bundle_id ? ` (${profile.bundle_id})` : ''}\n${formatRememberedWorkflows(profile, 20)}`,
+                        isError: false,
+                    };
+                }
+
+                case 'agent_remember_app_workflow': {
+                    const name = String(args.name || '').trim();
+                    if (!name) {
+                        return { result: 'agent_remember_app_workflow requires a non-empty name.', isError: true };
+                    }
+                    const workflow = {
+                        id: String(args.id || name).trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, ''),
+                        name,
+                        summary: String(args.summary || '').trim(),
+                        preconditions: Array.isArray(args.preconditions) ? args.preconditions.filter((s) => typeof s === 'string' && s.trim()) : [],
+                        postconditions: Array.isArray(args.postconditions) ? args.postconditions.filter((s) => typeof s === 'string' && s.trim()) : [],
+                        selectors: args.selectors && typeof args.selectors === 'object' ? args.selectors : undefined,
+                        steps: Array.isArray(args.steps) ? args.steps : [],
+                        destructive: args.destructive === true,
+                        last_verified_at: args.last_verified_at ? String(args.last_verified_at) : new Date().toISOString(),
+                        success_count: Number.isFinite(Number(args.success_count)) ? Number(args.success_count) : 1,
+                    };
+                    if (!workflow.id) workflow.id = `workflow-${Date.now()}`;
+                    const json = JSON.stringify(workflow);
+                    if (json.length > MAX_WORKFLOW_JSON_LENGTH) {
+                        return {
+                            result: `Refusing to save workflow: payload length ${json.length} exceeds ${MAX_WORKFLOW_JSON_LENGTH}.`,
+                            isError: true,
+                        };
+                    }
+                    const identity = await resolveAppIdentity(deps, args);
+                    if (identity.error) {
+                        return {
+                            result: `Could not resolve app profile: ${identity.error}${identity.detail ? ` (${identity.detail})` : ''}`,
+                            isError: true,
+                        };
+                    }
+                    const key = profileKey(identity.bundle_id, identity.app);
+                    if (!key) {
+                        return { result: 'Could not resolve app profile key.', isError: true };
+                    }
+                    const profiles = readAppProfiles(deps);
+                    const legacyKey = profileKey('', identity.app);
+                    const existing = (profiles[key] && typeof profiles[key] === 'object')
+                        ? profiles[key]
+                        : ((profiles[legacyKey] && typeof profiles[legacyKey] === 'object') ? profiles[legacyKey] : {});
+                    const workflows = normalizeWorkflowList(existing.workflows);
+                    const nextWorkflows = [workflow, ...workflows.filter((item) => item.id !== workflow.id)].slice(0, MAX_APP_WORKFLOWS);
+                    profiles[key] = {
+                        ...existing,
+                        app: identity.app || existing.app || key,
+                        bundle_id: identity.bundle_id || existing.bundle_id || key,
+                        updated_at: new Date().toISOString(),
+                        workflows: nextWorkflows,
+                    };
+                    if (!writeAppProfiles(deps, profiles)) {
+                        return { result: 'Could not save app workflow: app profile store unavailable.', isError: true };
+                    }
+                    return {
+                        result: `Remembered workflow "${workflow.name}" for ${profiles[key].app || key}. Workflows stored: ${nextWorkflows.length}.`,
+                        isError: false,
+                    };
                 }
 
                 case 'agent_read_subtree': {

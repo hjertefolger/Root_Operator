@@ -20,16 +20,16 @@
   "halo": {
     "padPx": 18,
     "actionAutoHideMs": 1700,
-    "focusAutoHideMs": 0,
+    "focusAutoHideMs": 2200,
+    "avatarDismissMs": 2250,
     "fadeInMs": 250,
     "fadeOutMs": 400,
     "borderScanDurationMs": 3600,
     "borderOpacityMin": 0.15,
     "borderOpacityMax": 0.34,
-    "waveSpotCount": 42,
-    "waveMinDurationMs": 1500,
-    "waveMaxDurationMs": 3000,
-    "waveMaxOpacity": 0.18,
+    "gridStepPx": 10,
+    "gridDotRadiusPx": 0.95,
+    "gridMaxOpacity": 0.24,
     "accent": "#4B6BFF"
   }
 }

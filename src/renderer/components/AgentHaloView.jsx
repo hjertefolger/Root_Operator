@@ -1,9 +1,11 @@
 /**
  * AGENT HALO VIEW
  *
- * Soft accent glow drawn around an AX element the agent is acting on.
+ * Dotted presence field drawn around an AX element the agent is acting on.
  * Sized by the main process to (frame.w + PAD*2, frame.h + PAD*2).
- * Inset rounded rectangle with a layered glow gradient + 1px stroke.
+ * The field is densest at the top-right edge, then fades toward the
+ * target center so it reads like an infinite-canvas grid instead of a
+ * generic glow ring.
  *
  * State arrives via IPC:
  *   AGENT_HALO_SHOW {width, height}  — fade in
@@ -15,6 +17,10 @@ import presenceMotionConfig from '../../shared/presence-motion-config.json';
 const HALO = presenceMotionConfig.halo || {};
 const ACCENT = HALO.accent || '#4B6BFF';
 const PAD = HALO.padPx || 18;
+
+function clamp01(value) {
+    return Math.max(0, Math.min(1, value));
+}
 
 function seededRandomFactory(seed) {
     let state = (Number.isFinite(seed) ? seed : 1) >>> 0;
@@ -28,28 +34,61 @@ function seededRandomFactory(seed) {
     };
 }
 
-function buildSpots(size, seed) {
-    const count = HALO.waveSpotCount || 42;
+function buildGridDots(size, seed) {
+    const width = Math.max(1, size.width);
+    const height = Math.max(1, size.height);
+    const step = Math.max(6, HALO.gridStepPx || 10);
+    const radius = Math.max(0.55, HALO.gridDotRadiusPx || 0.95);
+    const maxOpacity = Math.max(0.04, HALO.gridMaxOpacity || 0.24);
     const random = seededRandomFactory(seed);
-    const innerWidth = Math.max(1, size.width - PAD * 2);
-    const innerHeight = Math.max(1, size.height - PAD * 2);
-    const spots = [];
-    for (let i = 0; i < count; i += 1) {
-        const angle = random() * Math.PI * 2;
-        const radial = Math.pow(random(), 0.72);
-        const x = PAD + innerWidth * 0.5 + Math.cos(angle) * innerWidth * 0.48 * radial;
-        const y = PAD + innerHeight * 0.5 + Math.sin(angle) * innerHeight * 0.48 * radial;
-        spots.push({
-            id: i,
-            x,
-            y,
-            r: 1.6 + random() * 3.2,
-            duration: (HALO.waveMinDurationMs || 1500) + random() * ((HALO.waveMaxDurationMs || 3000) - (HALO.waveMinDurationMs || 1500)),
-            delay: -random() * (HALO.waveMaxDurationMs || 3000),
-            opacity: 0.05 + random() * ((HALO.waveMaxOpacity || 0.18) - 0.05),
-        });
+    const dots = [];
+    const startX = Math.max(0, PAD - step);
+    const startY = Math.max(0, PAD - step);
+    const endX = Math.min(width, width - PAD + step);
+    const endY = Math.min(height, height - PAD + step);
+    const cornerX = width - PAD * 0.65;
+    const cornerY = PAD * 0.75;
+    const centerX = width * 0.52;
+    const centerY = height * 0.52;
+    const reach = Math.max(56, Math.hypot(width, height) * 0.72);
+    const centerClear = Math.max(18, Math.min(width, height) * 0.3);
+    let id = 0;
+
+    for (let y = startY; y <= endY; y += step) {
+        for (let x = startX; x <= endX; x += step) {
+            const jitterX = (random() - 0.5) * 1.2;
+            const jitterY = (random() - 0.5) * 1.2;
+            const px = x + jitterX;
+            const py = y + jitterY;
+            const distCorner = Math.hypot(px - cornerX, py - cornerY);
+            const distCenter = Math.hypot(px - centerX, py - centerY);
+            const cornerFalloff = clamp01(1 - distCorner / reach);
+            const centerFade = clamp01((distCenter - centerClear) / Math.max(1, reach * 0.58));
+            const diagonalX = (px - centerX) / Math.max(1, cornerX - centerX);
+            const diagonalY = (centerY - py) / Math.max(1, centerY - cornerY);
+            const diagonalBias = clamp01((diagonalX + diagonalY + 0.18) / 2.05);
+            const opacity = maxOpacity
+                * Math.pow(cornerFalloff, 1.35)
+                * Math.pow(centerFade, 0.62)
+                * (0.34 + diagonalBias * 0.66);
+            if (opacity < 0.016) continue;
+
+            const duration = 2800 + random() * 1800;
+            dots.push({
+                id: id++,
+                x: px,
+                y: py,
+                r: radius + (random() - 0.5) * 0.18,
+                opacity,
+                lowOpacity: opacity * 0.5,
+                delay: -random() * duration,
+                duration,
+                shiftX: -0.65 - random() * 0.8,
+                shiftY: 0.55 + random() * 0.85,
+            });
+        }
     }
-    return spots;
+    return dots;
 }
 
 export default function AgentHaloView() {
@@ -83,10 +122,11 @@ export default function AgentHaloView() {
     const innerWidth = Math.max(0, payload.width - PAD * 2);
     const innerHeight = Math.max(0, payload.height - PAD * 2);
     const accent = payload.accent || ACCENT;
-    const spots = useMemo(() => buildSpots(size, payload.seed), [size.width, size.height, payload.seed]);
+    const gridDots = useMemo(() => buildGridDots(size, payload.seed), [size.width, size.height, payload.seed]);
     const fadeInMs = HALO.fadeInMs || 250;
     const fadeOutMs = HALO.fadeOutMs || 400;
     const borderScanMs = HALO.borderScanDurationMs || 3600;
+    const cornerTraceLength = Math.max(18, Math.min(38, Math.min(innerWidth, innerHeight) * 0.42));
 
     return (
         <div
@@ -107,10 +147,13 @@ export default function AgentHaloView() {
                     from { stroke-dashoffset: 0; }
                     to { stroke-dashoffset: -180; }
                 }
-                @keyframes agentHaloWave {
-                    0%, 100% { opacity: 0.025; transform: scale(0.82); }
-                    45% { opacity: var(--spot-opacity); transform: scale(1); }
-                    70% { opacity: var(--spot-fade-opacity); transform: scale(1.08); }
+                @keyframes agentHaloGridTravel {
+                    0%, 100% { opacity: var(--dot-opacity-low); transform: translate(0px, 0px); }
+                    46% { opacity: var(--dot-opacity); transform: translate(var(--dot-shift-x), var(--dot-shift-y)); }
+                }
+                @keyframes agentHaloEdgeTrace {
+                    0%, 100% { opacity: 0.18; }
+                    44% { opacity: 0.42; }
                 }
             `}</style>
             <svg
@@ -126,38 +169,55 @@ export default function AgentHaloView() {
                 }}
             >
                 <defs>
-                    <filter id="agent-halo-soften" x="-20%" y="-20%" width="140%" height="140%">
-                        <feGaussianBlur stdDeviation="4" />
+                    <filter id="agent-halo-soften" x="-15%" y="-15%" width="130%" height="130%">
+                        <feGaussianBlur stdDeviation="2.5" />
                     </filter>
+                    <linearGradient id="agent-halo-wash" x1="100%" y1="0%" x2="42%" y2="56%">
+                        <stop offset="0%" stopColor={accent} stopOpacity="0.16" />
+                        <stop offset="48%" stopColor={accent} stopOpacity="0.045" />
+                        <stop offset="100%" stopColor={accent} stopOpacity="0" />
+                    </linearGradient>
                 </defs>
                 <rect
-                    x={PAD - 7}
-                    y={PAD - 7}
-                    width={innerWidth + 14}
-                    height={innerHeight + 14}
-                    rx="10"
-                    fill="none"
-                    stroke={accent}
-                    strokeWidth="8"
-                    opacity="0.08"
+                    x={PAD - 8}
+                    y={PAD - 8}
+                    width={innerWidth + 16}
+                    height={innerHeight + 16}
+                    rx="12"
+                    fill="url(#agent-halo-wash)"
+                    opacity="0.72"
                     filter="url(#agent-halo-soften)"
                 />
-                {spots.map((spot) => (
+                {gridDots.map((dot) => (
                     <circle
-                        key={spot.id}
-                        cx={spot.x}
-                        cy={spot.y}
-                        r={spot.r}
+                        key={dot.id}
+                        cx={dot.x}
+                        cy={dot.y}
+                        r={dot.r}
                         fill={accent}
                         style={{
-                            '--spot-opacity': spot.opacity,
-                            '--spot-fade-opacity': spot.opacity * 0.58,
-                            opacity: 0.04,
-                            transformOrigin: `${spot.x}px ${spot.y}px`,
-                            animation: `agentHaloWave ${spot.duration}ms ease-in-out ${spot.delay}ms infinite`,
+                            '--dot-opacity': dot.opacity,
+                            '--dot-opacity-low': dot.lowOpacity,
+                            '--dot-shift-x': `${dot.shiftX}px`,
+                            '--dot-shift-y': `${dot.shiftY}px`,
+                            transformOrigin: `${dot.x}px ${dot.y}px`,
+                            animation: `agentHaloGridTravel ${dot.duration}ms ease-in-out ${dot.delay}ms infinite`,
                         }}
                     />
                 ))}
+                <path
+                    d={[
+                        `M ${PAD + innerWidth - cornerTraceLength} ${PAD}`,
+                        `H ${PAD + innerWidth}`,
+                        `V ${PAD + cornerTraceLength}`,
+                    ].join(' ')}
+                    fill="none"
+                    stroke={accent}
+                    strokeWidth="1.25"
+                    strokeLinecap="round"
+                    opacity={HALO.borderOpacityMax || 0.34}
+                    style={{ animation: `agentHaloEdgeTrace ${borderScanMs}ms ease-in-out infinite` }}
+                />
                 <rect
                     x={PAD}
                     y={PAD}
@@ -166,24 +226,13 @@ export default function AgentHaloView() {
                     rx="8"
                     fill="none"
                     stroke={accent}
-                    strokeWidth="1.2"
-                    strokeDasharray="2 9"
+                    strokeWidth="1"
+                    strokeDasharray="1 10"
                     strokeLinecap="round"
-                    opacity={HALO.borderOpacityMax || 0.34}
+                    opacity={HALO.borderOpacityMin || 0.15}
                     style={{
                         animation: `agentHaloScan ${borderScanMs}ms linear infinite`,
                     }}
-                />
-                <rect
-                    x={PAD + 0.5}
-                    y={PAD + 0.5}
-                    width={Math.max(0, innerWidth - 1)}
-                    height={Math.max(0, innerHeight - 1)}
-                    rx="8"
-                    fill="none"
-                    stroke={accent}
-                    strokeWidth="1"
-                    opacity={HALO.borderOpacityMin || 0.15}
                 />
             </svg>
         </div>

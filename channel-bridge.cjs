@@ -239,6 +239,52 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: 'object', properties: {} },
     },
     {
+      name: 'agent_discover_app',
+      description: 'Build a compact live app map for the frontmost or named macOS app: focused window/element, text inputs, pressable controls, menu buttons, top menu inventory, role counts, and remembered workflows for this app. Use this as the first step in unfamiliar apps before acting; it helps the agent learn available affordances without guessing. Menu discovery may briefly open app menus through AX but does not press leaf commands.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          app: { type: 'string', description: 'Optional app name or bundle id. Defaults to the frontmost app.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id. Equivalent to app for lookup.' },
+          include_menus: { type: 'boolean', description: 'Whether to inventory top-level menus. Default true. Set false for a faster pure window scan.' },
+          activate: { type: 'boolean', description: 'Whether to activate the named app before discovery. Default true when app/bundle_id is provided.' },
+        },
+      },
+    },
+    {
+      name: 'agent_list_app_workflows',
+      description: 'List learned computer-use workflows remembered for the frontmost or named app. Call after agent_discover_app when deciding whether a proven app-specific recipe already exists.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          app: { type: 'string', description: 'Optional app name or bundle id. Defaults to the frontmost app.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id. Equivalent to app for lookup.' },
+        },
+      },
+    },
+    {
+      name: 'agent_remember_app_workflow',
+      description: 'Save a successful app-specific workflow recipe so future agents can reuse it. Use only after verifying the workflow through the real bridge. Store semantic agent_act steps, selectors, preconditions, postconditions, and whether the workflow is destructive.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          app: { type: 'string', description: 'Optional app name or bundle id. Defaults to the frontmost app.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id. Equivalent to app for lookup.' },
+          id: { type: 'string', description: 'Optional stable workflow id. Defaults to a slug from name.' },
+          name: { type: 'string', description: 'Short workflow name.' },
+          summary: { type: 'string', description: 'What this workflow does and when to use it.' },
+          preconditions: { type: 'array', items: { type: 'string' }, description: 'Required visible/app state before running.' },
+          postconditions: { type: 'array', items: { type: 'string' }, description: 'State to verify after running.' },
+          selectors: { type: 'object', description: 'Stable selectors discovered for this app.' },
+          steps: { type: 'array', items: { type: 'object' }, description: 'Verified semantic action steps, usually agent_act steps.' },
+          destructive: { type: 'boolean', description: 'True if the workflow can delete, send, submit, spend, or otherwise have irreversible effects.' },
+          last_verified_at: { type: 'string', description: 'Optional ISO timestamp. Defaults to now.' },
+          success_count: { type: 'number', description: 'Optional success counter. Defaults to 1.' },
+        },
+        required: ['name'],
+      },
+    },
+    {
       name: 'agent_read_subtree',
       description: 'Read a scoped AX subtree by resolving a label/role target first, then walking only that subtree. Use this when read_window is too broad or sidebar/table content hides the target. Supports role, label, index, near_x/near_y, skip_role(s), and prefer_role(s). Pure AX read; does not move the cursor.',
       inputSchema: {
@@ -251,6 +297,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           near_y: { type: 'number', description: 'Optional screen-y for proximity disambiguation.' },
           skip_roles: { type: 'array', items: { type: 'string' }, description: 'Optional AX roles to omit while walking the subtree.' },
           prefer_roles: { type: 'array', items: { type: 'string' }, description: 'Optional AX roles to prioritize before lower-value branches.' },
+          exact: { type: 'boolean', description: 'If true, require exact label/value match and return not_found without slower substring fallback.' },
         },
       },
     },
@@ -624,6 +671,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_write_selection',
     'agent_check_ax',
     'agent_read_window',
+    'agent_discover_app',
+    'agent_list_app_workflows',
+    'agent_remember_app_workflow',
     'agent_read_subtree',
     'agent_find_element',
     'agent_focus_element',
@@ -710,16 +760,17 @@ function handleAgentTool(toolName, args) {
     }
 
     const callId = ++agentCallId;
-    // Agent AX calls may shell out to the Swift helper. The helper is
-    // fast (<200ms typical), but TCC permission prompts on first use
-    // can stall. Give it generous headroom.
+    // Agent AX calls shell out to the Swift helper. Simple reads are fast,
+    // but real app workflows such as Notes create/format/delete chains can
+    // take several seconds and should fail with helper detail, not a bridge
+    // race timeout.
     const timeout = setTimeout(() => {
       agentCallbacks.delete(callId);
       resolve({
         content: [{ type: 'text', text: 'Error: Agent action timed out' }],
         isError: true,
       });
-    }, 12000);
+    }, 30000);
 
     agentCallbacks.set(callId, { resolve, timeout });
 

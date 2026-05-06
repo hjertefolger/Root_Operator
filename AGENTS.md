@@ -1,0 +1,230 @@
+# AGENTS.md
+
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**Root Operator** is a personal AI assistant for macOS powered by Codex channels. It combines chat, terminal access, identity-aware workspace bootstrapping, and secure remote access into a single desktop product.
+
+## Build & Development Commands
+
+```bash
+# Install dependencies (triggers automatic native rebuild)
+npm install
+
+# Start app in development mode with HMR (recommended)
+npm run dev:app
+
+# Start app without HMR (loads built files)
+npm start
+
+# Rebuild native modules (node-pty, keytar) after node/electron version changes
+npm run rebuild
+
+# Build for macOS (unsigned, for local development)
+npm run build:unsigned
+
+# Build for macOS (requires Apple Developer credentials)
+npm run build
+```
+
+### Development with HMR
+
+The `npm run dev:app` command starts:
+1. Vite dev server for renderer on port 5174 (tray app HMR)
+2. Vite dev server for client on port 5175 (PWA client HMR)
+3. Electron loading from the dev servers
+
+Changes to React components are reflected immediately:
+- `src/renderer/` - Tray app components (hot reload)
+- `src/client/` - PWA client components (hot reload via proxy)
+
+## Architecture Overview
+
+### Process Architecture
+
+**Main Process** (`main.js`):
+- Electron main process that manages the app window, tray, and system integration
+- HTTP server (port 22000) that serves PWA client and handles WebSocket connections
+- Cloudflare tunnel manager that creates public URLs via `cloudflared` package
+- PTY (pseudoterminal) manager using `node-pty` for shell process spawning
+- E2E encryption layer using ECDH key exchange + AES-256-GCM
+- Secure credential storage via `keytar` (macOS Keychain)
+
+**Renderer Process** (`src/renderer/`):
+- React + Tailwind + shadcn/ui components
+- Entry point: `renderer.html` (built to `ui/dist/renderer.html`)
+- Main app: `src/renderer/App.jsx`
+- Components in `src/renderer/components/` (MainView, SettingsView, etc.)
+- Communicates with main process via IPC (see `preload.js` for channel whitelist)
+
+**Client/PWA** (`src/client/`):
+- React + Tailwind + shadcn/ui (same stack as renderer)
+- Entry point: `client.html` (built to `public/dist/client.html`)
+- Main app: `src/client/App.jsx`
+- Components: PairingScreen, Terminal, Header, VirtualKeyboard, EncryptionBadge
+- Hooks: useWebSocket, useAuth, useE2E, useTerminal, useTerminalPersistence
+- xterm.js terminal with fit and web-links addons
+- E2E encryption with fingerprint verification (12-word BIP39)
+- RSA-PSS authentication with 6-character pairing codes
+- WebSocket auto-reconnection with exponential backoff
+- Terminal content persistence via sessionStorage
+- Can be added to iOS home screen as PWA
+
+### Security Architecture
+
+**IPC Security** (`preload.js`):
+- Context isolation enabled
+- Channel whitelist pattern - only specific IPC channels are allowed
+- Renderer cannot access Node.js APIs directly
+
+**ANSI Sanitization** (`main.js:42-101`):
+- Filters dangerous ANSI escape sequences (OSC, DCS, APC, PM, SOS)
+- Blocks clipboard manipulation (OSC 52) and title spoofing (OSC 0/1/2)
+- Allows safe color palette sequences
+
+**E2E Encryption Flow** (`main.js:103-285`, `public/client.js`):
+1. Client connects via WebSocket
+2. Server initiates ECDH key exchange, sends public key + salt
+3. Client generates keypair, derives shared secret, sends public key
+4. Both sides derive AES-256-GCM session key via HKDF
+5. Both sides compute 12-word BIP39 fingerprint from shared secret + salt
+6. User verifies fingerprint match between desktop tray menu and iOS client
+7. All terminal I/O encrypted with AES-256-GCM (random IV per message)
+
+**Authentication** (`main.js`, `src/client/hooks/useAuth.js`):
+- RSA-PSS (2048-bit) public key authentication
+- New devices: 6-character pairing code displayed on client, user enters on desktop to approve
+- Returning devices: Server sends random challenge, client signs with private key, server verifies
+- Challenge-response enforced for ALL reconnections (proves key possession, not just key ID)
+- Approved keys stored in electron-store as `{kid, jwk}` pairs
+- Rate limiting: max 5 auth attempts per connection
+- Challenge expiry: 30 seconds
+
+**Origin Validation**:
+- WebSocket connections validated against Cloudflare tunnel URL
+- Blocks connections from unauthorized origins
+
+**WebSocket Reconnection** (`src/client/hooks/useWebSocket.js`):
+- Automatic reconnection with exponential backoff (1s → 30s max)
+- Jitter factor (±20%) to prevent thundering herd
+- Heartbeat ping/pong every 25s to detect dead connections
+- Handles network online/offline events
+- Handles iOS PWA visibility changes (background/foreground)
+- Server output buffer (1MB) preserves terminal history across reconnects
+
+**Terminal Persistence** (`src/client/hooks/useTerminalPersistence.js`):
+- Saves terminal content to sessionStorage (debounced 500ms)
+- Restores on page reload before server buffer arrives
+- Server buffer takes precedence as source of truth
+- Auto-saves on page hide (iOS PWA backgrounding)
+- Max 1MB content, uses sessionStorage for security (clears on tab close)
+
+### State Management
+
+**Electron Store**:
+- Keys: `cloudflare-token` (stored in keytar/Keychain, NOT electron-store)
+- Keys: `allowed-origin` (custom domain for tunnel)
+- Keys: `keys` (array of approved client public keys: `{kid, jwk}`)
+- Keys: `debug-logging-enabled` (boolean, default: false)
+
+**Global State** (`main.js:26-37`):
+- `mainWindow`: BrowserWindow instance
+- `tray`: Tray icon instance
+- `server`: HTTP server instance
+- `wss`: WebSocket server instance
+- `ptyProcess`: Active PTY process
+- `tunnelProcess`: Cloudflare tunnel child process
+- `pendingConns`: Map of pending WebSocket connections awaiting auth
+- `activeClients`: Set of authenticated WebSocket connections
+- `currentTunnelUrl`: Current tunnel URL for state sync
+- `currentFingerprint`: E2E session fingerprint (shown in tray)
+
+### File Structure
+
+```
+main.js                     Main process (Electron, server, tunnel, PTY, E2E)
+preload.js                  IPC bridge with channel whitelist
+renderer.html               Renderer entry point (tray app)
+client.html                 Client entry point (PWA)
+vite.renderer.config.js     Vite config for tray app (port 5174)
+vite.client.config.js       Vite config for PWA client (port 5175)
+src/renderer/               Electron renderer (React + Tailwind)
+  App.jsx                   Main React app
+  main.jsx                  React entry point
+  index.css                 Tailwind styles
+  components/               React components (MainView, SettingsView, etc.)
+  hooks/                    React hooks (useElectron)
+src/client/                 PWA client (React + Tailwind)
+  App.jsx                   Main React app
+  main.jsx                  React entry point
+  index.css                 Tailwind styles
+  components/               React components (PairingScreen, Terminal, Header, VirtualKeyboard)
+  hooks/                    React hooks (useWebSocket, useAuth, useE2E, useTerminal, useTerminalPersistence)
+src/components/ui/          shadcn/ui components (Button, Switch, Input OTP, etc.)
+public/                     Static assets
+  bip39-words.json          BIP39 wordlist for fingerprints
+  fonts/                    Geist fonts
+  manifest.json             PWA manifest
+public/dist/                Built client output
+ui/dist/                    Built renderer output
+build/entitlements.mac.plist  macOS entitlements for signing
+scripts/notarize.js         Notarization script (currently disabled)
+```
+
+## Key Implementation Details
+
+### Debug Logging
+
+Debug logging is OFF by default and can be toggled via Settings in the UI. When enabled, logs are written to:
+- macOS: `~/Library/Logs/RootOperator/debug.log` (or `~/Library/Logs/PocketBridge/debug.log` if using legacy name)
+
+Logs auto-rotate at 10 MB (keeps last 3 files). Check `isDebugLoggingEnabled()` before logging with `logDebug()`.
+
+### Cloudflare Tunnel
+
+The app uses the `cloudflared` npm package which provides a managed wrapper. On start:
+1. Spawns `cloudflared tunnel --url http://localhost:22000`
+2. Package emits `url` event with tunnel URL
+3. Tunnel URL sent to renderer via `TUNNEL_LIVE` IPC event
+4. QR code generated for iOS scanning
+
+Custom domains can be configured via `allowed-origin` store setting, which requires a Cloudflare token with tunnel permissions.
+
+### Native Module Dependencies
+
+- `node-pty`: PTY/shell spawning (requires native rebuild)
+- `keytar`: Keychain access (requires native rebuild)
+
+Both are listed in `asarUnpack` in package.json because they contain native code that cannot be inside asar archives.
+
+### Path Traversal Protection
+
+The PWA server (`servePWA()`) implements strict path validation:
+- Normalizes all paths
+- Validates against base directories (`/public`, `/node_modules`)
+- Rejects null bytes and parent directory traversal
+- See `main.js:1078-1088` for implementation
+
+## Common Development Pitfalls
+
+1. **After changing Node/Electron version**: Run `npm run rebuild` to recompile native modules
+2. **E2E not working**: Check that both client and server show matching fingerprints
+3. **Tunnel fails to start**: Check Cloudflare token is valid (if using custom domain)
+4. **IPC channel blocked**: Add channel to whitelist in `preload.js`
+5. **Logs not appearing**: Check if debug logging is enabled via Settings UI
+
+## macOS Code Signing & Notarization
+
+Currently DISABLED for easier local development. To enable:
+
+1. Join Apple Developer Program ($99/year)
+2. Update `package.json`:
+   - `identity: null` → `identity: "Developer ID Application: Your Name (TEAM_ID)"`
+   - `hardenedRuntime: false` → `hardenedRuntime: true`
+3. Set environment variables:
+   - `APPLE_ID`
+   - `APPLE_APP_SPECIFIC_PASSWORD`
+   - `APPLE_TEAM_ID`
+
+See `scripts/notarize.js` for full setup instructions.
