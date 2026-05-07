@@ -607,6 +607,166 @@ console.log(JSON.stringify({
     assert.equal(payload.steps[1].action, 'AXPress');
 });
 
+test('agent_describe_ops returns generic op registry', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        helperPath: null,
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_describe_ops', args: {} });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /wait_for_role/);
+    assert.match(r.result, /write_selection/);
+    assert.match(r.result, /Selector fields/);
+});
+
+test('agent_describe_ops documents production verification and scoped fallbacks', async () => {
+    const handler = init({
+        screen: fakeScreen(),
+        helperPath: null,
+        getAgentAvatar: () => null,
+        logDebug: () => {},
+    });
+    const r = await handler.handle({ tool: 'agent_describe_ops', args: {} });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /menu: aliases=menu_command,menu-command/);
+    assert.match(r.result, /verify_font_size/);
+    assert.match(r.result, /Do not treat an intermediate control AXValue as proof/);
+    assert.match(r.result, /AXUIElementCopyAttributeValue/);
+    assert.match(r.result, /require_focus=false/);
+    assert.match(r.result, /Known native pattern for font-size combo boxes/);
+});
+
+test('channel bridge describes semantic verification for agent_act', () => {
+    const bridgeSource = fs.readFileSync(path.join(__dirname, '..', 'channel-bridge.cjs'), 'utf8');
+    assert.match(bridgeSource, /verify the requested app-state postcondition/);
+    assert.match(bridgeSource, /alias menu_command/);
+    assert.match(bridgeSource, /scoped keystroke\/type_text CGEvents/);
+    assert.match(bridgeSource, /verify_font_size/);
+    assert.match(bridgeSource, /not just the font-size control value/);
+    assert.match(bridgeSource, /Do not use this for multi-step targeted app workflows/);
+});
+
+test('agent_act surfaces read step outputs', async () => {
+    const helperPath = makeFakeHelper(`
+const payload = JSON.parse(process.argv[3]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({
+    ok: true,
+    index,
+    op: step.op,
+    role: 'AXTextArea',
+    value: step.op === 'read' ? 'hello from read' : undefined,
+    frame: { x: 10, y: 20, w: 30, h: 40 }
+  }))
+}));
+`);
+    const handler = init(makeDeps(fakeAvatar().instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_act',
+        args: {
+            force: true,
+            steps: [
+                { op: 'resolve', app: 'Notes', scope: 'app', role: 'AXTextArea', as: 'editor' },
+                { op: 'read', target: 'editor' },
+            ],
+        },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Step outputs:/);
+    assert.match(r.result, /hello from read/);
+});
+
+test('focus lease from agent_act lets select_substring run without restating selector', async () => {
+    const callsPath = path.join(os.tmpdir(), `lease-calls-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const callsPath = ${JSON.stringify(callsPath)};
+const argv = process.argv.slice(2);
+const calls = fs.existsSync(callsPath) ? JSON.parse(fs.readFileSync(callsPath, 'utf8')) : [];
+calls.push(argv);
+fs.writeFileSync(callsPath, JSON.stringify(calls));
+const payload = JSON.parse(argv[1]);
+const steps = payload.steps.map((step, index) => {
+  const base = { ok: true, index, op: step.op, role: step.role || 'AXTextArea', frame: { x: 10, y: 20, w: 30, h: 40 } };
+  if (step.op === 'resolve') return { ...base, found: true, as: step.as, label: 'Body' };
+  if (step.op === 'focus') return { ...base, action: 'focus', fresh_verified: true };
+  if (step.op === 'select_substring') return { ...base, action: 'select_range', location: 6, length: String(step.needle || '').length, total_chars: 30 };
+  return base;
+});
+console.log(JSON.stringify({ ok: true, cursor_unchanged: true, cursor_delta: 0, steps }));
+`);
+    const handler = init(makeDeps(fakeAvatar().instance, { helperPath }));
+    const focused = await handler.handle({
+        tool: 'agent_act',
+        args: {
+            force: true,
+            steps: [
+                { op: 'resolve', app: 'Notes', scope: 'app', role: 'AXTextArea', as: 'editor' },
+                { op: 'focus', target: 'editor' },
+            ],
+        },
+    });
+    assert.equal(focused.isError, false);
+
+    const selected = await handler.handle({
+        tool: 'agent_select_substring',
+        args: { needle: 'demo', force: true },
+    });
+    assert.equal(selected.isError, false);
+    assert.match(selected.result, /Selected "demo"/);
+
+    const calls = JSON.parse(fs.readFileSync(callsPath, 'utf8'));
+    assert.equal(calls.length, 2);
+    const secondPayload = JSON.parse(calls[1][1]);
+    assert.deepEqual(secondPayload.steps.map((step) => step.op), ['resolve', 'focus', 'select_substring']);
+    assert.equal(secondPayload.steps[0].app, 'Notes');
+    assert.equal(secondPayload.steps[0].role, 'AXTextArea');
+});
+
+test('focus lease invalidates on user activity without force', async () => {
+    const helperPath = makeFakeHelper(`
+const payload = JSON.parse(process.argv[3]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({ ok: true, index, op: step.op, role: step.role || 'AXTextArea', found: step.op === 'resolve', frame: { x: 1, y: 2, w: 3, h: 4 } }))
+}));
+`);
+    let exposeUserActivity = false;
+    const handler = init({
+        ...makeDeps(fakeAvatar().instance, { helperPath }),
+        getAgentEvents: () => ({
+            getEvents: () => (exposeUserActivity
+                ? [{ event: 'app_activated', app: 'Safari', ts: (Date.now() + 2000) / 1000 }]
+                : []),
+        }),
+    });
+    const focused = await handler.handle({
+        tool: 'agent_act',
+        args: {
+            force: true,
+            steps: [
+                { op: 'resolve', app: 'Notes', scope: 'app', role: 'AXTextArea', as: 'editor' },
+                { op: 'focus', target: 'editor' },
+            ],
+        },
+    });
+    assert.equal(focused.isError, false);
+    exposeUserActivity = true;
+    const selected = await handler.handle({
+        tool: 'agent_select_substring',
+        args: { needle: 'demo' },
+    });
+    assert.equal(selected.isError, true);
+    assert.match(selected.result, /focus_invalidated_by_user_activity/);
+});
+
 test('agent_act triggers visual feedback for every successful framed bridge step', async () => {
     const helperPath = makeFakeHelper(`
 const steps = [
@@ -830,6 +990,68 @@ test('agent_menu_command rejects empty or non-string path', async () => {
     });
     assert.equal(bad.isError, true);
     assert.match(bad.result, /must be non-empty strings/);
+});
+
+test('agent_menu_command targets named app through atomic AX chain', async () => {
+    const argvPath = path.join(os.tmpdir(), `menu-app-chain-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+const payload = JSON.parse(argv[1]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({ ok: true, index, op: step.op, action: 'menu', frame: { x: 10, y: 20, w: 30, h: 40 } }))
+}));
+`);
+    const handler = init(makeDeps(fakeAvatar().instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_menu_command',
+        args: { app: 'Finder', path: ['File', 'New Finder Window'], force: true },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Menu command completed 1 step/);
+    const argv = JSON.parse(fs.readFileSync(argvPath, 'utf8'));
+    assert.equal(argv[0], 'act');
+    const payload = JSON.parse(argv[1]);
+    assert.deepEqual(payload.steps[0], {
+        op: 'menu',
+        app: 'Finder',
+        path: ['File', 'New Finder Window'],
+        activate: true,
+    });
+});
+
+test('agent_press_named targets named app through atomic AX chain', async () => {
+    const argvPath = path.join(os.tmpdir(), `press-app-chain-${process.pid}-${Date.now()}.json`);
+    const helperPath = makeFakeHelper(`
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(argv));
+const payload = JSON.parse(argv[1]);
+console.log(JSON.stringify({
+  ok: true,
+  cursor_unchanged: true,
+  cursor_delta: 0,
+  steps: payload.steps.map((step, index) => ({ ok: true, index, op: step.op, action: 'press', label: step.label, role: 'AXButton', frame: { x: 10, y: 20, w: 30, h: 40 } }))
+}));
+`);
+    const handler = init(makeDeps(fakeAvatar().instance, { helperPath }));
+    const r = await handler.handle({
+        tool: 'agent_press_named',
+        args: { app: 'Calculator', label: '1', role: 'AXButton', force: true },
+    });
+    assert.equal(r.isError, false);
+    assert.match(r.result, /Press named completed 1 step/);
+    const argv = JSON.parse(fs.readFileSync(argvPath, 'utf8'));
+    assert.equal(argv[0], 'act');
+    const payload = JSON.parse(argv[1]);
+    assert.equal(payload.steps[0].op, 'press_named');
+    assert.equal(payload.steps[0].app, 'Calculator');
+    assert.equal(payload.steps[0].label, '1');
+    assert.equal(payload.steps[0].role, 'AXButton');
 });
 
 test('agent_keystroke refuses while user activity is detected (no force)', async () => {

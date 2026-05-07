@@ -14,7 +14,7 @@ const path = require('path');
 const fs = require('fs');
 const presenceMotionConfig = require('../shared/presence-motion-config.json');
 
-const HELPER_TIMEOUT_MS = 20000; // Notes and other rich apps need room for multi-step AX chains
+const HELPER_TIMEOUT_MS = 45000; // Long launch/wait AX chains need room to settle without helper timeouts.
 
 // Hard caps on AX write payloads. The AX channel can technically accept
 // long strings but the user-visible blast radius scales with size.
@@ -47,6 +47,9 @@ const MAX_CHAIN_JSON_LENGTH = 120000;
 const APP_PROFILE_STORE_KEY = 'agentAppProfiles';
 const MAX_APP_WORKFLOWS = 40;
 const MAX_WORKFLOW_JSON_LENGTH = 80000;
+const FOCUS_LEASE_TTL_MS = 5000;
+const FOCUS_LEASE_TARGET = '__focus_lease_target';
+const MAX_FORMATTED_STEP_OUTPUT_CHARS = 12000;
 
 const DEFAULT_APP_WORKFLOWS = {
     'com.apple.Notes': [
@@ -199,6 +202,35 @@ const DEFAULT_APP_BUNDLE_ALIASES = {
     Dictionary: 'com.apple.Dictionary',
 };
 
+const AGENT_ACT_OPS = [
+    { op: 'launch', aliases: ['launch_app'], required: ['app|bundle_id|bundle'], optional: ['activate', 'timeout_ms'] },
+    { op: 'wait_window', aliases: ['wait_for_app_window'], required: ['app|bundle_id|bundle'], optional: ['timeout_ms'] },
+    { op: 'wait_ms', aliases: ['sleep', 'sleep_ms', 'wait'], required: ['ms|duration_ms'], optional: [] },
+    { op: 'wait_for_role', aliases: ['wait_for_element', 'wait_until_present'], required: ['role|label|x/y'], optional: ['app|bundle_id', 'scope', 'timeout_ms', 'as', 'index', 'near_x/near_y', 'prefer_roles', 'skip_roles', 'exact'] },
+    { op: 'resolve', required: ['as', 'role|label|x/y'], optional: ['app|bundle_id', 'scope', 'index', 'near_x/near_y', 'prefer_roles', 'skip_roles', 'exact', 'optional'] },
+    { op: 'focus', required: ['target'], optional: ['allow_unstable'] },
+    { op: 'inspect', required: ['target'], optional: [] },
+    { op: 'perform_action', aliases: ['action'], required: ['target', 'action'], optional: [] },
+    { op: 'set_attribute', required: ['target', 'attribute', 'value|text'], optional: ['location/length for AXSelectedTextRange'] },
+    { op: 'set_value', required: ['target', 'text'], optional: [] },
+    { op: 'select_all', required: ['target'], optional: [] },
+    { op: 'select_range', required: ['target', 'location', 'length'], optional: [] },
+    { op: 'select_substring', required: ['target', 'needle'], optional: ['occurrence'] },
+    { op: 'write_selection', aliases: ['write'], required: ['target', 'text'], optional: ['replace_all'] },
+    { op: 'insert_text', required: ['target', 'text'], optional: ['location'] },
+    { op: 'menu', aliases: ['menu_command', 'menu-command'], required: ['path'], optional: ['app|bundle_id', 'activate'] },
+    { op: 'press_named', required: ['label'], optional: ['app|bundle_id', 'role', 'index', 'near_x/near_y'] },
+    { op: 'hid', required: ['x/y|target'], optional: ['kind', 'button', 'count'] },
+    { op: 'keystroke', aliases: ['key'], required: ['key'], optional: ['app|bundle_id', 'mods', 'require_focus'] },
+    { op: 'type_text', aliases: ['type'], required: ['text'], optional: ['app|bundle_id', 'require_focus'] },
+    { op: 'read', required: ['target'], optional: [] },
+    { op: 'verify_value', required: ['target'], optional: ['equals', 'contains'] },
+    { op: 'font_info', required: ['target'], optional: ['location'] },
+    { op: 'verify_font_size', required: ['target', 'size|font_size|expected'], optional: ['tolerance'] },
+    { op: 'verify_present', required: ['role|label|x/y'], optional: ['app|bundle_id', 'scope', 'index', 'near_x/near_y', 'skip_roles', 'exact'] },
+    { op: 'verify_absent', required: ['role|label|x/y'], optional: ['app|bundle_id', 'scope', 'index', 'near_x/near_y', 'skip_roles', 'exact'] },
+];
+
 // User-activity guard window. Before posting a keystroke or typing
 // text we look at the AX subscribe ring buffer. If we see a recent
 // AXValueChanged or AXFocusedUIElementChanged that we did NOT cause
@@ -334,13 +366,21 @@ function formatTree(node, depth, lines) {
     const parts = [node.role];
     if (node.subrole) parts.push(`(${node.subrole})`);
     if (node.label) parts.push(`"${node.label}"`);
-    if (node.value && (!node.label || node.value !== node.label)) {
-        parts.push(`= ${JSON.stringify(node.value).slice(0, 80)}`);
-    }
+    const hasDistinctValue = node.value && (!node.label || node.value !== node.label);
+    const textRoles = new Set(['AXTextArea', 'AXTextField', 'AXSearchField', 'AXComboBox']);
+    const renderValueInline = hasDistinctValue && !textRoles.has(node.role);
+    if (renderValueInline) parts.push(`= ${JSON.stringify(String(node.value).slice(0, 120))}`);
     if (node.frame) {
         parts.push(`[${Math.round(node.frame.x)},${Math.round(node.frame.y)} ${Math.round(node.frame.w)}x${Math.round(node.frame.h)}]`);
     }
     lines.push(`${indent}${parts.join(' ')}`);
+    if (hasDistinctValue && textRoles.has(node.role)) {
+        lines.push(`${indent}  value:`);
+        const value = String(node.value);
+        for (const line of compactOutput(value, 8000).split('\n')) {
+            lines.push(`${indent}    ${line}`);
+        }
+    }
     if (Array.isArray(node.children)) {
         for (const child of node.children) {
             formatTree(child, depth + 1, lines);
@@ -635,6 +675,160 @@ function buildElementTargetArgs(args, toolName, { requireLabel = false, requireT
     out.push(...disambig.args);
     if (label) out.push(label);
     return { args: out };
+}
+
+const SELECTOR_KEYS = [
+    'app',
+    'application',
+    'bundle',
+    'bundle_id',
+    'scope',
+    'label',
+    'role',
+    'index',
+    'near_x',
+    'near_y',
+    'x',
+    'y',
+    'point',
+    'skip_role',
+    'skip_roles',
+    'prefer_role',
+    'prefer_roles',
+    'exact',
+];
+
+function cloneSelectorValue(value) {
+    if (Array.isArray(value)) return value.slice();
+    if (value && typeof value === 'object') return { ...value };
+    return value;
+}
+
+function hasSelectorTarget(selector) {
+    if (!selector || typeof selector !== 'object') return false;
+    if (String(selector.label || '').trim()) return true;
+    if (String(selector.role || '').trim()) return true;
+    if (selector.point && typeof selector.point === 'object') {
+        return finiteNumber(selector.point.x) !== null && finiteNumber(selector.point.y) !== null;
+    }
+    return finiteNumber(selector.x) !== null && finiteNumber(selector.y) !== null;
+}
+
+function selectorFromSource(source, fallbackScope) {
+    if (!source || typeof source !== 'object') return null;
+    const selector = {};
+    for (const key of SELECTOR_KEYS) {
+        if (source[key] !== undefined && source[key] !== null) {
+            selector[key] = cloneSelectorValue(source[key]);
+        }
+    }
+    if (!selector.scope && fallbackScope) selector.scope = fallbackScope;
+    if (!selector.scope && (selector.app || selector.application || selector.bundle || selector.bundle_id)) {
+        selector.scope = 'app';
+    }
+    return hasSelectorTarget(selector) ? selector : null;
+}
+
+function selectorFromArgs(args, fallbackScope) {
+    return selectorFromSource(args, fallbackScope);
+}
+
+function stripControlKeysFromSelectorArgs(args) {
+    const out = {};
+    for (const key of SELECTOR_KEYS) {
+        if (args[key] !== undefined && args[key] !== null) {
+            out[key] = cloneSelectorValue(args[key]);
+        }
+    }
+    return out;
+}
+
+function resolveStepName(step) {
+    if (!step || typeof step !== 'object') return '';
+    return String(step.as || step.var || '').trim();
+}
+
+function focusLeaseFromActSteps(inputSteps, result) {
+    if (!Array.isArray(inputSteps) || !result || !result.ok || !Array.isArray(result.steps)) {
+        return null;
+    }
+    const resolves = new Map();
+    for (let i = 0; i < inputSteps.length; i += 1) {
+        const step = inputSteps[i];
+        const op = String(step && step.op || '').toLowerCase();
+        if (op === 'resolve' || op === 'wait_for_role' || op === 'wait_for_element' || op === 'wait_until_present') {
+            const name = resolveStepName(step);
+            const stepResult = result.steps[i];
+            const selector = selectorFromSource(step, step.scope || (step.app || step.bundle_id ? 'app' : 'window'));
+            if (name && selector && stepResult && !stepResult.error && stepResult.found !== false) {
+                resolves.set(name, selector);
+            }
+        }
+    }
+    for (let i = inputSteps.length - 1; i >= 0; i -= 1) {
+        const step = inputSteps[i];
+        const op = String(step && step.op || '').toLowerCase();
+        const stepResult = result.steps[i];
+        if (op === 'focus' && stepResult && !stepResult.error) {
+            const targetName = String(step.target || 'target');
+            const selector = resolves.get(targetName) || selectorFromSource(step, step.scope);
+            if (selector) {
+                return {
+                    selector,
+                    source: 'agent_act',
+                    role: stepResult.role,
+                    label: stepResult.label,
+                    frame: stepResult.frame,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+function focusLeaseFromSelector(selector, source, result) {
+    if (!selector) return null;
+    return {
+        selector,
+        source,
+        role: result && result.role,
+        label: result && result.label,
+        frame: result && result.frame,
+    };
+}
+
+function leasedActSteps(selector, actionStep) {
+    return [
+        { ...selector, op: 'resolve', as: FOCUS_LEASE_TARGET },
+        { op: 'focus', target: FOCUS_LEASE_TARGET, allow_unstable: true },
+        { ...actionStep, target: FOCUS_LEASE_TARGET },
+    ];
+}
+
+function formatDescribeOps() {
+    const lines = [
+        'agent_act op registry:',
+    ];
+    for (const spec of AGENT_ACT_OPS) {
+        const aliases = Array.isArray(spec.aliases) && spec.aliases.length
+            ? ` aliases=${spec.aliases.join(',')}`
+            : '';
+        const required = Array.isArray(spec.required) && spec.required.length
+            ? ` required=${spec.required.join(',')}`
+            : ' required=none';
+        const optional = Array.isArray(spec.optional) && spec.optional.length
+            ? ` optional=${spec.optional.join(',')}`
+            : '';
+        lines.push(`- ${spec.op}:${aliases}${required}${optional}`);
+    }
+    lines.push('Selector fields: app/bundle_id, scope=window|app|system|focused|target, role, label, index, near_x+near_y, x+y, prefer_roles, skip_roles, exact.');
+    lines.push('Production rules: inspect/discover the AX tree, resolve semantic elements, perform AX actions or set AX attributes, and verify the requested app-state postcondition in the same chain. Do not treat an intermediate control AXValue as proof unless that value is the requested state.');
+    lines.push('Native control rule: prefer AXUIElementCopyAttributeValue, AXUIElementIsAttributeSettable, AXUIElementSetAttributeValue, and AXUIElementPerformAction. If an AX setter/action reports success but verification fails, stop and report the mismatch instead of trying unrelated setters.');
+    lines.push('CGEvent/HID fallback policy: use only for focus repair, text insertion fallback, or controls with no reliable AX action after explicit user consent. Keep fallback steps scoped to the intended app with app/bundle_id plus require_focus=false only when the app has just been activated/resolved in the same chain; preserve cursor/clipboard and fail closed with diagnostics.');
+    lines.push('Focus rule: some native controls accept AXFocused or AXValue without changing the underlying document/app state. For unstable focus or pop-up/combo controls, do not loop on AXFocused; perform the native user gesture in a single scoped chain and verify the semantic result.');
+    lines.push('Rich text rule: changing a formatting control is not sufficient. Resolve the edited text element and verify actual attributed content with font_info or verify_font_size when the user asked to change text size.');
+    lines.push('Known native pattern for font-size combo boxes: launch/wait_window, resolve edited text as body, select_all/select_range, resolve the font-size AXComboBox by label, hid click it, keystroke cmd+a scoped to the app with require_focus=false, type_text the numeric size scoped to the app, keystroke return scoped to the app, then verify_font_size on body.');
+    return lines.join('\n');
 }
 
 function finiteNumber(value) {
@@ -932,6 +1126,35 @@ function formatRunChain(result) {
     return `Run chain returned unexpected: ${JSON.stringify(result).slice(0, 200)}`;
 }
 
+function compactOutput(text, limit = MAX_FORMATTED_STEP_OUTPUT_CHARS) {
+    const s = String(text || '');
+    if (s.length <= limit) return s;
+    return `${s.slice(0, limit)}\n...(truncated ${s.length - limit} chars)`;
+}
+
+function formatStepOutputs(result) {
+    if (!result || !Array.isArray(result.steps)) return '';
+    const outputSteps = result.steps.filter((step) => {
+        if (!step || step.error) return false;
+        return String(step.op || '').toLowerCase() === 'read'
+            || String(step.action || '').toLowerCase() === 'read';
+    });
+    if (outputSteps.length === 0) return '';
+    const lines = ['Step outputs:'];
+    for (const step of outputSteps) {
+        const idx = step.index !== undefined ? `step ${step.index}` : 'read';
+        lines.push(`${idx}:`);
+        lines.push(compactOutput(formatRead(step)));
+    }
+    return lines.join('\n');
+}
+
+function formatRunChainWithOutputs(result) {
+    const base = formatRunChain(result);
+    const outputs = formatStepOutputs(result);
+    return outputs ? `${base}\n${outputs}` : base;
+}
+
 function formatEventLine(evt) {
     if (!evt || typeof evt !== 'object') return '';
     const tsIso = Number.isFinite(evt.ts)
@@ -1026,6 +1249,7 @@ function init(deps) {
     // user-activity checks ignore events older than this — those are
     // ours, not the user's. Updated on every successful action.
     let lastSelfActionAt = 0;
+    let focusLease = null;
 
     function bumpSelfActionAt() {
         lastSelfActionAt = Date.now();
@@ -1102,15 +1326,114 @@ function init(deps) {
         return null;
     }
 
+    function rememberFocusLease(partial) {
+        if (!partial || !partial.selector) return null;
+        const now = Date.now();
+        focusLease = {
+            ...partial,
+            createdAt: now,
+            expiresAt: now + FOCUS_LEASE_TTL_MS,
+        };
+        return focusLease;
+    }
+
+    function clearFocusLease() {
+        focusLease = null;
+    }
+
+    function focusLeaseInvalidatingActivity() {
+        if (!focusLease || typeof deps.getAgentEvents !== 'function') return null;
+        const events = deps.getAgentEvents();
+        if (!events || typeof events.getEvents !== 'function') return null;
+        const sinceMs = Math.max(USER_ACTIVITY_WINDOW_MS, Date.now() - focusLease.createdAt + 250);
+        const list = events.getEvents({ since_ms: sinceMs });
+        if (!Array.isArray(list) || list.length === 0) return null;
+        const selfCutoffMs = lastSelfActionAt - SELF_ACTION_WINDOW_MS;
+        const triggers = new Set([
+            'AXValueChanged',
+            'AXFocusedUIElementChanged',
+            'AXSelectedTextChanged',
+            'AXFocusedWindowChanged',
+            'AXMainWindowChanged',
+            'AXMenuOpened',
+            'app_activated',
+        ]);
+        for (const e of list) {
+            if (!e || !triggers.has(e.event)) continue;
+            const tsMs = Number(e.ts) * 1000;
+            if (!Number.isFinite(tsMs) || tsMs < focusLease.createdAt) continue;
+            if (lastSelfActionAt > 0 && tsMs >= selfCutoffMs && tsMs <= lastSelfActionAt + SELF_ACTION_WINDOW_MS) {
+                continue;
+            }
+            return e;
+        }
+        return null;
+    }
+
+    function usableFocusLease(force = false) {
+        if (!focusLease || !focusLease.selector) return { lease: null };
+        if (Date.now() > focusLease.expiresAt) {
+            clearFocusLease();
+            return { lease: null, expired: true };
+        }
+        const offending = focusLeaseInvalidatingActivity();
+        if (offending && !force) {
+            return { lease: null, invalidated: offending };
+        }
+        return { lease: focusLease, invalidated: offending || null };
+    }
+
+    function formatFocusLeaseInvalidation(offending) {
+        const event = offending && offending.event ? offending.event : 'unknown activity';
+        const app = offending && offending.app ? ` in ${offending.app}` : '';
+        return `focus_invalidated_by_user_activity: ${event}${app}. Pass force=true to override.`;
+    }
+
+    async function runActSteps(steps, cursorTolerance) {
+        const payload = {
+            cursor_tolerance: cursorTolerance,
+            steps,
+        };
+        return runHelper(deps, ['act', JSON.stringify(payload)]);
+    }
+
+    function lastStepResult(result) {
+        if (!result || !Array.isArray(result.steps) || result.steps.length === 0) return result;
+        return result.steps[result.steps.length - 1];
+    }
+
+    async function runSelectorAction(selector, actionStep, cursorTolerance) {
+        const steps = leasedActSteps(selector, actionStep);
+        const result = await runActSteps(steps, cursorTolerance);
+        return { result, step: lastStepResult(result), steps };
+    }
+
+    function selectorOrLease(args, force, fallbackScope) {
+        const explicit = selectorFromArgs(stripControlKeysFromSelectorArgs(args), fallbackScope);
+        if (explicit) return { selector: explicit, source: 'explicit' };
+        const leaseState = usableFocusLease(force);
+        if (leaseState.invalidated) {
+            return { error: formatFocusLeaseInvalidation(leaseState.invalidated) };
+        }
+        if (leaseState.lease) {
+            return { selector: leaseState.lease.selector, source: 'lease' };
+        }
+        return { selector: null };
+    }
+
     // Pulse the halo around the AX element identified by the helper's
     // structured frame, if the halo overlay is wired and the frame is
     // valid. Best-effort — never throw, never block the action result.
     function haloOptionsForResult(result) {
         const action = String((result && (result.action || result.op)) || '').toLowerCase();
+        const role = result && result.role ? String(result.role) : undefined;
+        const explicitRadius = result && (result.borderRadius ?? result.border_radius);
+        const parsedRadius = Number(explicitRadius);
+        const radius = Number.isFinite(parsedRadius) ? parsedRadius : undefined;
         if (action === 'focus' || action === 'read' || action === 'inspect') {
-            return { mode: action || 'focus' };
+            return { mode: action || 'focus', role, borderRadius: radius };
         }
-        return { mode: action || 'action' };
+        return { mode: action || 'action', role, borderRadius: radius };
     }
 
     function maybeHalo(result, options = {}) {
@@ -1247,6 +1570,10 @@ function init(deps) {
                     };
                 }
 
+                case 'agent_describe_ops': {
+                    return { result: formatDescribeOps(), isError: false };
+                }
+
                 case 'agent_read_at_cursor': {
                     const cursor = deps.screen.getCursorScreenPoint();
                     const r = await runHelper(deps, ['read-at', String(cursor.x), String(cursor.y)]);
@@ -1255,6 +1582,19 @@ function init(deps) {
                 }
 
                 case 'agent_read_focused': {
+                    const force = args.force === true;
+                    const target = selectorOrLease(args, force, 'window');
+                    if (target.error) return { result: `Read focused failed: ${target.error}`, isError: true };
+                    if (target.selector) {
+                        const { result: chain, step } = await runSelectorAction(target.selector, { op: 'read' }, args.cursor_tolerance);
+                        if (chain.ok) {
+                            rememberFocusLease(focusLeaseFromSelector(target.selector, target.source === 'lease' ? 'agent_read_focused:lease' : 'agent_read_focused', step));
+                            bumpSelfActionAt();
+                            if (step && !step.error) showActionAt(avatar, step);
+                            return { result: formatRead(step), isError: !!(step && step.error) };
+                        }
+                        return { result: formatRunChain(chain).replace(/^Run chain/, 'Read focused chain'), isError: true };
+                    }
                     const r = await runHelper(deps, ['read-focused']);
                     if (!r.error || r.error === 'no_text') showActionAt(avatar, r);
                     return { result: formatRead(r), isError: !!r.error && r.error !== 'no_text' };
@@ -1281,9 +1621,33 @@ function init(deps) {
                         };
                     }
                     const force = args.force === true;
+                    const target = selectorOrLease(args, force, 'window');
+                    if (target.error) {
+                        return { result: `AX write failed: ${target.error}`, isError: true };
+                    }
                     const refused = refuseIfUserActive(force, 'Refused write');
                     if (refused) return refused;
                     lastWriteAt = now;
+                    if (target.selector) {
+                        const { result: chain, step } = await runSelectorAction(
+                            target.selector,
+                            { op: 'write_selection', text, replace_all: replaceAll },
+                            args.cursor_tolerance,
+                        );
+                        if (chain.ok && step && !step.error) {
+                            bumpSelfActionAt();
+                            rememberFocusLease(focusLeaseFromSelector(target.selector, target.source === 'lease' ? 'agent_write_selection:lease' : 'agent_write_selection', step));
+                            showActionAt(avatar, step);
+                            return { result: formatWrite(step), isError: false };
+                        }
+                        if (chain.error) {
+                            return {
+                                result: formatRunChain(chain).replace(/^Run chain/, 'Write selection chain'),
+                                isError: true,
+                            };
+                        }
+                        return { result: formatWrite(step || chain), isError: true };
+                    }
                     // Resolve the target via the user's cursor position
                     // rather than system focus. The Presence bubble owns
                     // focus while the user is typing into it, so writing
@@ -1441,7 +1805,11 @@ function init(deps) {
                         deps,
                         await runHelper(deps, ['focus-element', ...target.args]),
                     );
-                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    if (r.ok) {
+                        bumpSelfActionAt();
+                        rememberFocusLease(focusLeaseFromSelector(selectorFromArgs(args, 'window'), 'agent_focus_element', r));
+                        showActionAt(avatar, r);
+                    }
                     return { result: formatFocus(r), isError: !r.ok };
                 }
 
@@ -1464,7 +1832,11 @@ function init(deps) {
                         deps,
                         await runHelper(deps, ['focus-at', String(x.value), String(y.value)]),
                     );
-                    if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
+                    if (r.ok) {
+                        bumpSelfActionAt();
+                        rememberFocusLease(focusLeaseFromSelector({ scope: 'system', x: x.value, y: y.value }, 'agent_focus_at', r));
+                        showActionAt(avatar, r);
+                    }
                     return { result: formatFocus(r), isError: !r.ok };
                 }
 
@@ -1510,7 +1882,7 @@ function init(deps) {
                         bumpSelfActionAt();
                         scheduleActionSignals(avatar, r);
                     }
-                    return { result: formatRunChain(r), isError: !r.ok };
+                    return { result: formatRunChainWithOutputs(r), isError: !r.ok };
                 }
 
                 case 'agent_act': {
@@ -1539,9 +1911,15 @@ function init(deps) {
                     const r = await runHelper(deps, ['act', json]);
                     if (r.ok) {
                         bumpSelfActionAt();
+                        const nextLease = focusLeaseFromActSteps(steps, r);
+                        if (nextLease) {
+                            rememberFocusLease(nextLease);
+                        } else {
+                            clearFocusLease();
+                        }
                         scheduleActionSignals(avatar, r);
                     }
-                    return { result: formatRunChain(r).replace(/^Run chain/, 'Generic action'), isError: !r.ok };
+                    return { result: formatRunChainWithOutputs(r).replace(/^Run chain/, 'Generic action'), isError: !r.ok };
                 }
 
                 case 'agent_press_named': {
@@ -1565,6 +1943,27 @@ function init(deps) {
                     const refused = refuseIfUserActive(force, 'Refused press');
                     if (refused) return refused;
                     lastPressAt = now;
+                    if (args.app || args.application || args.bundle_id || args.bundle) {
+                        releaseHostKeyboardFocus('agent_press_named');
+                        const steps = [
+                            {
+                                op: 'press_named',
+                                app: args.app || args.application,
+                                bundle_id: args.bundle_id || args.bundle,
+                                label,
+                                role: args.role,
+                                index: args.index,
+                                near_x: args.near_x,
+                                near_y: args.near_y,
+                            },
+                        ];
+                        const r = await runActSteps(steps, args.cursor_tolerance);
+                        if (r.ok) {
+                            bumpSelfActionAt();
+                            scheduleActionSignals(avatar, r);
+                        }
+                        return { result: formatRunChain(r).replace(/^Run chain/, 'Press named'), isError: !r.ok };
+                    }
                     const helperArgs = ['press-named'];
                     if (args.role) {
                         helperArgs.push('--role', String(args.role));
@@ -1874,8 +2273,30 @@ function init(deps) {
                         return { result: 'agent_select_range requires a non-negative integer length.', isError: true };
                     }
                     const force = args.force === true;
+                    const target = selectorOrLease(args, force, 'window');
+                    if (target.error) return { result: `Select range failed: ${target.error}`, isError: true };
                     const refused = refuseIfUserActive(force, 'Refused select range');
                     if (refused) return refused;
+                    if (target.selector) {
+                        const { result: chain, step } = await runSelectorAction(
+                            target.selector,
+                            { op: 'select_range', location, length },
+                            args.cursor_tolerance,
+                        );
+                        if (chain.ok && step && !step.error) {
+                            bumpSelfActionAt();
+                            rememberFocusLease(focusLeaseFromSelector(target.selector, target.source === 'lease' ? 'agent_select_range:lease' : 'agent_select_range', step));
+                            showActionAt(avatar, step);
+                            return {
+                                result: `Selected ${step.length} chars at offset ${step.location} (of ${step.total_chars}).`,
+                                isError: false,
+                            };
+                        }
+                        return {
+                            result: formatRunChain(chain).replace(/^Run chain/, 'Select range chain'),
+                            isError: true,
+                        };
+                    }
                     const r = await runHelper(deps, [
                         'select-range', '--location', String(location), '--length', String(length),
                     ]);
@@ -1894,8 +2315,30 @@ function init(deps) {
 
                 case 'agent_select_all': {
                     const force = args.force === true;
+                    const target = selectorOrLease(args, force, 'window');
+                    if (target.error) return { result: `Select all failed: ${target.error}`, isError: true };
                     const refused = refuseIfUserActive(force, 'Refused select all');
                     if (refused) return refused;
+                    if (target.selector) {
+                        const { result: chain, step } = await runSelectorAction(
+                            target.selector,
+                            { op: 'select_all' },
+                            args.cursor_tolerance,
+                        );
+                        if (chain.ok && step && !step.error) {
+                            bumpSelfActionAt();
+                            rememberFocusLease(focusLeaseFromSelector(target.selector, target.source === 'lease' ? 'agent_select_all:lease' : 'agent_select_all', step));
+                            showActionAt(avatar, step);
+                            return {
+                                result: `Selected ${step.length} of ${step.total_chars} chars.`,
+                                isError: false,
+                            };
+                        }
+                        return {
+                            result: formatRunChain(chain).replace(/^Run chain/, 'Select all chain'),
+                            isError: true,
+                        };
+                    }
                     const r = await runHelper(deps, ['select-all']);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
@@ -1919,8 +2362,30 @@ function init(deps) {
                         ? Number(args.occurrence)
                         : 0;
                     const force = args.force === true;
+                    const target = selectorOrLease(args, force, 'window');
+                    if (target.error) return { result: `Select substring failed: ${target.error}`, isError: true };
                     const refused = refuseIfUserActive(force, 'Refused select substring');
                     if (refused) return refused;
+                    if (target.selector) {
+                        const { result: chain, step } = await runSelectorAction(
+                            target.selector,
+                            { op: 'select_substring', needle, occurrence },
+                            args.cursor_tolerance,
+                        );
+                        if (chain.ok && step && !step.error) {
+                            bumpSelfActionAt();
+                            rememberFocusLease(focusLeaseFromSelector(target.selector, target.source === 'lease' ? 'agent_select_substring:lease' : 'agent_select_substring', step));
+                            showActionAt(avatar, step);
+                            return {
+                                result: `Selected "${needle}" (occurrence ${occurrence}) at offset ${step.location}.`,
+                                isError: false,
+                            };
+                        }
+                        return {
+                            result: formatRunChain(chain).replace(/^Run chain/, 'Select substring chain'),
+                            isError: true,
+                        };
+                    }
                     const helperArgs = ['select-substring', '--occurrence', String(occurrence), needle];
                     const r = await runHelper(deps, helperArgs);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
@@ -1967,6 +2432,24 @@ function init(deps) {
                         }
                     }
                     lastPressAt = now;
+                    if (args.app || args.application || args.bundle_id || args.bundle) {
+                        releaseHostKeyboardFocus('agent_menu_command');
+                        const steps = [
+                            {
+                                op: 'menu',
+                                app: args.app || args.application,
+                                bundle_id: args.bundle_id || args.bundle,
+                                path,
+                                activate: args.activate !== false,
+                            },
+                        ];
+                        const r = await runActSteps(steps, args.cursor_tolerance);
+                        if (r.ok) {
+                            bumpSelfActionAt();
+                            scheduleActionSignals(avatar, r);
+                        }
+                        return { result: formatRunChain(r).replace(/^Run chain/, 'Menu command'), isError: !r.ok };
+                    }
                     const r = await runHelper(deps, ['menu-command', ...path]);
                     if (r.ok) { bumpSelfActionAt(); showActionAt(avatar, r); }
                     if (r.error) {
@@ -2006,11 +2489,16 @@ module.exports = {
         formatFocus,
         formatFocusDiagnostics,
         formatRunChain,
+        formatRunChainWithOutputs,
+        formatStepOutputs,
+        formatDescribeOps,
         formatEventLine,
         formatEvents,
         runHelper,
         buildDisambiguationArgs,
         buildElementTargetArgs,
+        selectorFromArgs,
+        focusLeaseFromActSteps,
         requireFiniteArg,
         optionalDurationMs,
         normalizeButton,

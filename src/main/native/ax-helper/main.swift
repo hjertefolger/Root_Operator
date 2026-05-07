@@ -42,6 +42,9 @@ func emitInternalError(_ message: String) -> Never {
 // MARK: — AX helpers
 
 let AX_MESSAGE_TIMEOUT_SECONDS: Float = 0.25
+let AXPositionAttributeName = kAXPositionAttribute as String
+let AXSizeAttributeName = kAXSizeAttribute as String
+let AXFrameAttributeName = "AXFrame"
 
 func prepareAXElement(_ element: AXUIElement) {
     _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGE_TIMEOUT_SECONDS)
@@ -900,7 +903,15 @@ func cmdWriteFocused(_ args: [String]) -> Never {
 let TREE_MAX_DEPTH = 12
 let TREE_MAX_NODES = 2000
 let TREE_VALUE_TRUNC = 200
+let TREE_TEXT_VALUE_TRUNC = 8000
 let TREE_MAX_CHILDREN_PER_ELEMENT: CFIndex = 250
+
+let TEXT_VALUE_ROLES: Set<String> = [
+    "AXTextArea",
+    "AXTextField",
+    "AXSearchField",
+    "AXComboBox",
+]
 
 func resolveActiveAppElement() -> (pid: pid_t, element: AXUIElement)? {
     guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
@@ -1063,8 +1074,9 @@ func truncate(_ s: String, _ n: Int) -> String {
     return String(s[..<end]) + "…"
 }
 
-func nodeSummary(_ element: AXUIElement) -> [String: Any] {
-    var node: [String: Any] = ["role": roleString(element)]
+func nodeSummary(_ element: AXUIElement, fullValue: Bool = false) -> [String: Any] {
+    let role = roleString(element)
+    var node: [String: Any] = ["role": role]
     if let subrole = axCopyString(element, kAXSubroleAttribute as String) {
         node["subrole"] = subrole
     }
@@ -1076,7 +1088,8 @@ func nodeSummary(_ element: AXUIElement) -> [String: Any] {
         node["label"] = truncate(help, TREE_VALUE_TRUNC)
     }
     if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
-        node["value"] = truncate(value, TREE_VALUE_TRUNC)
+        let limit = fullValue || TEXT_VALUE_ROLES.contains(role) ? TREE_TEXT_VALUE_TRUNC : TREE_VALUE_TRUNC
+        node["value"] = truncate(value, limit)
     }
     if let frame = frameOf(element) {
         node["frame"] = frame
@@ -2766,15 +2779,35 @@ func parseModifierFlags(_ csv: String) -> CGEventFlags {
     return flags
 }
 
-func parseKey(_ raw: String) -> CGKeyCode {
-    // Numeric form: "38" or "0x26"
+func modifierFlagsValue(_ csv: String) -> (flags: CGEventFlags, error: String?) {
+    var flags: CGEventFlags = []
+    let tokens = csv.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    for tok in tokens where !tok.isEmpty {
+        switch tok {
+        case "cmd", "command":   flags.insert(.maskCommand)
+        case "shift":            flags.insert(.maskShift)
+        case "opt", "option", "alt": flags.insert(.maskAlternate)
+        case "ctrl", "control":  flags.insert(.maskControl)
+        case "fn":               flags.insert(.maskSecondaryFn)
+        default:                 return ([], "unknown modifier '\(tok)'")
+        }
+    }
+    return (flags, nil)
+}
+
+func keyCodeValue(_ raw: String) -> CGKeyCode? {
     if let hex = raw.lowercased().hasPrefix("0x") ? UInt16(raw.dropFirst(2), radix: 16) : nil {
         return CGKeyCode(hex)
     }
     if let dec = UInt16(raw) {
         return CGKeyCode(dec)
     }
-    if let mapped = NAMED_KEYS[raw.lowercased()] {
+    return NAMED_KEYS[raw.lowercased()]
+}
+
+func parseKey(_ raw: String) -> CGKeyCode {
+    // Numeric form: "38" or "0x26"
+    if let mapped = keyCodeValue(raw) {
         return mapped
     }
     emitError("bad_key", "unknown key name '\(raw)' — use a named key or numeric virtual code")
@@ -2792,6 +2825,55 @@ func ensureFocusedElement() -> AXUIElement {
         emitError("no_focus", "no focused UI element; keystroke would have no target")
     }
     return raw as! AXUIElement
+}
+
+func focusedElementIfAvailable() -> (status: AXError, element: AXUIElement?) {
+    let systemWide = AXUIElementCreateSystemWide()
+    var focused: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused)
+    if status == .success, let raw = focused {
+        let element = raw as! AXUIElement
+        return (status, element)
+    }
+    return (status, nil)
+}
+
+func frontmostMatches(identifier: String?) -> Bool {
+    guard let raw = identifier?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return true
+    }
+    guard let target = runningApplication(identifier: raw),
+          let front = NSWorkspace.shared.frontmostApplication else {
+        return false
+    }
+    return front.processIdentifier == target.processIdentifier
+}
+
+func keyboardContext(requireFocus: Bool, appIdentifier: String?) -> (error: [String: Any]?, focused: AXUIElement?) {
+    if !frontmostMatches(identifier: appIdentifier) {
+        return ([
+            "error": "wrong_frontmost_app",
+            "expected": appIdentifier ?? "",
+            "actual": NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
+            "actual_bundle_id": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+        ], nil)
+    }
+
+    let focused = focusedElementIfAvailable()
+    if requireFocus && focused.element == nil {
+        return ([
+            "error": "no_focus",
+            "detail": "no focused UI element; keystroke would have no target",
+            "focus_status": Int(focused.status.rawValue),
+        ], nil)
+    }
+    if !requireFocus && (appIdentifier == nil || appIdentifier!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+        return ([
+            "error": "missing_app_scope",
+            "detail": "require_focus=false requires app, application, bundle, or bundle_id",
+        ], nil)
+    }
+    return (nil, focused.element)
 }
 
 // Build a CGEventSource using `.privateState` so posted modifier
@@ -3334,6 +3416,98 @@ func cmdTypeText(_ args: [String]) -> Never {
     }
     emit(result)
     exit(0)
+}
+
+func keystrokePayload(step: [String: Any]) -> [String: Any] {
+    let keyRaw = stringValue(step["key"]) ?? stringValue(step["text"])
+    guard let keyName = keyRaw, !keyName.isEmpty else {
+        return ["error": "bad_step", "detail": "keystroke requires key"]
+    }
+    guard let key = keyCodeValue(keyName) else {
+        return ["error": "bad_key", "detail": "unknown key name '\(keyName)'"]
+    }
+    let modCsv = stringValue(step["mods"]) ?? ""
+    let parsedFlags = modifierFlagsValue(modCsv)
+    if let error = parsedFlags.error {
+        return ["error": "bad_modifier", "detail": error]
+    }
+    let appIdentifier = stepAppIdentifier(step)
+    let requireFocus = boolValue(step["require_focus"], default: true)
+    let context = keyboardContext(requireFocus: requireFocus, appIdentifier: appIdentifier)
+    if let error = context.error { return error }
+    guard let src = makeEventSource() else {
+        return ["error": "event_source_private_failed", "detail": "CGEventSource(.privateState) returned nil"]
+    }
+    guard
+        let down = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true),
+        let up = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: false)
+    else {
+        return ["error": "event_create_failed"]
+    }
+    if !parsedFlags.flags.isEmpty {
+        down.flags = parsedFlags.flags
+        up.flags = parsedFlags.flags
+    }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.012)
+    up.post(tap: .cghidEventTap)
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "keystroke",
+        "key": keyName,
+        "key_code": Int(key),
+        "mods": modCsv,
+        "require_focus": requireFocus,
+    ]
+    if let appIdentifier = appIdentifier { result["app"] = appIdentifier }
+    if let focused = context.focused {
+        result["role"] = roleString(focused)
+        if let frame = frameOf(focused) { result["frame"] = frame }
+    }
+    return result
+}
+
+func typeTextPayload(step: [String: Any]) -> [String: Any] {
+    guard let text = stringValue(step["text"]), !text.isEmpty else {
+        return ["error": "bad_step", "detail": "type_text requires text"]
+    }
+    let utf16 = Array(text.utf16)
+    if utf16.count > 2000 {
+        return ["error": "text_too_long", "detail": "max 2000 UTF-16 code units; got \(utf16.count)"]
+    }
+    let appIdentifier = stepAppIdentifier(step)
+    let requireFocus = boolValue(step["require_focus"], default: true)
+    let context = keyboardContext(requireFocus: requireFocus, appIdentifier: appIdentifier)
+    if let error = context.error { return error }
+    guard let src = makeEventSource() else {
+        return ["error": "event_source_private_failed", "detail": "CGEventSource(.privateState) returned nil"]
+    }
+    guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else {
+        return ["error": "event_create_failed"]
+    }
+    utf16.withUnsafeBufferPointer { buf in
+        down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+    }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.012)
+    if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+        utf16.withUnsafeBufferPointer { buf in
+            up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+        }
+        up.post(tap: .cghidEventTap)
+    }
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "type_text",
+        "length": utf16.count,
+        "require_focus": requireFocus,
+    ]
+    if let appIdentifier = appIdentifier { result["app"] = appIdentifier }
+    if let focused = context.focused {
+        result["role"] = roleString(focused)
+        if let frame = frameOf(focused) { result["frame"] = frame }
+    }
+    return result
 }
 
 let MODIFIER_KEY_SPECS: [String: (code: CGKeyCode, flag: CGEventFlags)] = [
@@ -3882,10 +4056,14 @@ func applicationElement(identifier: String?) -> (app: NSRunningApplication, elem
 
 func appWindows(_ appElem: AXUIElement) -> [AXUIElement] {
     var roots: [AXUIElement] = []
-    appendUniqueElement(axCopyElement(appElem, kAXFocusedWindowAttribute as String), to: &roots)
-    appendUniqueElement(axCopyElement(appElem, kAXMainWindowAttribute as String), to: &roots)
+    func appendWindow(_ element: AXUIElement?) {
+        guard let element = element, roleString(element) == "AXWindow" else { return }
+        appendUniqueElement(element, to: &roots)
+    }
+    appendWindow(axCopyElement(appElem, kAXFocusedWindowAttribute as String))
+    appendWindow(axCopyElement(appElem, kAXMainWindowAttribute as String))
     for window in axCopyArrayWithStatus(appElem, kAXWindowsAttribute as String).array {
-        appendUniqueElement(window, to: &roots)
+        appendWindow(window)
     }
     return roots
 }
@@ -4332,15 +4510,16 @@ func resolveElementFromStep(
 }
 
 func elementPayload(_ element: AXUIElement) -> [String: Any] {
+    let role = roleString(element)
     var result: [String: Any] = [
-        "role": roleString(element),
+        "role": role,
         "actions": actionNames(element).sorted(),
         "settable_attributes": settableAttributeNames(element),
     ]
     if let label = displayLabel(element) { result["label"] = label }
     if let frame = frameOf(element) { result["frame"] = frame }
     if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
-        result["value"] = truncate(value, TREE_VALUE_TRUNC)
+        result["value"] = truncate(value, TEXT_VALUE_ROLES.contains(role) ? TREE_TEXT_VALUE_TRUNC : TREE_VALUE_TRUNC)
     }
     return result
 }
@@ -4589,6 +4768,109 @@ func selectRangePayload(element: AXUIElement, location: Int, length: Int) -> [St
     return result
 }
 
+func writeSelectionPayload(element: AXUIElement, text: String, allowFullValue: Bool) -> [String: Any] {
+    let role = roleString(element)
+    if WRITE_BLOCKED_ROLES.contains(role) {
+        var result: [String: Any] = [
+            "error": "blocked_role",
+            "role": role,
+            "detail": "Refusing to write to a sensitive field.",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        return result
+    }
+    if !WRITE_ALLOWED_ROLES.contains(role) {
+        var result: [String: Any] = [
+            "error": "unsupported_role",
+            "role": role,
+            "detail": "AX write is restricted to text-bearing roles.",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        return result
+    }
+
+    _ = AXUIElementSetAttributeValue(
+        element,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    )
+
+    let selectedText = axCopyString(element, kAXSelectedTextAttribute as String)
+    let hasSelection = (selectedText != nil) && !(selectedText!.isEmpty)
+    if hasSelection {
+        let status = AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextAttribute as CFString,
+            text as CFTypeRef
+        )
+        if status == .success {
+            var result: [String: Any] = [
+                "ok": true,
+                "action": "write_selection",
+                "mode": "selection",
+                "role": role,
+                "length": (text as NSString).length,
+            ]
+            if let frame = frameOf(element) { result["frame"] = frame }
+            return result
+        }
+        var result: [String: Any] = [
+            "error": "selection_write_failed",
+            "role": role,
+            "detail": "ax_status=\(status.rawValue)",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        return result
+    }
+
+    if !allowFullValue {
+        var result: [String: Any] = [
+            "error": "no_selection",
+            "role": role,
+            "detail": "There is no selected text to replace. Use replace_all=true to overwrite the entire field.",
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        return result
+    }
+
+    let status = AXUIElementSetAttributeValue(
+        element,
+        kAXValueAttribute as CFString,
+        text as CFTypeRef
+    )
+    if status == .success {
+        let verified = waitForAXAttributeValue(element, kAXValueAttribute as String, expected: text)
+        if !verified.matched {
+            var failed: [String: Any] = [
+                "error": "value_verify_failed",
+                "role": role,
+                "expected": text,
+                "actual": verified.actual,
+                "detail": "AXValue did not match after AXUIElementSetAttributeValue succeeded",
+            ]
+            if let frame = frameOf(element) { failed["frame"] = frame }
+            return failed
+        }
+        var result: [String: Any] = [
+            "ok": true,
+            "action": "write_selection",
+            "mode": "value",
+            "role": role,
+            "length": (text as NSString).length,
+            "verified": true,
+        ]
+        if let frame = frameOf(element) { result["frame"] = frame }
+        return result
+    }
+    var result: [String: Any] = [
+        "error": "value_write_failed",
+        "role": role,
+        "detail": "ax_status=\(status.rawValue)",
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    return result
+}
+
 func insertTextPayload(element: AXUIElement, text: String, location: Int?) -> [String: Any] {
     if let loc = location {
         let selected = selectRangePayload(element: element, location: loc, length: 0)
@@ -4645,6 +4927,124 @@ func verifyValuePayload(element: AXUIElement, equals: String?, contains: String?
         "length": (value as NSString).length,
         "value": value,
     ]
+}
+
+func axFontAttributeName() -> String {
+    return kAXFontTextAttribute.takeUnretainedValue() as String
+}
+
+func axFontSizeKeyName() -> String {
+    return kAXFontSizeKey.takeUnretainedValue() as String
+}
+
+func fontSizeFromAttribute(_ raw: Any?) -> Double? {
+    if let font = raw as? NSFont {
+        return Double(font.pointSize)
+    }
+    if let dict = raw as? NSDictionary {
+        let key = axFontSizeKeyName()
+        if let number = dict[key] as? NSNumber {
+            return number.doubleValue
+        }
+        for (k, v) in dict {
+            if String(describing: k) == key, let number = v as? NSNumber {
+                return number.doubleValue
+            }
+        }
+    }
+    if let dict = raw as? [AnyHashable: Any] {
+        let key = axFontSizeKeyName()
+        if let number = dict[key] as? NSNumber {
+            return number.doubleValue
+        }
+        for (k, v) in dict {
+            if String(describing: k) == key, let number = v as? NSNumber {
+                return number.doubleValue
+            }
+        }
+    }
+    return nil
+}
+
+func fontInfoPayload(element: AXUIElement, location requestedLocation: Int? = nil) -> [String: Any] {
+    let total = axNumberOfCharacters(element) ?? 0
+    guard total > 0 else {
+        return ["error": "no_text", "detail": "target has no characters"]
+    }
+    let location = max(0, min(requestedLocation ?? 0, total - 1))
+    var range = CFRange(location: location, length: 1)
+    guard let rangeValue = AXValueCreate(.cfRange, &range) else {
+        return ["error": "range_create_failed"]
+    }
+    var raw: CFTypeRef?
+    let status = AXUIElementCopyParameterizedAttributeValue(
+        element,
+        kAXAttributedStringForRangeParameterizedAttribute as CFString,
+        rangeValue,
+        &raw
+    )
+    guard status == .success, let value = raw else {
+        return [
+            "error": "attributed_string_failed",
+            "detail": "ax_status=\(status.rawValue)",
+            "attribute": kAXAttributedStringForRangeParameterizedAttribute as String,
+        ]
+    }
+    guard let attributed = value as? NSAttributedString, attributed.length > 0 else {
+        return ["error": "bad_attributed_string", "detail": "AXAttributedStringForRange did not return NSAttributedString"]
+    }
+
+    var effective = NSRange(location: 0, length: 0)
+    let attrs = attributed.attributes(at: 0, effectiveRange: &effective)
+    let fontKey = NSAttributedString.Key(axFontAttributeName())
+    let rawFont = attrs[fontKey] ?? attrs[.font]
+    guard let size = fontSizeFromAttribute(rawFont) else {
+        return [
+            "error": "font_size_missing",
+            "attribute_keys": attrs.keys.map { $0.rawValue }.sorted(),
+            "font_attribute": axFontAttributeName(),
+            "font_size_key": axFontSizeKeyName(),
+        ]
+    }
+
+    var result: [String: Any] = [
+        "ok": true,
+        "action": "font_info",
+        "role": roleString(element),
+        "location": location,
+        "font_size": size,
+        "range_length": effective.length,
+    ]
+    if let frame = frameOf(element) { result["frame"] = frame }
+    if let value = axCopyString(element, kAXValueAttribute as String), !value.isEmpty {
+        result["value"] = truncate(value, TREE_VALUE_TRUNC)
+    }
+    return result
+}
+
+func verifyFontSizePayload(element: AXUIElement, expected: Double, tolerance: Double) -> [String: Any] {
+    var info = fontInfoPayload(element: element)
+    if info["error"] != nil { return info }
+    guard let actual = info["font_size"] as? Double else {
+        return ["error": "font_size_missing"]
+    }
+    let delta = abs(actual - expected)
+    if delta > tolerance {
+        info["error"] = "font_size_mismatch"
+        info["expected"] = expected
+        info["actual"] = actual
+        info["delta"] = delta
+        info["tolerance"] = tolerance
+        info["ok"] = false
+        return info
+    }
+    info["ok"] = true
+    info["action"] = "verify_font_size"
+    info["expected"] = expected
+    info["actual"] = actual
+    info["delta"] = delta
+    info["tolerance"] = tolerance
+    return info
 }
 
 func performMenuCommandPayload(_ args: [String], bundleID: String? = nil, activate: Bool = true) -> [String: Any] {
@@ -4850,9 +5250,146 @@ func normalizedAXAttributeName(_ raw: String?) -> String? {
         return kAXFocusedAttribute as String
     case "selected_text", "selectedtext", "axselectedtext", "kaxselectedtextattribute":
         return kAXSelectedTextAttribute as String
+    case "position", "axposition", "kaxpositionattribute":
+        return AXPositionAttributeName
+    case "size", "axsize", "kaxsizeattribute":
+        return AXSizeAttributeName
+    case "frame", "axframe", "kaxframeattribute":
+        return AXFrameAttributeName
     default:
         return raw
     }
+}
+
+func dictionaryValue(_ value: Any?) -> [String: Any]? {
+    if let dict = value as? [String: Any] { return dict }
+    if let dict = value as? NSDictionary { return dict as? [String: Any] }
+    return nil
+}
+
+func finiteDoubleField(_ dict: [String: Any], _ names: [String]) -> Double? {
+    for name in names {
+        if let value = doubleValue(dict[name]) {
+            return value
+        }
+    }
+    return nil
+}
+
+func sizePayload(_ size: CGSize) -> [String: Any] {
+    return [
+        "width": Double(size.width),
+        "height": Double(size.height),
+    ]
+}
+
+func rectPayload(_ rect: CGRect) -> [String: Any] {
+    return [
+        "x": Double(rect.origin.x),
+        "y": Double(rect.origin.y),
+        "width": Double(rect.size.width),
+        "height": Double(rect.size.height),
+    ]
+}
+
+func rectPayloadFromFrame(_ frame: [String: Any]?) -> [String: Any]? {
+    guard let frame = frame,
+          let x = doubleValue(frame["x"]),
+          let y = doubleValue(frame["y"]),
+          let width = doubleValue(frame["width"]) ?? doubleValue(frame["w"]),
+          let height = doubleValue(frame["height"]) ?? doubleValue(frame["h"]) else {
+        return nil
+    }
+    return [
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+    ]
+}
+
+func axStructValueForAttribute(_ attribute: String, rawValue: Any?) -> (value: CFTypeRef?, expected: Any?, error: String?) {
+    guard let dict = dictionaryValue(rawValue) else {
+        switch attribute {
+        case AXPositionAttributeName:
+            return (nil, nil, "AXPosition requires value { x, y }")
+        case AXSizeAttributeName:
+            return (nil, nil, "AXSize requires value { width, height }")
+        case AXFrameAttributeName:
+            return (nil, nil, "AXFrame requires value { x, y, width, height }")
+        default:
+            return (nil, nil, nil)
+        }
+    }
+
+    if attribute == AXPositionAttributeName {
+        guard let x = finiteDoubleField(dict, ["x"]),
+              let y = finiteDoubleField(dict, ["y"]) else {
+            return (nil, nil, "AXPosition requires finite numeric x and y")
+        }
+        var point = CGPoint(x: x, y: y)
+        guard let axValue = AXValueCreate(.cgPoint, &point) else {
+            return (nil, nil, "AXPosition AXValueCreate failed")
+        }
+        return (axValue, pointPayload(point), nil)
+    }
+
+    if attribute == AXSizeAttributeName {
+        guard let width = finiteDoubleField(dict, ["width", "w"]),
+              let height = finiteDoubleField(dict, ["height", "h"]) else {
+            return (nil, nil, "AXSize requires finite numeric width and height")
+        }
+        var size = CGSize(width: width, height: height)
+        guard let axValue = AXValueCreate(.cgSize, &size) else {
+            return (nil, nil, "AXSize AXValueCreate failed")
+        }
+        return (axValue, sizePayload(size), nil)
+    }
+
+    if attribute == AXFrameAttributeName {
+        guard let x = finiteDoubleField(dict, ["x"]),
+              let y = finiteDoubleField(dict, ["y"]),
+              let width = finiteDoubleField(dict, ["width", "w"]),
+              let height = finiteDoubleField(dict, ["height", "h"]) else {
+            return (nil, nil, "AXFrame requires finite numeric x, y, width, and height")
+        }
+        var rect = CGRect(x: x, y: y, width: width, height: height)
+        guard let axValue = AXValueCreate(.cgRect, &rect) else {
+            return (nil, nil, "AXFrame AXValueCreate failed")
+        }
+        return (axValue, rectPayload(rect), nil)
+    }
+
+    return (nil, nil, nil)
+}
+
+func isGeometryAXAttribute(_ attribute: String) -> Bool {
+    return attribute == AXPositionAttributeName
+        || attribute == AXSizeAttributeName
+        || attribute == AXFrameAttributeName
+}
+
+func setAXFrameByPositionAndSize(_ element: AXUIElement, rawValue: Any?) -> (ok: Bool, statuses: [String: Int]) {
+    let position = axStructValueForAttribute(AXPositionAttributeName, rawValue: rawValue)
+    let size = axStructValueForAttribute(AXSizeAttributeName, rawValue: rawValue)
+    guard let positionValue = position.value,
+          let sizeValue = size.value else {
+        return (false, [
+            AXPositionAttributeName: Int(AXError.illegalArgument.rawValue),
+            AXSizeAttributeName: Int(AXError.illegalArgument.rawValue),
+        ])
+    }
+    let positionTarget = elementOrAncestorSettable(element, attribute: AXPositionAttributeName)
+    let sizeTarget = elementOrAncestorSettable(element, attribute: AXSizeAttributeName)
+    let positionStatus = AXUIElementSetAttributeValue(positionTarget, AXPositionAttributeName as CFString, positionValue)
+    let sizeStatus = AXUIElementSetAttributeValue(sizeTarget, AXSizeAttributeName as CFString, sizeValue)
+    return (
+        positionStatus == .success && sizeStatus == .success,
+        [
+            AXPositionAttributeName: Int(positionStatus.rawValue),
+            AXSizeAttributeName: Int(sizeStatus.rawValue),
+        ]
+    )
 }
 
 func cfValueForAX(_ value: Any?) -> CFTypeRef? {
@@ -4871,12 +5408,70 @@ func serializableAXValue(_ value: CFTypeRef?) -> Any {
     if typeID == CFStringGetTypeID(), let s = value as? String { return s }
     if typeID == CFBooleanGetTypeID() { return CFBooleanGetValue((value as! CFBoolean)) }
     if let n = value as? NSNumber { return n }
+    if typeID == AXValueGetTypeID() {
+        let axValue = value as! AXValue
+        switch AXValueGetType(axValue) {
+        case .cgPoint:
+            var point = CGPoint.zero
+            if AXValueGetValue(axValue, .cgPoint, &point) {
+                return pointPayload(point)
+            }
+        case .cgSize:
+            var size = CGSize.zero
+            if AXValueGetValue(axValue, .cgSize, &size) {
+                return sizePayload(size)
+            }
+        case .cgRect:
+            var rect = CGRect.zero
+            if AXValueGetValue(axValue, .cgRect, &rect) {
+                return rectPayload(rect)
+            }
+        case .cfRange:
+            var range = CFRange(location: 0, length: 0)
+            if AXValueGetValue(axValue, .cfRange, &range) {
+                return [
+                    "location": range.location,
+                    "length": range.length,
+                ]
+            }
+        default:
+            break
+        }
+    }
     if typeID == AXUIElementGetTypeID() { return ["role": roleString(value as! AXUIElement)] }
     return String(describing: value)
 }
 
+func doubleApproximatelyEqual(_ lhs: Double, _ rhs: Double, tolerance: Double = 0.75) -> Bool {
+    return abs(lhs - rhs) <= tolerance
+}
+
+func dictionaryMatchesExpected(_ actual: [String: Any], _ expected: [String: Any]) -> Bool {
+    for (key, expectedValue) in expected {
+        guard let expectedDouble = doubleValue(expectedValue) else {
+            if String(describing: actual[key] ?? "") != String(describing: expectedValue) {
+                return false
+            }
+            continue
+        }
+        guard let actualDouble = doubleValue(actual[key]) else {
+            return false
+        }
+        if !doubleApproximatelyEqual(actualDouble, expectedDouble) {
+            return false
+        }
+    }
+    return true
+}
+
 func axAttributeMatchesExpected(_ actual: CFTypeRef?, expected: Any?) -> Bool {
     guard let actual = actual else { return expected == nil || expected is NSNull }
+    if let expectedDict = dictionaryValue(expected) {
+        if let actualDict = serializableAXValue(actual) as? [String: Any] {
+            return dictionaryMatchesExpected(actualDict, expectedDict)
+        }
+        return false
+    }
     if let expected = expected as? String {
         if CFGetTypeID(actual) == CFStringGetTypeID(), let s = actual as? String {
             return s == expected
@@ -4944,10 +5539,25 @@ func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [
     }
 
     let rawValue = step.keys.contains("value") ? step["value"] : step["text"]
-    guard let cfValue = cfValueForAX(rawValue) else {
+    let structValue = axStructValueForAttribute(attribute, rawValue: rawValue)
+    if let error = structValue.error {
+        return ["error": "bad_step", "detail": error]
+    }
+    guard let cfValue = structValue.value ?? cfValueForAX(rawValue) else {
         return ["error": "bad_step", "detail": "set_attribute requires value"]
     }
-    let status = AXUIElementSetAttributeValue(attrTarget, attribute as CFString, cfValue)
+    let expectedValue = structValue.expected ?? rawValue
+    var usedFrameFallback = false
+    var frameFallbackStatuses: [String: Int]? = nil
+    var status = AXUIElementSetAttributeValue(attrTarget, attribute as CFString, cfValue)
+    if status != .success && attribute == AXFrameAttributeName {
+        let fallback = setAXFrameByPositionAndSize(attrTarget, rawValue: rawValue)
+        usedFrameFallback = fallback.ok
+        frameFallbackStatuses = fallback.statuses
+        if fallback.ok {
+            status = .success
+        }
+    }
     if status != .success {
         var result: [String: Any] = [
             "error": "set_attribute_failed",
@@ -4957,26 +5567,48 @@ func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [
             "settable_attributes": settableAttributeNames(attrTarget),
             "detail": "ax_status=\(status.rawValue)",
         ]
+        if let frameFallbackStatuses = frameFallbackStatuses {
+            result["frame_fallback_statuses"] = frameFallbackStatuses
+        }
         if let frame = frameOf(attrTarget) { result["frame"] = frame }
         return result
     }
     var verified = false
+    var adjustedActual: Any? = nil
     if attribute != kAXSelectedTextAttribute as String {
-        let verification = waitForAXAttributeValue(attrTarget, attribute, expected: rawValue)
-        if !verification.matched {
-            var result: [String: Any] = [
-                "error": "set_attribute_verify_failed",
-                "target": target.name,
-                "attribute": attribute,
-                "role": roleString(attrTarget),
-                "expected": rawValue as Any,
-                "actual": verification.actual,
-                "detail": "\(attribute) did not match after AXUIElementSetAttributeValue succeeded",
-            ]
-            if let frame = frameOf(attrTarget) { result["frame"] = frame }
-            return result
+        if attribute == AXFrameAttributeName {
+            let actual = rectPayloadFromFrame(frameOf(attrTarget))
+            if let actual = actual,
+               let expectedDict = dictionaryValue(expectedValue),
+               dictionaryMatchesExpected(actual, expectedDict) {
+                verified = true
+            } else if isGeometryAXAttribute(attribute) {
+                adjustedActual = actual as Any
+            } else {
+                adjustedActual = NSNull()
+            }
+        } else {
+            let verification = waitForAXAttributeValue(attrTarget, attribute, expected: expectedValue)
+            if !verification.matched {
+                if isGeometryAXAttribute(attribute) {
+                    adjustedActual = verification.actual
+                } else {
+                    var result: [String: Any] = [
+                        "error": "set_attribute_verify_failed",
+                        "target": target.name,
+                        "attribute": attribute,
+                        "role": roleString(attrTarget),
+                        "expected": expectedValue as Any,
+                        "actual": verification.actual,
+                        "detail": "\(attribute) did not match after AXUIElementSetAttributeValue succeeded",
+                    ]
+                    if let frame = frameOf(attrTarget) { result["frame"] = frame }
+                    return result
+                }
+            } else {
+                verified = true
+            }
         }
-        verified = true
     } else {
         Thread.sleep(forTimeInterval: 0.05)
     }
@@ -4988,6 +5620,17 @@ func setGenericAttributePayload(step: [String: Any], context: ChainContext) -> [
         "attribute": attribute,
         "verified": verified,
     ]) { _, new in new }
+    if adjustedActual != nil {
+        result["adjusted_by_system"] = true
+        result["requested_value"] = expectedValue as Any
+        result["actual_value"] = adjustedActual as Any
+    }
+    if usedFrameFallback {
+        result["frame_fallback"] = "AXPosition+AXSize"
+    }
+    if let frameFallbackStatuses = frameFallbackStatuses {
+        result["frame_fallback_statuses"] = frameFallbackStatuses
+    }
     return result
 }
 
@@ -5009,6 +5652,52 @@ func verifyPresencePayload(step: [String: Any], context: ChainContext, expectPre
         return ["error": "verify_absent_failed", "detail": "target still exists"]
     }
     return ["ok": true, "action": "verify_absent", "found": false]
+}
+
+func waitForElementPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
+    let parsed = stepElementArgs(step)
+    if (parsed.label == nil || parsed.label!.isEmpty)
+        && parsed.role == nil
+        && stepPoint(step) == nil {
+        return ["error": "bad_step", "detail": "wait_for_role requires role, label, or x/y"]
+    }
+    let timeoutMs = max(0, min(30000, intValue(step["timeout_ms"]) ?? intValue(step["ms"]) ?? 8000))
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+    var lastSearched = 0
+    var lastMatchCount = 0
+    repeat {
+        if let found = resolveElementFromStep(step: step, context: context) {
+            if let name = stringValue(step["as"]) ?? stringValue(step["var"]), !name.isEmpty {
+                context.targets[name] = found.element
+                context.missingTargets.remove(name)
+            }
+            var result = elementPayload(found.element)
+            result.merge([
+                "ok": true,
+                "action": "wait_for_role",
+                "found": true,
+                "searched": found.searched,
+                "match_count": found.matchCount,
+                "match_index": found.matchIndex,
+                "timeout_ms": timeoutMs,
+            ]) { _, new in new }
+            if let name = stringValue(step["as"]) ?? stringValue(step["var"]), !name.isEmpty {
+                result["as"] = name
+            }
+            return result
+        }
+        let diag = resolveSearchDiagnostics(step: step, context: context)
+        lastSearched = diag.searched
+        lastMatchCount = diag.matchCount
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return [
+        "error": "not_found",
+        "detail": "target was not found within \(timeoutMs)ms",
+        "searched": lastSearched,
+        "match_count": lastMatchCount,
+        "timeout_ms": timeoutMs,
+    ]
 }
 
 func hidStepPayload(step: [String: Any], context: ChainContext) -> [String: Any] {
@@ -5061,12 +5750,15 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
         }
         return waitForAppWindow(bundleID: bundleID, timeoutMs: intValue(step["timeout_ms"]) ?? 8000)
 
-    case "sleep":
-        let durationMs = max(0, min(10000, intValue(step["duration_ms"]) ?? 0))
+    case "sleep", "wait_ms", "sleep_ms", "wait":
+        let durationMs = max(0, min(30000, intValue(step["ms"]) ?? intValue(step["duration_ms"]) ?? intValue(step["timeout_ms"]) ?? 0))
         if durationMs > 0 {
             Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
         }
-        return ["ok": true, "duration_ms": durationMs]
+        return ["ok": true, "action": "wait_ms", "duration_ms": durationMs]
+
+    case "wait_for_role", "wait_for_element", "wait_until_present":
+        return waitForElementPayload(step: step, context: context)
 
     case "press_named":
         return pressNamedPayload(step: step)
@@ -5092,6 +5784,12 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
 
     case "hid":
         return hidStepPayload(step: step, context: context)
+
+    case "keystroke", "key":
+        return keystrokePayload(step: step)
+
+    case "type_text", "type":
+        return typeTextPayload(step: step)
 
     case "focus":
         guard let target = targetElement(step, context: context) else {
@@ -5132,6 +5830,19 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
             return ["error": "bad_step", "detail": "insert_text requires text"]
         }
         return insertTextPayload(element: target.element, text: text, location: intValue(step["location"]))
+
+    case "write_selection", "write":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let text = stringValue(step["text"]) else {
+            return ["error": "bad_step", "detail": "write_selection requires text"]
+        }
+        return writeSelectionPayload(
+            element: target.element,
+            text: text,
+            allowFullValue: boolValue(step["replace_all"], default: false)
+        )
 
     case "select_all":
         guard let target = targetElement(step, context: context) else {
@@ -5177,7 +5888,7 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
         }
         return selectRangePayload(element: target.element, location: found, length: (needle as NSString).length)
 
-    case "menu":
+    case "menu", "menu_command", "menu-command":
         let path = stringArrayValue(step["path"])
         return performMenuCommandPayload(
             path,
@@ -5199,6 +5910,25 @@ func performChainStep(_ step: [String: Any], context: ChainContext) -> [String: 
             element: target.element,
             equals: stringValue(step["equals"]),
             contains: stringValue(step["contains"])
+        )
+
+    case "font_info":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        return fontInfoPayload(element: target.element, location: intValue(step["location"]))
+
+    case "verify_font_size":
+        guard let target = targetElement(step, context: context) else {
+            return ["error": "unknown_target", "detail": stringValue(step["target"]) ?? "target"]
+        }
+        guard let expected = doubleValue(step["size"] ?? step["font_size"] ?? step["expected"]) else {
+            return ["error": "bad_step", "detail": "verify_font_size requires size"]
+        }
+        return verifyFontSizePayload(
+            element: target.element,
+            expected: expected,
+            tolerance: doubleValue(step["tolerance"]) ?? 0.5
         )
 
     case "verify_absent":

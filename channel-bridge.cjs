@@ -212,17 +212,36 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_read_focused',
-      description: 'Read text from the currently focused UI element via macOS accessibility. Useful when the user is composing in a text field and the cursor isn\'t hovering it. Returns the same shape as agent_read_at_cursor.',
-      inputSchema: { type: 'object', properties: {} },
+      description: 'Read text from the currently focused UI element via macOS accessibility. Reuses a recent focus lease from agent_act/focus/select when available, or accepts optional selector fields (app, role, label, index, near_x/near_y) to resolve+focus+read in one native chain.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          app: { type: 'string', description: 'Optional app name or bundle id used with role/label selector.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id used with role/label selector.' },
+          role: { type: 'string', description: 'Optional AX role to resolve before reading, e.g. AXTextArea.' },
+          label: { type: 'string', description: 'Optional label/value substring to resolve before reading.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
+          force: { type: 'boolean', description: 'Override focus-lease invalidation after explicit consent.' },
+        },
+      },
     },
     {
       name: 'agent_write_selection',
-      description: 'Replace the user\'s current text selection with new text via the macOS accessibility channel. NEVER call without explicit user approval — your job is to show the proposed text in the bubble first, then call this only after the user confirms. Default: requires a non-empty selection (refuses to overwrite a whole field). To overwrite the entire focused field (rare, ask first), pass replace_all=true. Refuses sensitive roles (passwords, secure inputs). Capped at 8000 chars and rate-limited to one write per 750ms.',
+      description: 'Replace the user\'s current text selection with new text via the macOS accessibility channel. Reuses a recent focus lease from agent_act/focus/select when available, or accepts optional selector fields (app, role, label, index, near_x/near_y) to resolve+focus+write in one native chain. NEVER call without explicit user approval. Default: requires a non-empty selection. To overwrite the entire focused field, pass replace_all=true. Refuses sensitive roles.',
       inputSchema: {
         type: 'object',
         properties: {
           text: { type: 'string', description: 'The text to write. Must be non-empty.' },
           replace_all: { type: 'boolean', description: 'If true, replace the entire focused field even with no selection. Default false. Use only when the user has explicitly asked to replace the whole field.' },
+          app: { type: 'string', description: 'Optional app name or bundle id used with role/label selector.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id used with role/label selector.' },
+          role: { type: 'string', description: 'Optional AX role to resolve before writing, e.g. AXTextArea.' },
+          label: { type: 'string', description: 'Optional label/value substring to resolve before writing.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
           force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['text'],
@@ -231,6 +250,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'agent_check_ax',
       description: 'Check whether the macOS Accessibility permission is granted for Root Operator. Returns {trusted: true|false}. Call this once at the start of any AX-using flow so you can give the user an actionable error if the permission is missing.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'agent_describe_ops',
+      description: 'Return the generic agent_act operation registry with aliases, required fields, optional fields, and selector fields. Call this before composing a cold agent_act chain if you do not remember the exact op names or schema.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -374,7 +398,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_act',
-      description: 'Execute an atomic generic macOS computer-use action list in one ax-helper process. Prefer this over adding new named tools. Generic steps include launch/wait_window, resolve by app/window/system scope, inspect, perform_action for any AX action exposed by the element (AXPress, AXShowMenu, AXIncrement, custom actions), set_attribute for settable AX attributes (AXValue, AXSelected, AXFocused, AXSelectedText), cursor-invariant HID fallback, read, and verify_present/verify_absent. Existing agent_run_chain steps are still accepted for compatibility.',
+      description: 'Execute an atomic generic macOS computer-use action list in one ax-helper process. Prefer this over adding new named tools. First inspect/discover the AX tree, resolve semantic elements, use AX actions/settable AX attributes, and verify the requested app-state postcondition in the same chain. Do not treat an intermediate control AXValue as proof unless that value is the requested state. Generic steps include launch/wait_window, resolve/wait_for_role by app/window/system scope, inspect, perform_action for exposed AX actions, set_attribute/set_value/select_all/select_range/select_substring/write_selection/insert_text, menu (alias menu_command), cursor-invariant hid, scoped keystroke/type_text CGEvents, read, verify_value, font_info, verify_font_size, verify_present, and verify_absent. For native controls with unstable AXFocused or display-only AXValue, do not loop on focus setters; perform the native user gesture in one scoped chain and verify semantic state. For rich text size changes, verify the edited text element with verify_font_size, not just the font-size control value. Existing agent_run_chain steps are still accepted for compatibility.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -396,6 +420,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           label: { type: 'string', description: 'Substring to match against the element\'s title, description, or help (case-insensitive).' },
+          app: { type: 'string', description: 'Optional Apple app name or bundle id. When provided, resolves and acts in that app through a single AX chain instead of relying on the frontmost window.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id companion to app.' },
           role: { type: 'string', description: 'Optional AX role to constrain the search (e.g. "AXButton", "AXLink").' },
           index: { type: 'number', description: 'Optional 0-based index into the sorted match list. 0 = best match (default).' },
           near_x: { type: 'number', description: 'Optional screen-x; when paired with near_y, sorts matches by distance to (near_x, near_y) ascending.' },
@@ -480,7 +506,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_keystroke',
-      description: 'Post a single keyboard event (down + up) via macOS CGEvent — does NOT move the user\'s hardware cursor. Routes the keystroke to whatever element currently has system focus, so this requires a focused element (refuses with no_focus otherwise). Use named keys ("return", "esc", "tab", "up", "down", "left", "right", "j", "f5") or numeric virtual codes ("0x26"). Combine with `mods` (CSV: cmd, shift, opt, ctrl, fn) for chord shortcuts (Cmd+Shift+J, Cmd+S). Refuses by default if user activity is detected in the last ~1.2s — pass force=true to override after explicit user consent. Rate-limited to one keystroke per 200ms. Prefer agent_menu_command for menu invocations and agent_select_* for text selection — keystrokes are the right tool for app-specific shortcuts and key-driven navigation.',
+      description: 'Post a single keyboard event (down + up) via macOS CGEvent — does NOT move the user\'s hardware cursor. Routes the keystroke to whatever element currently has system focus, so this requires a focused element (refuses with no_focus otherwise). Do not use this for multi-step targeted app workflows, popups, combo boxes, or formatting flows where focus can change between tool calls; use agent_act with scoped keystroke/type_text steps and a semantic verification step. Use named keys ("return", "esc", "tab", "up", "down", "left", "right", "j", "f5") or numeric virtual codes ("0x26"). Combine with `mods` (CSV: cmd, shift, opt, ctrl, fn) for chord shortcuts (Cmd+Shift+J, Cmd+S). Refuses by default if user activity is detected in the last ~1.2s — pass force=true to override after explicit user consent. Rate-limited to one keystroke per 200ms. Prefer agent_menu_command for menu invocations and agent_select_* for text selection — keystrokes are for app-specific shortcuts and key-driven navigation after focus is already proven.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -493,7 +519,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_keystroke_global',
-      description: 'Post a single keyboard event without requiring a focused AX element. Use for apps/windows where only the app has focus or AX focus is unavailable. Same key/mod syntax, user-activity guard, and rate limit as agent_keystroke.',
+      description: 'Post a single keyboard event without requiring a focused AX element. Use only when the user explicitly wants a global/app-level shortcut and the target app is already frontmost. Do not use as a recovery path for a failed targeted workflow; use agent_act with app-scoped keystroke/type_text and postcondition verification. Same key/mod syntax, user-activity guard, and rate limit as agent_keystroke.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -534,7 +560,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_type_text',
-      description: 'Type Unicode text via macOS CGEvent into the focused element — exercises real key handling (paragraph styling, autocomplete, IME, app key handlers) unlike AX value-write. Use this for natural-typing flows where character-by-character behavior matters; use agent_write_selection when you want a clean AX replacement that bypasses key handlers. Requires focused element. Same user-activity guard and rate limit as keystroke (one per 750ms). Hard-capped at 2000 UTF-16 code units (more conservative than AX writes since this is a real keyboard-synthesis path).',
+      description: 'Type Unicode text via macOS CGEvent into the focused element — exercises real key handling (paragraph styling, autocomplete, IME, app key handlers) unlike AX value-write. Use this only when focus is already proven and one standalone typing action is enough. Do not use this for multi-step targeted app workflows, popups, combo boxes, or formatting flows where focus can change between tool calls; use agent_act with scoped type_text/keystroke steps and a semantic verification step. Use agent_write_selection when you want a clean AX replacement that bypasses key handlers. Requires focused element. Same user-activity guard and rate limit as keystroke (one per 750ms). Hard-capped at 2000 UTF-16 code units (more conservative than AX writes since this is a real keyboard-synthesis path).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -552,6 +578,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           location: { type: 'number', description: '0-based character offset where the selection starts.' },
           length: { type: 'number', description: 'Number of characters to select. Capped at remaining text.' },
+          app: { type: 'string', description: 'Optional app name or bundle id used with role/label selector.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id used with role/label selector.' },
+          role: { type: 'string', description: 'Optional AX role to resolve before selecting, e.g. AXTextArea.' },
+          label: { type: 'string', description: 'Optional label/value substring to resolve before selecting.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
           force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['location', 'length'],
@@ -563,18 +596,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
+          app: { type: 'string', description: 'Optional app name or bundle id used with role/label selector.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id used with role/label selector.' },
+          role: { type: 'string', description: 'Optional AX role to resolve before selecting, e.g. AXTextArea.' },
+          label: { type: 'string', description: 'Optional label/value substring to resolve before selecting.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
           force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
       },
     },
     {
       name: 'agent_select_substring',
-      description: 'Find a substring in the currently focused text element and select it via AX (kAXSelectedTextRangeAttribute). UTF-16 code-unit accurate so it works correctly with native text apps (Notes, Mail, TextEdit). Pick a specific occurrence with `occurrence` (0-based, default 0 = first match).',
+      description: 'Find a substring in the focused or recently leased text element and select it via AX (kAXSelectedTextRangeAttribute). UTF-16 code-unit accurate for native text apps. Optional selector fields (app, role, label, index, near_x/near_y) resolve+focus before selecting, so agents can edit by needle instead of offsets.',
       inputSchema: {
         type: 'object',
         properties: {
           needle: { type: 'string', description: 'Text to find within the focused element.' },
           occurrence: { type: 'number', description: '0-based occurrence index (default 0 = first match).' },
+          app: { type: 'string', description: 'Optional app name or bundle id used with role/label selector.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id used with role/label selector.' },
+          role: { type: 'string', description: 'Optional AX role to resolve before selecting, e.g. AXTextArea.' },
+          label: { type: 'string', description: 'Optional label/value substring to resolve before selecting.' },
+          index: { type: 'number', description: 'Optional 0-based match index.' },
+          near_x: { type: 'number', description: 'Optional screen-x for proximity disambiguation, paired with near_y.' },
+          near_y: { type: 'number', description: 'Optional screen-y companion to near_x.' },
           force: { type: 'boolean', description: 'Override the recent user-activity guard after explicit consent.' },
         },
         required: ['needle'],
@@ -582,10 +629,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_menu_command',
-      description: 'Invoke a menu item in the frontmost app by walking the AXMenuBar with a path of titles (e.g. ["Format","Body"], ["Edit","Find","Find…"]). Pure AX — no keystrokes, no menu visually flashing open. Match strategy: exact title match first, then unique case-insensitive prefix; ambiguous prefix matches return ambiguous_menu_segment. Descends through any AXMenu intermediate container automatically and polls briefly for child population after opening a non-leaf. Same user-activity guard as keystroke / type-text — refused if the user just switched apps or opened a menu (override with force=true after explicit consent).',
+      description: 'Invoke a menu item by walking an app AXMenuBar with a path of titles (e.g. ["Format","Body"], ["Edit","Find","Find…"]). Pass app/bundle_id for Apple native apps so the helper activates and targets that app through one AX chain. Pure AX — no keystrokes, no visual coordinate clicking. Match strategy: exact title match first, then unique case-insensitive prefix; ambiguous prefix matches return ambiguous_menu_segment. Descends through AXMenu containers and polls for child population after opening a non-leaf.',
       inputSchema: {
         type: 'object',
         properties: {
+          app: { type: 'string', description: 'Optional Apple app name or bundle id to activate and target, e.g. Finder, Safari, Notes, Mail.' },
+          bundle_id: { type: 'string', description: 'Optional bundle id companion to app.' },
           path: {
             type: 'array',
             description: 'Menu path as an array of titles, top-level first. E.g. ["Format","Body"].',
@@ -670,6 +719,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     'agent_read_focused',
     'agent_write_selection',
     'agent_check_ax',
+    'agent_describe_ops',
     'agent_read_window',
     'agent_discover_app',
     'agent_list_app_workflows',
