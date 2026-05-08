@@ -1,20 +1,21 @@
 <h1 align="center">Root_Operator</h1>
 
 <p align="center">
-  <a href="package.json"><img src="https://img.shields.io/badge/version-2.4.4-blue.svg" alt="Version"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/version-2.4.5-blue.svg" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="package.json"><img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform"></a>
   <a href="package.json"><img src="https://img.shields.io/badge/electron-39-blue.svg" alt="Electron"></a>
 </p>
 
-<p align="center"><strong>Personal AI assistant for macOS powered by Claude Code channels.</strong></p>
+<p align="center"><strong>Your second self at the Mac. Watches your work, acts alongside you, replies through your phone.</strong></p>
 
 <br>
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
 <br>
-✨ Persistent cron scheduler, identity system, and in-harness continuity + semantic recall — all local
+✨ Computer Use, persistent scheduler, identity, and in-harness continuity + semantic recall — all local
 <br>
 
+- 🖱️ **Computer Use & Presence** — operate Mac apps via Accessibility + HID with semantic verification; cursor-invariant (your cursor never moves)
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
@@ -35,6 +36,7 @@
 > - Keep secrets and credentials out of the agent's reachable filesystem
 > - Use device pairing and E2E encryption -- never expose the tunnel without authentication
 > - Monitor the agent's activity via the real-time indicators and debug logs
+> - Computer Use grants are per-app and in-memory only -- you approve each app the agent drives, every session
 
 <br>
 
@@ -49,6 +51,19 @@
 | Remote tools feel disconnected from your machine | PWA that lives on your home screen like a native app |
 
 ## Features
+
+### Computer Use & Presence
+
+The agent operates your Mac alongside you — not for you. It reads the screen via Accessibility (AX), drives controls via AX writes and synthesized HID, and verifies outcomes semantically (e.g. confirms the font size actually changed on the selection, not just that a combobox accepted a value).
+
+- **Cursor-invariant** -- the agent never visibly borrows your cursor. HID synthesis saves and restores your pointer with sub-frame precision; if it can't, it fails closed
+- **Atomic chains** -- `agent_act` runs multi-step workflows (focus → select → write → verify) as one unit, holding focus across steps that fragmented per-tool calls would lose
+- **Op registry** -- `agent_describe_ops` documents known native patterns (e.g. font-size combo boxes, NSComboBox commit, geometry attribute shapes) so chains compose against verified primitives
+- **Per-app permission** -- every app the agent drives prompts for explicit consent on first use; grants live in-memory only and reset each session
+- **Read primitives** -- focused element, subtree, window, cursor neighborhood; for situational awareness without disturbing focus
+- **Drive primitives** -- click, hover, drag, type, keystroke (app-scoped + global), key hold, modifier latch, scroll, menu commands, named-key press, selection by range/substring
+
+Built on a native `ax-helper` (separate process, hardened entitlements) plus an Electron-side action registry. AX-first by default, HID as fallback with explicit guards.
 
 ### Claude Code Channel
 
@@ -116,7 +131,7 @@ Two complementary layers give Claude memory without a cloud round-trip.
 
 ## Requirements
 
-- **macOS** 11+ (Big Sur or later) -- **Apple Silicon (M1 or newer)**. Intel Macs are not supported as of v2.4.4.
+- **macOS** 11+ (Big Sur or later) -- **Apple Silicon (M1 or newer)**. Intel Macs are not supported as of v2.4.5.
 - **Claude Code** (latest, with channels support)
 
 ## Installation
@@ -128,11 +143,12 @@ The app is signed and notarized -- macOS will allow it to run without extra step
 ## Quick Start
 
 1. **Launch** Root Operator -- it lives in your menu bar
-2. **Start the tunnel** -- click the power button to create a Cloudflare Tunnel
-3. **Open the tunnel URL** on your phone (copy from the desktop app)
-4. **Pair** -- enter the 6-character code shown on your phone into the desktop app
-5. **Verify** -- confirm the hex fingerprint matches on both devices
-6. **Go** -- encrypted chat with Claude from anywhere
+2. **Grant macOS permissions** -- Accessibility and Screen Recording (System Settings → Privacy & Security). Required for Computer Use; the app will prompt on first use
+3. **Start the tunnel** -- click the power button to create a Cloudflare Tunnel
+4. **Open the tunnel URL** on your phone (copy from the desktop app)
+5. **Pair** -- enter the 6-character code shown on your phone into the desktop app
+6. **Verify** -- confirm the hex fingerprint matches on both devices
+7. **Go** -- encrypted chat with Claude from anywhere
 
 ## Architecture
 
@@ -208,7 +224,9 @@ sequenceDiagram
 
 ## MCP Tools
 
-Root Operator exposes tools to Claude Code via the MCP bridge:
+Root Operator exposes tools to Claude Code via the MCP bridge.
+
+### Channel & Scheduling
 
 | Tool | Purpose |
 |------|---------|
@@ -218,10 +236,44 @@ Root Operator exposes tools to Claude Code via the MCP bridge:
 | `ro_delete_schedule(id)` | Delete a scheduled job |
 | `ro_toggle_schedule(id, enabled)` | Enable or disable a job |
 | `ro_run_now(id)` | Trigger a job immediately |
+
+### Memory
+
+| Tool | Purpose |
+|------|---------|
 | `ro_memory_search(query, limit?, chat_id?)` | Recall memories older than the session's channel-history tail |
 | `ro_memory_save(content, chat_id?)` | Save content to memory (bypasses the indexing toggle) |
 | `ro_memory_update(id, content)` | Update a stored memory by id |
 | `ro_memory_delete(id)` | Delete a stored memory by id |
+
+### Computer Use
+
+Discovery and atomic execution:
+
+| Tool | Purpose |
+|------|---------|
+| `agent_describe_ops(...)` | Documented patterns and primitive specs — call this before composing chains for native controls |
+| `agent_act(steps)` | Atomic multi-step chain (focus → select → write → verify) holding focus across steps |
+| `agent_run_chain(...)` | Lower-level chain runner |
+| `agent_list_app_workflows`, `agent_remember_app_workflow` | Per-app workflow library |
+| `agent_check_ax`, `agent_discover_app` | Pre-flight + capability checks |
+
+Read:
+
+| Tool | Purpose |
+|------|---------|
+| `agent_read_focused`, `agent_read_subtree`, `agent_read_window`, `agent_read_at_cursor` | AX reads at varying scope, non-disruptive |
+| `agent_find_element`, `agent_recent_events` | Locate elements, inspect recent activity |
+
+Drive:
+
+| Tool | Purpose |
+|------|---------|
+| `agent_click_at`, `agent_press_at`, `agent_hover_at`, `agent_drag`, `agent_scroll_at` | HID with cursor save/restore |
+| `agent_focus_at`, `agent_focus_element`, `agent_park`, `agent_move_to`, `agent_move_to_cursor` | Focus and pointer management |
+| `agent_type_text`, `agent_keystroke`, `agent_keystroke_global`, `agent_press_named`, `agent_key_hold`, `agent_modifier_latch` | Text and key input |
+| `agent_select_all`, `agent_select_range`, `agent_select_substring`, `agent_write_selection` | Selection and structured writes |
+| `agent_menu_command` | Drive native menus by path |
 
 ## Configuration
 
@@ -283,6 +335,12 @@ preload.js               # IPC bridge with security whitelist
 channel-bridge.cjs       # MCP server -- bridges Electron <-> Claude Code
 claude-stop-hook.cjs     # Claude session cleanup hook
 src/
+  main/
+    agent-actions.js     # Computer Use action registry (op specs + dispatch)
+    agent-avatar.js      # Presence dot + halo state
+    agent-halo.js        # Detach/return motion
+    claude-lifecycle.js  # Claude Code subprocess management
+  shared/                # Shared config (presence motion, etc.)
   channel-manager.js     # IPC client for channel bridge (Unix socket)
   chat-store.js          # JSONL message persistence (200-msg rotation)
   scheduler.js           # Persistent cron scheduler (node-cron)
@@ -292,6 +350,7 @@ src/
   client/                # PWA client (React + Tailwind + shadcn/ui)
     components/          # ChannelChat, SecurityPanel, PairingScreen, Header
     hooks/               # useWebSocket, useAuth, useE2E, useNotifications, useFileAttachment
+build/native/ax-helper   # Native AX/HID helper (separate process, hardened)
 public/                  # Static assets, fonts, PWA manifest, service worker
 workspace-templates/     # Default identity files (seeded on first run)
 worker/                  # Cloudflare Worker for custom subdomains (optional)
