@@ -41,15 +41,19 @@
 
 <br>
 
-## Why Root Operator?
+## Keyboard Shortcuts
 
-| Problem | Root Operator |
-|---------|---------------|
-| SSH is complex to set up and expose | One-click Cloudflare Tunnel -- zero open ports, zero config |
-| Terminal apps lack end-to-end encryption | Authenticated ECDH + AES-256-GCM with mutual identity verification |
-| No way to reach Claude Code from your phone | Claude Code channels -- chat with your desktop agent from anywhere |
-| Scheduled tasks need cron + SSH + scripts | Built-in persistent scheduler with natural language cron jobs |
-| Remote tools feel disconnected from your machine | PWA that lives on your home screen like a native app |
+Presence is built around the keyboard. Everything below works system-wide, in any app, without taking focus.
+
+| Keys | Action |
+|------|--------|
+| `Shift + Shift` | Open the cursor companion at your cursor — a small input, ready to type |
+| `Enter` | Send the prompt (text only) |
+| `Option + Enter` | Send with an 800×800 capture centered on your cursor |
+| `Option + Shift + Enter` | Send with a full-screen capture |
+| `Option + Shift + Shift` | Open the area selector — drag to pick a region, annotate (mark, color, undo/redo), then send |
+| `Shift + Enter` | Newline in the prompt |
+| `Esc` / right-click outside | Dismiss the companion (half-written prompts persist) |
 
 ## Features
 
@@ -57,19 +61,9 @@
 
 A cursor-anchored prompt surface that lives everywhere on the Mac. Tap Shift twice and a small input appears at your cursor — type, send, get a reply right where you're looking. Optional captures attach automatically.
 
-**Shortcuts:**
-
-| Keys | Action |
-|------|--------|
-| `Shift + Shift` | Open / focus the cursor companion at your cursor position |
-| `Enter` | Send the prompt (text only) |
-| `Option + Enter` | Send with an 800×800 capture centered on your cursor |
-| `Option + Shift + Enter` | Send with a full-screen capture |
-| `Option + Shift + Shift` | Open the area selector — drag to pick a region, annotate it (mark, color, undo/redo), then send |
-| `Shift + Enter` | Newline in the prompt |
-| `Esc` / right-click outside | Dismiss |
-
 The companion is a non-stealing NSPanel — it doesn't take focus from the app you're working in. Replies stack near the bubble; half-written prompts persist across dismissals.
+
+See [Keyboard Shortcuts](#keyboard-shortcuts) for the full surface.
 
 ### Computer Use *(Beta)*
 
