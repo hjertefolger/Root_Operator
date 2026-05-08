@@ -149,6 +149,7 @@
       "src/updater.js",
       "src/dynamic-memory/**/*",
       "src/main/**/*",
+      "src/shared/**/*",
       "src/orphan-kill.js",
       "tray_*.png",
       "ui/**/*",
