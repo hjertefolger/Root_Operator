@@ -211,7 +211,7 @@ const AGENT_ACT_OPS = [
     { op: 'focus', required: ['target'], optional: ['allow_unstable'] },
     { op: 'inspect', required: ['target'], optional: [] },
     { op: 'perform_action', aliases: ['action'], required: ['target', 'action'], optional: [] },
-    { op: 'set_attribute', required: ['target', 'attribute', 'value|text'], optional: ['location/length for AXSelectedTextRange'] },
+    { op: 'set_attribute', required: ['target', 'attribute', 'value|text'], optional: ['location/length for AXSelectedTextRange', '{x,y} object for AXPosition', '{width,height} object for AXSize'] },
     { op: 'set_value', required: ['target', 'text'], optional: [] },
     { op: 'select_all', required: ['target'], optional: [] },
     { op: 'select_range', required: ['target', 'location', 'length'], optional: [] },
@@ -829,6 +829,7 @@ function formatDescribeOps() {
     lines.push('Focus rule: some native controls accept AXFocused or AXValue without changing the underlying document/app state. For unstable focus or pop-up/combo controls, do not loop on AXFocused; perform the native user gesture in a single scoped chain and verify the semantic result.');
     lines.push('Rich text rule: changing a formatting control is not sufficient. Resolve the edited text element and verify actual attributed content with font_info or verify_font_size when the user asked to change text size.');
     lines.push('Known native pattern for font-size combo boxes: launch/wait_window, resolve edited text as body, select_all/select_range, resolve the font-size AXComboBox by label, hid click it, keystroke cmd+a scoped to the app with require_focus=false, type_text the numeric size scoped to the app, keystroke return scoped to the app, then verify_font_size on body.');
+    lines.push('Geometry attribute rule: AXPosition expects an object {x:int, y:int} and AXSize expects {width:int, height:int} — strings like "1110,40" are rejected. set_value uses text (string), not value. AXSelectedTextRange uses location/length integers.');
     return lines.join('\n');
 }
 

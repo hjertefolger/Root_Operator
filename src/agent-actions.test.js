@@ -637,6 +637,9 @@ test('agent_describe_ops documents production verification and scoped fallbacks'
     assert.match(r.result, /require_focus=false/);
     assert.match(r.result, /Workflow-first rule/);
     assert.match(r.result, /Known native pattern for font-size combo boxes/);
+    assert.match(r.result, /Geometry attribute rule/);
+    assert.match(r.result, /AXPosition expects an object \{x:int, y:int\}/);
+    assert.match(r.result, /AXSize expects \{width:int, height:int\}/);
 });
 
 test('channel bridge describes semantic verification for agent_act', () => {
@@ -646,6 +649,9 @@ test('channel bridge describes semantic verification for agent_act', () => {
     assert.match(bridgeSource, /scoped keystroke\/type_text CGEvents/);
     assert.match(bridgeSource, /verify_font_size/);
     assert.match(bridgeSource, /not just the font-size control value/);
+    assert.match(bridgeSource, /Geometry attribute rule/);
+    assert.match(bridgeSource, /AXPosition expects \{x,y\}/);
+    assert.match(bridgeSource, /AXSize expects \{width,height\}/);
     assert.match(bridgeSource, /Do not use this for multi-step targeted app workflows/);
     assert.match(bridgeSource, /Workflow-first rule/);
     assert.match(bridgeSource, /before composing new primitive agent_act steps/);
