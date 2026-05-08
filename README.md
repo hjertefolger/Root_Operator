@@ -53,6 +53,8 @@ Root Operator is built around the keyboard. Everything below works system-wide, 
 | `⌘ ⇧ K` | Toggle the desktop chat window |
 | `⌘ ⇧ L` | Toggle Cursor Presence on/off |
 
+The tunnel starts automatically when Root Operator launches — the shortcut is for taking it off and on without quitting the app. Auto-start can be disabled in Settings.
+
 ### Presence
 
 | Keys | Action |
