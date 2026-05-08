@@ -7,7 +7,7 @@
   <a href="package.json"><img src="https://img.shields.io/badge/electron-39-blue.svg" alt="Electron"></a>
 </p>
 
-<p align="center"><strong>Your second self at the Mac. Watches your work, acts alongside you, replies through your phone.</strong></p>
+<p align="center"><strong>Your second self at the Mac. Watches your work, acts alongside you, replies wherever you are.</strong></p>
 
 <br>
 <img width="1920" height="1080" alt="root-operator-2" src="https://github.com/user-attachments/assets/1649f994-f6dc-4779-bf63-4cd552333279" />
@@ -26,8 +26,8 @@
 - 🧠 **Continuity & recall** — selected channel history injected into every session; optional local-embedder index for deeper semantic search
 <br>
 
-> **Security notice**
->
+## ⚠️ Security Notice
+
 > Root Operator gives the connected AI agent (Claude Code) powerful capabilities on your Mac -- including running shell commands, reading and writing files, installing packages, and managing scheduled jobs. By default, it runs with `--dangerously-skip-permissions`, meaning the agent can act without per-action approval.
 >
 > **Only run Root Operator if you understand the risks and trust the agent's configuration.** This is a personal tool designed for a single trusted operator -- not a multi-user or shared system.
