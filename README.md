@@ -405,6 +405,16 @@ npm run rebuild
 - Check that `~/.root-operator/workspace/` exists (created on first run)
 - Right-click tray icon to verify Channel mode is active
 
+### Status dot stays orange after launch ("Claude session not started")
+Root Operator runs Claude with `--dangerously-skip-permissions`. The first time you use that flag, Claude shows a one-time TUI acknowledgement that must be accepted interactively — Root Operator can't accept it for you, so the session hangs and the status dot stays orange.
+
+Fix:
+1. Quit Root Operator
+2. In a terminal, run: `claude --dangerously-skip-permissions`
+3. Accept the acknowledgement at the prompt
+4. Quit the terminal session (the acceptance is persisted)
+5. Relaunch Root Operator — the status dot should turn green
+
 ### Push notifications not arriving
 - Ensure notifications are enabled in the web client (bell icon)
 - Background the app -- notifications are suppressed when the app is in the foreground
