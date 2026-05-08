@@ -3,6 +3,7 @@ import { PictureInPicture2 } from 'lucide-react';
 import rabbitLogo from '../../client/assets/rabbit.svg';
 import ChannelChat from '../../client/components/ChannelChat';
 import { mergeChannelActivity } from '../../client/lib/channelActivity';
+import { mergeChannelMessages } from '../../client/lib/channelMessages';
 import { useElectron } from '../hooks/useElectron';
 
 const STATUS_COLORS = {
@@ -11,33 +12,6 @@ const STATUS_COLORS = {
   red: '#d44d69',
 };
 const DESKTOP_LOCAL_CHAT_ID = 'desktop-local';
-
-function mergeMessages(prev, incoming) {
-  if (!Array.isArray(incoming) || incoming.length === 0) {
-    return prev;
-  }
-
-  const next = [...prev];
-  const seen = new Set(prev.map((item) => {
-    const attachmentKey = Array.isArray(item.attachments)
-      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
-      : '';
-    return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
-  }));
-
-  for (const item of incoming) {
-    const attachmentKey = Array.isArray(item.attachments)
-      ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
-      : '';
-    const key = `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      next.push(item);
-    }
-  }
-
-  return next;
-}
 
 function LocalChatView({ tunnelState }) {
   const { invoke, on } = useElectron();
@@ -78,7 +52,7 @@ function LocalChatView({ tunnelState }) {
 
       if (payload.type === 'channel_message') {
         setWaiting(false);
-        setMessages((prev) => mergeMessages(prev, [{
+        setMessages((prev) => mergeChannelMessages(prev, [{
           role: payload.role || 'assistant',
           content: payload.content,
           ts: payload.ts || new Date().toISOString(),
@@ -109,7 +83,7 @@ function LocalChatView({ tunnelState }) {
           return;
         }
         if (state) {
-          setMessages((prev) => mergeMessages(prev, state.messages || []));
+          setMessages((prev) => mergeChannelMessages(prev, state.messages || []));
           setWaiting(Boolean(state.waiting));
           setActivities(state.activities || []);
           setAlwaysOnTop(Boolean(state.alwaysOnTop));

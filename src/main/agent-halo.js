@@ -22,11 +22,31 @@ const presenceMotionConfig = require('../shared/presence-motion-config.json');
 // outside every edge.
 const HALO_CONFIG = presenceMotionConfig.halo || {};
 const PAD = HALO_CONFIG.padPx || 18;
+const WINDOW_RADIUS_PX = Number.isFinite(HALO_CONFIG.windowRadiusPx) ? HALO_CONFIG.windowRadiusPx : 12;
 
 // Auto-hide after this much time. Long enough to read; short enough
 // that a stalled agent doesn't leave a lingering ring. Renderer fade-out
 // duration is added on top inside the React component.
 const AUTO_HIDE_MS = HALO_CONFIG.actionAutoHideMs || 1700;
+
+function clampRadius(value, width, height) {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return Math.max(0, Math.min(value, Math.max(0, Math.min(width, height) / 2)));
+}
+
+function borderRadiusForFrame(frame, options = {}) {
+    const explicit = Number(options.borderRadius ?? options.border_radius);
+    if (Number.isFinite(explicit)) {
+        return clampRadius(explicit, frame.w, frame.h);
+    }
+
+    const role = typeof options.role === 'string' ? options.role : '';
+    if (role === 'AXWindow' || role === 'AXSheet' || role === 'AXDialog' || role === 'AXPopover') {
+        return clampRadius(WINDOW_RADIUS_PX, frame.w, frame.h);
+    }
+
+    return clampRadius(Number(HALO_CONFIG.defaultRadiusPx || 0), frame.w, frame.h);
+}
 
 function init(deps) {
     if (!deps || !deps.BrowserWindow || !deps.app || !deps.loadRendererWindow) {
@@ -135,6 +155,8 @@ function init(deps) {
                 height,
                 mode: options.mode || 'action',
                 sustain: options.sustain === true,
+                role: options.role,
+                borderRadius: borderRadiusForFrame(frame, options),
                 seed: Math.floor(Date.now() % 2147483647),
                 accent: HALO_CONFIG.accent,
             };

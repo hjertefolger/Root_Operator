@@ -22,69 +22,54 @@ function clamp01(value) {
     return Math.max(0, Math.min(1, value));
 }
 
-function seededRandomFactory(seed) {
-    let state = (Number.isFinite(seed) ? seed : 1) >>> 0;
-    if (state === 0) state = 0x9e3779b9;
-    return () => {
-        state += 0x6D2B79F5;
-        let t = state;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
+function clampRadius(value, width, height) {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return Math.max(0, Math.min(value, Math.max(0, Math.min(width, height) / 2)));
 }
 
-function buildGridDots(size, seed) {
+function buildGridDots(size) {
     const width = Math.max(1, size.width);
     const height = Math.max(1, size.height);
-    const step = Math.max(6, HALO.gridStepPx || 10);
-    const radius = Math.max(0.55, HALO.gridDotRadiusPx || 0.95);
-    const maxOpacity = Math.max(0.04, HALO.gridMaxOpacity || 0.24);
-    const random = seededRandomFactory(seed);
+    const step = Math.max(7, HALO.gridStepPx || 10);
+    const radius = Math.max(0.65, Math.min(1.25, HALO.gridDotRadiusPx || 0.95));
+    const maxOpacity = Math.max(0.08, HALO.gridMaxOpacity || 0.26);
     const dots = [];
-    const startX = Math.max(0, PAD - step);
-    const startY = Math.max(0, PAD - step);
-    const endX = Math.min(width, width - PAD + step);
-    const endY = Math.min(height, height - PAD + step);
-    const cornerX = width - PAD * 0.65;
-    const cornerY = PAD * 0.75;
-    const centerX = width * 0.52;
-    const centerY = height * 0.52;
-    const reach = Math.max(56, Math.hypot(width, height) * 0.72);
-    const centerClear = Math.max(18, Math.min(width, height) * 0.3);
+    const startX = Math.max(0, PAD - 8);
+    const startY = Math.max(0, PAD - 8);
+    const endX = Math.min(width, width - PAD + 8);
+    const endY = Math.min(height, height - PAD + 8);
+    const gradientStart = { x: width - PAD * 0.55, y: PAD * 0.45 };
+    const gradientEnd = { x: width * 0.42, y: height * 0.56 };
+    const vx = gradientEnd.x - gradientStart.x;
+    const vy = gradientEnd.y - gradientStart.y;
+    const lenSq = Math.max(1, vx * vx + vy * vy);
+    const len = Math.sqrt(lenSq);
+    const bandWidth = Math.max(44, Math.hypot(width, height) * 0.56);
     let id = 0;
 
     for (let y = startY; y <= endY; y += step) {
         for (let x = startX; x <= endX; x += step) {
-            const jitterX = (random() - 0.5) * 1.2;
-            const jitterY = (random() - 0.5) * 1.2;
-            const px = x + jitterX;
-            const py = y + jitterY;
-            const distCorner = Math.hypot(px - cornerX, py - cornerY);
-            const distCenter = Math.hypot(px - centerX, py - centerY);
-            const cornerFalloff = clamp01(1 - distCorner / reach);
-            const centerFade = clamp01((distCenter - centerClear) / Math.max(1, reach * 0.58));
-            const diagonalX = (px - centerX) / Math.max(1, cornerX - centerX);
-            const diagonalY = (centerY - py) / Math.max(1, centerY - cornerY);
-            const diagonalBias = clamp01((diagonalX + diagonalY + 0.18) / 2.05);
+            const px = x;
+            const py = y;
+            const dx = px - gradientStart.x;
+            const dy = py - gradientStart.y;
+            const t = clamp01((dx * vx + dy * vy) / lenSq);
+            const axisDistance = Math.abs(dx * vy - dy * vx) / len;
+            const alongFade = Math.pow(1 - t, 1.55);
+            const bandFade = Math.pow(clamp01(1 - axisDistance / bandWidth), 0.9);
+            const topRightBias = clamp01((px / width) * 0.56 + ((height - py) / height) * 0.44);
             const opacity = maxOpacity
-                * Math.pow(cornerFalloff, 1.35)
-                * Math.pow(centerFade, 0.62)
-                * (0.34 + diagonalBias * 0.66);
-            if (opacity < 0.016) continue;
+                * alongFade
+                * (0.28 + bandFade * 0.72)
+                * (0.38 + topRightBias * 0.62);
+            if (opacity < 0.018) continue;
 
-            const duration = 2800 + random() * 1800;
             dots.push({
                 id: id++,
                 x: px,
                 y: py,
-                r: radius + (random() - 0.5) * 0.18,
+                r: radius,
                 opacity,
-                lowOpacity: opacity * 0.5,
-                delay: -random() * duration,
-                duration,
-                shiftX: -0.65 - random() * 0.8,
-                shiftY: 0.55 + random() * 0.85,
             });
         }
     }
@@ -93,7 +78,7 @@ function buildGridDots(size, seed) {
 
 export default function AgentHaloView() {
     const [visible, setVisible] = useState(false);
-    const [payload, setPayload] = useState({ width: 0, height: 0, seed: 1, accent: ACCENT });
+    const [payload, setPayload] = useState({ width: 0, height: 0, seed: 1, accent: ACCENT, borderRadius: 0 });
 
     useEffect(() => {
         if (!window.electronAPI || typeof window.electronAPI.on !== 'function') return;
@@ -105,6 +90,7 @@ export default function AgentHaloView() {
                     seed: Number.isFinite(payload.seed) ? payload.seed : Date.now(),
                     accent: payload.accent || ACCENT,
                     mode: payload.mode || 'action',
+                    borderRadius: Number.isFinite(payload.borderRadius) ? payload.borderRadius : 0,
                 });
             }
             setVisible(true);
@@ -122,11 +108,34 @@ export default function AgentHaloView() {
     const innerWidth = Math.max(0, payload.width - PAD * 2);
     const innerHeight = Math.max(0, payload.height - PAD * 2);
     const accent = payload.accent || ACCENT;
-    const gridDots = useMemo(() => buildGridDots(size, payload.seed), [size.width, size.height, payload.seed]);
+    const gridDots = useMemo(() => buildGridDots(size), [size.width, size.height]);
     const fadeInMs = HALO.fadeInMs || 250;
     const fadeOutMs = HALO.fadeOutMs || 400;
     const borderScanMs = HALO.borderScanDurationMs || 3600;
-    const cornerTraceLength = Math.max(18, Math.min(38, Math.min(innerWidth, innerHeight) * 0.42));
+    const targetRadius = clampRadius(payload.borderRadius, innerWidth, innerHeight);
+    const fieldInset = 8;
+    const fieldX = PAD - fieldInset;
+    const fieldY = PAD - fieldInset;
+    const fieldWidth = innerWidth + fieldInset * 2;
+    const fieldHeight = innerHeight + fieldInset * 2;
+    const fieldRadius = clampRadius(targetRadius > 0 ? targetRadius + fieldInset : 0, fieldWidth, fieldHeight);
+    const maxCornerTrace = Math.max(0, Math.min(innerWidth, innerHeight));
+    const cornerTraceLength = Math.min(maxCornerTrace, Math.max(
+        targetRadius + 14,
+        Math.min(42, maxCornerTrace * 0.42),
+    ));
+    const edgeTracePath = targetRadius > 0
+        ? [
+            `M ${PAD + innerWidth - cornerTraceLength} ${PAD}`,
+            `H ${PAD + innerWidth - targetRadius}`,
+            `Q ${PAD + innerWidth} ${PAD} ${PAD + innerWidth} ${PAD + targetRadius}`,
+            `V ${PAD + cornerTraceLength}`,
+        ].join(' ')
+        : [
+            `M ${PAD + innerWidth - cornerTraceLength} ${PAD}`,
+            `H ${PAD + innerWidth}`,
+            `V ${PAD + cornerTraceLength}`,
+        ].join(' ');
 
     return (
         <div
@@ -146,10 +155,6 @@ export default function AgentHaloView() {
                 @keyframes agentHaloScan {
                     from { stroke-dashoffset: 0; }
                     to { stroke-dashoffset: -180; }
-                }
-                @keyframes agentHaloGridTravel {
-                    0%, 100% { opacity: var(--dot-opacity-low); transform: translate(0px, 0px); }
-                    46% { opacity: var(--dot-opacity); transform: translate(var(--dot-shift-x), var(--dot-shift-y)); }
                 }
                 @keyframes agentHaloEdgeTrace {
                     0%, 100% { opacity: 0.18; }
@@ -177,40 +182,42 @@ export default function AgentHaloView() {
                         <stop offset="48%" stopColor={accent} stopOpacity="0.045" />
                         <stop offset="100%" stopColor={accent} stopOpacity="0" />
                     </linearGradient>
+                    <clipPath id="agent-halo-field-clip">
+                        <rect
+                            x={fieldX}
+                            y={fieldY}
+                            width={fieldWidth}
+                            height={fieldHeight}
+                            rx={fieldRadius}
+                            ry={fieldRadius}
+                        />
+                    </clipPath>
                 </defs>
                 <rect
-                    x={PAD - 8}
-                    y={PAD - 8}
-                    width={innerWidth + 16}
-                    height={innerHeight + 16}
-                    rx="12"
+                    x={fieldX}
+                    y={fieldY}
+                    width={fieldWidth}
+                    height={fieldHeight}
+                    rx={fieldRadius}
+                    ry={fieldRadius}
                     fill="url(#agent-halo-wash)"
                     opacity="0.72"
                     filter="url(#agent-halo-soften)"
                 />
-                {gridDots.map((dot) => (
-                    <circle
-                        key={dot.id}
-                        cx={dot.x}
-                        cy={dot.y}
-                        r={dot.r}
-                        fill={accent}
-                        style={{
-                            '--dot-opacity': dot.opacity,
-                            '--dot-opacity-low': dot.lowOpacity,
-                            '--dot-shift-x': `${dot.shiftX}px`,
-                            '--dot-shift-y': `${dot.shiftY}px`,
-                            transformOrigin: `${dot.x}px ${dot.y}px`,
-                            animation: `agentHaloGridTravel ${dot.duration}ms ease-in-out ${dot.delay}ms infinite`,
-                        }}
-                    />
-                ))}
+                <g clipPath="url(#agent-halo-field-clip)" style={{ mixBlendMode: 'screen' }}>
+                    {gridDots.map((dot) => (
+                        <circle
+                            key={dot.id}
+                            cx={dot.x}
+                            cy={dot.y}
+                            r={dot.r}
+                            fill={accent}
+                            opacity={dot.opacity}
+                        />
+                    ))}
+                </g>
                 <path
-                    d={[
-                        `M ${PAD + innerWidth - cornerTraceLength} ${PAD}`,
-                        `H ${PAD + innerWidth}`,
-                        `V ${PAD + cornerTraceLength}`,
-                    ].join(' ')}
+                    d={edgeTracePath}
                     fill="none"
                     stroke={accent}
                     strokeWidth="1.25"
@@ -223,7 +230,8 @@ export default function AgentHaloView() {
                     y={PAD}
                     width={innerWidth}
                     height={innerHeight}
-                    rx="8"
+                    rx={targetRadius}
+                    ry={targetRadius}
                     fill="none"
                     stroke={accent}
                     strokeWidth="1"

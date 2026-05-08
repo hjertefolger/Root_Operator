@@ -10,32 +10,7 @@ import { useAuth } from './hooks/useAuth';
 import { useNotifications } from './hooks/useNotifications';
 import { useFileAttachment } from './hooks/useFileAttachment';
 import { mergeChannelActivity } from './lib/channelActivity';
-
-function getMessageKey(item) {
-  const attachmentKey = Array.isArray(item.attachments)
-    ? item.attachments.map((attachment) => `${attachment.id || attachment.name}:${attachment.sha256 || ''}`).join('|')
-    : '';
-  return `${item.role}:${item.ts || ''}:${item.content}:${attachmentKey}`;
-}
-
-function mergeMessages(prev, incoming) {
-  if (!Array.isArray(incoming) || incoming.length === 0) {
-    return prev;
-  }
-
-  const next = [...prev];
-  const seen = new Set(prev.map(getMessageKey));
-
-  for (const item of incoming) {
-    const key = getMessageKey(item);
-    if (!seen.has(key)) {
-      seen.add(key);
-      next.push(item);
-    }
-  }
-
-  return next;
-}
+import { mergeChannelMessages } from './lib/channelMessages';
 
 function getBootstrapLabel({
   isLoading,
@@ -208,10 +183,7 @@ function App() {
 
         if (parsed.type === 'channel_history') {
           const incoming = Array.isArray(parsed.messages) ? parsed.messages : [];
-          // Replace only on the first arrival per session. Subsequent
-          // re-sends (reconnect mid-conversation) merge so we don't clobber
-          // any channel_message that arrived first on a slow path.
-          setChannelMessages((prev) => (prev.length === 0 ? incoming : mergeMessages(prev, incoming)));
+          setChannelMessages((prev) => mergeChannelMessages(prev, incoming));
           setChannelHistoryLoaded(true);
         } else if (parsed.type === 'channel_message') {
           // Clear badge when receiving a message while visible
@@ -222,7 +194,7 @@ function App() {
             navigator.serviceWorker.controller.postMessage({ type: 'clear_badge' });
           }
           setChannelWaiting(false);
-          setChannelMessages(prev => mergeMessages(prev, [{
+          setChannelMessages(prev => mergeChannelMessages(prev, [{
             role: parsed.role || 'assistant',
             content: parsed.content,
             ts: parsed.ts || new Date().toISOString(),

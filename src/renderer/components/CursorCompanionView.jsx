@@ -128,6 +128,20 @@ const STACK_TOP = ANCHOR_Y + 18;
 const LOADER_LEFT = ANCHOR_X + 8;
 const LOADER_TOP = ANCHOR_Y + 10;
 
+function getPromptWidthMirrorText(value) {
+  if (!value) return ' ';
+  const lines = String(value).split('\n');
+  return lines.reduce((longest, line) => (
+    line.length > longest.length ? line : longest
+  ), '') || ' ';
+}
+
+function getPromptWrapMirrorText(value) {
+  if (!value) return ' ';
+  const text = String(value);
+  return text.endsWith('\n') ? `${text} ` : text;
+}
+
 function CursorCompanionView() {
   const { invoke, on } = useElectron();
   const textareaRef = useRef(null);
@@ -162,6 +176,8 @@ function CursorCompanionView() {
   const replyScrollRefs = useRef({}); // { [id]: HTMLElement }
   const repliesRef = useRef([]);
   const inputScrollableRef = useRef(false);
+  const widthMirrorText = useMemo(() => getPromptWidthMirrorText(prompt), [prompt]);
+  const wrapMirrorText = useMemo(() => getPromptWrapMirrorText(prompt), [prompt]);
 
   useEffect(() => {
     repliesRef.current = replies;
@@ -298,10 +314,21 @@ function CursorCompanionView() {
       try {
         const end = live.value.length;
         live.setSelectionRange(end, end);
-        live.scrollTop = live.scrollHeight;
+        const maxScroll = Math.max(0, live.scrollHeight - live.clientHeight);
+        live.scrollTop = maxScroll > 1 ? maxScroll : 0;
       } catch (_) {}
     });
   }, [inputOpen, textareaMounted]);
+
+  useLayoutEffect(() => {
+    if (!inputOpen || !textareaMounted) return;
+    const node = textareaRef.current;
+    if (!node) return;
+    const maxScroll = Math.max(0, node.scrollHeight - node.clientHeight);
+    if (maxScroll <= 1 && node.scrollTop !== 0) {
+      node.scrollTop = 0;
+    }
+  }, [inputOpen, textareaMounted, inputBox.height, inputBox.textHeight, prompt]);
 
   useLayoutEffect(() => {
     if (!inputOpen || !textareaMounted) {
@@ -494,9 +521,25 @@ function CursorCompanionView() {
   // Main owns physical right-click dismissal through the global mouse
   // hook. The renderer only suppresses the default context menu so one
   // gesture cannot peel two replies through both event paths.
-  const handleReplyContextMenu = useCallback(() => (e) => {
+  const handleReplyContextMenu = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
+  }, []);
+
+  const handleReplyMeasure = useCallback((id, size) => {
+    setReplySizes((prev) => {
+      const existing = prev[id];
+      if (existing && existing.width === size.width && existing.height === size.height) return prev;
+      return { ...prev, [id]: size };
+    });
+  }, []);
+
+  const handleReplyScrollRef = useCallback((id, node) => {
+    if (node) {
+      replyScrollRefs.current[id] = node;
+    } else {
+      delete replyScrollRefs.current[id];
+    }
   }, []);
 
   const interactiveActive = inputOpen || replies.length > 0 || Boolean(pendingAttachment);
@@ -736,14 +779,8 @@ function CursorCompanionView() {
             origin={positions.replyStack || { left: STACK_LEFT, top: STACK_TOP }}
             visible={state === 'visible'}
             onContextMenu={handleReplyContextMenu}
-            scrollRefs={replyScrollRefs}
-            onMeasure={(id, size) => {
-              setReplySizes((prev) => {
-                const existing = prev[id];
-                if (existing && existing.width === size.width && existing.height === size.height) return prev;
-                return { ...prev, [id]: size };
-              });
-            }}
+            onScrollRef={handleReplyScrollRef}
+            onMeasure={handleReplyMeasure}
           />
         )}
       </LayerWrapper>
@@ -789,7 +826,7 @@ function CursorCompanionView() {
           top: 0,
         }}
       >
-        {prompt || ' '}
+        {widthMirrorText}
       </span>
       <div
         ref={wrapMirrorRef}
@@ -811,7 +848,7 @@ function CursorCompanionView() {
           top: 0,
         }}
       >
-        {prompt || ' '}
+        {wrapMirrorText}
       </div>
 
       <style>{`
@@ -891,7 +928,7 @@ function LayerWrapper({ visible, duration = 220, children }) {
  * peeking from below by STACK_PEEK_OFFSET each. Each reply's bubble is
  * absolutely positioned within the stack outer.
  */
-function ReplyStack({ replies, origin, visible, onContextMenu, scrollRefs, onMeasure }) {
+function ReplyStack({ replies, origin, visible, onContextMenu, onScrollRef, onMeasure }) {
   // Order: replies[0] = oldest, replies[last] = newest.
   // Newest sits at z-top fully visible; older are offset down behind it.
   const count = replies.length;
@@ -905,6 +942,11 @@ function ReplyStack({ replies, origin, visible, onContextMenu, scrollRefs, onMea
         opacity: visible ? 1 : 0,
         transition: 'opacity 200ms ease, top 240ms cubic-bezier(0.22, 1, 0.36, 1)',
         pointerEvents: 'auto',
+        transform: 'translate3d(0, 0, 0)',
+        transformOrigin: 'top left',
+        willChange: 'top, opacity',
+        backfaceVisibility: 'hidden',
+        isolation: 'isolate',
       }}
     >
       {replies.map((reply, idx) => {
@@ -927,11 +969,8 @@ function ReplyStack({ replies, origin, visible, onContextMenu, scrollRefs, onMea
             offsetY={offsetY}
             zIndex={idx}
             isTop={isTop}
-            onContextMenu={onContextMenu(reply.id)}
-            scrollRefSetter={(node) => {
-              if (node) scrollRefs.current[reply.id] = node;
-              else delete scrollRefs.current[reply.id];
-            }}
+            onContextMenu={onContextMenu}
+            onScrollRef={onScrollRef}
             onMeasure={onMeasure}
           />
         );
@@ -941,11 +980,14 @@ function ReplyStack({ replies, origin, visible, onContextMenu, scrollRefs, onMea
 }
 
 const ReplyBubble = memo(function ReplyBubble({
-  reply, offsetY, zIndex, isTop, onContextMenu, scrollRefSetter, onMeasure,
+  reply, offsetY, zIndex, isTop, onContextMenu, onScrollRef, onMeasure,
 }) {
   const mirrorRef = useRef(null);
   const naturalMirrorRef = useRef(null);
   const [size, setSize] = useState({ width: PILL_MIN_WIDTH, height: PILL_HEIGHT });
+  const setScrollRef = useCallback((node) => {
+    onScrollRef(reply.id, node);
+  }, [onScrollRef, reply.id]);
 
   useLayoutEffect(() => {
     const innerHorizPadding = RESPONSE_PADDING_X + (RESPONSE_PADDING_X - RESPONSE_INNER_RIGHT_PAD);
@@ -997,11 +1039,16 @@ const ReplyBubble = memo(function ReplyBubble({
           zIndex,
           opacity: isTop ? 1 : 0.78,
           transition: 'top 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease, width 240ms ease, height 240ms ease',
+          transform: 'translate3d(0, 0, 0)',
+          transformOrigin: 'top left',
+          willChange: 'top, opacity, width, height',
+          backfaceVisibility: 'hidden',
+          contain: 'layout paint style',
           pointerEvents: isTop ? 'auto' : 'none',
         }}
       >
         <div
-          ref={scrollRefSetter}
+          ref={setScrollRef}
           className="cursor-thin-scroll"
           style={{
             flex: '1 1 auto',
