@@ -15,7 +15,8 @@
 ✨ Computer Use, persistent scheduler, identity, and in-harness continuity + semantic recall — all local
 <br>
 
-- 🖱️ **Computer Use & Presence** — operate Mac apps via Accessibility + HID with semantic verification; cursor-invariant (your cursor never moves)
+- 👁️ **Presence** — Shift+Shift to prompt from anywhere on the Mac; capture cursor-area or full-screen with one keystroke; annotate a region before sending
+- 🖱️ **Computer Use** *(Beta)* — operate Mac apps via Accessibility + HID with semantic verification; cursor-invariant (your cursor never moves)
 - 🔑 **True E2E**: ECDH key exchange → HKDF → AES-256-GCM
 - 🛡️ **RSA-PSS with challenge-response**
 - 🔐 **Session fingerprinting**: matching fingerprint on your phone and your Mac — if they match, no one is intercepting
@@ -52,7 +53,25 @@
 
 ## Features
 
-### Computer Use & Presence
+### Presence
+
+A cursor-anchored prompt surface that lives everywhere on the Mac. Tap Shift twice and a small input appears at your cursor — type, send, get a reply right where you're looking. Optional captures attach automatically.
+
+**Shortcuts:**
+
+| Keys | Action |
+|------|--------|
+| `Shift + Shift` | Open / focus the cursor companion at your cursor position |
+| `Enter` | Send the prompt (text only) |
+| `Option + Enter` | Send with an 800×800 capture centered on your cursor |
+| `Option + Shift + Enter` | Send with a full-screen capture |
+| `Option + Shift + Shift` | Open the area selector — drag to pick a region, annotate it (mark, color, undo/redo), then send |
+| `Shift + Enter` | Newline in the prompt |
+| `Esc` / right-click outside | Dismiss |
+
+The companion is a non-stealing NSPanel — it doesn't take focus from the app you're working in. Replies stack near the bubble; half-written prompts persist across dismissals.
+
+### Computer Use *(Beta)*
 
 The agent operates your Mac alongside you — not for you. It reads the screen via Accessibility (AX), drives controls via AX writes and synthesized HID, and verifies outcomes semantically (e.g. confirms the font size actually changed on the selection, not just that a combobox accepted a value).
 
@@ -63,7 +82,7 @@ The agent operates your Mac alongside you — not for you. It reads the screen v
 - **Read primitives** -- focused element, subtree, window, cursor neighborhood; for situational awareness without disturbing focus
 - **Drive primitives** -- click, hover, drag, type, keystroke (app-scoped + global), key hold, modifier latch, scroll, menu commands, named-key press, selection by range/substring
 
-Built on a native `ax-helper` (separate process, hardened entitlements) plus an Electron-side action registry. AX-first by default, HID as fallback with explicit guards.
+Built on a native `ax-helper` (separate process, hardened entitlements) plus an Electron-side action registry. AX-first by default, HID as fallback with explicit guards. Beta: coverage of native controls expanding; report patterns that don't compose cleanly.
 
 ### Claude Code Channel
 
