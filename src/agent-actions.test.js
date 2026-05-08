@@ -635,6 +635,7 @@ test('agent_describe_ops documents production verification and scoped fallbacks'
     assert.match(r.result, /Do not treat an intermediate control AXValue as proof/);
     assert.match(r.result, /AXUIElementCopyAttributeValue/);
     assert.match(r.result, /require_focus=false/);
+    assert.match(r.result, /Workflow-first rule/);
     assert.match(r.result, /Known native pattern for font-size combo boxes/);
 });
 
@@ -646,6 +647,8 @@ test('channel bridge describes semantic verification for agent_act', () => {
     assert.match(bridgeSource, /verify_font_size/);
     assert.match(bridgeSource, /not just the font-size control value/);
     assert.match(bridgeSource, /Do not use this for multi-step targeted app workflows/);
+    assert.match(bridgeSource, /Workflow-first rule/);
+    assert.match(bridgeSource, /before composing new primitive agent_act steps/);
 });
 
 test('agent_act surfaces read step outputs', async () => {

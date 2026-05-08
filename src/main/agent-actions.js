@@ -822,6 +822,7 @@ function formatDescribeOps() {
         lines.push(`- ${spec.op}:${aliases}${required}${optional}`);
     }
     lines.push('Selector fields: app/bundle_id, scope=window|app|system|focused|target, role, label, index, near_x+near_y, x+y, prefer_roles, skip_roles, exact.');
+    lines.push('Workflow-first rule: before composing primitive actions in an unfamiliar app, call agent_discover_app and agent_list_app_workflows; reuse a verified workflow when one matches the user request.');
     lines.push('Production rules: inspect/discover the AX tree, resolve semantic elements, perform AX actions or set AX attributes, and verify the requested app-state postcondition in the same chain. Do not treat an intermediate control AXValue as proof unless that value is the requested state.');
     lines.push('Native control rule: prefer AXUIElementCopyAttributeValue, AXUIElementIsAttributeSettable, AXUIElementSetAttributeValue, and AXUIElementPerformAction. If an AX setter/action reports success but verification fails, stop and report the mismatch instead of trying unrelated setters.');
     lines.push('CGEvent/HID fallback policy: use only for focus repair, text insertion fallback, or controls with no reliable AX action after explicit user consent. Keep fallback steps scoped to the intended app with app/bundle_id plus require_focus=false only when the app has just been activated/resolved in the same chain; preserve cursor/clipboard and fail closed with diagnostics.');

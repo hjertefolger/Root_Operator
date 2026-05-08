@@ -264,7 +264,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_discover_app',
-      description: 'Build a compact live app map for the frontmost or named macOS app: focused window/element, text inputs, pressable controls, menu buttons, top menu inventory, role counts, and remembered workflows for this app. Use this as the first step in unfamiliar apps before acting; it helps the agent learn available affordances without guessing. Menu discovery may briefly open app menus through AX but does not press leaf commands.',
+      description: 'Build a compact live app map for the frontmost or named macOS app: focused window/element, text inputs, pressable controls, menu buttons, top menu inventory, role counts, and remembered workflows for this app. Workflow-first rule: before composing primitive actions in an unfamiliar app, call agent_discover_app, then agent_list_app_workflows, and reuse a verified workflow when one matches the user request. Menu discovery may briefly open app menus through AX but does not press leaf commands.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -277,7 +277,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_list_app_workflows',
-      description: 'List learned computer-use workflows remembered for the frontmost or named app. Call after agent_discover_app when deciding whether a proven app-specific recipe already exists.',
+      description: 'List learned computer-use workflows remembered for the frontmost or named app. Workflow-first rule: call this after agent_discover_app and before composing new primitive agent_act steps; if a non-destructive verified workflow matches the task, reuse/adapt that workflow instead of inventing a fresh primitive chain.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -398,7 +398,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'agent_act',
-      description: 'Execute an atomic generic macOS computer-use action list in one ax-helper process. Prefer this over adding new named tools. First inspect/discover the AX tree, resolve semantic elements, use AX actions/settable AX attributes, and verify the requested app-state postcondition in the same chain. Do not treat an intermediate control AXValue as proof unless that value is the requested state. Generic steps include launch/wait_window, resolve/wait_for_role by app/window/system scope, inspect, perform_action for exposed AX actions, set_attribute/set_value/select_all/select_range/select_substring/write_selection/insert_text, menu (alias menu_command), cursor-invariant hid, scoped keystroke/type_text CGEvents, read, verify_value, font_info, verify_font_size, verify_present, and verify_absent. For native controls with unstable AXFocused or display-only AXValue, do not loop on focus setters; perform the native user gesture in one scoped chain and verify semantic state. For rich text size changes, verify the edited text element with verify_font_size, not just the font-size control value. Existing agent_run_chain steps are still accepted for compatibility.',
+      description: 'Execute an atomic generic macOS computer-use action list in one ax-helper process. Prefer this over adding new named tools. Workflow-first rule: in an unfamiliar app, call agent_discover_app and agent_list_app_workflows before composing primitive steps; reuse a verified workflow when one matches. Then inspect/discover the AX tree, resolve semantic elements, use AX actions/settable AX attributes, and verify the requested app-state postcondition in the same chain. Do not treat an intermediate control AXValue as proof unless that value is the requested state. Generic steps include launch/wait_window, resolve/wait_for_role by app/window/system scope, inspect, perform_action for exposed AX actions, set_attribute/set_value/select_all/select_range/select_substring/write_selection/insert_text, menu (alias menu_command), cursor-invariant hid, scoped keystroke/type_text CGEvents, read, verify_value, font_info, verify_font_size, verify_present, and verify_absent. For native controls with unstable AXFocused or display-only AXValue, do not loop on focus setters; perform the native user gesture in one scoped chain and verify semantic state. For rich text size changes, verify the edited text element with verify_font_size, not just the font-size control value. Existing agent_run_chain steps are still accepted for compatibility.',
       inputSchema: {
         type: 'object',
         properties: {
