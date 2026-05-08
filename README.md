@@ -43,17 +43,32 @@
 
 ## Keyboard Shortcuts
 
-Presence is built around the keyboard. Everything below works system-wide, in any app, without taking focus.
+Root Operator is built around the keyboard. Everything below works system-wide, in any app, without taking focus.
+
+### General
 
 | Keys | Action |
 |------|--------|
-| `Shift + Shift` | Open the cursor companion at your cursor — a small input, ready to type |
-| `Enter` | Send the prompt (text only) |
-| `Option + Enter` | Send with an 800×800 capture centered on your cursor |
-| `Option + Shift + Enter` | Send with a full-screen capture |
-| `Option + Shift + Shift` | Open the area selector — drag to pick a region, annotate (mark, color, undo/redo), then send |
-| `Shift + Enter` | Newline in the prompt |
-| `Esc` / right-click outside | Dismiss the companion (half-written prompts persist) |
+| `⌘ ⇧ J` | Toggle the Cloudflare tunnel |
+| `⌘ ⇧ K` | Toggle the desktop chat window |
+| `⌘ ⇧ L` | Toggle Cursor Presence on/off |
+
+### Presence
+
+| Keys | Action |
+|------|--------|
+| `⇧ ⇧` | Open the cursor companion at your cursor (or continue the conversation from an open reply) |
+| `⌥ ⇧ ⇧` | Open the area selector — drag to pick a region, annotate (mark, color, undo/redo), then send |
+| `Right-click` / `Esc` | Dismiss the companion or reply (half-written prompts persist) |
+
+### Sending & Writing
+
+| Keys | Action |
+|------|--------|
+| `↵` | Send the prompt (text only) |
+| `⌥ ↵` | Send with an 800×800 capture centered on your cursor |
+| `⌥ ⇧ ↵` | Send with a full-screen capture |
+| `⇧ ↵` | Newline in the prompt |
 
 ## Features
 
